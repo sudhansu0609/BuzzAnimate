@@ -1,0 +1,177 @@
+{
+  "api": {
+    "64": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "qwen_3_4b.safetensors",
+        "device": "default",
+        "type": "lumina2"
+      }
+    },
+    "65": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "ae.safetensors"
+      }
+    },
+    "66": {
+      "class_type": "ConditioningZeroOut",
+      "inputs": {
+        "conditioning": [
+          "69",
+          0
+        ]
+      }
+    },
+    "67": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "72",
+          0
+        ],
+        "vae": [
+          "65",
+          0
+        ]
+      }
+    },
+    "68": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "z_image_turbo_bf16.safetensors",
+        "weight_dtype": "default"
+      }
+    },
+    "69": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "clip": [
+          "64",
+          0
+        ],
+        "text": "a long dirt road early 2000s, front view , there are trees ion randowm faching on both sides of road and behind the athere are long bushes and bamboo trees.the road is long and dark atmosphere, the road is dirt and  dirt texture not straight line , dark scene, thick black outlines on every object. the path is dirty with lots of dirt texture and gravel and not straight, the path has grass patches on it and snall gravel and stones,.scene is dark, dark lighting , horror cinemaric lighting, thick black outlines:1.3\n\n\"2D digital animation style\ndigital painting:1.2, illustration style,vector saturated colors:1.3 "
+      }
+    },
+    "70": {
+      "class_type": "EmptySD3LatentImage",
+      "inputs": {
+        "batch_size": 1,
+        "height": 720,
+        "width": 1280
+      }
+    },
+    "71": {
+      "class_type": "ModelSamplingAuraFlow",
+      "inputs": {
+        "model": [
+          "78",
+          0
+        ],
+        "shift": 3.01
+      }
+    },
+    "72": {
+      "class_type": "KSampler",
+      "inputs": {
+        "cfg": 1,
+        "denoise": 1,
+        "latent_image": [
+          "70",
+          0
+        ],
+        "model": [
+          "71",
+          0
+        ],
+        "negative": [
+          "66",
+          0
+        ],
+        "positive": [
+          "69",
+          0
+        ],
+        "sampler_name": "res_multistep",
+        "scheduler": "simple",
+        "seed": 908144325932793,
+        "steps": 8
+      }
+    },
+    "73": {
+      "class_type": "ImageUpscaleWithModel",
+      "inputs": {
+        "image": [
+          "67",
+          0
+        ],
+        "upscale_model": [
+          "74",
+          0
+        ]
+      }
+    },
+    "74": {
+      "class_type": "UpscaleModelLoader",
+      "inputs": {
+        "model_name": "4x-UltraSharp.pth"
+      }
+    },
+    "75": {
+      "class_type": "ImageScaleBy",
+      "inputs": {
+        "image": [
+          "73",
+          0
+        ],
+        "scale_by": 1,
+        "upscale_method": "nearest-exact"
+      }
+    },
+    "76": {
+      "class_type": "PreviewImage",
+      "inputs": {
+        "images": [
+          "75",
+          0
+        ]
+      }
+    },
+    "78": {
+      "class_type": "LoraLoaderModelOnly",
+      "inputs": {
+        "lora_name": "zImageTurboKhayal3Bajev1.14.safetensors",
+        "model": [
+          "68",
+          0
+        ],
+        "strength_model": 0.23
+      }
+    },
+    "79": {
+      "class_type": "Image Save",
+      "inputs": {
+        "dpi": 300,
+        "embed_workflow": "true",
+        "extension": "jpeg",
+        "filename_delimiter": "_",
+        "filename_number_padding": 4,
+        "filename_number_start": "false",
+        "filename_prefix": "ComfyUI",
+        "images": [
+          "75",
+          0
+        ],
+        "lossless_webp": "false",
+        "optimize_image": "true",
+        "output_path": "B:\\youtubeProjects\\Khayal3Baje\\stories\\pandit\\pics",
+        "overwrite_mode": "false",
+        "quality": 100,
+        "show_history": "false",
+        "show_history_by_prefix": "true",
+        "show_previews": "true"
+      }
+    }
+  },
+  "source_hash": "c5b987245062fdc6"
+}

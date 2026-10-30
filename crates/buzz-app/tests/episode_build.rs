@@ -603,6 +603,19 @@ fn an_unknown_asset_is_a_note_not_a_failure() {
     assert!(reports[0].captions > 0);
 }
 
+/// AN13: story channels build no caption layers.
+#[test]
+fn captions_off_builds_no_caption_layers() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let lib = library(dir.path());
+    let play = Screenplay::parse(SCRIPT);
+    let casting = Casting::from_json(CASTING).expect("casting");
+    let opts = BuildOptions { captions: false, ..BuildOptions::default() };
+    let (doc, reports) = build_episode(&play, &casting, &lib, &[4], &opts);
+    assert_eq!(reports[0].captions, 0);
+    assert!(!doc.scene().layers().iter().any(|l| l.name.to_lowercase().contains("subtitle")));
+}
+
 #[test]
 fn a_set_with_no_background_is_built_from_the_setting() {
     let built = build(&[5]);

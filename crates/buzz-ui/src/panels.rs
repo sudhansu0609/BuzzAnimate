@@ -187,6 +187,10 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             // The producer (PRODUCER_PLAN P6): script, audio and art in, an
             // episode out.
             ui.menu_button("AI", |ui| {
+                item(ui, Command::NewEpisode, true, &mut raised);
+                ui.separator();
+                item(ui, Command::StoryToScreenplay, true, &mut raised);
+                item(ui, Command::Casting, true, &mut raised);
                 item(ui, Command::ProduceEpisode, true, &mut raised);
             });
             ui.separator();
@@ -296,6 +300,12 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 view.show_pasteboard,
                 &mut raised,
             );
+            toggle(
+                ui,
+                Command::ToggleNeighbours,
+                view.show_neighbours,
+                &mut raised,
+            );
             // Opens a dialog rather than toggling straight away, so this is
             // a plain `item`, not a `toggle` — "Match theme" versus a picked
             // colour is a choice, not an on/off switch.
@@ -361,6 +371,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                     ui.close();
                 }
             }
+            // The co-pilot's window for a produced episode (ANIMATE_COPILOT_PLAN B4).
+            item(ui, Command::ProducerPanel, true, &mut raised);
             ui.separator();
 
             // **Workspace: the three named presets, and the two ways to
@@ -917,6 +929,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             ] {
                 item(ui, c, has_selection, &mut raised);
             }
+            // Nothing selected: the symbol being edited, else the stage.
+            item(ui, Command::EvenLines, true, &mut raised);
+            item(ui, Command::RemoveBackgroundSpecks, true, &mut raised);
 
             // Animate keeps these in a Transform submenu of Modify.
             ui.separator();

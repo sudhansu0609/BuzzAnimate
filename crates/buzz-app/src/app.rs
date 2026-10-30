@@ -641,6 +641,11 @@ enum AiResult {
         report: Box<crate::produce::ProduceReport>,
         open: bool,
     },
+    /// File > AI > Story to Screenplay (ANIMATE_COPILOT_PLAN B1): the cast
+    /// lines and where `screenplay.md` was written.
+    StoryConverted { cast: Vec<String>, screenplay: std::path::PathBuf },
+    /// The Producer window / a co-pilot tool (B4): what one action changed.
+    Copilot { out: std::path::PathBuf, result: Box<crate::copilot::ActionResult> },
 }
 
 /// What the Assistant's `transcribe` listens to.
@@ -1157,6 +1162,23 @@ pub struct App {
     /// **File ▸ AI ▸ Produce Episode…** (PRODUCER_PLAN P6): the dialog's choices.
     produce: buzz_ui::produce_dialog::ProduceDialogState,
     produce_task: Option<crate::tasks::TaskId>,
+    /// Window > Producer (B4): the co-pilot's tree and the action running.
+    producer: buzz_ui::producer_panel::ProducerState,
+    producer_task: Option<crate::tasks::TaskId>,
+    /// Files a co-pilot action rebuilt: when one is read back it replaces the
+    /// open tab's document in place (no new tab per action).
+    reload_paths: std::collections::BTreeSet<std::path::PathBuf>,
+    story: buzz_ui::produce_dialog::StoryDialogState,
+    story_task: Option<crate::tasks::TaskId>,
+    /// **File > AI > Casting...** (ANIMATE_COPILOT_PLAN B2): who plays whom.
+    casting: buzz_ui::casting_dialog::CastingDialogState,
+    /// **File > AI > New Episode...** (ANIMATE_COPILOT_PLAN B7): the guided window.
+    episode: buzz_ui::episode_window::EpisodeState,
+    episode_task: Option<crate::tasks::TaskId>,
+    episode_parts_rx: Option<crossbeam_channel::Receiver<Vec<buzz_ui::episode_window::PartInfo>>>,
+    /// **Window ▸ Storyboard** (STORYBOARD_PLAN S3): the board, its pictures
+    /// and the worker that makes and draws them.
+    storyboard: crate::storyboard_panel::StoryboardPanel,
     arrange_rx: Option<crossbeam_channel::Receiver<ArrangeMsg>>,
     /// The open character's loaded document, and the wardrobe and poses derived
     /// from it. Held here rather than re-read from disk every frame: a
@@ -1459,6 +1481,16 @@ impl App {
             arrange_task: None,
             produce: buzz_ui::produce_dialog::ProduceDialogState::default(),
             produce_task: None,
+            producer: buzz_ui::producer_panel::ProducerState::default(),
+            producer_task: None,
+            reload_paths: std::collections::BTreeSet::new(),
+            story: buzz_ui::produce_dialog::StoryDialogState::default(),
+            story_task: None,
+            casting: buzz_ui::casting_dialog::CastingDialogState::default(),
+            episode: buzz_ui::episode_window::EpisodeState::default(),
+            episode_task: None,
+            episode_parts_rx: None,
+            storyboard: crate::storyboard_panel::StoryboardPanel::default(),
             arrange_rx: None,
             cast_sheet: None,
             preview: crate::preview::Preview::default(),
@@ -2761,6 +2793,7 @@ const KEYBOARD_COMMANDS: &[Command] = &[
     // The remaining View toggles, for the same reason.
     Command::ToggleSnapping,
     Command::TogglePasteboard,
+    Command::ToggleNeighbours,
     Command::ToggleLayoutLock,
     Command::ZoomShowAll,
     Command::ToggleLightGizmos,
@@ -3899,7 +3932,14 @@ impl App {
         self.staging_dialog(&ctx);
         self.recovery_dialog(&ctx);
         self.trace_dialog(&ctx);
+        // Even Out Lines (E2): the editor previews and applies what it asks.
+        let even_lines = buzz_ui::even_lines_dialog(&ctx, &mut self.editor.even_lines_dialog);
+        self.editor.even_lines_action(even_lines);
         self.produce_dialog(&ctx);
+        self.story_dialog(&ctx);
+        self.producer_window(&ctx);
+        self.casting_dialog(&ctx);
+        self.episode_window(&ctx);
         self.snapshots_dialog(&ctx);
         self.estate_dialog(&ctx);
         self.pasteboard_colour_dialog(&ctx);
@@ -4848,6 +4888,7 @@ impl App {
                 | ToggleGuides
                 | ToggleSnapping
                 | TogglePasteboard
+                | ToggleNeighbours
                 | PasteboardColour
                 | TogglePanel(_)
                 | ToggleLayoutLock
@@ -5565,6 +5606,13 @@ impl App {
 
             Tasks => self.tasks_panel(ui),
             Ai => self.draw_ai_panel(ui),
+            Storyboard => {
+                if let Some(crate::storyboard_panel::StoryboardAction::OpenScene { scene, frame }) = self.storyboard.ui(ui)
+                    && let Err(e) = self.storyboard_open_scene(scene, frame)
+                {
+                    self.storyboard.status = e;
+                }
+            }
             MotionEditor => self.motion_editor_panel(ui),
             Sequence => self.sequence_panel(ui),
         }
@@ -8079,6 +8127,8 @@ impl App {
             });
             item(ui, Command::ClearAllKeyframes, has_instance);
             item(ui, Command::RigHead, has_instance);
+            item(ui, Command::EvenLines, has_selection);
+            item(ui, Command::RemoveBackgroundSpecks, has_selection);
             // Copy Motion / Paste Motion (C1), on what was right-clicked.
             let has_motion = self.editor.motion_clip.is_some();
             item(ui, Command::CopyMotion, has_selection);
@@ -8471,6 +8521,37 @@ impl App {
         &mut self.editor
     }
 
+    /// The Storyboard panel's state, for the agent's storyboard actions and
+    /// headless checks.
+    pub fn storyboard_mut(&mut self) -> &mut crate::storyboard_panel::StoryboardPanel {
+        &mut self.storyboard
+    }
+
+    /// Show the Storyboard panel.
+    pub fn reveal_storyboard(&mut self) {
+        self.editor.workspace.reveal(buzz_ui::PanelId::Storyboard);
+    }
+
+    /// **Open scene** from a storyboard panel: the open document's scene
+    /// made from script scene `number` (`Scene 4 — …`, as the episode build
+    /// names them), at `frame`.
+    pub fn storyboard_open_scene(&mut self, number: u32, frame: u32) -> Result<String, String> {
+        let names = self.editor.doc.scene_names();
+        let want = format!("Scene {number}");
+        let index = names
+            .iter()
+            .position(|n| {
+                let n = n.trim();
+                n == want || n.strip_prefix(&want).is_some_and(|rest| rest.starts_with([' ', '\u{2014}', '-', ':']))
+            })
+            .ok_or_else(|| format!("the open document has no scene {number} (its scenes: {})", names.join(", ")))?;
+        self.editor.switch_scene(index);
+        self.editor.set_frame(frame);
+        let name = names[index].clone();
+        self.editor.status = Some(format!("Storyboard: {name}, frame {}", frame + 1));
+        Ok(name)
+    }
+
     pub(crate) fn dispatch(&mut self, command: Command) {
         // Master Audio mode's confirm is "choose it again"; anything else in
         // between disarms it, so a stale count is never confirmed.
@@ -8552,6 +8633,24 @@ impl App {
             Command::TranscribeWithBuzzEdit => self.estate_open_dialog(crate::estate::DialogKind::Transcribe),
             Command::ImportScriptFromStudio => self.estate_open_dialog(crate::estate::DialogKind::Studio),
             Command::ProduceEpisode => self.produce.open = true,
+            Command::NewEpisode => self.open_episode(),
+            Command::StoryToScreenplay => self.story.open = true,
+            Command::ProducerPanel => self.open_producer(),
+            Command::Casting => self.open_casting(),
+            // The Storyboard panel's own buttons (STORYBOARD_PLAN S3).
+            Command::StoryboardMake => {
+                self.reveal_storyboard();
+                if let Err(e) = self.storyboard.make() {
+                    self.storyboard.status = e;
+                }
+            }
+            Command::StoryboardEdit => self.reveal_storyboard(),
+            Command::StoryboardExport => {
+                self.reveal_storyboard();
+                if let Err(e) = self.storyboard.export() {
+                    self.storyboard.status = e;
+                }
+            }
             other => self.editor.run(other),
         }
     }
@@ -9541,8 +9640,13 @@ impl App {
             Loaded::Document { path, result } => {
                 match result {
                     Ok(doc) => {
-                        self.open_document_in_new_tab(*doc);
+                        // A co-pilot rebuild reloads into the same tab (playhead and camera kept).
+                        let doc = if self.reload_paths.remove(&path) { self.replace_open_document(&path, *doc) } else { Some(*doc) };
+                        if let Some(doc) = doc {
+                            self.open_document_in_new_tab(doc);
+                        }
                         self.remember_document_directory(&path);
+                        self.producer_note_opened(&path);
                         self.editor.status = Some(format!("Opened {}", path.display()));
                     }
                     Err(why) => self.editor.status = Some(why),
@@ -10270,6 +10374,23 @@ impl App {
                     r.report.display()
                 );
                 self.produce.status = Some(summary.clone());
+                if self.episode.busy {
+                    self.episode.busy = false;
+                    self.episode.finished = true;
+                    self.episode.running_step = None;
+                    self.episode.status = Some(summary.clone());
+                    self.episode.stills = report
+                        .buzz
+                        .parent()
+                        .and_then(|d| std::fs::read_dir(d.join("stills")).ok())
+                        .map(|rd| {
+                            let mut v: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("png"))).collect();
+                            v.sort();
+                            v
+                        })
+                        .unwrap_or_default();
+                    self.episode_read_plan();
+                }
                 if job_value.is_some() {
                     job_value = Some(serde_json::json!({
                         "buzz": r.buzz,
@@ -10289,6 +10410,37 @@ impl App {
                     self.open_path(&report.buzz);
                 }
                 self.editor.status = Some(summary);
+            }
+            AiResult::Copilot { out, result } => {
+                self.producer.busy = false;
+                let summary = format!("Producer: {} (scene(s) {:?} rebuilt)", result.changed, result.scenes);
+                self.producer.status = Some(summary.clone());
+                self.producer.last_change = Some(format!("{}. Scene(s) {:?} rebuilt; the rest is untouched.", result.changed, result.scenes));
+                if self.producer.out.trim() == out.display().to_string() || self.producer.out.trim().is_empty() {
+                    self.producer.out = out.display().to_string();
+                    self.producer_load();
+                }
+                if let Some(value) = job_value.as_mut() {
+                    *value = result.to_json();
+                }
+                if let Some(buzz) = crate::copilot::buzz_path(&out) {
+                    self.reload_paths.insert(buzz.clone());
+                    self.open_path(&buzz);
+                }
+                self.editor.status = Some(summary);
+            }
+            AiResult::StoryConverted { cast, screenplay } => {
+                self.story.busy = false;
+                self.story.status = Some(format!("Done: {} cast member(s).", cast.len()));
+                if self.episode.converting {
+                    self.episode.converting = false;
+                    let text = std::fs::read_to_string(&screenplay).unwrap_or_default();
+                    self.episode.set_screenplay(&screenplay.display().to_string(), text, cast.clone());
+                    self.episode.status = Some(format!("Screenplay ready: {} cast member(s). Edit it if you like, then Next.", cast.len()));
+                }
+                self.story.cast_lines = cast;
+                self.story.screenplay = Some(screenplay.display().to_string());
+                self.editor.status = Some(format!("Screenplay written: {}", screenplay.display()));
             }
         }
 
@@ -10943,6 +11095,444 @@ impl App {
         id
     }
 
+    /// Window > Producer: open the window, on the open document's folder when that is a produced episode.
+    fn open_producer(&mut self) {
+        self.producer.open = true;
+        if self.producer.out.trim().is_empty()
+            && let Some(dir) = self.editor.doc.path().and_then(|p| p.parent()).filter(|d| crate::copilot::is_episode_dir(d))
+        {
+            self.producer.out = dir.display().to_string();
+        }
+        if self.producer.view.is_none() && !self.producer.out.trim().is_empty() {
+            self.producer_load();
+        }
+    }
+
+    fn producer_load(&mut self) {
+        if self.producer.catalogue.is_empty() {
+            let library = buzz_doc::AssetLibrary::user();
+            if let Some(root) = library.root().map(std::path::Path::to_path_buf) {
+                self.producer.catalogue = crate::my_cast::catalogue_for(&root, &self.episode.series)
+                    .into_iter()
+                    .map(|e| buzz_ui::casting_dialog::CastingPick {
+                        thumb: Some(e.thumb.as_str()).filter(|t| !t.is_empty()).map(|t| root.join(t)).filter(|p| p.is_file()),
+                        name: e.name,
+                        folder: e.folder,
+                        path: e.path,
+                        score: 0.0,
+                    })
+                    .collect();
+            }
+        }
+        let out = std::path::PathBuf::from(self.producer.out.trim());
+        match crate::copilot::view(&out) {
+            Ok(v) => {
+                self.producer.set_view(v);
+                self.producer.status = Some(format!("Loaded {}", out.display()));
+            }
+            Err(e) => self.producer.status = Some(format!("{e:#}")),
+        }
+    }
+
+    /// A produced .buzz was opened: the Producer window offers its folder.
+    fn producer_note_opened(&mut self, path: &std::path::Path) {
+        let Some(dir) = path.parent().filter(|d| crate::copilot::is_episode_dir(d)) else { return };
+        let same = self.producer.out.trim() == dir.display().to_string();
+        self.producer.out = dir.display().to_string();
+        self.producer.open = true;
+        if !same || self.producer.view.is_none() {
+            self.producer_load();
+        }
+    }
+
+    fn producer_window(&mut self, ctx: &egui::Context) {
+        if self.producer.busy && self.producer_task.is_some_and(|t| !self.tasks.is_running(t)) {
+            self.producer.busy = false;
+            self.producer_task = None;
+        }
+        match buzz_ui::producer_panel::producer_panel(ctx, &mut self.producer) {
+            buzz_ui::producer_panel::ProducerAction::Load => self.producer_load(),
+            buzz_ui::producer_panel::ProducerAction::Run(req) => {
+                let out = std::path::PathBuf::from(self.producer.out.trim());
+                let id = self.copilot_spawn(out, req.action, req.args);
+                self.producer_task = Some(id);
+                self.producer.busy = true;
+                self.producer.last_change = None;
+                self.producer.status = Some("Working: see the Tasks panel (Cancel is there)".into());
+            }
+            buzz_ui::producer_panel::ProducerAction::None => {}
+        }
+    }
+
+    /// One co-pilot action as a Task (Cancel in the Tasks panel); the result lands as `AiResult::Copilot`.
+    pub(crate) fn copilot_spawn(&mut self, out: std::path::PathBuf, action: String, args: serde_json::Value) -> crate::tasks::TaskId {
+        let (send, receive) = crossbeam_channel::bounded(1);
+        self.last_ai_task = None;
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, format!("Producer: {action}"), move |ctx| {
+            let progress = ctx.progress.clone();
+            let cancel = ctx.cancel.clone();
+            let mut say = |line: &str| progress.detail(line.to_string());
+            match crate::copilot::run_tool(&out, &action, &args, &mut say, &|| cancel.is_cancelled()) {
+                Ok(result) => {
+                    let _ = send.send(AiResult::Copilot { out: out.clone(), result: Box::new(result) });
+                    crate::tasks::TaskOutcome::Finished(String::new())
+                }
+                Err(_) if cancel.is_cancelled() => crate::tasks::TaskOutcome::Cancelled,
+                Err(e) => crate::tasks::TaskOutcome::Failed(format!("Producer {action}: {e:#}")),
+            }
+        });
+        self.track_ai(id, receive);
+        id
+    }
+
+    /// The Assistant's co-pilot tools: the folder is the `out` arg, else the Producer window's, else the open document's.
+    pub(crate) fn agent_copilot_async(&mut self, tool: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let out = args
+            .get("out")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| Some(self.producer.out.trim()).filter(|s| !s.is_empty()).map(std::path::PathBuf::from))
+            .or_else(|| self.editor.doc.path().and_then(|p| p.parent()).filter(|d| crate::copilot::is_episode_dir(d)).map(std::path::Path::to_path_buf))
+            .ok_or("no episode folder: pass out (the producer's output folder), or open a produced .buzz")?;
+        if !crate::copilot::is_episode_dir(&out) {
+            return Err(format!("{} is not a produced episode folder (produce the episode first)", out.display()));
+        }
+        let mut args = args.clone();
+        if let Some(o) = args.as_object_mut() {
+            o.remove("out");
+        }
+        let id = self.copilot_spawn(out.clone(), tool.to_string(), args);
+        self.producer.busy = true;
+        self.producer_task = Some(id);
+        let job = self.agent_track_last_job(tool).ok_or("the co-pilot task did not start")?;
+        Ok(crate::agent::jobs::started(tool, job, &format!("{tool} is being applied to {} off the UI thread (only the affected scene is rebuilt)", out.display())))
+    }
+
+    /// File > AI > New Episode...: open the guided window with the first series' remembered look.
+    fn open_episode(&mut self) {
+        self.episode.open = true;
+        self.episode.series_list = crate::episode_settings::series_list();
+        if self.episode.series.trim().is_empty() {
+            self.episode.series = self.episode.series_list.first().cloned().unwrap_or_default();
+            self.episode_apply_series();
+        }
+        self.episode_refresh_pictures();
+    }
+
+    /// The Look step's "Pictures" line and the flows its profile folder holds.
+    fn episode_refresh_pictures(&mut self) {
+        let (line, flows) = crate::comfy_profile::pictures_line(&self.episode.series);
+        self.episode.pictures = line;
+        let names: Vec<String> = buzz_doc::AssetLibrary::user()
+            .root()
+            .map(|r| crate::my_cast::catalogue_for(r, &self.episode.series).into_iter().map(|e| e.name).collect())
+            .unwrap_or_default();
+        self.episode.sources = crate::my_cast::sources_line(&self.episode.series, &names);
+        self.episode.picture_flows = flows;
+    }
+
+    /// The Look (and generated-cast choice) remembered for the window's series.
+    fn episode_apply_series(&mut self) {
+        let series = self.episode.series.trim().to_string();
+        if series.is_empty() {
+            return;
+        }
+        let known = crate::episode_settings::load_in(&crate::comfy_profile::profiles_root(), &series).is_some() || self.episode.series_list.contains(&series);
+        if !known {
+            return;
+        }
+        let s = crate::episode_settings::load(&series);
+        let e = &mut self.episode;
+        e.world = s.world;
+        e.style = s.style;
+        e.style_text = s.style_text;
+        e.captions = s.captions;
+        e.objects = s.objects;
+        e.angles = s.angles;
+        e.allow_generated = s.allow_generated;
+    }
+
+    fn episode_save_look(&mut self) {
+        let series = self.episode.series.trim().to_string();
+        let e = &self.episode;
+        let s = crate::episode_settings::SeriesSettings {
+            world: e.world.clone(),
+            style: e.style,
+            style_text: e.style_text.clone(),
+            captions: e.captions,
+            objects: e.objects,
+            angles: e.angles,
+            allow_generated: e.allow_generated,
+        };
+        if let Err(err) = crate::episode_settings::save(&series, &s) {
+            self.episode.status = Some(format!("Could not remember the look: {err}"));
+        }
+    }
+
+    /// The part -> scenes table the last run wrote (`parts.json`), if any.
+    fn episode_read_plan(&mut self) {
+        self.episode.plan.clear();
+        self.episode.uncovered.clear();
+        let path = std::path::Path::new(self.episode.out.trim()).join("parts.json");
+        let Some(plan) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<crate::produce_parts::PartsPlan>(&t).ok()) else { return };
+        self.episode.plan = plan
+            .parts
+            .iter()
+            .map(|p| buzz_ui::episode_window::PlanRow {
+                n: p.n,
+                file: p.file.clone(),
+                seconds: p.duration,
+                scenes: p.scenes.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+            })
+            .collect();
+        self.episode.uncovered = plan.uncovered_lines;
+    }
+
+    /// The Episode window: keeps its flags in step with the tasks, then carries out what was clicked.
+    fn episode_window(&mut self, ctx: &egui::Context) {
+        use buzz_ui::episode_window::EpisodeAction as A;
+        if !self.episode.open {
+            return;
+        }
+        if self.episode.converting && !self.story.busy {
+            self.episode.converting = false;
+        }
+        if let Some(rx) = &self.episode_parts_rx {
+            if let Ok(parts) = rx.try_recv() {
+                self.episode.parts = parts;
+                self.episode_parts_rx = None;
+            }
+        }
+        if self.episode.busy {
+            let running = self.episode_task.and_then(|id| self.tasks.running().find(|t| t.id == id).map(|t| t.progress()));
+            match running {
+                Some(p) => {
+                    self.episode.running_step = Some(p.done as usize);
+                    self.episode.detail = p.detail;
+                }
+                None => {
+                    self.episode.busy = false;
+                    if !self.episode.finished {
+                        self.episode.status = Some("The run stopped before it finished (cancelled or failed). The Tasks panel says why; run again to carry on where it stopped.".into());
+                    }
+                }
+            }
+        }
+        match buzz_ui::episode_window::episode_window(ctx, &mut self.episode, &mut self.casting) {
+            A::Convert => {
+                self.story.story = self.episode.story.clone();
+                self.story.series = self.episode.series.clone();
+                self.story.out = self.episode.out.clone();
+                self.episode.converting = true;
+                self.start_story_convert();
+                if !self.story.busy {
+                    self.episode.converting = false;
+                }
+                self.episode.status = self.story.status.clone();
+            }
+            A::UseAsScreenplay => {
+                let path = std::path::PathBuf::from(self.episode.story.trim());
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        if self.episode.out.trim().is_empty() {
+                            self.episode.out = path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+                        }
+                        self.episode.set_screenplay(&path.display().to_string(), text, Vec::new());
+                        self.episode.status = Some("Screenplay loaded. The cast is read in step 2.".into());
+                    }
+                    Err(e) => self.episode.status = Some(format!("Could not read {}: {e}", path.display())),
+                }
+            }
+            A::SaveScreenplay => {
+                self.episode.status = Some(match std::fs::write(self.episode.screenplay_path.trim(), &self.episode.screenplay_text) {
+                    Ok(()) => {
+                        self.episode.screenplay_dirty = false;
+                        "Screenplay saved.".to_string()
+                    }
+                    Err(e) => format!("Could not save the screenplay: {e}"),
+                });
+            }
+            A::CastLoad => {
+                self.casting.series = self.episode.series.trim().to_string();
+                self.casting.out = self.episode.out.trim().to_string();
+                self.casting_load();
+            }
+            A::CastSave => {
+                self.casting.series = self.episode.series.trim().to_string();
+                self.casting.out = self.episode.out.trim().to_string();
+                self.casting_save();
+                self.episode_save_look();
+            }
+            A::FixRig => {
+                self.dispatch(Command::AiRigLayers);
+                self.episode.status = Some("Rigging the open character as layers so its mouth moves. Open the character's file first if nothing happens.".into());
+            }
+            A::ListParts => {
+                self.episode_read_plan();
+                let dir = std::path::PathBuf::from(self.episode.audio_parts.trim());
+                if dir.is_dir() {
+                    let (tx, rx) = crossbeam_channel::bounded(1);
+                    self.episode_parts_rx = Some(rx);
+                    let repaint = ctx.clone();
+                    std::thread::spawn(move || {
+                        let parts = crate::produce_parts::list_parts(&dir)
+                            .unwrap_or_default()
+                            .iter()
+                            .enumerate()
+                            .map(|(k, f)| buzz_ui::episode_window::PartInfo {
+                                n: k + 1,
+                                file: f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                                seconds: buzz_audio::Clip::open(f).map(|c| c.duration_seconds()).unwrap_or(0.0),
+                            })
+                            .collect();
+                        let _ = tx.send(parts);
+                        repaint.request_repaint();
+                    });
+                } else {
+                    self.episode.parts.clear();
+                }
+            }
+            A::SeriesChanged => {
+                self.episode_apply_series();
+                self.episode_refresh_pictures();
+            }
+            A::PicturesChanged => {
+                if let Some(file) = self.episode.pictures_pick.take() {
+                    self.episode.status = Some(match crate::comfy_profile::set_workflows(self.episode.series.trim(), &file) {
+                        Ok(()) => format!("Backgrounds and characters now use {file}"),
+                        Err(e) => format!("Could not change the pictures flow: {e}"),
+                    });
+                    self.episode_refresh_pictures();
+                }
+            }
+            A::SaveLook => self.episode_save_look(),
+            A::Produce => self.episode_produce(),
+            A::CancelProduce => {
+                if let Some(id) = self.episode_task {
+                    self.tasks.cancel(id);
+                    self.episode.status = Some("Cancelling: the run stops between steps.".into());
+                }
+            }
+            A::OpenInProducer => {
+                let out = self.episode.out.trim().to_string();
+                self.producer.out = out.clone();
+                self.producer.open = true;
+                self.producer.selected = buzz_ui::producer_panel::Selection::None;
+                self.producer_load();
+                if let Some(buzz) = crate::copilot::buzz_path(std::path::Path::new(&out)) {
+                    self.open_path(&buzz);
+                }
+            }
+            A::Close | A::None => {}
+        }
+    }
+
+    /// Step 5: the window's choices as one producer run.
+    fn episode_produce(&mut self) {
+        let e = &self.episode;
+        let script = std::path::PathBuf::from(e.screenplay_path.trim());
+        if e.screenplay_dirty {
+            if let Err(err) = std::fs::write(&script, &e.screenplay_text) {
+                self.episode.status = Some(format!("Could not save the screenplay: {err}"));
+                return;
+            }
+        }
+        let optional = |t: &str| Some(t.trim()).filter(|t| !t.is_empty()).map(std::path::PathBuf::from);
+        let mut req = crate::produce::ProduceRequest::new(script, std::path::PathBuf::from(e.out.trim()));
+        req.audio = optional(&e.audio_full);
+        req.audio_parts = optional(&e.audio_parts);
+        req.part = (!e.whole).then_some(e.part).filter(|n| *n > 0);
+        req.story_dir = optional(&e.story_dir);
+        req.allow_generated_cast = e.allow_generated;
+        let preset = buzz_ui::produce_dialog::STYLE_PRESETS.get(e.style).copied().unwrap_or("comic");
+        let mut style = crate::backdrop::Style::by_name(preset).unwrap_or_default();
+        if !e.style_text.trim().is_empty() {
+            style.suffix = format!("{}, {}", style.suffix, e.style_text.trim());
+        }
+        req.style = style;
+        req.series = e.series.trim().to_string();
+        req.world = if e.world.trim().is_empty() { buzz_ui::produce_dialog::default_world(&req.series).to_string() } else { e.world.trim().to_string() };
+        req.captions = Some(e.captions);
+        req.objects = Some(e.objects);
+        req.angle_pictures = e.angles;
+        req.stills = 1;
+        let id = self.start_produce(req, false);
+        self.episode_task = Some(id);
+        self.episode.busy = true;
+        self.episode.finished = false;
+        self.episode.running_step = Some(0);
+        self.episode.detail.clear();
+        self.episode.stills.clear();
+        self.episode.status = Some("Producing: you can keep working. Cancel stops it between steps.".into());
+        self.episode_save_look();
+    }
+
+    /// The dialog behind File > AI > Story to Screenplay: the conversion is
+    /// one AI task in the Tasks panel, with Cancel.
+    fn story_dialog(&mut self, ctx: &egui::Context) {
+        if self.story.busy && self.story_task.is_some_and(|t| !self.tasks.is_running(t)) {
+            self.story.busy = false;
+            self.story_task = None;
+        }
+        match buzz_ui::produce_dialog::story_dialog(ctx, &mut self.story) {
+            buzz_ui::produce_dialog::StoryDialogAction::Convert => self.start_story_convert(),
+            buzz_ui::produce_dialog::StoryDialogAction::Guided => {
+                self.story.open = false;
+                self.open_episode();
+                self.episode.story = self.story.story.trim().to_string();
+                self.episode.out = self.story.out.trim().to_string();
+                if !self.story.series.trim().is_empty() {
+                    self.episode.series = self.story.series.trim().to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Run the story -> screenplay conversion on `self.story`'s fields (the dialog's and the Episode window's).
+    fn start_story_convert(&mut self) {
+        let story = std::path::PathBuf::from(self.story.story.trim());
+        if !story.is_file() {
+            self.story.status = Some(format!("No story file at {}", story.display()));
+            return;
+        }
+        let Some(assets) = buzz_doc::AssetLibrary::user().root().map(std::path::Path::to_path_buf) else {
+            self.story.status = Some("There is no asset library folder on this machine".into());
+            return;
+        };
+        let out = std::path::PathBuf::from(self.story.out.trim());
+        let series = self.story.series.trim().to_string();
+        let (send, receive) = crossbeam_channel::bounded(1);
+        self.last_ai_task = None;
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "AI: Story to Screenplay", move |ctx| {
+            let progress = ctx.progress.clone();
+            let cancel = ctx.cancel.clone();
+            let llm = buzz_ai::story::Endpoints::standard();
+            let mut say = |line: &str| progress.detail(line.to_string());
+            match buzz_ai::story::story_to_screenplay(&llm, "", &story, &series, &out, &assets, &mut say, &|| cancel.is_cancelled()) {
+                Ok(r) => {
+                    let cast = r
+                        .cast
+                        .iter()
+                        .map(|c| format!("{} ({}){}", c.name, c.id, if c.role.is_empty() { String::new() } else { format!(", {}", c.role) }))
+                        .collect();
+                    let _ = send.send(AiResult::StoryConverted { cast, screenplay: r.screenplay });
+                    crate::tasks::TaskOutcome::Finished(String::new())
+                }
+                Err(buzz_ai::story::StoryError::Cancelled) => crate::tasks::TaskOutcome::Cancelled,
+                Err(e) => crate::tasks::TaskOutcome::Failed(format!("Story to Screenplay: {e}")),
+            }
+        });
+        self.track_ai(id, receive);
+        self.story_task = Some(id);
+        self.story.busy = true;
+        self.story.cast_lines.clear();
+        self.story.screenplay = None;
+        self.story.status = Some("Converting: see the Tasks panel (Cancel is there)".into());
+    }
+
     /// The dialog behind File ▸ AI ▸ Produce Episode…
     fn produce_dialog(&mut self, ctx: &egui::Context) {
         // A run that ended without a result (cancelled, failed) frees the button.
@@ -10968,6 +11558,8 @@ impl App {
                 let mut req = crate::produce::ProduceRequest::new(script, std::path::PathBuf::from(state.out.trim()));
                 let optional = |t: &str| Some(t.trim()).filter(|t| !t.is_empty()).map(std::path::PathBuf::from);
                 req.audio = optional(&state.audio);
+                req.audio_parts = optional(&state.audio_parts);
+                req.part = state.part.trim().parse::<usize>().ok().filter(|n| *n > 0);
                 req.characters_dir = optional(&state.characters);
                 let preset = buzz_ui::produce_dialog::STYLE_PRESETS.get(state.style).copied().unwrap_or("comic");
                 let mut style = crate::backdrop::Style::by_name(preset).unwrap_or_default();
@@ -10990,8 +11582,124 @@ impl App {
                 self.produce.busy = true;
                 self.produce.status = Some("Producing: see the Tasks panel (Cancel is there)".into());
             }
+            buzz_ui::produce_dialog::ProduceDialogAction::Casting => {
+                self.casting.series = self.produce.series.trim().to_string();
+                self.casting.out = self.produce.out.trim().to_string();
+                self.open_casting();
+            }
+            buzz_ui::produce_dialog::ProduceDialogAction::Guided => {
+                self.produce.open = false;
+                self.open_episode();
+                let (p, e) = (&self.produce, &mut self.episode);
+                if !p.series.trim().is_empty() {
+                    e.series = p.series.trim().to_string();
+                }
+                e.out = p.out.trim().to_string();
+                e.audio_full = p.audio.trim().to_string();
+                e.audio_parts = p.audio_parts.trim().to_string();
+                if !p.world.trim().is_empty() {
+                    e.world = p.world.trim().to_string();
+                }
+                e.story = p.script.trim().to_string();
+                if !e.story.is_empty() {
+                    if let Ok(text) = std::fs::read_to_string(&e.story) {
+                        let path = e.story.clone();
+                        e.set_screenplay(&path, text, Vec::new());
+                    }
+                }
+            }
             buzz_ui::produce_dialog::ProduceDialogAction::Cancel | buzz_ui::produce_dialog::ProduceDialogAction::None => {}
         }
+    }
+
+    /// File > AI > Casting...: open the dialog and read the cast.
+    fn open_casting(&mut self) {
+        self.casting.open = true;
+        self.casting_load();
+    }
+
+    /// The dialog behind File > AI > Casting (ANIMATE_COPILOT_PLAN B2).
+    fn casting_dialog(&mut self, ctx: &egui::Context) {
+        match buzz_ui::casting_dialog::casting_dialog(ctx, &mut self.casting) {
+            buzz_ui::casting_dialog::CastingAction::Load => self.casting_load(),
+            buzz_ui::casting_dialog::CastingAction::Save => self.casting_save(),
+            buzz_ui::casting_dialog::CastingAction::FixRig => self.dispatch(Command::AiRigLayers),
+            _ => {}
+        }
+    }
+
+    /// Read the series' cast and choices into the dialog's rows (no model: the
+    /// kept choice, else the shortlist's best as a suggestion).
+    fn casting_load(&mut self) {
+        use buzz_ui::casting_dialog::{CastingPick, CastingRow};
+        let library = buzz_doc::AssetLibrary::user();
+        let Some(root) = library.root().map(std::path::Path::to_path_buf) else {
+            self.casting.status = Some("There is no asset library folder on this machine".into());
+            return;
+        };
+        let series = self.casting.series.trim().to_string();
+        let out = std::path::PathBuf::from(self.casting.out.trim());
+        let members = crate::my_cast::members_for_dialog(&out, &root, &series);
+        if members.is_empty() {
+            self.casting.rows.clear();
+            self.casting.status = Some("No cast found: convert a story first (cast.json in the episode folder) or name a series that has one".into());
+            return;
+        }
+        let catalogue = crate::my_cast::catalogue_for(&root, &series);
+        let file = crate::my_cast::load_casting(&root, &series);
+        let pick = |c: &crate::my_cast::Candidate| CastingPick {
+            name: c.entry.name.clone(),
+            folder: c.entry.folder.clone(),
+            path: c.entry.path.clone(),
+            thumb: Some(c.entry.thumb.as_str()).filter(|t| !t.is_empty()).map(|t| root.join(t)).filter(|p| p.is_file()),
+            score: c.score as f32,
+        };
+        let rows: Vec<CastingRow> = crate::my_cast::view(&catalogue, &file, &members)
+            .into_iter()
+            .map(|r| CastingRow {
+                key: r.member.key(),
+                member: r.member.name.clone(),
+                role: r.member.role.clone(),
+                readiness: r.chosen.as_ref().and_then(|c| crate::my_cast::readiness_of(&library, &c.entry.name)).map(|x| x.line()).unwrap_or_default(),
+                chosen: r.chosen.as_ref().map(pick),
+                reason: r.reason,
+                locked: r.locked,
+                suggested: r.suggested,
+                alternatives: r.alternatives.iter().map(pick).collect(),
+            })
+            .collect();
+        self.casting.status = Some(format!("{} people; {} of your characters", rows.len(), catalogue.len()));
+        self.casting.rows = rows;
+        self.casting.dirty = false;
+    }
+
+    /// Write the dialog's picks to the series' casting.json.
+    fn casting_save(&mut self) {
+        let Some(root) = buzz_doc::AssetLibrary::user().root().map(std::path::Path::to_path_buf) else {
+            self.casting.status = Some("There is no asset library folder on this machine".into());
+            return;
+        };
+        let series = self.casting.series.trim().to_string();
+        let out = std::path::PathBuf::from(self.casting.out.trim());
+        let members = crate::my_cast::members_for_dialog(&out, &root, &series);
+        let catalogue = crate::my_cast::catalogue_for(&root, &series);
+        let picks: Vec<(crate::my_cast::Member, Option<(crate::my_cast::Entry, String, bool)>)> = self
+            .casting
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let member = members.iter().find(|m| m.key() == row.key)?.clone();
+                let chosen = row.chosen.as_ref().and_then(|c| catalogue.iter().find(|e| e.path == c.path)).cloned();
+                Some((member, chosen.map(|e| (e, row.reason.clone(), row.locked))))
+            })
+            .collect();
+        self.casting.status = Some(match crate::my_cast::save_view(&root, &series, &picks) {
+            Ok(()) => {
+                self.casting.dirty = false;
+                format!("Saved {}", crate::my_cast::casting_path(&root, &series).display())
+            }
+            Err(e) => format!("Could not save the casting: {e}"),
+        });
     }
 
     /// The Assistant's `produce_episode` (P6): the producer as a job.
@@ -12629,6 +13337,34 @@ impl App {
         self.documents.push(OpenDocument { doc, view });
         let index = self.documents.len() - 1;
         self.switch_to_tab(index);
+    }
+
+    /// **Co-pilot reload.** Put `doc`, freshly read from `path`, into the tab that already
+    /// shows that file, keeping that tab's playhead and camera (selection is cleared: its
+    /// objects may be gone). Hands the document back when no tab shows `path`.
+    fn replace_open_document(&mut self, path: &std::path::Path, doc: Document) -> Option<Document> {
+        let Some(index) = (0..self.documents.len()).find(|&i| self.tab_document(i).path() == Some(path)) else {
+            return Some(doc);
+        };
+        let last = doc.scene().frame_count().saturating_sub(1);
+        let fresh = crate::editor::DocView::fresh(&doc);
+        if index == self.active_document {
+            let (_old_doc, old_view) = self.editor.swap_document(doc, fresh);
+            self.editor.camera = old_view.camera;
+            self.editor.current_frame = old_view.current_frame.min(last);
+            self.stage_stamp = None;
+            self.scroll_extent = None;
+            self.bounds_table = None;
+            self.reset_light_cache();
+            self.thumbnails.clear();
+            self.warm_activated();
+        } else {
+            let slot = &mut self.documents[index];
+            slot.doc = doc;
+            slot.view.selection = fresh.selection;
+            slot.view.current_frame = slot.view.current_frame.min(last);
+        }
+        None
     }
 
     /// The document showing in tab `i` — the live one in `self.editor` if

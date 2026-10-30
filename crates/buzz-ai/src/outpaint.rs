@@ -1295,6 +1295,176 @@ pub fn take_back_flank(label: &mut [i32], w: usize, h: usize, cut: &JointCut, pa
     moved
 }
 
+/// **SH: the limb root's disc radius** `(R, half_band)`: `half_band` is half the
+/// limb's band width at the cut station (`0.5 · (hi − lo) + 0.5`, as
+/// [`joint_disc`] reads it at the joint); `R` is that, no larger than the distance
+/// from the joint to the nearest pixel outside `body` (the body without its
+/// limbs, `w × h`) less 1 px (as [`joint_disc`] caps its disc), at least 0. `None`
+/// when the band has no run at the cut station.
+pub fn root_disc_radius(cut: &JointCut, body: &[bool], w: usize, h: usize) -> Option<(f32, f32)> {
+    let i = usize::try_from(cut.t_cut.floor() as i64 - cut.k_lo).ok()?;
+    let (lo, hi) = (*cut.band.get(i)?)?;
+    let half_band = 0.5 * (hi - lo) + 0.5;
+    let r = if body.len() == w * h { half_band.min(distance_to_outside(body, w, h, cut.origin, half_band + 2.0) - 1.0) } else { half_band };
+    Some((r.max(0.0), half_band))
+}
+
+/// **SH: a limb's root turns as a disc about its joint.** Every pixel of `child`
+/// (the shoulder's upper arm, the hip's thigh) on the joint side of the cut
+/// (`t < t_cut`) farther than `r` from the joint goes to `parent` (the chest, the
+/// hips), keeping its source colours as [`take_back_joint_side`] does: the rest
+/// picture is the same pixels with another owner. What the limb keeps of its root
+/// lies within the disc of radius `r` about the joint, which turns into itself, so
+/// no corner of a wide root sweeps past the body's outline when the limb turns.
+/// With `sweep`, the limb's pixels past the cut (`t ≥ t_cut`, all outside the
+/// body without its limbs) within `sweep` of the joint go too: the visible sleeve
+/// top that sweeps up. Returns the number of pixels moved.
+#[allow(clippy::too_many_arguments)]
+pub fn take_back_beyond_disc(
+    label: &mut [i32],
+    w: usize,
+    h: usize,
+    cut: &JointCut,
+    parent: i32,
+    child: i32,
+    r: f32,
+    sweep: Option<f32>,
+) -> usize {
+    if label.len() != w * h {
+        return 0;
+    }
+    let mut moved = 0;
+    for i in 0..w * h {
+        if label[i] != child {
+            continue;
+        }
+        let (t, s) = cut.frame(i % w, i / w);
+        let d2 = t * t + s * s;
+        if (t < cut.t_cut && d2 > r * r) || sweep.is_some_and(|sw| t >= cut.t_cut && d2 <= sw * sw) {
+            label[i] = parent;
+            moved += 1;
+        }
+    }
+    moved
+}
+
+/// **SH: the limb's disc about its joint.** On the limb's completed picture `rgba`
+/// (`source`'s size), every pixel within `r` of `head` that is still empty
+/// (alpha 0) and `allowed` (hidden under a part that paints over the limb, inside
+/// the matte) is painted with the limb's first full cross-section from `t_from`
+/// along the bone (as [`outpaint_limb`] picks its colour station from the cut),
+/// the colour at `s` across the axis rescaled from `±r` to that section's width;
+/// painted pixels are marked in `extruded`. `visible` is the limb's own straight
+/// RGBA (its visible pixels). Returns the number of pixels painted.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_joint_disc(
+    rgba: &mut [u8],
+    extruded: &mut [bool],
+    visible: &[u8],
+    allowed: &[bool],
+    head: (f32, f32),
+    tail: (f32, f32),
+    source: &image::RgbaImage,
+    r: f32,
+    t_from: f32,
+) -> usize {
+    let (w, h) = (source.width() as usize, source.height() as usize);
+    let n = w * h;
+    if rgba.len() != n * 4 || visible.len() != n * 4 || extruded.len() != n || allowed.len() != n || r <= 0.0 {
+        return 0;
+    }
+    let (ax, ay) = (tail.0 - head.0, tail.1 - head.1);
+    let len = (ax * ax + ay * ay).sqrt();
+    if len < 1e-3 {
+        return 0;
+    }
+    let u = (ax / len, ay / len);
+    let nrm = (-u.1, u.0);
+    let Some(profile) = Profile::measure(visible, w, h, head, u) else { return 0 };
+    let k_start = profile.k0.max(t_from.floor() as i64);
+    let Some(k_cut) = (k_start..k_start + 2 * SLOPE_STATIONS).find(|&k| profile.at(k).is_some()) else { return 0 };
+    let width_at = |k: i64| profile.at(k).map(|(lo, hi)| hi - lo);
+    let full = (k_cut..k_cut + CUT_INSET_PX + 2 * SLOPE_STATIONS).filter_map(width_at).fold(0.0f32, f32::max);
+    let is_full = |k: i64| width_at(k).is_some_and(|wd| wd >= FULL_SECTION * full);
+    let Some(k_src) = (k_cut + CUT_INSET_PX..k_cut + CUT_INSET_PX + 2 * SLOPE_STATIONS)
+        .find(|&k| is_full(k))
+        .or_else(|| (k_cut + CUT_INSET_PX..k_cut + CUT_INSET_PX + SLOPE_STATIONS).find(|&k| profile.at(k).is_some()))
+        .or_else(|| (k_cut..k_cut + CUT_INSET_PX).rev().find(|&k| profile.at(k).is_some()))
+    else {
+        return 0;
+    };
+    let Some((lo_s, hi_s)) = profile.at(k_src) else { return 0 };
+    let (c_s, hw_s) = (0.5 * (lo_s + hi_s), 0.5 * (hi_s - lo_s));
+    // The section's colours, 1 px apart across it: the nearest visible pixel to
+    // each sample point, a fully opaque one when there is one.
+    let samples = ((hi_s - lo_s).ceil().max(0.0) as usize) + 1;
+    let step = if samples > 1 { (hi_s - lo_s) / (samples - 1) as f32 } else { 0.0 };
+    let mut colours: Vec<Option<[u8; 3]>> = (0..samples)
+        .map(|j| {
+            let s = if samples > 1 { lo_s + j as f32 * step } else { c_s };
+            let px = head.0 + k_src as f32 * u.0 + s * nrm.0;
+            let py = head.1 + k_src as f32 * u.1 + s * nrm.1;
+            let (cx, cy) = (px.round() as i64, py.round() as i64);
+            let mut best: Option<(bool, f32, i64, i64)> = None;
+            for dy in -SAMPLE_SEARCH_PX..=SAMPLE_SEARCH_PX {
+                for dx in -SAMPLE_SEARCH_PX..=SAMPLE_SEARCH_PX {
+                    let (x, y) = (cx + dx, cy + dy);
+                    if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                        continue;
+                    }
+                    let a = visible[(y as usize * w + x as usize) * 4 + 3];
+                    if a <= 128 {
+                        continue;
+                    }
+                    let opaque = a >= OPAQUE_ALPHA;
+                    let d = (x as f32 - px).powi(2) + (y as f32 - py).powi(2);
+                    if best.is_none_or(|(bo, bd, _, _)| (opaque && !bo) || (opaque == bo && d < bd)) {
+                        best = Some((opaque, d, x, y));
+                    }
+                }
+            }
+            best.map(|(_, _, x, y)| {
+                let p = source.get_pixel(x as u32, y as u32).0;
+                [p[0], p[1], p[2]]
+            })
+        })
+        .collect();
+    let known: Vec<usize> = (0..samples).filter(|&j| colours[j].is_some()).collect();
+    if known.is_empty() {
+        return 0;
+    }
+    for j in 0..samples {
+        if colours[j].is_none() {
+            let nearest = known.iter().copied().min_by_key(|&k| (k.abs_diff(j), k)).unwrap_or(known[0]);
+            colours[j] = colours[nearest];
+        }
+    }
+    let cl = |v: f32, m: usize| (v.max(0.0) as usize).min(m.saturating_sub(1));
+    let (x0, x1) = (cl((head.0 - r).floor(), w), cl((head.0 + r).ceil(), w));
+    let (y0, y1) = (cl((head.1 - r).floor(), h), cl((head.1 + r).ceil(), h));
+    let mut painted = 0;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let i = y * w + x;
+            if !allowed[i] || rgba[i * 4 + 3] != 0 {
+                continue;
+            }
+            let (dx, dy) = (x as f32 - head.0, y as f32 - head.1);
+            if dx * dx + dy * dy > r * r + EDGE_EPS {
+                continue;
+            }
+            let s = dx * nrm.0 + dy * nrm.1;
+            let s_src = c_s + s * (hw_s / r);
+            let j = if step > 0.0 { ((s_src - lo_s) / step).round().clamp(0.0, (samples - 1) as f32) as usize } else { 0 };
+            let Some(rgb) = colours[j] else { continue };
+            rgba[i * 4..i * 4 + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            extruded[i] = true;
+            painted += 1;
+        }
+    }
+    painted
+}
+
 /// B1b: a limb borrows its counterpart's picture when it owns less than this
 /// share of the counterpart's pixel count.
 const BORROW_SHARE: f64 = 0.2;

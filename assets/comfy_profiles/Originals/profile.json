@@ -1,0 +1,18 @@
+{
+  "background_workflow": null,
+  "character_workflow": null,
+  "angle_workflow": "multiple_scene_angles-v1.0.json",
+  "base_size": [1280, 720],
+  "captions": true,
+  "objects_as_symbols": true,
+  "angle_pictures": true,
+  "world": "a semi-rural small town in North India, 2010s: smartphones, motorbikes, small shops and tea stalls",
+  "style_text": "easy-going flat 2D illustration, clean lines, warm bright colours, simple shading",
+  "cast_sources": {
+    "library": ["Cast"],
+    "fla": [],
+    "story_animate_folder": false,
+    "exclude": ["Ana *", "Bo *"],
+    "extra_folders": ["B:\\youtubeProjects\\Originals"]
+  }
+}

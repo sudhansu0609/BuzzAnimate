@@ -64,7 +64,7 @@ pub struct HeadRigReport {
 
 /// What a head layer (or a named object on one) is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Part {
+pub(crate) enum Part {
     Sound,
     Eye,
     Lid,
@@ -77,7 +77,7 @@ enum Part {
     Extra,
 }
 
-fn classify(name: &str) -> Option<Part> {
+pub(crate) fn classify(name: &str) -> Option<Part> {
     let n = name.to_lowercase();
     let has = |w: &str| n.contains(w);
     Some(if has("sound") || has("audio") || has("voice") {
@@ -197,6 +197,20 @@ pub(super) fn clip_shape(s: &ShapeData, clip: &BezPath, op: BoolOp) -> Option<Sh
 }
 
 fn flatten_into(scene: &Scene, object: &Object, parent: Affine, colours: &[ColorTransform], out: &mut Vec<ShapeData>, depth: usize) {
+    flatten_into_placed(scene, object, parent, colours, out, &mut Vec::new(), depth);
+}
+
+/// [`flatten_into`], also noting where every symbol shown inside is placed:
+/// (symbol, its space → the flattened space). E1e (`docs/EVEN_LINES_PLAN.md`).
+fn flatten_into_placed(
+    scene: &Scene,
+    object: &Object,
+    parent: Affine,
+    colours: &[ColorTransform],
+    out: &mut Vec<ShapeData>,
+    placed: &mut Vec<(SymbolId, Affine)>,
+    depth: usize,
+) {
     if !object.visible || depth > 12 {
         return;
     }
@@ -205,19 +219,20 @@ fn flatten_into(scene: &Scene, object: &Object, parent: Affine, colours: &[Color
         ObjectKind::Shape(s) => out.push(transformed(s, world, colours)),
         ObjectKind::Group(children) => {
             for c in children {
-                flatten_into(scene, c, world, colours, out, depth + 1);
+                flatten_into_placed(scene, c, world, colours, out, placed, depth + 1);
             }
         }
         ObjectKind::Instance(i) => {
             let Some(symbol) = scene.library().get(i.symbol) else { return };
+            placed.push((i.symbol, world));
             let frame = i.resolve_frame(symbol.kind, 0, symbol.length());
             let mut chain = vec![i.color];
             chain.extend_from_slice(colours);
-            flatten_stack(scene, &symbol.layers, frame, world, &chain, out, depth + 1);
+            flatten_stack_placed(scene, &symbol.layers, frame, world, &chain, out, placed, depth + 1);
         }
         ObjectKind::Armature(rig) => {
             for part in rig.posed() {
-                flatten_into(scene, &part, world, colours, out, depth + 1);
+                flatten_into_placed(scene, &part, world, colours, out, placed, depth + 1);
             }
         }
         ObjectKind::Warp(w) => out.push(transformed(&w.warped(), world, colours)),
@@ -233,6 +248,22 @@ pub(super) fn flatten_stack(
     out: &mut Vec<ShapeData>,
     depth: usize,
 ) {
+    flatten_stack_placed(scene, stack, frame, world, colours, out, &mut Vec::new(), depth);
+}
+
+/// [`flatten_stack`], also noting every symbol placement inside (see
+/// [`flatten_into_placed`]).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn flatten_stack_placed(
+    scene: &Scene,
+    stack: &LayerStack,
+    frame: u32,
+    world: Affine,
+    colours: &[ColorTransform],
+    out: &mut Vec<ShapeData>,
+    placed: &mut Vec<(SymbolId, Affine)>,
+    depth: usize,
+) {
     for layer in stack.paint_order() {
         if matches!(layer.kind, LayerKind::Folder | LayerKind::Guide | LayerKind::Mask | LayerKind::InverseMask)
             || !layer.is_drawable_at(frame)
@@ -242,7 +273,7 @@ pub(super) fn flatten_stack(
         }
         let mut shapes = Vec::new();
         for o in layer.objects_at(frame) {
-            flatten_into(scene, o, world, colours, &mut shapes, depth);
+            flatten_into_placed(scene, o, world, colours, &mut shapes, placed, depth);
         }
         if let Some(mask) = stack.mask_for(layer.id).and_then(|m| stack.get(m)) {
             let mut mask_shapes = Vec::new();

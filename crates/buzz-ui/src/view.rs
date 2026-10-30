@@ -61,6 +61,11 @@ pub struct ViewSettings {
     pub lock_guides: bool,
     /// Draw artwork sitting outside the stage rectangle.
     pub show_pasteboard: bool,
+    /// Edit in place: draw the scene around the open symbol, veiled, so a
+    /// part can be extended under its neighbour with the neighbour's edge in
+    /// view. Off hides the context entirely.
+    #[serde(default = "show_neighbours_default")]
+    pub show_neighbours: bool,
     pub snap: SnapSettings,
     /// Grid spacing in document units.
     pub grid_spacing: f64,
@@ -75,6 +80,10 @@ pub struct ViewSettings {
     pub shape_tolerance: buzz_geom::Tolerance,
 }
 
+fn show_neighbours_default() -> bool {
+    true
+}
+
 impl Default for ViewSettings {
     fn default() -> Self {
         Self {
@@ -83,6 +92,7 @@ impl Default for ViewSettings {
             show_guides: true,
             lock_guides: false,
             show_pasteboard: true,
+            show_neighbours: true,
             snap: SnapSettings::default(),
             shape_tolerance: buzz_geom::Tolerance::Normal,
             // Animate's default grid.

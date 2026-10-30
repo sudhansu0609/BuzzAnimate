@@ -376,7 +376,11 @@ fn encode(
     //
     // Animate pales the context rather than hiding it, and the pale is the
     // point: everything solid on screen is then the thing you are editing.
-    if !scene.edit_path().is_empty() {
+    //
+    // View ▸ Show Neighbours turns the context off entirely; on, the veil is
+    // 0xA6 so the neighbours sit at about 35 % — enough to read the torso's
+    // edge a part is being extended under (TRACE_SPILL_AND_OUTPAINT_PLAN C2).
+    if !scene.edit_path().is_empty() && editor.view.show_neighbours {
         let context = FrameOptions {
             masks: MaskDisplay::WhenLocked,
             // Not lit: shading and cast shadows on artwork that is only there
@@ -395,7 +399,7 @@ fn encode(
         let seen = editor.camera.visible_doc_rect();
         builder.fill_shape(
             &seen.inflate(seen.width(), seen.height()),
-            peniko::Color::from_rgba8(0xFF, 0xFF, 0xFF, 0xC4),
+            peniko::Color::from_rgba8(0xFF, 0xFF, 0xFF, 0xA6),
         );
     }
 

@@ -123,6 +123,28 @@ impl ComfyClient {
         Err(format!("ComfyUI was started but did not answer within {} s", wait.as_secs()))
     }
 
+    /// `POST /free`: ask ComfyUI to unload its models and free memory (best effort).
+    pub fn free_memory(&self) -> Result<(), String> {
+        if !is_local(&self.base_url) {
+            return Err(format!("{} is not a localhost URL", self.base_url));
+        }
+        agent(Duration::from_secs(30))
+            .post(&format!("{}/free", self.base_url))
+            .send_json(json!({"unload_models": true, "free_memory": true}))
+            .map(|_| ())
+            .map_err(|e| format!("ComfyUI /free: {e}"))
+    }
+
+    /// `GET /object_info`: every node class with its input choices.
+    pub fn object_info(&self) -> Result<Value, String> {
+        agent(Duration::from_secs(60))
+            .get(&format!("{}/object_info", self.base_url))
+            .call()
+            .map_err(|e| format!("ComfyUI /object_info: {e}"))?
+            .into_json()
+            .map_err(|e| format!("ComfyUI /object_info: {e}"))
+    }
+
     /// `POST /prompt`: the prompt id.
     pub fn queue(&self, workflow: Value) -> Result<String, String> {
         if !is_local(&self.base_url) {
@@ -191,6 +213,33 @@ impl ComfyClient {
             std::thread::sleep(Duration::from_secs(1));
         }
         Err(format!("ComfyUI job {prompt_id} did not finish within {} s", timeout.as_secs()))
+    }
+
+    /// `POST /upload/image` (multipart, overwrite): the name ComfyUI keeps the
+    /// picture under, for a `LoadImage` node.
+    pub fn upload_image(&self, name: &str, png: &[u8]) -> Result<String, String> {
+        if !is_local(&self.base_url) {
+            return Err(format!("{} is not a localhost URL", self.base_url));
+        }
+        let boundary = "----buzzanimateboundary7d3f";
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{name}\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(png);
+        body.extend_from_slice(
+            format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"overwrite\"\r\n\r\ntrue\r\n--{boundary}--\r\n").as_bytes(),
+        );
+        let r = agent(Duration::from_secs(120))
+            .post(&format!("{}/upload/image", self.base_url))
+            .set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+            .send_bytes(&body)
+            .map_err(|e| format!("ComfyUI upload failed: {e}"))?;
+        let v: Value = r.into_json().map_err(|e| format!("ComfyUI upload: not JSON ({e})"))?;
+        Ok(v.get("name").and_then(Value::as_str).unwrap_or(name).to_string())
     }
 
     /// `GET /view`: the file's bytes.

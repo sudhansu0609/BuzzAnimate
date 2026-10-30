@@ -2660,6 +2660,17 @@ mod head_rig;
 mod head_cut;
 pub use head_rig::{HeadRigReport, flatten_rest, head_rig_flag, head_symbol_for, head_target, rig_head};
 
+/// E2: Even Out Lines, `docs/EVEN_LINES_PLAN.md`.
+mod even_lines;
+pub use even_lines::{
+    EvenLinesPlan, EvenLinesReport, EvenLinesScope, EvenLinesSettings, EvenLinesTrace, apply_even_lines,
+    default_solid_above, nested_symbols, plan_even_lines, retrace_even_lines, trace_even_lines,
+};
+
+/// A6b: Remove Background Specks, `docs/TRACE_SPILL_AND_OUTPAINT_PLAN.md`.
+mod background_specks;
+pub use background_specks::{SpecksReport, remove_background_specks};
+
 /// The `biped_full` slots a merged drawing is cut between: every body part
 /// but the brows, which sit inside the head.
 const SPLIT_SLOTS: usize = 15;
@@ -4449,6 +4460,11 @@ pub struct AppliedLayerRig {
     pub legs_folder: bool,
     /// Face layers renamed inside the head symbol.
     pub face_renamed: usize,
+    /// The head symbol Rig Head runs on: the plan's, or (H2a, with
+    /// `plan.rig_head`) the one made from a plain-drawing head piece.
+    pub head_symbol: Option<buzz_scene::SymbolId>,
+    /// H2a: the head piece was a plain drawing and was made a head symbol.
+    pub head_made: bool,
 }
 
 /// **R2.** Carry out `plan` inside its character symbol: each piece on a
@@ -4655,6 +4671,15 @@ fn apply_layer_rig_pieces(scene: &mut Scene, plan: &LayerRigPlan) -> Option<Appl
     };
     let layers_after = work.library().get(plan.symbol).map_or(0, |s| s.layers.len());
 
+    // H2a: a head piece that is a plain drawing (shapes, groups) becomes a
+    // head symbol, so Rig Head has a symbol to rig in the same step.
+    let mut head_symbol = plan.head_symbol;
+    let mut head_made = false;
+    if plan.rig_head && head_symbol.is_none() {
+        head_symbol = make_head_symbol(&mut work, plan, &rig);
+        head_made = head_symbol.is_some();
+    }
+
     // The head symbol's face layers (no parenting inside it).
     let mut face_renamed = 0;
     if let Some(head) = plan.head_symbol
@@ -4687,7 +4712,60 @@ fn apply_layer_rig_pieces(scene: &mut Scene, plan: &LayerRigPlan) -> Option<Appl
         renamed,
         legs_folder,
         face_renamed,
+        head_symbol,
+        head_made,
     })
+}
+
+/// **H2a.** The head piece's layer (the lead of the head slot) holding a
+/// plain drawing on its one keyframe: the drawing moved into a new graphic
+/// symbol "<character> head" (one frame, in the character's folder) and an
+/// instance of it at identity, single frame, put in its place, so nothing
+/// moves. `None`, with nothing changed, when there is no head piece, it is
+/// already a symbol, or its layer is animated.
+fn make_head_symbol(scene: &mut Scene, plan: &LayerRigPlan, rig: &LayerRig) -> Option<buzz_scene::SymbolId> {
+    const HEAD_SLOT: usize = 2;
+    let lead_name = plan.pieces.iter().find(|p| p.slot == HEAD_SLOT && p.lead).map(|p| p.new_layer_name.clone());
+    let character = scene.library().get(plan.symbol)?;
+    let (name, folder) = (character.name.clone(), character.folder.clone());
+    let stack = &character.layers;
+    let heads: Vec<LayerId> = rig.layers.iter().filter(|(s, _)| *s == HEAD_SLOT).map(|(_, l)| *l).collect();
+    let layer_id = heads
+        .iter()
+        .copied()
+        .find(|l| lead_name.as_ref().is_some_and(|n| stack.get(*l).is_some_and(|x| x.name == *n)))
+        .or_else(|| heads.first().copied())?;
+    let layer = stack.get(layer_id)?;
+    if layer.frames.keyframe_count() != 1 {
+        return None;
+    }
+    let key = layer.frames.keyframes().first()?;
+    let objects: Vec<Arc<Object>> = key.objects.iter().cloned().collect();
+    if objects.is_empty() || (objects.len() == 1 && objects[0].instance().is_some()) {
+        return None;
+    }
+    let head = scene.add_symbol(format!("{name} head"), buzz_scene::SymbolKind::Graphic, folder.as_deref());
+    let inner = scene.library().get(head)?.layers.iter().next()?.id;
+    scene.library_mut().update(head, |s| {
+        s.layers.update(inner, |l| {
+            let mut k = buzz_scene::Keyframe::new(0);
+            k.objects = Arc::new(objects);
+            l.frames = buzz_scene::LayerTimeline::from_parts(vec![k], 1);
+        });
+    });
+    let mut instance = Object::instance_of(scene.next_object_id(), head);
+    if let ObjectKind::Instance(i) = &mut instance.kind {
+        i.loop_mode = buzz_scene::LoopMode::SingleFrame;
+        i.first_frame = 0;
+    }
+    let instance = Arc::new(instance);
+    let stack = scene.library_mut().layers_mut(plan.symbol)?;
+    stack.update(layer_id, |l| {
+        if let Some(k) = l.frames.keyframes_mut().first_mut() {
+            k.objects = Arc::new(vec![instance]);
+        }
+    });
+    Some(head)
 }
 
 /// The `biped_full` slots that are legs: hips (lower cloth), thighs, shins,

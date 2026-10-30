@@ -47,6 +47,29 @@ pub struct Breakdown {
     pub world: String,
     pub characters: Vec<CharacterBrief>,
     pub scenes: Vec<SceneBrief>,
+    /// The hints' style text, ends every location look.
+    pub style: String,
+    /// AN4: character key (upper-case) -> the pose names its folder has pictures for.
+    pub poses_available: BTreeMap<String, Vec<String>>,
+    /// AN9: location key -> its look and seed family.
+    pub looks: BTreeMap<String, LocationLook>,
+}
+
+impl Breakdown {
+    /// The parts a breakdown takes from the script and hints, not from analysis.
+    fn from_hints(play: &Screenplay, hints: &BreakdownHints) -> Self {
+        Breakdown {
+            title: play.title.clone(),
+            world: hints.world.clone(),
+            style: hints.style.clone(),
+            poses_available: hints
+                .known_poses
+                .iter()
+                .map(|(k, v)| (norm(k), v.iter().map(|p| p.to_lowercase().replace(' ', "_")).collect()))
+                .collect(),
+            ..Default::default()
+        }
+    }
 }
 
 /// One character of the script.
@@ -86,6 +109,36 @@ pub struct ShotBrief {
     pub kind: String,
     /// The character the shot is on; empty for a wide.
     pub on: String,
+    /// AN9: the angle, one of [`CAMERAS`]; `kind` is what the episode builder
+    /// frames (`low_angle`, `reverse`... are `medium` there).
+    pub camera: String,
+    /// AN9: the plate prompt of this angle: the location's look + the camera's
+    /// framing words + nobody in frame. What the backdrop step draws from.
+    pub background_prompt: String,
+    /// AN9: shared by every shot of the location.
+    pub seed_family: u64,
+}
+
+/// AN9: one location's look, shared by all its shots.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LocationLook {
+    /// Location description, time, weather, lighting, era/world and the series
+    /// style text; no people, no camera words.
+    pub look: String,
+    pub seed_family: u64,
+    /// The `setting` the look was written for.
+    pub setting: String,
+}
+
+/// AN4: a `[Name: pose, position]` tag of the script.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct StageTag {
+    pub name: String,
+    pub pose: String,
+    /// `left`, `centre`, `right`, `door`, `30%`; empty when not given.
+    pub position: String,
 }
 
 /// One scene of the script, broken down.
@@ -118,6 +171,12 @@ pub struct SceneBrief {
     pub lighting: Lighting,
     pub shots: Vec<ShotBrief>,
     pub mood: String,
+    /// AN4: the pose picture each present character plays (a pose name from the
+    /// character's folder); a script tag wins over the choice made from the action.
+    pub poses: BTreeMap<String, String>,
+    /// AN13: the concrete set nouns of the slugline and the first action line
+    /// ("an old peepal tree", "a broken lamp post"); they lead the background prompt.
+    pub set_nouns: Vec<String>,
 }
 
 /// What the producer knows besides the script.
@@ -132,7 +191,12 @@ pub struct BreakdownHints {
     /// Where and when the story lives: "rural Bihar, India, late 1990s". Ends
     /// every background prompt, so a generator does not draw a generic street.
     pub world: String,
+    /// AN4: character name -> the pose names its folder has pictures for.
+    pub known_poses: BTreeMap<String, Vec<String>>,
 }
+
+/// AN9: the camera angles.
+pub const CAMERAS: &[&str] = &["wide", "medium", "close", "low_angle", "high_angle", "over_shoulder", "reverse"];
 
 const SETTINGS: &[&str] = &["daylight", "sunset", "night", "interior", "storm"];
 const LIGHT_KEYS: &[&str] = &["sun", "lamp", "moon", "window", "none"];
@@ -335,7 +399,7 @@ pub fn breakdown_offline(play: &Screenplay, hints: &BreakdownHints) -> Breakdown
         .zip(&slugs)
         .map(|(s, slug)| offline_scene(s, slug.as_ref(), &characters))
         .collect();
-    let mut b = Breakdown { title: play.title.clone(), world: hints.world.clone(), characters, scenes };
+    let mut b = Breakdown { characters, scenes, ..Breakdown::from_hints(play, hints) };
     tidy(&mut b, play);
     b
 }
@@ -357,6 +421,10 @@ pub fn tidy(b: &mut Breakdown, play: &Screenplay) {
         }
         s.background_prompt = without_people(&s.background_prompt, &s.slugline);
     }
+    // AN4 / AN9: tags and poses, a camera per shot, one look per location.
+    apply_stage(b, play);
+    fill_cameras(b);
+    apply_looks(b);
 }
 
 /// Words that put a person (or a group) into a picture. A background generator
@@ -610,6 +678,7 @@ fn offline_scene(scene: &ScriptScene, slug: Option<&Slugline>, characters: &[Cha
         Item::Action(a) => Some(a.trim().to_string()),
         _ => None,
     });
+    let nouns = set_nouns(slug.map(|s| s.raw.as_str()).unwrap_or(""), first_action.as_deref());
     let mut background_prompt = sentence_case(&location);
     if let Some(s) = slug
         && !s.time.trim().is_empty()
@@ -637,8 +706,10 @@ fn offline_scene(scene: &ScriptScene, slug: Option<&Slugline>, characters: &[Cha
         enter: BTreeMap::new(),
         props: Vec::new(),
         lighting: lighting_for(setting),
-        shots: vec![ShotBrief { at_line: 0, kind: "wide".into(), on: String::new() }],
+        shots: offline_shots(scene, characters),
         mood: String::new(),
+        set_nouns: nouns,
+        ..Default::default()
     }
 }
 
@@ -911,6 +982,7 @@ struct LlmShot {
     at_line: i64,
     kind: String,
     on: String,
+    camera: String,
 }
 
 /// Pass 2's schema. Maps are lists of `{name, …}` here: strict JSON schema
@@ -970,9 +1042,10 @@ fn scenes_schema() -> Value {
                                 "properties": {
                                     "at_line": { "type": "integer" },
                                     "kind": { "type": "string", "enum": SHOT_KINDS },
-                                    "on": { "type": "string" }
+                                    "on": { "type": "string" },
+                                    "camera": { "type": "string", "enum": CAMERAS }
                                 },
-                                "required": ["at_line", "kind", "on"],
+                                "required": ["at_line", "kind", "on", "camera"],
                                 "additionalProperties": false
                             }
                         },
@@ -1009,6 +1082,10 @@ from left, right or front; warm for sunlight, lamps and sunsets. \
 `shots`: camera cuts. `at_line` is the [line n] number a cut starts on. The first shot is wide at line 0. \
 Add a medium or close shot `on` the speaking character for a long or important line or a punchline, and go back to wide afterwards; \
 leave `on` empty for a wide shot. Keep it to a few cuts per scene. \
+`camera` is the angle of each shot, chosen from what happens there: wide (the establishing shot, kind wide), \
+medium or reverse (dialogue, alternating between two speakers; kind medium), close (a reveal, a reaction, a punchline; kind close), \
+low_angle (something big, scary or powerful looms; kind medium), high_angle (looking down from a roof, a fall, someone small; kind medium), \
+over_shoulder (a private or tense exchange; kind medium). \
 `mood`: two or three words. \
 Output strictly valid JSON according to the schema.";
 
@@ -1161,11 +1238,13 @@ fn merge_scene(
         if shots.iter().any(|x| x.at_line == s.at_line as usize) {
             continue;
         }
-        shots.push(ShotBrief { at_line: s.at_line as usize, kind: s.kind, on });
+        // AN9: the model's camera when it is one of ours and fits the kind; else filled in by `tidy`.
+        let camera = if CAMERAS.contains(&s.camera.as_str()) && kind_of_camera(&s.camera) == s.kind { s.camera } else { String::new() };
+        shots.push(ShotBrief { at_line: s.at_line as usize, kind: s.kind, on, camera, ..Default::default() });
     }
     shots.sort_by_key(|s| s.at_line);
     if shots.first().is_none_or(|s| s.at_line != 0) {
-        shots.insert(0, ShotBrief { at_line: 0, kind: "wide".into(), on: String::new() });
+        shots.insert(0, ShotBrief { at_line: 0, kind: "wide".into(), camera: "wide".into(), ..Default::default() });
     }
     out.shots = shots;
     out.mood = got.mood.trim().to_string();
@@ -1234,9 +1313,507 @@ pub fn breakdown_cancellable(
             keys_used.entry(s.location_key.clone()).or_insert_with(|| s.slugline.clone());
         }
     }
-    let mut b = Breakdown { title: play.title.clone(), world: hints.world.clone(), characters, scenes };
+    let mut b = Breakdown { characters, scenes, ..Breakdown::from_hints(play, hints) };
     tidy(&mut b, play);
     Some(b)
+}
+
+// -- AN4: tags and poses ------------------------------------------------------------------------
+
+/// `left`, `centre`, `right`, `door` or `30%`, normalised; `None` for anything else.
+fn normalise_position(word: &str) -> Option<String> {
+    let w = word.trim().to_lowercase();
+    match w.as_str() {
+        "left" | "l" => Some("left".into()),
+        "right" | "r" => Some("right".into()),
+        "centre" | "center" | "middle" | "c" => Some("centre".into()),
+        "door" | "doorway" => Some("door".into()),
+        _ => {
+            let n: f64 = w.strip_suffix('%')?.trim().parse().ok()?;
+            n.is_finite().then(|| format!("{}%", n.clamp(0.0, 100.0).round()))
+        }
+    }
+}
+
+/// Across the stage (0..1) for a normalised position.
+pub fn position_x(position: &str) -> Option<f64> {
+    match position {
+        "left" => Some(0.2),
+        "centre" => Some(0.5),
+        "right" => Some(0.8),
+        "door" => Some(0.88),
+        p => p.strip_suffix('%')?.parse::<f64>().ok().map(|n| (n / 100.0).clamp(0.05, 0.95)),
+    }
+}
+
+/// **`[Name: pose, position]` tags** in a paragraph of the script. Either part
+/// may be left out (`[Guddu: sitting]`, `[Raju: right]`); a pose is any word
+/// that is not a position. A bracket without a colon (`[VISUAL]`) is no tag.
+pub fn parse_tags(text: &str) -> Vec<StageTag> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(']') else { break };
+        let inner = &after[..close];
+        rest = &after[close + 1..];
+        let Some((name, args)) = inner.split_once(':') else { continue };
+        let name = name.trim();
+        if name.is_empty() || name.split_whitespace().count() > 3 {
+            continue;
+        }
+        let (mut pose, mut position) = (String::new(), String::new());
+        for part in args.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            match normalise_position(part) {
+                Some(p) => {
+                    if position.is_empty() {
+                        position = p;
+                    }
+                }
+                None => {
+                    if pose.is_empty() {
+                        pose = part.to_lowercase().replace(' ', "_");
+                    }
+                }
+            }
+        }
+        if pose.is_empty() && position.is_empty() {
+            continue;
+        }
+        out.push(StageTag { name: name.to_string(), pose, position });
+    }
+    out
+}
+
+/// The part of a pose word that action lines inflect: `sitting` -> `sit`,
+/// `scared` -> `scar`, `pointing` -> `point`.
+fn pose_stem(pose: &str) -> String {
+    let lower = pose.to_lowercase();
+    let word = lower.split('_').next().unwrap_or_default();
+    let mut stem = word;
+    for suffix in ["ing", "ed", "e"] {
+        if let Some(x) = stem.strip_suffix(suffix) {
+            if x.len() >= 3 {
+                stem = x;
+            }
+            break;
+        }
+    }
+    let mut chars: Vec<char> = stem.chars().collect();
+    if chars.len() > 3 && chars[chars.len() - 1] == chars[chars.len() - 2] {
+        chars.pop();
+    }
+    chars.into_iter().collect()
+}
+
+/// The pose, among `variants`, an action line gives `names` ("Guddu sits on
+/// the bench" -> `sitting`); `None` when no line does.
+fn pose_from_actions(actions: &[String], names: &[String], variants: &[String]) -> Option<String> {
+    for action in actions {
+        let lower = action.to_lowercase();
+        for clause in lower.split(['.', ',', ';', '!', '?']) {
+            if !names.iter().any(|n| mentions(clause, n)) {
+                continue;
+            }
+            for v in variants {
+                let stem = pose_stem(v);
+                if stem.len() < 3 {
+                    continue;
+                }
+                let hit = clause
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|w| w.starts_with(&stem) && w.len() <= stem.len() + 4);
+                if hit {
+                    return Some(v.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Poses and stage tags, applied to every scene (idempotent; tidy runs it
+/// again on a breakdown read from a file). The pose of a character comes from
+/// the action lines among the pictures their folder has; a script tag
+/// `[Name: pose, position]` then wins: its pose, its place across the stage
+/// (`door` also walks them in) and being on stage at all.
+fn apply_stage(b: &mut Breakdown, play: &Screenplay) {
+    let characters = b.characters.clone();
+    let available = b.poses_available.clone();
+    for s in &mut b.scenes {
+        let Some(src) = play.scene(s.number) else { continue };
+        s.poses.clear();
+        let actions: Vec<String> = src
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Action(a) => Some(a.clone()),
+                _ => None,
+            })
+            .collect();
+        for key in s.present.clone() {
+            let Some(c) = characters.iter().find(|c| norm(&c.name) == key) else { continue };
+            let variants: Vec<String> = std::iter::once(&c.name)
+                .chain(&c.aliases)
+                .find_map(|n| available.get(&norm(n)).cloned())
+                .unwrap_or_default();
+            if variants.is_empty() {
+                continue;
+            }
+            let names: Vec<String> = std::iter::once(&c.name)
+                .chain(&c.aliases)
+                .map(|n| n.trim().to_lowercase())
+                .filter(|n| !n.is_empty())
+                .collect();
+            if let Some(p) = pose_from_actions(&actions, &names, &variants) {
+                s.poses.insert(key, p);
+            }
+        }
+        for item in &src.items {
+            let Item::Action(a) = item else { continue };
+            for tag in parse_tags(a) {
+                let key = resolve(&tag.name, &characters);
+                if !characters.iter().any(|c| norm(&c.name) == key) || is_voice_only(&key, &characters) {
+                    continue;
+                }
+                if !s.present.contains(&key) {
+                    s.present.push(key.clone());
+                    s.absent.retain(|x| *x != key);
+                }
+                if !tag.pose.is_empty() {
+                    s.poses.insert(key.clone(), tag.pose.clone());
+                }
+                match position_x(&tag.position) {
+                    Some(x) => {
+                        s.place.insert(key.clone(), x);
+                        if tag.position == "door" {
+                            s.enter.insert(key.clone(), if x > 0.5 { "right" } else { "left" }.into());
+                        }
+                    }
+                    None => {
+                        s.place.entry(key.clone()).or_insert(0.5);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// -- AN9: cameras, looks, prompts ---------------------------------------------------------------
+
+/// What the episode builder frames for a camera: it knows wide / medium / close.
+pub fn kind_of_camera(camera: &str) -> &'static str {
+    match camera {
+        "wide" => "wide",
+        "close" => "close",
+        _ => "medium",
+    }
+}
+
+fn has_any(text: &str, words: &[&str]) -> bool {
+    words.iter().any(|w| text.contains(w))
+}
+
+/// The angle an action line asks for, if it asks for one.
+fn camera_from_action(action_lower: &str) -> Option<&'static str> {
+    if has_any(action_lower, &["from above", "rooftop", "terrace", "balcony", "looks down", "climbs", "falls from"]) {
+        Some("high_angle")
+    } else if has_any(action_lower, &["looms", "towers", "enormous", "giant", "stands over", "looks up"]) {
+        Some("low_angle")
+    } else if has_any(
+        action_lower,
+        &["suddenly", "reveal", "discover", "gasps", "realis", "realiz", "shocked", "notices", "finds ", "opens the"],
+    ) {
+        Some("close")
+    } else {
+        None
+    }
+}
+
+/// **The camera of each shot with no model**: the establishing shot is wide;
+/// a change of speaker cuts to a medium, alternating medium and reverse; a
+/// reveal in the action before a line cuts to a close (a low or high angle when
+/// the action looms or looks down). At most 8 cuts.
+fn offline_shots(scene: &ScriptScene, characters: &[CharacterBrief]) -> Vec<ShotBrief> {
+    let mut shots =
+        vec![ShotBrief { at_line: 0, kind: "wide".into(), camera: "wide".into(), ..Default::default() }];
+    let (mut line, mut flip) = (0usize, false);
+    let mut last: Option<String> = None;
+    let mut action = String::new();
+    for item in &scene.items {
+        match item {
+            Item::Action(a) => action = a.to_lowercase(),
+            Item::Dialogue(d) => {
+                let key = resolve(&d.speaker, characters);
+                let seen = d.voice == Voice::OnScreen && !is_voice_only(&key, characters);
+                if seen && line > 0 && shots.len() < 8 {
+                    let camera = match camera_from_action(&action) {
+                        Some(c) => Some(c),
+                        None if last.as_deref() != Some(key.as_str()) => {
+                            flip = !flip;
+                            Some(if flip { "medium" } else { "reverse" })
+                        }
+                        None => None,
+                    };
+                    if let Some(c) = camera {
+                        shots.push(ShotBrief {
+                            at_line: line,
+                            kind: kind_of_camera(c).into(),
+                            on: key.clone(),
+                            camera: c.into(),
+                            ..Default::default()
+                        });
+                    }
+                }
+                if seen {
+                    last = Some(key);
+                }
+                action.clear();
+                line += 1;
+            }
+            _ => {}
+        }
+    }
+    shots
+}
+
+/// Gives every shot a camera that fits its kind: the model's was checked in
+/// `merge_scene`; a missing one is `wide` / `close`, or medium alternating
+/// with reverse. The shot's `kind` follows its camera.
+fn fill_cameras(b: &mut Breakdown) {
+    for s in &mut b.scenes {
+        let mut mediums = 0usize;
+        for shot in s.shots.iter_mut() {
+            if !CAMERAS.contains(&shot.camera.as_str()) || kind_of_camera(&shot.camera) != shot.kind {
+                shot.camera = match shot.kind.as_str() {
+                    "wide" => "wide",
+                    "close" => "close",
+                    _ => {
+                        let c = if mediums % 2 == 0 { "medium" } else { "reverse" };
+                        mediums += 1;
+                        c
+                    }
+                }
+                .to_string();
+            } else if kind_of_camera(&shot.camera) == "medium" {
+                mediums += 1;
+            }
+        }
+    }
+}
+
+/// Words that end a noun phrase (a verb or a preposition starts the next one).
+const NOUN_STOPS: &[&str] = &[
+    "in", "on", "at", "near", "under", "by", "beside", "behind", "from", "that", "which", "who", "where", "while",
+    "is", "are", "was", "were", "stands", "sits", "leans", "hangs", "lies", "flickers", "rises", "stood", "sat",
+    "over", "above", "across", "against", "towards", "toward", "into", "through", "as",
+];
+const PERSON_WORDS: &[&str] = &[
+    "man", "woman", "boy", "girl", "child", "children", "people", "person", "villager", "villagers", "figure", "he",
+    "she", "they", "lady", "men", "women", "kid", "kids", "mother", "father",
+];
+
+fn is_article(w: &str) -> bool {
+    matches!(w.to_lowercase().as_str(), "a" | "an" | "the" | "one" | "two" | "three" | "some")
+}
+
+/// One noun phrase from `piece` if it starts with an article: up to the first
+/// stop word (a following "with ..." stays), at most nine words; `None` for a person.
+fn noun_phrase(piece: &str) -> Option<String> {
+    let words: Vec<&str> = piece.split_whitespace().collect();
+    if words.len() < 2 || !is_article(words[0].trim_matches(|c: char| !c.is_alphanumeric())) {
+        return None;
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for w in &words {
+        let bare = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if !out.is_empty() && NOUN_STOPS.contains(&bare.as_str()) {
+            break;
+        }
+        out.push(w);
+        if out.len() >= 9 {
+            break;
+        }
+    }
+    let phrase = out.join(" ").trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+    let lower = phrase.to_lowercase();
+    let people = lower.split_whitespace().any(|w| PERSON_WORDS.contains(&w));
+    (phrase.split_whitespace().count() >= 2 && !people).then_some(phrase)
+}
+
+/// **AN13: the set's concrete nouns**: the list items of the scene's first action
+/// line ("A narrow mud lane, an old peepal tree, a broken lamp post.") and the
+/// noun phrase after a preposition in the slugline ("... NEAR AN OLD PEEPAL TREE").
+/// Only phrases that start with an article are taken, people are left out.
+pub fn set_nouns(slugline: &str, first_action: Option<&str>) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut add = |p: String| {
+        let low = p.to_lowercase();
+        if !found.iter().any(|f| f.to_lowercase().contains(&low) || low.contains(&f.to_lowercase())) {
+            found.push(p);
+        }
+    };
+    if let Some(action) = first_action {
+        let first_sentence = action.split(['.', '!', '?']).next().unwrap_or("");
+        for piece in first_sentence.replace(';', ",").split(',') {
+            let piece = piece.trim();
+            let piece = piece.strip_prefix("and ").unwrap_or(piece);
+            if let Some(p) = noun_phrase(piece) {
+                add(p);
+            }
+        }
+    }
+    let low = slugline.to_lowercase();
+    let place = low.split(['\u{2014}', '\u{2013}']).next().unwrap_or("").split(" - ").next().unwrap_or("");
+    for prep in [" near ", " by ", " beside ", " outside ", " behind ", " under ", " at "] {
+        if let Some((_, rest)) = place.split_once(prep) {
+            if let Some(p) = noun_phrase(rest.trim()) {
+                add(p);
+            }
+            break;
+        }
+    }
+    found.truncate(5);
+    found
+}
+
+/// Nouns first: "A narrow mud lane, an old peepal tree." then the rest.
+fn lead_with_nouns(nouns: &[String], rest: String) -> String {
+    if nouns.is_empty() {
+        return rest;
+    }
+    let lead = nouns.join(", ");
+    format!("{}. {rest}", sentence_case_first(&lead))
+}
+
+/// At most `max` words, cut at the last full word and closed with a full stop.
+fn cap_words(text: &str, max: usize) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() <= max {
+        return text.to_string();
+    }
+    let cut = words[..max].join(" ");
+    format!("{}.", cut.trim_end_matches(|c: char| !c.is_alphanumeric()))
+}
+
+/// Words that say nothing to a picture generator.
+const VAGUE_WORDS: &[&str] =
+    &["beautiful", "nice", "lovely", "amazing", "stunning", "pretty", "gorgeous", "wonderful", "good", "great"];
+
+fn strip_vague(text: &str) -> String {
+    text.split(' ')
+        .filter(|w| {
+            let bare = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            !VAGUE_WORDS.contains(&bare.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The framing words of one camera angle.
+fn camera_words(camera: &str) -> &'static str {
+    match camera {
+        "wide" => "Wide establishing view of the whole place, far back so all of it is in frame",
+        "close" => "Close view on one detail of the place, shallow depth of field",
+        "low_angle" => "Low camera near the ground looking up, walls and sky towering above",
+        "high_angle" => "High camera looking down on the place from above, ground and rooftops seen from over their tops",
+        "over_shoulder" => "Camera at shoulder height looking along the place, a soft dark foreground edge framing the view",
+        "reverse" => "The reverse view: the camera turned about to look at the opposite side of the place",
+        _ => "Medium view at eye level, the middle of the place in focus",
+    }
+}
+
+/// FNV-1a of the location key, in 48 bits.
+fn seed_family_of(key: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h & 0xFFFF_FFFF_FFFF
+}
+
+fn setting_phrase(setting: &str) -> &'static str {
+    match setting {
+        "sunset" => "at sunset",
+        "night" => "at night",
+        "interior" => "indoors",
+        "storm" => "during a storm",
+        _ => "by day",
+    }
+}
+
+/// **A location's look**: the place and time from the slugline, the scene's own
+/// description (people taken out), the weather and the light, the props as
+/// nouns, the world (era, region) and the series style text.
+fn location_look(s: &SceneBrief, world: &str, style: &str) -> String {
+    let mut out = full_background_prompt(s, world);
+    out.push(' ');
+    out.push_str(match s.setting.as_str() {
+        "storm" => "Heavy storm clouds, rain-wet ground, wind in the trees.",
+        "night" => "Clear night sky, dark ground with pools of lamplight.",
+        "sunset" => "Evening sky turning orange, long shadows.",
+        "interior" => "Indoors, no sky.",
+        _ => "Clear daytime sky, dry ground.",
+    });
+    let source = match s.lighting.key.as_str() {
+        "sun" => "sunlight",
+        "lamp" => "lamp light",
+        "moon" => "moonlight",
+        "window" => "daylight through a window",
+        _ => "",
+    };
+    if !source.is_empty() {
+        let side = match s.lighting.from.as_str() {
+            "left" => " from the left",
+            "right" => " from the right",
+            _ => "",
+        };
+        out.push_str(&format!(" {} {source}{side}.", if s.lighting.warm { "Warm" } else { "Cool" }));
+    }
+    if !s.mood.trim().is_empty() {
+        out.push_str(&format!(" Mood: {}.", s.mood.trim().to_lowercase()));
+    }
+    let mut out = with_details(out, &s.props);
+    if !style.trim().is_empty() {
+        out.push_str(&format!(" Style: {}.", style.trim().trim_end_matches('.')));
+    }
+    // AN13: the concrete set nouns lead; the text encoder handles ~70 words well.
+    cap_words(&lead_with_nouns(&s.set_nouns, strip_vague(&out)), 70)
+}
+
+/// One shot's plate prompt: the look, the camera's framing words, nobody in frame.
+fn shot_prompt(look: &str, other_setting: Option<&str>, camera: &str) -> String {
+    let when = other_setting.map(|s| format!(" This shot is {}.", setting_phrase(s))).unwrap_or_default();
+    format!("{}{when} {}. Nobody in frame, empty of people.", look.trim_end(), camera_words(camera))
+}
+
+/// One look and one seed family per location (the first scene set there
+/// writes it), and every shot's plate prompt from its location's look and its
+/// own camera. A scene of the same place at another time of day says so.
+fn apply_looks(b: &mut Breakdown) {
+    let (world, style) = (b.world.clone(), b.style.clone());
+    let key_of = |s: &SceneBrief| {
+        if s.location_key.trim().is_empty() { format!("scene_{}", s.number) } else { s.location_key.trim().to_string() }
+    };
+    let mut looks: BTreeMap<String, LocationLook> = BTreeMap::new();
+    for s in &b.scenes {
+        let key = key_of(s);
+        if !looks.contains_key(&key) {
+            let look = location_look(s, &world, &style);
+            looks.insert(key.clone(), LocationLook { look, seed_family: seed_family_of(&key), setting: s.setting.clone() });
+        }
+    }
+    for s in &mut b.scenes {
+        let key = key_of(s);
+        let Some(look) = looks.get(&key) else { continue };
+        let other = (look.setting != s.setting).then(|| s.setting.clone());
+        for shot in &mut s.shots {
+            shot.seed_family = look.seed_family;
+            shot.background_prompt = shot_prompt(&look.look, other.as_deref(), &shot.camera);
+        }
+    }
+    b.looks = looks;
 }
 
 // -- the casting file -----------------------------------------------------------------------
@@ -1361,17 +1938,28 @@ pub fn casting_value(b: &Breakdown, cast_names: &BTreeMap<String, String>) -> Va
             if let Some(side) = s.enter.get(name) {
                 spec.insert("enter".into(), json!(side));
             }
+            // AN4: the pose (`apply_pose_rigs` turns it into a Cast rig).
+            if let Some(pose) = s.poses.get(name) {
+                spec.insert("pose".into(), json!(pose));
+            }
             place.insert(name.clone(), Value::Object(spec));
         }
         let shots: Vec<Value> = s
             .shots
             .iter()
             .map(|sh| {
-                if sh.on.is_empty() {
-                    json!({ "at_line": sh.at_line, "kind": sh.kind })
-                } else {
-                    json!({ "at_line": sh.at_line, "kind": sh.kind, "on": sh.on })
+                let mut v = json!({
+                    "at_line": sh.at_line,
+                    "kind": sh.kind,
+                    // AN9: the camera angle and the prompt this shot's plate is drawn from.
+                    "camera": sh.camera,
+                    "background_prompt": sh.background_prompt,
+                    "seed_family": sh.seed_family,
+                });
+                if !sh.on.is_empty() {
+                    v["on"] = json!(sh.on);
                 }
+                v
             })
             .collect();
         scenes.insert(
@@ -1382,11 +1970,82 @@ pub fn casting_value(b: &Breakdown, cast_names: &BTreeMap<String, String>) -> Va
                 "absent": s.absent,
                 "props_wanted": s.props,
                 "location": s.location_key,
-                "background_prompt": with_details(full_background_prompt(s, &b.world), &s.props),
+                "background_prompt": cap_words(&lead_with_nouns(&s.set_nouns, with_details(full_background_prompt(s, &b.world), &s.props)), 70),
                 "lighting": s.lighting,
                 "shots": shots,
             }),
         );
     }
-    json!({ "characters": characters, "scenes": scenes })
+    let looks: serde_json::Map<String, Value> = b
+        .looks
+        .iter()
+        .map(|(k, l)| (k.clone(), json!({ "look": l.look, "seed_family": l.seed_family })))
+        .collect();
+    json!({ "characters": characters, "scenes": scenes, "looks": looks })
+}
+
+/// **AN4**: turns each placed pose into the pose picture's Cast rig. `rigs`
+/// maps a character key (upper-case) to `pose -> Cast rig`; a scene's place
+/// entry whose pose has a rig gets it as `cast` (the builder's per-scene rig
+/// swap). A pose without a rig is left as the base rig.
+pub fn apply_pose_rigs(casting: &mut Value, rigs: &BTreeMap<String, BTreeMap<String, String>>) {
+    let Some(scenes) = casting["scenes"].as_object_mut() else { return };
+    for set in scenes.values_mut() {
+        let Some(place) = set["place"].as_object_mut() else { continue };
+        for (name, spec) in place.iter_mut() {
+            let Some(pose) = spec["pose"].as_str().map(str::to_string) else { continue };
+            let Some(by_pose) = rigs.get(&norm(name)) else { continue };
+            let wanted = pose.to_lowercase().replace(' ', "_");
+            if let Some(rig) = by_pose.get(&wanted) {
+                spec["cast"] = json!(rig);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_tags_give_pose_and_position() {
+        let t = parse_tags("The bench. [Guddu: sitting, left] and [Raju: scared, 30%] [VISUAL] [SOUND: wind]");
+        assert_eq!(t[0], StageTag { name: "Guddu".into(), pose: "sitting".into(), position: "left".into() });
+        assert_eq!(t[1], StageTag { name: "Raju".into(), pose: "scared".into(), position: "30%".into() });
+        assert_eq!(position_x("left"), Some(0.2));
+        assert_eq!(position_x("30%"), Some(0.3));
+        // A tag wins over the offline placement.
+        let play = Screenplay::parse("## SCENE 1 \u{2014} BENCH\n\n**EXT. TEA STALL \u{2014} DAY**\n\nGuddu waits. [Guddu: sitting, left]\n\n**GUDDU**\nHello.\n\n**RAJU**\nHi.\n");
+        let b = breakdown_offline(&play, &BreakdownHints::default());
+        assert_eq!(b.scenes[0].place["GUDDU"], 0.2);
+        assert_eq!(b.scenes[0].poses["GUDDU"], "sitting");
+    }
+
+    #[test]
+    fn offline_cameras_wide_then_medium_reverse() {
+        let play = Screenplay::parse(
+            "## SCENE 1 \u{2014} TALK\n\n**EXT. TEA STALL \u{2014} DAY**\n\nDusty lane, a tin roof.\n\n**GUDDU**\nOne.\n\n**RAJU**\nTwo.\n\n**GUDDU**\nThree.\n\n**RAJU**\nFour.\n",
+        );
+        let b = breakdown_offline(&play, &BreakdownHints { world: "rural Bihar, 2010s".into(), ..Default::default() });
+        let cams: Vec<&str> = b.scenes[0].shots.iter().map(|s| s.camera.as_str()).collect();
+        assert_eq!(cams, ["wide", "medium", "reverse", "medium"]);
+        let wide = &b.scenes[0].shots[0];
+        let low = shot_prompt("Tea stall.", None, "low_angle");
+        assert!(low.contains("Low camera near the ground looking up") && low.contains("Nobody in frame"));
+        assert!(wide.background_prompt.contains("Rural Bihar") && wide.seed_family == b.scenes[0].shots[1].seed_family);
+    }
+
+    /// AN13: the slugline's and first action line's set nouns lead the prompt, capped at ~70 words.
+    #[test]
+    fn set_nouns_lead_the_background_prompt() {
+        let nouns = set_nouns(
+            "EXT. VILLAGE LANE NEAR AN OLD PEEPAL TREE \u{2014} NIGHT",
+            Some("A narrow mud lane, an old peepal tree, a broken lamp post. Ramesh walks in."),
+        );
+        assert!(nouns.iter().any(|n| n == "an old peepal tree") && nouns.iter().any(|n| n == "a broken lamp post"), "{nouns:?}");
+        let s = SceneBrief { set_nouns: nouns, setting: "night".into(), ..Default::default() };
+        let look = location_look(&s, "rural Bihar, India", "painterly");
+        assert!(look.starts_with("A narrow mud lane, an old peepal tree"), "{look}");
+        assert!(look.split_whitespace().count() <= 70);
+    }
 }

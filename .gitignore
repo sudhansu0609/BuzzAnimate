@@ -2,6 +2,11 @@
 **/*.rs.bk
 *.pdb
 
+# Setup wizard (scripts/app_installer): SmartCleaner's marker and the setup log.
+/installer/installed.json
+/installer/*.exe
+/logs/
+
 # BuzzAnimate local state
 /settings.local.json
 /.buzz-cache/
@@ -17,3 +22,7 @@
 .env
 .env.*
 !.env.example
+
+# local image datasets (staging/storyboard reference stills)
+/dataset2/
+installer/setup.running

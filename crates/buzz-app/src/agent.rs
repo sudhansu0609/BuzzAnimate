@@ -123,8 +123,9 @@ pub fn route(command: Command) -> Route {
         New | LipSync | TraceBitmapOptions | SetScene | DirectScene | SceneryFor | Perform
         | AddFollowThrough | AddWiggle | AddTitleCard | AiIdentifyAssets | AiRigVectorCharacter | AiRigLayers
         | AiDirectStory | AiCharacterFromImage | AiMouthChart | ClearAllKeyframes | CleanUpLayers
-        | ArrangeLayers | RepairLayerRigs | RigHead | PasteMotion | PasteMotionSpecial | PastePose | CopyPerformance
-        | PastePerformance | PastePerformanceSpecial => Route::Args,
+        | ArrangeLayers | RepairLayerRigs | RigHead | EvenLines | RemoveBackgroundSpecks | PasteMotion | PasteMotionSpecial | PastePose | CopyPerformance
+        | PastePerformance | PastePerformanceSpecial | StoryboardMake | StoryboardEdit
+        | StoryboardExport => Route::Args,
 
         // Needs the user, or has no document effect.
         Quit | Close | ShortcutEditor | Snapshots | About | AiModels | PasteboardColour
@@ -132,14 +133,17 @@ pub fn route(command: Command) -> Route {
         // Dialogs over BuzzEdit and Buzzcaf Studio; their tools take args.
         SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => Route::Excluded,
         // The producer's dialog; its tool takes args (`produce_episode`).
-        ProduceEpisode => Route::Excluded,
+        ProduceEpisode | NewEpisode | StoryToScreenplay | Casting => Route::Excluded,
+
+        // The Producer window (B4); its tools take args.
+        ProducerPanel => Route::Excluded,
 
         // Everything else runs as it does from the menu or the keyboard.
         SaveSnapshot | AttachSound | RemoveSound | NewMouthSymbol | DetectBeats | FitToNarration
         | LipSyncFromCaptions | Undo | Redo | Cut | Copy | Paste | Delete | SelectAll | Deselect
         | DuplicateSelection | ZoomIn | ZoomOut | ZoomActual | ZoomFitInWindow | ZoomShowFrame
         | ZoomShowAll | ToggleRulers | ToggleGrid | ToggleGuides | ToggleSnapping
-        | TogglePasteboard | GroupSelection | UngroupSelection | BreakApart | BringToFront
+        | TogglePasteboard | ToggleNeighbours | GroupSelection | UngroupSelection | BreakApart | BringToFront
         | BringForward | SendBackward | SendToBack | RetargetPerformance | SwapSymbol
         | PaintThrough | ExposeOnTwos | ExposeOnThrees | SelectSameColour | ThickenStroke
         | ThinStroke | TraceBitmap | TraceLineArt | ConvertLinesToFills | ExpandFill
@@ -194,6 +198,11 @@ pub fn execute(app: &mut App, call: &AgentCall) -> AgentResult {
         "send_to_buzzedit" | "buzzedit_projects" | "transcribe_with_buzzedit" | "studio_projects"
         | "studio_build_episode" => crate::estate::tool(app, &call.tool, &call.args),
         "produce_episode" => produce_episode(app, &call.args),
+        // The co-pilot (ANIMATE_COPILOT_PLAN B4): the Producer panel's actions.
+        name if crate::copilot::TOOLS.contains(&name) => match app.agent_copilot_async(name, &call.args) {
+            Ok(started) => AgentResult::ok(started),
+            Err(e) => AgentResult::err(e),
+        },
         other => AgentResult::err(format!("unknown tool '{other}'")),
     }
 }
@@ -876,7 +885,21 @@ pub const AGENT_TOOLS: &[(&str, &str)] = &[
     ("studio_build_episode", "{project: Studio project id, asset?: the project's script asset (default script), out_dir?: folder (default <the Studio project's folder>/animation), start?: bool} -> {started:true, job}; fetches the script and builds the episode (.buzz + report.md) as POST /api/episode does; wait_for_jobs gives {files, warnings, out_dir}. The script needs '## SCENE n — TITLE' headings"),
     ("dress_set_from_assets", "{query: the scene's words (slugline + what happens, e.g. \"EXT. CHHOTU'S TEA STALL - MORNING, a village lane\"; INT./room/inside -> a room; night/evening -> that sky), style?: name of an asset whose style to follow} -> dresses the open scene's set from the user's own assets (the asset index): a sky, trees and buildings along the horizon at three depths, bushes clear of the rigs on stage, or one room indoors; behind everything already there (in front of Set the scene's Sky/Ground layers; with none, a ground and a sky are staged first); one undo step. Returns {pieces:[{role, name, record, why}], notes, failed, interior, procedural_advised, layers}. Needs the index"),
     ("arrange_assets", "{dry_run?: bool (default true)} -> Arrange by type & style from the asset index: dry run gives {moves, counts:{\"Type/Style\": n}, cast_kept, unindexed, first_moves:[{name, from, to, guessed}]} and moves nothing; dry_run:false moves the files (Cast/ never) and returns {moved, created_folders}; the Assets panel's Undo arrange reverses it. Needs the index (built by the Assets panel's Arrange by type & style…)"),
-    ("produce_episode", "{script: screenplay file ('## SCENE n — TITLE' headings), out: output folder, audio?: the dialogue recording of the script's scenes in order, characters?: folder with one sub-folder of pictures per character, style?: comic|painterly|inked|free words (default comic), series?: the series name (names the .buzz and Backgrounds/<series>/), world?: where and when the story lives, ending every background prompt (default \"rural Bihar, India, late 1990s\" for Chirailiya, else none)} -> {started:true, job}; the producer: script breakdown by the model, layer rigs for the cast (kept when Cast has them), one ComfyUI background per place traced into Backgrounds/<series>/, the recording's lines found, the episode built (<out>/<series>.buzz) with auto camera cuts, lights and title cards, a preview MP4 per scene joined into <series>.mp4, and <out>/report.md; resumable (a second call skips unchanged steps); takes minutes, so call wait_for_jobs for {buzz, mp4, report, cast, backgrounds, cuts, lines_from_audio, lines_from_text, warnings}"),
+    ("produce_episode", "{script: screenplay file ('## SCENE n — TITLE' headings), out: output folder, audio?: the dialogue recording of the script's scenes in order, characters?: folder with one sub-folder of pictures per character, style?: comic|painterly|inked|free words (default comic), series?: the series name (names the .buzz and Backgrounds/<series>/), world?: where and when the story lives, ending every background prompt (default \"a semi-rural small town in North India, 2010s: smartphones, motorbikes, small shops and tea stalls of that decade\" for Chirailiya, else none)} -> {started:true, job}; the producer: script breakdown by the model, layer rigs for the cast (kept when Cast has them), one ComfyUI background per place traced into Backgrounds/<series>/, the recording's lines found, the episode built (<out>/<series>.buzz) with auto camera cuts, lights and title cards, a preview MP4 per scene joined into <series>.mp4, and <out>/report.md; resumable (a second call skips unchanged steps); takes minutes, so call wait_for_jobs for {buzz, mp4, report, cast, backgrounds, cuts, lines_from_audio, lines_from_text, warnings}"),
+    ("redo_background", "{location: the background's key in backgrounds.json (the scene's location, e.g. courtyard), angle?: wide (default)|low_angle|high_angle|over_shoulder|reverse, out?: the producer's output folder (default: the Producer window's or the open produced .buzz's)} -> {started:true, job}; draws that background again with a new seed (an angle is re-angled from the wide by Qwen), traces and saves it, then rebuilds ONLY the scenes that use it; wait_for_jobs gives {changed, scenes_rebuilt, still}. The change is an override: it survives later full rebuilds"),
+    ("set_background_prompt", "{location, angle?, text: the new prompt (what the camera sees, no people; e.g. \"a courtyard with a broken well\"), out?} -> {started:true, job}; redraws the background from the new prompt, then rebuilds only the scenes that use it; wait_for_jobs gives {changed, scenes_rebuilt, still}"),
+    ("pick_background_try", "{location, angle?, n: which of the background's tries to keep (1-based, the Producer panel shows them), out?} -> {started:true, job}; keeps that try, traces it again and rebuilds only the scenes that use it"),
+    ("reangle_background", "{location, angle: low_angle|high_angle|over_shoulder|reverse, out?} -> {started:true, job}; re-angles that picture from the location's wide with a new seed (Qwen) and rebuilds only the scenes that cut to it"),
+    ("recast", "{member: the character's name, asset: a Cast rig name or a library asset path, scope?: episode (default)|scene, scene?: the scene number when scope is scene, out?} -> {started:true, job}; another character plays the member, for the whole episode or one scene; rebuilds only the scenes they are in"),
+    ("set_pose", "{line: \"scene:item\" (the Producer panel's line id), character, pose: a pose name from the character's folder (sitting, scared...), out?} -> {started:true, job}; poses the character in that line's scene and rebuilds only that scene"),
+    ("move_character", "{scene, shot?: the shot number (1-based, default 1), character, x: feet across the stage 0..1, y: feet down the stage 0..1, out?} -> {started:true, job}; stands the character there (a pin: the stage keeps it) and rebuilds only that scene"),
+    ("set_shot_camera", "{scene, shot: 1-based place in the scene's shot list, camera: wide|medium|close|low_angle|high_angle|over_shoulder|reverse, out?} -> {started:true, job}; changes that one shot's camera (an angle uses the location's angle background) and rebuilds only that scene"),
+    ("add_cut", "{scene, at_line: the dialogue line the cut starts on (0-based), camera, out?} -> {started:true, job}; adds a camera cut and rebuilds only that scene"),
+    ("remove_cut", "{scene, shot: 1-based, out?} -> {started:true, job}; removes that cut (a scene keeps at least one shot) and rebuilds only that scene"),
+    ("retime_line", "{line: \"scene:item\", start_delta: seconds added to the line's start (negative: earlier), end_delta: seconds added to its end, out?} -> {started:true, job}; nudges one line's timing from the recording (the other lines do not move) and rebuilds only that scene. Needs a recording"),
+    ("set_speaker", "{line: \"scene:item\", member: who speaks it, out?} -> {started:true, job}; changes the speaker (so whose mouth moves) and rebuilds only that scene"),
+    ("redo_lipsync", "{line?: \"scene:item\", part?: audio part number, out?} (one of line, part) -> {started:true, job}; cuts the lip sync again for that line's scene, or the scenes of that part"),
+    ("rebuild_scene", "{scene, out?} -> {started:true, job}; rebuilds just that scene from the casting and the overrides (every co-pilot change is listed under Overrides in report.md)"),
 ];
 
 /// The `produce_episode` tool: the producer as an Assistant job.

@@ -3,16 +3,16 @@
 //!
 //! ```text
 //! cargo run --release -p buzz-app --example produce -- \
-//!     --script ep1/script.txt --out out/ [--audio scenes.wav] [--characters ep1/] \
+//!     --script ep1/script.txt --out out/ [--audio full_episode.wav] [--audio-parts <folder of ~3-min parts>] [--part N] [--characters ep1/] \
 //!     [--style comic|painterly|inked|"free text"] [--series Name] [--world "rural Bihar, India, late 1990s"] \
 //!     [--scenes 4-6] [--assets <library>] [--index <.buzz-index.json>] [--size 1920x1080] \
-//!     [--no-backgrounds] [--mp4] [--height 540] [--stills 4] [--launch-comfy] [--offline] [--fresh] [--redo <step>] [--cancel-after <s>]
+//!     [--no-backgrounds] [--mp4] [--height 540] [--stills 4] [--launch-comfy] [--offline] [--fresh] [--objects|--no-objects] [--captions on|off] [--story-dir <story folder>] [--allow-generated-cast] [--redo <step>] [--cancel-after <s>]
 //! ```
 //!
 //! Everything lands in `--out`: `breakdown.json`, `cast.json`,
 //! `backgrounds.json` (+ `backgrounds/*.png`), `audio.json`, `casting.json`,
 //! `<series>.buzz`, `scenes/*.mp4` + `<series>.mp4` with `--mp4`, `stills/`
-//! with `--stills N`, `report.md`, and `produce.json`, which lets a second run
+//! with `--stills N`, `report.md` (+ `parts.json`, `audio/full.wav`, `audio/parts/` from `--audio-parts` / `--audio`; `--part N` writes `part_N.mp4`, `part_N/`), and `produce.json`, which lets a second run
 //! skip every step whose inputs did not change (`--fresh` redoes them all;
 //! `--redo backgrounds` redoes that step and every later one).
 //! `--assets` is the asset library rigs and backgrounds are saved into
@@ -44,6 +44,8 @@ fn main() -> Result<()> {
     let mut out = None;
     let mut req_style = Style::comic();
     let mut audio = None;
+    let mut audio_parts = None;
+    let mut part: Option<usize> = None;
     let mut characters = None;
     let mut series = String::new();
     let mut world = String::new();
@@ -58,6 +60,10 @@ fn main() -> Result<()> {
     let mut launch = false;
     let mut offline = false;
     let mut fresh = false;
+    let mut objects: Option<bool> = None;
+    let mut captions: Option<bool> = None;
+    let mut story_dir: Option<PathBuf> = None;
+    let mut allow_generated_cast = false;
     let mut redo = None;
     let mut cancel_after: Option<f64> = None;
     while let Some(flag) = args.next() {
@@ -66,6 +72,8 @@ fn main() -> Result<()> {
             "--script" => script = Some(PathBuf::from(value("--script")?)),
             "--out" => out = Some(PathBuf::from(value("--out")?)),
             "--audio" => audio = Some(PathBuf::from(value("--audio")?)),
+            "--audio-parts" => audio_parts = Some(PathBuf::from(value("--audio-parts")?)),
+            "--part" => part = Some(value("--part")?.parse()?),
             "--characters" => characters = Some(PathBuf::from(value("--characters")?)),
             "--style" => {
                 let text = value("--style")?;
@@ -88,6 +96,18 @@ fn main() -> Result<()> {
             "--launch-comfy" => launch = true,
             "--offline" => offline = true,
             "--fresh" => fresh = true,
+            "--objects" => objects = Some(true),
+            "--no-objects" => objects = Some(false),
+            "--captions" => {
+                let v = value("--captions")?;
+                captions = Some(match v.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => bail!("--captions is on or off"),
+                });
+            }
+            "--story-dir" => story_dir = Some(PathBuf::from(value("--story-dir")?)),
+            "--allow-generated-cast" => allow_generated_cast = true,
             "--cancel-after" => cancel_after = Some(value("--cancel-after")?.parse()?),
             "--redo" => {
                 let v = value("--redo")?;
@@ -100,6 +120,8 @@ fn main() -> Result<()> {
     let out = out.context("--out <dir> is required")?;
     let mut req = ProduceRequest::new(script, out);
     req.audio = audio;
+    req.audio_parts = audio_parts;
+    req.part = part;
     req.characters_dir = characters;
     req.style = req_style;
     req.series = series;
@@ -115,6 +137,10 @@ fn main() -> Result<()> {
     req.launch_comfy = launch;
     req.offline = offline;
     req.fresh = fresh;
+    req.objects = objects;
+    req.captions = captions;
+    req.story_dir = story_dir;
+    req.allow_generated_cast = allow_generated_cast;
     req.redo = redo;
 
     let started = Instant::now();

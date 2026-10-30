@@ -324,6 +324,20 @@ impl Document {
             .collect()
     }
 
+    /// Replace what the scene at `index` holds with `scene`, keeping its name,
+    /// key and role (the Producer panel's scoped rebuild, B4). The scene gets a
+    /// fresh history. `false` when there is no such scene.
+    pub fn replace_scene(&mut self, index: usize, scene: Scene) -> bool {
+        let Some(slot) = self.scenes.get_mut(index) else {
+            return false;
+        };
+        let mut history = History::default();
+        history.mark_saved(scene.revision());
+        slot.scene = scene;
+        slot.history = history;
+        true
+    }
+
     /// Add a new empty scene after the active one and switch to it. The stage
     /// size, frame rate and background carry over, as a new scene in Animate
     /// inherits the document's, so the shots match without setting them again.
@@ -1117,6 +1131,24 @@ impl Document {
             || slot.scene.revision() != checkpoint.scene.revision();
         slot.history
             .collapse_run(&checkpoint.history, checkpoint.scene, label, changed);
+        true
+    }
+
+    /// Put the checkpointed scene and its history back as they were at
+    /// `checkpoint`: a run taken back leaving no undo step and no redo entry
+    /// (a cancelled preview). Returns false (and touches nothing) if the
+    /// document was replaced or the scene is gone.
+    pub fn restore_checkpoint(&mut self, checkpoint: RunCheckpoint) -> bool {
+        if checkpoint.uid != self.uid {
+            return false;
+        }
+        let Some(index) = self.index_of_key(checkpoint.key) else {
+            return false;
+        };
+        let slot = &mut self.scenes[index];
+        slot.history
+            .collapse_run(&checkpoint.history, checkpoint.scene.clone(), "", false);
+        slot.scene = checkpoint.scene;
         true
     }
 

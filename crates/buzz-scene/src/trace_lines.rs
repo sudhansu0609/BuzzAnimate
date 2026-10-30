@@ -97,25 +97,164 @@ pub(crate) fn is_ink_drawing(w: usize, h: usize, pixels: &[u8], options: &TraceO
 }
 
 fn trace_core(w: usize, h: usize, pixels: &[u8], options: &TraceOptions) -> TraceReport {
+    trace_core_with(w, h, pixels, options, Straighten::default())
+}
+
+/// **How much straighter than the tracer's own** a `Stroke`-style line is
+/// built (Even Out Lines, `docs/EVEN_LINES_PLAN.md` E1). The default is the
+/// tracer exactly as it always was.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Straighten {
+    /// Added to the Douglas-Peucker tolerance, in pixels of the traced picture.
+    pub(crate) extra_tolerance: f64,
+    /// Build the line from straight segments (corners kept) instead of a
+    /// Catmull-Rom curve.
+    pub(crate) polyline: bool,
+}
+
+/// [`trace_core`] with a [`Straighten`] for its `Stroke`-style lines: the
+/// entry Even Out Lines traces its ink masks through.
+pub(crate) fn trace_core_with(
+    w: usize,
+    h: usize,
+    pixels: &[u8],
+    options: &TraceOptions,
+    straighten: Straighten,
+) -> TraceReport {
+    trace_core_inner(w, h, pixels, options, straighten, None).0
+}
+
+/// [`trace_core_with`] with **masses by opening** (`docs/EVEN_LINES_PLAN.md`
+/// E1b), for Even Out Lines only: a mass is the ink deeper than
+/// `max_line_radius` grown back by its own depth (not the whole connected
+/// component), the rest is skeletonised as line, with a band `tuck` pixels
+/// into the mass so a line runs on under it. Also returns the deepest ink's
+/// distance-field radius, in pixels.
+pub(crate) fn trace_core_opened(
+    w: usize,
+    h: usize,
+    pixels: &[u8],
+    options: &TraceOptions,
+    straighten: Straighten,
+    tuck: f64,
+) -> (TraceReport, f64) {
+    trace_core_inner(w, h, pixels, options, straighten, Some(tuck.max(0.0)))
+}
+
+/// The ink pixels within their own depth of a pixel deeper than `max_radius`:
+/// the union of the discs of radius `r(p)` round every such `p` (the opening
+/// of the ink at that radius). Done as one distance transform of
+/// `-r(p)²` on the deep pixels: a pixel is inside some disc where it is `< 0`.
+fn opened_masses(ink: &[bool], r: &[f64], w: usize, h: usize, max_radius: f64) -> Vec<bool> {
+    let mut tmp = vec![0.0f64; w * h];
+    let mut col = vec![0.0f64; h];
+    for x in 0..w {
+        for y in 0..h {
+            let i = y * w + x;
+            col[y] = if ink[i] && r[i] > max_radius { -(r[i] * r[i]) } else { EDT_INF };
+        }
+        let d = dt_1d(&col);
+        for y in 0..h {
+            tmp[y * w + x] = d[y];
+        }
+    }
+    let mut out = vec![false; w * h];
+    let mut row = vec![0.0f64; w];
+    for y in 0..h {
+        row.copy_from_slice(&tmp[y * w..(y + 1) * w]);
+        let d = dt_1d(&row);
+        for x in 0..w {
+            let i = y * w + x;
+            out[i] = ink[i] && d[x] < 0.0;
+        }
+    }
+    out
+}
+
+/// **Small masses fold into lines** (`docs/EVEN_LINES_PLAN.md` E1c a): a
+/// component of the opened `region` whose deep core (ink deeper than
+/// `max_radius`) is small — under `(2 × line_px)²` pixels, or an inscribed
+/// radius under `1.6 × max_radius` — and that touches line ink (ink outside
+/// the region) is a line thickening, not a solid area: it leaves the region,
+/// so the strokes draw it. Judged against the region as given.
+fn fold_small_masses(
+    region: &mut [bool],
+    ink: &[bool],
+    r: &[f64],
+    w: usize,
+    h: usize,
+    max_radius: f64,
+    line_px: f64,
+) {
+    let min_core = (2.0 * line_px).powi(2);
+    let mut visited = vec![false; w * h];
+    let mut fold: Vec<usize> = Vec::new();
+    for start in 0..w * h {
+        if !region[start] || visited[start] {
+            continue;
+        }
+        let comp = flood(region, w, h, start, &mut visited, true, 8);
+        let core = comp.iter().filter(|&&p| r[p] > max_radius).count();
+        let inscribed = comp.iter().fold(0.0f64, |m, &p| m.max(r[p]));
+        if (core as f64) >= min_core && inscribed >= 1.6 * max_radius {
+            continue;
+        }
+        let touches = comp.iter().any(|&p| {
+            neighbours8(p % w, p / w, w, h).into_iter().any(|(nx, ny)| {
+                let n = ny * w + nx;
+                ink[n] && !region[n]
+            })
+        });
+        if touches {
+            fold.extend(comp);
+        }
+    }
+    for p in fold {
+        region[p] = false;
+    }
+}
+
+fn trace_core_inner(
+    w: usize,
+    h: usize,
+    pixels: &[u8],
+    options: &TraceOptions,
+    straighten: Straighten,
+    open: Option<f64>,
+) -> (TraceReport, f64) {
     // With `ink_masses: false` the mass part of the ink is already stripped
     // here (see `traced_ink`), so only the strokes are left to skeletonise.
     let ink = traced_ink(w, h, pixels, options);
 
     if !ink.iter().any(|&v| v) {
-        return TraceReport {
-            message: "No ink found in that picture".into(),
-            ..Default::default()
-        };
+        return (
+            TraceReport {
+                message: "No ink found in that picture".into(),
+                ..Default::default()
+            },
+            0.0,
+        );
     }
 
     let r = edt(&ink, w, h);
+    let deepest = r.iter().fold(0.0f64, |m, &d| m.max(d));
 
     // **D. Masses.** Anything too fat to be a line is traced as a filled
     // region instead, and excluded from the skeleton. (Not with
     // `ink_masses: false`: they are dropped from the ink above.)
     let max_radius = options.max_line_radius.max(0.5);
     let (masses, mass_pixels) = if options.ink_masses {
-        find_masses(&ink, &r, w, h, max_radius, pixels, options)
+        match open {
+            // Every component of the opened region holds a pixel deeper
+            // than `max_radius`, so each one is a mass.
+            Some(tuck) => {
+                let mut region = opened_masses(&ink, &r, w, h, max_radius);
+                // E1c (a): the tuck is half a line width.
+                fold_small_masses(&mut region, &ink, &r, w, h, max_radius, 2.0 * tuck);
+                find_masses(&region, &r, w, h, max_radius, pixels, options)
+            }
+            None => find_masses(&ink, &r, w, h, max_radius, pixels, options),
+        }
     } else {
         (Vec::new(), Vec::new())
     };
@@ -123,6 +262,24 @@ fn trace_core(w: usize, h: usize, pixels: &[u8], options: &TraceOptions) -> Trac
     for &p in &mass_pixels {
         skeleton_source[p] = false;
     }
+    // By opening: the line ink runs on `tuck` pixels into the mass, and a
+    // chain lying wholly inside the mass is dropped below.
+    let mut in_mass: Vec<bool> = Vec::new();
+    if let Some(tuck) = open
+        && !mass_pixels.is_empty()
+    {
+        in_mass = vec![false; w * h];
+        for &p in &mass_pixels {
+            in_mass[p] = true;
+        }
+        let near_line = distance_to_set(&skeleton_source, w, h);
+        for i in 0..w * h {
+            if in_mass[i] && near_line[i] <= tuck {
+                skeleton_source[i] = true;
+            }
+        }
+    }
+    let inside_mass = |chain: &[SkelPoint]| !in_mass.is_empty() && chain.iter().all(|p| in_mass[p.pixel]);
 
     // **E. Skeleton.**
     zhang_suen(&mut skeleton_source, w, h);
@@ -130,7 +287,10 @@ fn trace_core(w: usize, h: usize, pixels: &[u8], options: &TraceOptions) -> Trac
 
     // **F. Graph, G. Prune, H. Continuation.**
     let (nodes, edges, mut closed) = skeleton_graph(&skeleton_source, w, h);
-    let edges = prune(nodes.clone(), edges, &r, options.min_line_length.max(0.0));
+    // E1c (c): by opening, end branches under 1.5 × the local line width
+    // (`2r` at the junction) go too.
+    let spur_factor = if open.is_some() { 1.5 } else { 0.0 };
+    let edges = prune(nodes.clone(), edges, &r, options.min_line_length.max(0.0), spur_factor);
     let mut chains = pair_junctions(&nodes, edges, &r);
 
     // Pruning and pairing can collapse a whole loop down to one edge whose
@@ -152,16 +312,19 @@ fn trace_core(w: usize, h: usize, pixels: &[u8], options: &TraceOptions) -> Trac
     let mut lines: Vec<(f64, ShapeData)> = Vec::new();
     for chain in chains {
         let length = arc_length(&chain);
-        if length < options.min_line_length.max(0.0) {
+        if length < options.min_line_length.max(0.0) || inside_mass(&chain) {
             continue;
         }
-        if let Some(shape) = chain_to_shape(&chain, false, &r, w, pixels, options) {
+        if let Some(shape) = chain_to_shape(&chain, false, &r, w, pixels, options, straighten) {
             lines.push((length, shape));
         }
     }
     for chain in closed {
+        if inside_mass(&chain) {
+            continue;
+        }
         let length = arc_length(&chain);
-        if let Some(shape) = chain_to_shape(&chain, true, &r, w, pixels, options) {
+        if let Some(shape) = chain_to_shape(&chain, true, &r, w, pixels, options, straighten) {
             lines.push((length, shape));
         }
     }
@@ -211,14 +374,17 @@ fn trace_core(w: usize, h: usize, pixels: &[u8], options: &TraceOptions) -> Trac
         }
     };
 
-    TraceReport {
-        shapes,
-        regions: mass_count,
-        specks: 0,
-        strokes,
-        fills: fill_count,
-        message,
-    }
+    (
+        TraceReport {
+            shapes,
+            regions: mass_count,
+            specks: 0,
+            strokes,
+            fills: fill_count,
+            message,
+        },
+        deepest,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,7 +1590,15 @@ fn edge_arc_length(edge: &WorkEdge) -> f64 {
         .sum()
 }
 
-fn prune(nodes: Vec<Node>, mut edges: Vec<WorkEdge>, r: &[f64], min_line_length: f64) -> Vec<WorkEdge> {
+/// `spur_factor` (Even Out Lines only, else `0`): an end branch shorter than
+/// this many times the local line width (`2r` at its junction) is a spur too.
+fn prune(
+    nodes: Vec<Node>,
+    mut edges: Vec<WorkEdge>,
+    r: &[f64],
+    min_line_length: f64,
+    spur_factor: f64,
+) -> Vec<WorkEdge> {
     let junction_r = |node: usize| -> f64 {
         let p = nodes[node].pixel;
         r[p.min(r.len() - 1)]
@@ -1449,7 +1623,8 @@ fn prune(nodes: Vec<Node>, mut edges: Vec<WorkEdge>, r: &[f64], min_line_length:
                 continue;
             }
             let junction_node = if leaf_a { edge.node_b } else { edge.node_a };
-            let limit = min_line_length.max(2.0 * junction_r(junction_node));
+            let jr = junction_r(junction_node);
+            let limit = min_line_length.max(2.0 * jr).max(spur_factor * 2.0 * jr);
             if edge_arc_length(edge) < limit {
                 drop_indices.push(i);
             }
@@ -1674,7 +1849,7 @@ fn smooth_chain(samples: &[StrokeSample], line_smooth: f64, closed: bool) -> Vec
 }
 
 /// Douglas-Peucker over `f64` points.
-fn simplify_points(points: &[Point], tol: f64) -> Vec<Point> {
+pub(crate) fn simplify_points(points: &[Point], tol: f64) -> Vec<Point> {
     if points.len() < 3 {
         return points.to_vec();
     }
@@ -1720,7 +1895,7 @@ fn simplify_points(points: &[Point], tol: f64) -> Vec<Point> {
 /// neighbours on a loop. Wrapping a couple of points from each side into the
 /// fit, then keeping only the segments of the true loop, gives every point
 /// — including the one the list starts on — a real neighbour on both sides.
-fn closed_catmull_rom(points: &[Point]) -> BezPath {
+pub(crate) fn closed_catmull_rom(points: &[Point]) -> BezPath {
     let n = points.len();
     if n < 3 {
         let mut path = catmull_rom(points);
@@ -1760,6 +1935,7 @@ fn chain_to_shape(
     img_w: usize,
     pixels: &[u8],
     options: &TraceOptions,
+    straighten: Straighten,
 ) -> Option<ShapeData> {
     if chain.len() < 2 {
         return None;
@@ -1796,12 +1972,22 @@ fn chain_to_shape(
     match options.line_style {
         LineStyle::Stroke => {
             let points: Vec<Point> = smoothed.iter().map(|s| s.point).collect();
-            let tol = 0.35 + 1.15 * smooth_line;
+            let tol = 0.35 + 1.15 * smooth_line + straighten.extra_tolerance.max(0.0);
             let simplified = simplify_points(&points, tol);
             if simplified.len() < 2 {
                 return None;
             }
-            let path = if closed {
+            let path = if straighten.polyline {
+                let mut path = BezPath::new();
+                path.move_to(simplified[0]);
+                for &p in &simplified[1..] {
+                    path.line_to(p);
+                }
+                if closed {
+                    path.close_path();
+                }
+                path
+            } else if closed {
                 closed_catmull_rom(&simplified)
             } else {
                 catmull_rom(&simplified)

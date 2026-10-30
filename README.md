@@ -17,6 +17,19 @@ AVM2/ABC), ISO standards (PDF), or plain XML (XFL).
 
 ---
 
+## Install
+
+Run `installer\BuzzAnimate Setup.exe`. It installs in place — builds the
+release binary once (needs the Rust toolchain, https://rustup.rs), then makes
+the Desktop/Start Menu shortcuts. Re-run it any time to repair the build (e.g.
+after a disk cleaner removes `target\`); `Uninstall BuzzAnimate.exe` removes
+the shortcuts and the Apps & features entry but keeps the folder.
+
+To just build the environment without the wizard:
+`powershell -ExecutionPolicy Bypass -File installer\setup_env.ps1`
+
+---
+
 ## 📚 Documentation & User Guides
 
 New to BuzzAnimate or migrating from Adobe Animate? Explore the complete documentation suite:

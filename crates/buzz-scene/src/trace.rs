@@ -372,6 +372,31 @@ pub fn trace(width: u32, height: u32, pixels: &[u8], options: &TraceOptions) -> 
     }
 }
 
+pub use crate::trace_colour::{background_pockets, blend_rims, ink_paper_blend, sheet_background};
+
+/// [`trace`], with the sheet's background colour given (A6a of
+/// `docs/TRACE_SPILL_AND_OUTPAINT_PLAN.md`): for `TraceMode::InkAndColour`,
+/// paper showing through inside the figure (between hair curls, body-hair
+/// strands) is measured against `background` instead of the picture's own
+/// border (a cut-out has none), and never taken inside `protect` (eyes,
+/// mouth; `width × height`). Every other mode is [`trace`].
+pub fn trace_with_background(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    options: &TraceOptions,
+    background: Option<[u8; 3]>,
+    protect: Option<&[bool]>,
+) -> TraceReport {
+    if options.mode == TraceMode::InkAndColour {
+        let (w, h) = (width as usize, height as usize);
+        if w > 0 && h > 0 && pixels.len() >= w * h * 4 && protect.is_none_or(|p| p.len() == w * h) {
+            return crate::trace_colour::trace_ink_and_colour_with(width, height, pixels, options, background, protect);
+        }
+    }
+    trace(width, height, pixels, options)
+}
+
 /// **The ink coverage field** `trace_ink` thresholds and traces: `F` per
 /// native pixel, `0` (paper) to `1` (solid ink) — the thin dark line against
 /// whatever it is drawn on, and the dark masses (hair, pupils, shoes),

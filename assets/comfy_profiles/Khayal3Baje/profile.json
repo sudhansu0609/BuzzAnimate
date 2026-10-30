@@ -1,0 +1,19 @@
+{
+  "background_workflow": "image_z_image_turboLora2.json",
+  "character_workflow": "image_z_image_turboLora2.json",
+  "angle_workflow": "multiple_scene_angles-v1.0.json",
+  "base_size": [1280, 720],
+  "captions": false,
+  "style_text": "2D digital animation style, digital painting, illustration style, desaturated colours, bold black outlines",
+  "cast_sources": {
+    "library": ["Characters"],
+    "fla": [
+      "B:\\youtubeProjects\\Khayal3Baje\\latestLibrary\\charactersNew1.fla",
+      "B:\\youtubeProjects\\Khayal3Baje\\stories\\morecharacters.fla",
+      "B:\\youtubeProjects\\Khayal3Baje\\stories\\womanSample.fla",
+      "B:\\youtubeProjects\\Khayal3Baje\\stories\\sampleNaming.fla"
+    ],
+    "story_animate_folder": true,
+    "exclude": ["Ana *", "Bo *"]
+  }
+}

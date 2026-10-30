@@ -55,6 +55,38 @@ const MIN_BONE_LENGTH: f64 = 6.0;
 /// BM: what a press on bare artwork says in Move mode, where it does nothing.
 pub const BONE_MOVE_ON_ARTWORK: &str = "Move mode \u{2014} switch to Create to add bones";
 
+/// The Even Out Lines dialog's preview (`docs/EVEN_LINES_PLAN.md` E2).
+pub struct EvenLinesSession {
+    plan: crate::rigging::EvenLinesPlan,
+    trace: crate::rigging::EvenLinesTrace,
+    /// History when the dialog opened: Apply folds every preview into one
+    /// step from here, Cancel puts it back exactly (no undo step, no redo).
+    checkpoint: buzz_doc::RunCheckpoint,
+}
+
+/// Even Out Lines settings asked for without the dialog; `None` is the
+/// dialog's default.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvenLinesRequest {
+    pub face_width: Option<f64>,
+    pub body_width: Option<f64>,
+    pub keep_weight: Option<bool>,
+    pub straighten: Option<f64>,
+    pub solid_above: Option<f64>,
+}
+
+/// Remove Background Specks settings (A6b); `None` is the default
+/// (`buzz_scene::background_specks::SpeckOptions::default`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpecksRequest {
+    /// The sheet's paper colour; `None` guesses it from the art.
+    pub colour: Option<[u8; 3]>,
+    /// A speck lies wholly within this distance (units) of the outline, or touches the outside.
+    pub reach: Option<f64>,
+    /// The largest speck (square units).
+    pub max_area: Option<f64>,
+}
+
 /// The whole editor.
 pub struct Editor {
     pub doc: Document,
@@ -231,6 +263,11 @@ pub struct Editor {
     /// `Some` only while the dialog itself is open — see
     /// `Command::TraceBitmapOptions` and `Workspace::trace`.
     pub trace_dialog: Option<buzz_scene::TraceOptions>,
+    /// The Even Out Lines dialog (`docs/EVEN_LINES_PLAN.md` E2).
+    pub even_lines_dialog: buzz_ui::EvenLinesDialogState,
+    /// Its preview: the ink found, its centrelines, and where history stood
+    /// when it opened. `Some` only while the dialog is open.
+    pub even_lines: Option<EvenLinesSession>,
     /// A rigging drag in progress: building a bone, posing one, or moving a
     /// warp handle. Held here rather than in the tool machine because it began
     /// with a question about the document.
@@ -670,6 +707,8 @@ impl Editor {
             pending_motion_path: None,
             import_summary: None,
             trace_dialog: None,
+            even_lines_dialog: buzz_ui::EvenLinesDialogState::default(),
+            even_lines: None,
             should_quit: false,
             status: None,
             waveform_cache: WaveformCache::default(),
@@ -880,11 +919,17 @@ impl Editor {
         let ids = self.selection.ids();
         match ids.as_slice() {
             [] => None,
-            [id] => self
-                .doc
-                .scene()
-                .find_object(*id)
-                .map(|(_, object)| self.doc.scene().pivot_of(object)),
+            // Through the layer parenting the artwork is drawn with: on a
+            // layer that follows another, the point rides with the parent's
+            // motion as the artwork does. Without it, turning the arm left the
+            // wrist's point where the wrist used to be, and turning the wrist
+            // then pulled it off the arm.
+            [id] => {
+                let scene = self.doc.scene();
+                scene.find_object(*id).map(|(layer, object)| {
+                    scene.layers().inherited_transform(layer, self.current_frame) * scene.pivot_of(object)
+                })
+            }
             many => {
                 if let Some((for_ids, at)) = &self.group_pivot
                     && for_ids == many
@@ -910,6 +955,12 @@ impl Editor {
                 let frame = self.current_frame;
                 self.group_pivot = None;
                 self.doc.edit("Transformation Point", |scene| {
+                    // `at` is where it is drawn; stored before the layer
+                    // parenting (see `pivot`).
+                    let at = scene
+                        .find_object(id)
+                        .and_then(|(layer, _)| invert(scene.layers().inherited_transform(layer, frame)))
+                        .map_or(at, |back| back * at);
                     scene.set_pivot_at(frame, id, at);
                 });
             }
@@ -5367,6 +5418,7 @@ impl Editor {
             ToggleGuides => self.view.show_guides = !self.view.show_guides,
             ToggleSnapping => self.view.snap.to_objects = !self.view.snap.to_objects,
             TogglePasteboard => self.view.show_pasteboard = !self.view.show_pasteboard,
+            ToggleNeighbours => self.view.show_neighbours = !self.view.show_neighbours,
 
             GroupSelection => self.group_selection(),
             UngroupSelection => self.ungroup_selection(),
@@ -5391,6 +5443,10 @@ impl Editor {
             },
             SmoothSelection => self.reshape_selection(Reshape::Smooth),
             StraightenSelection => self.reshape_selection(Reshape::Straighten),
+            EvenLines => self.open_even_lines(),
+            RemoveBackgroundSpecks => {
+                let _ = self.remove_background_specks(None, SpecksRequest::default());
+            }
             RecogniseShape => self.recognise_selection(),
             FlipHorizontal => self.mirror_selection(true),
             FlipVertical => self.mirror_selection(false),
@@ -5822,7 +5878,11 @@ impl Editor {
             // Buzzcaf Studio over HTTP, which `Editor` has no thread for.
             SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => {}
             // Handled by `App` (`crate::produce`): a dialog, then a task.
-            ProduceEpisode => {}
+            ProduceEpisode | NewEpisode | StoryToScreenplay | Casting => {}
+            // Handled by `App` (`crate::copilot`): the Producer window.
+            ProducerPanel => {}
+            // Handled by `App` (`crate::storyboard_panel`): a panel and its worker.
+            StoryboardMake | StoryboardEdit | StoryboardExport => {}
             // Agent only (`agent::dialogs::mouth_chart`): it needs a chart file
             // and a character, which no menu item can ask for.
             AiMouthChart => {}
@@ -9621,8 +9681,9 @@ impl Editor {
         let mut head_rig = None;
         self.doc.edit("AI Rig as Layers", |scene| {
             applied = crate::rigging::apply_layer_rig_plan(scene, &plan);
-            // H1: the head rigged like the user's, in the same step.
-            if let (true, Some(_), Some(head)) = (plan.rig_head, &applied, plan.head_symbol) {
+            // H1: the head rigged like the user's, in the same step (H2a: a
+            // plain-drawing head was made a head symbol by the apply).
+            if let (true, Some(head)) = (plan.rig_head, applied.as_ref().and_then(|a| a.head_symbol)) {
                 let style = buzz_rig::head_style::HeadStyle::animate_convention();
                 head_rig = Some(crate::rigging::rig_head(scene, head, &style));
             }
@@ -9753,6 +9814,249 @@ impl Editor {
             self.selection.prune(self.doc.scene());
         }
         result
+    }
+
+    /// What **Even Out Lines** works on (`docs/EVEN_LINES_PLAN.md` E2):
+    /// `element`, else the selection — shapes, or instances (their symbols,
+    /// recursively) — else the whole timeline being edited (the symbol open,
+    /// else the stage) and every symbol inside it.
+    fn even_lines_scope(&self, element: Option<ObjectId>) -> crate::rigging::EvenLinesScope {
+        let scene = self.doc.scene();
+        let ids: Vec<ObjectId> = match element {
+            Some(id) => vec![id],
+            None => self.selection.iter().collect(),
+        };
+        let mut scope = crate::rigging::EvenLinesScope::default();
+        for id in ids {
+            let Some((_, object)) = scene.find_object(id) else { continue };
+            match &object.kind {
+                ObjectKind::Shape(_) => scope.shapes.push(id),
+                _ => {
+                    for symbol in crate::rigging::nested_symbols(object) {
+                        if !scope.symbols.contains(&symbol) {
+                            scope.symbols.push(symbol);
+                        }
+                    }
+                }
+            }
+        }
+        if scope.shapes.is_empty() && scope.symbols.is_empty() {
+            scope.whole_timeline = true;
+        }
+        scope
+    }
+
+    /// The Even Out Lines dialog's settings.
+    fn even_lines_settings(&self) -> crate::rigging::EvenLinesSettings {
+        let d = &self.even_lines_dialog;
+        crate::rigging::EvenLinesSettings {
+            face_width: d.face_width,
+            body_width: d.body_width,
+            keep_weight: d.keep_weight,
+            straighten: d.straighten,
+            solid_above: d.solid_above,
+        }
+    }
+
+    /// **Even Out Lines…**: find and measure the ink of the scope, open the
+    /// dialog on its measured widths, and preview the result on the stage.
+    pub fn open_even_lines(&mut self) {
+        if self.even_lines.is_some() {
+            return;
+        }
+        let scope = self.even_lines_scope(None);
+        let plan = crate::rigging::plan_even_lines(self.doc.scene(), &scope);
+        if plan.is_empty() {
+            self.status = Some(
+                "Even Out Lines: no traced ink here (filled shapes on an \"Ink\" layer, or dark filled shapes)".into(),
+            );
+            return;
+        }
+        let quarter = |v: f64, lo: f64, hi: f64| ((v * 4.0).round() / 4.0).clamp(lo, hi);
+        let d = &mut self.even_lines_dialog;
+        d.face_width = quarter(plan.face_measured.or(plan.ink_measured).unwrap_or(1.5), 0.25, 12.0);
+        d.body_width = quarter(plan.body_measured.or(plan.ink_measured).unwrap_or(2.0), 0.25, 12.0);
+        d.keep_weight = true;
+        d.straighten = 0.0;
+        d.solid_above = quarter(crate::rigging::default_solid_above(&plan), 0.5, 40.0);
+        d.has_face = plan.has_face();
+        d.has_body = plan.has_body();
+        d.open = true;
+        let trace = crate::rigging::trace_even_lines(&plan, d.straighten, d.solid_above, false);
+        self.doc.end_gesture();
+        self.even_lines = Some(EvenLinesSession {
+            plan,
+            trace,
+            checkpoint: self.doc.run_checkpoint(),
+        });
+        self.even_lines_preview();
+    }
+
+    /// Write the dialog's result over the scope's original ink — exactly what
+    /// Apply commits. Not yet one undo step: Apply folds the previews into
+    /// one, Cancel takes them back.
+    fn even_lines_preview(&mut self) {
+        let settings = self.even_lines_settings();
+        let Some(session) = self.even_lines.as_mut() else { return };
+        let mut report = crate::rigging::EvenLinesReport::default();
+        self.doc.edit("Even Out Lines", |scene| {
+            report = crate::rigging::apply_even_lines(scene, &session.plan, &mut session.trace, &settings);
+        });
+        let d = &mut self.even_lines_dialog;
+        d.face_lines = report.face_lines;
+        d.body_lines = report.body_lines;
+        d.solids = report.solids;
+    }
+
+    /// Trace the open session's ink again for the dialog's straighten and
+    /// solid-above (`draft`: at the lower scale, while a slider drags).
+    fn even_lines_retrace(&mut self, draft: bool) {
+        let settings = self.even_lines_settings();
+        if let Some(session) = self.even_lines.as_mut() {
+            // Only the sets whose result can change are traced again (E1b).
+            let previous = std::mem::take(&mut session.trace);
+            session.trace = crate::rigging::retrace_even_lines(
+                &session.plan,
+                previous,
+                settings.straighten,
+                settings.solid_above,
+                draft,
+            );
+        }
+    }
+
+    /// What the Even Out Lines dialog asked for.
+    pub fn even_lines_action(&mut self, action: buzz_ui::EvenLinesAction) {
+        use buzz_ui::EvenLinesAction as A;
+        match action {
+            A::None => {}
+            A::Widths => self.even_lines_preview(),
+            A::Retrace { draft } => {
+                self.even_lines_retrace(draft);
+                self.even_lines_preview();
+            }
+            A::Apply => {
+                let settings = self.even_lines_settings();
+                let stale = self.even_lines.as_ref().is_some_and(|s| {
+                    s.trace.draft || s.trace.straighten != settings.straighten || s.trace.solid_above != settings.solid_above
+                });
+                if stale {
+                    self.even_lines_retrace(false);
+                }
+                self.even_lines_preview();
+                self.even_lines_dialog.open = false;
+                let Some(session) = self.even_lines.take() else { return };
+                self.doc.collapse_run(session.checkpoint, "Even Out Lines");
+                self.doc.end_gesture();
+                self.selection.prune(self.doc.scene());
+                let d = &self.even_lines_dialog;
+                self.status = Some(format!(
+                    "Even Out Lines: {} face lines at {} px, {} body lines at {} px, {} solid areas kept",
+                    d.face_lines, d.face_width, d.body_lines, d.body_width, d.solids
+                ));
+            }
+            A::Cancel => {
+                self.even_lines_dialog.open = false;
+                let Some(session) = self.even_lines.take() else { return };
+                // Back to the checkpoint: no undo step and no redo entry (E1b).
+                self.doc.restore_checkpoint(session.checkpoint);
+                self.doc.end_gesture();
+                self.selection.prune(self.doc.scene());
+                self.status = Some("Even Out Lines: cancelled, the ink is as it was".into());
+            }
+        }
+    }
+
+    /// **Even Out Lines** without the dialog (the AI agent's `even_lines`):
+    /// any setting left `None` is the dialog's default for the scope; one undo
+    /// step ("Even Out Lines").
+    pub fn even_out_lines(
+        &mut self,
+        element: Option<ObjectId>,
+        request: EvenLinesRequest,
+    ) -> Result<crate::rigging::EvenLinesReport, String> {
+        let scope = self.even_lines_scope(element);
+        let plan = crate::rigging::plan_even_lines(self.doc.scene(), &scope);
+        if plan.is_empty() {
+            let message =
+                "Even Out Lines: no traced ink here (filled shapes on an \"Ink\" layer, or dark filled shapes)".to_string();
+            self.status = Some(message.clone());
+            return Err(message);
+        }
+        let quarter = |v: f64, lo: f64, hi: f64| ((v * 4.0).round() / 4.0).clamp(lo, hi);
+        let settings = crate::rigging::EvenLinesSettings {
+            face_width: request
+                .face_width
+                .unwrap_or_else(|| quarter(plan.face_measured.or(plan.ink_measured).unwrap_or(1.5), 0.25, 12.0)),
+            body_width: request
+                .body_width
+                .unwrap_or_else(|| quarter(plan.body_measured.or(plan.ink_measured).unwrap_or(2.0), 0.25, 12.0)),
+            keep_weight: request.keep_weight.unwrap_or(true),
+            straighten: request.straighten.unwrap_or(0.0),
+            solid_above: request
+                .solid_above
+                .unwrap_or_else(|| quarter(crate::rigging::default_solid_above(&plan), 0.5, 40.0)),
+        };
+        let mut trace = crate::rigging::trace_even_lines(&plan, settings.straighten, settings.solid_above, false);
+        let mut report = crate::rigging::EvenLinesReport::default();
+        self.doc.end_gesture();
+        self.doc.edit("Even Out Lines", |scene| {
+            report = crate::rigging::apply_even_lines(scene, &plan, &mut trace, &settings);
+        });
+        self.doc.end_gesture();
+        self.selection.prune(self.doc.scene());
+        self.status = Some(format!(
+            "Even Out Lines: {} face lines at {} px, {} body lines at {} px, {} solid areas kept",
+            report.face_lines, report.face_width, report.body_lines, report.body_width, report.solids
+        ));
+        Ok(report)
+    }
+
+    /// **Remove Background Specks** (Modify ▸ Shape, A6b of
+    /// `docs/TRACE_SPILL_AND_OUTPAINT_PLAN.md`): the sheet's paper traced as
+    /// small light fills near a character's outline, deleted on every keyframe
+    /// of `element`, else the selection (instances: their symbols and every
+    /// symbol inside), else the timeline being edited; one undo step. `Err`
+    /// (and the status line) when there is none.
+    pub fn remove_background_specks(
+        &mut self,
+        element: Option<ObjectId>,
+        request: SpecksRequest,
+    ) -> Result<crate::rigging::SpecksReport, String> {
+        let scope = self.even_lines_scope(element);
+        let mut options = buzz_scene::background_specks::SpeckOptions::default();
+        options.colour = request.colour;
+        if let Some(reach) = request.reach {
+            options.reach = reach;
+        }
+        if let Some(max_area) = request.max_area {
+            options.max_area = max_area;
+        }
+        let mut report = crate::rigging::SpecksReport::default();
+        self.doc.end_gesture();
+        self.doc.edit("Remove Background Specks", |scene| {
+            report = crate::rigging::remove_background_specks(scene, &scope, &options);
+        });
+        self.doc.end_gesture();
+        self.selection.prune(self.doc.scene());
+        let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+        if report.shapes_removed + report.shapes_clipped == 0 {
+            let message = match report.colour {
+                Some(c) => format!("Remove Background Specks: no specks of the paper colour {} near the outline", hex(c)),
+                None => "Remove Background Specks: no paper-coloured fills touch the outline (give the paper colour)".to_string(),
+            };
+            self.status = Some(message.clone());
+            return Err(message);
+        }
+        self.status = Some(format!(
+            "Removed {} background specks ({} more cut down, {:.0} sq px) on {} keyframes, paper {}",
+            report.shapes_removed,
+            report.shapes_clipped,
+            report.area,
+            report.keyframes,
+            report.colour.map(hex).unwrap_or_default()
+        ));
+        Ok(report)
     }
 
     /// **Arrange Layers** on the timeline being edited, as one undo step

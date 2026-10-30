@@ -356,7 +356,7 @@ fn subpaths(path: &BezPath) -> Vec<BezPath> {
 }
 
 /// Scan-convert a filled path into the grid with the non-zero rule.
-fn rasterise_fill(path: &BezPath, grid: &mut Grid, area: Rect, ppu: f64) {
+pub(crate) fn rasterise_fill(path: &BezPath, grid: &mut Grid, area: Rect, ppu: f64) {
     // Flatten into polylines, in grid coordinates.
     let tol = 0.2 / ppu;
     let mut subpaths: Vec<Vec<Point>> = Vec::new();

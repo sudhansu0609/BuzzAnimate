@@ -81,6 +81,9 @@ humantime = "=2.4.0"
 # E3): the same blocking HTTP client `buzz-ai` already uses, so nothing new is
 # compiled. Only ever called off the UI thread.
 ureq = { version = "2.10", features = ["json"] }
+# Storyboard S3: the board sheet as one PDF. Already in the workspace (the PDF
+# importer reads with it); nothing new is compiled.
+lopdf.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 # Embeds the icon into the .exe, so Explorer and the taskbar show it too.

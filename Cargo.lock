@@ -697,6 +697,7 @@ dependencies = [
  "humantime",
  "image",
  "kurbo",
+ "lopdf",
  "peniko",
  "png",
  "pollster 1.0.1",

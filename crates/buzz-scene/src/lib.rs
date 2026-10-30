@@ -26,11 +26,13 @@
 //! tell whether what it holds is current instead of trusting it blindly.
 
 pub mod arrange;
+pub mod background_specks;
 pub mod art;
 pub mod bucket;
 pub mod camera_track;
 pub mod cleanup;
 pub mod effect_brush;
+pub mod even_lines;
 pub mod gradient;
 pub mod image;
 pub mod index;

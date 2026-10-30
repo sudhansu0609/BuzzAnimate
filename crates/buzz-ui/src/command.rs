@@ -81,6 +81,26 @@ pub enum Command {
     /// finished episode out (breakdown, cast, backgrounds, audio, build,
     /// render). See `buzz_app::produce` (PRODUCER_PLAN P6).
     ProduceEpisode,
+    /// **New Episode**: the guided five-step window (Story, Cast, Audio, Look,
+    /// Produce). See `crate::episode_window` (ANIMATE_COPILOT_PLAN B7).
+    NewEpisode,
+    /// **Story to Screenplay**: a first-person story in, the producer's
+    /// screenplay and cast out. See `buzz_ai::story` (ANIMATE_COPILOT_PLAN B1).
+    StoryToScreenplay,
+    /// **Casting**: who plays whom, from the creator's own characters
+    /// (ANIMATE_COPILOT_PLAN B2). See `buzz_app::my_cast`.
+    Casting,
+    /// **Producer** (Window): the co-pilot panel for a produced episode (ANIMATE_COPILOT_PLAN B4).
+    ProducerPanel,
+    /// **Make Storyboard**: the Storyboard panel's Make — the episode's
+    /// board (`storyboard.json`), a picture per panel. See
+    /// `buzz_app::storyboard` (`docs/STORYBOARD_PLAN.md` S3).
+    StoryboardMake,
+    /// **Edit Storyboard**: opens the Storyboard panel; the agent edits a
+    /// panel from args.
+    StoryboardEdit,
+    /// **Export Storyboard Sheets**: the board as PNG pages and one PDF.
+    StoryboardExport,
 
     // Edit
     Undo,
@@ -105,6 +125,9 @@ pub enum Command {
     ToggleGuides,
     ToggleSnapping,
     TogglePasteboard,
+    /// View ▸ Show Neighbours: while a symbol is open in place, draw what
+    /// surrounds it (veiled, at 35 %) or hide it. `ViewSettings::show_neighbours`.
+    ToggleNeighbours,
     /// Open View > Pasteboard Colour…: "Match theme" (the default) or a
     /// colour picker, persisted in `Workspace::pasteboard`.
     PasteboardColour,
@@ -163,6 +186,15 @@ pub enum Command {
     ExpandFill,
     SmoothSelection,
     StraightenSelection,
+    /// **Even Out Lines…** (Modify ▸ Shape): filled ink shapes turned into
+    /// even-width strokes, face lines and body lines each at their own width
+    /// (`docs/EVEN_LINES_PLAN.md` E2).
+    EvenLines,
+    /// **Remove Background Specks** (Modify ▸ Shape): the sheet's paper traced
+    /// as small white or cream fills between hair curls and body-hair strands
+    /// near a character's outline, deleted on every keyframe of the selection
+    /// or the timeline (`docs/TRACE_SPILL_AND_OUTPAINT_PLAN.md` A6b).
+    RemoveBackgroundSpecks,
     /// Modify ▸ Shape ▸ Recognise Shape: turn a drawn wobble into the circle,
     /// rectangle or line it was meant to be.
     RecogniseShape,
@@ -654,6 +686,13 @@ command_table! {
             SendToBuzzEdit => "buzzedit_send",
             ImportScriptFromStudio => "studio_import_script",
             ProduceEpisode => "produce_episode_dialog",
+            NewEpisode => "new_episode_window",
+            StoryToScreenplay => "story_to_screenplay_dialog",
+            Casting => "casting_dialog",
+            ProducerPanel => "producer_panel",
+            StoryboardMake => "storyboard_make",
+            StoryboardEdit => "storyboard_edit",
+            StoryboardExport => "storyboard_export",
             Undo => "undo",
             Redo => "redo",
             Cut => "cut",
@@ -674,6 +713,7 @@ command_table! {
             ToggleGuides => "toggle_guides",
             ToggleSnapping => "toggle_snapping",
             TogglePasteboard => "toggle_pasteboard",
+            ToggleNeighbours => "toggle_neighbours",
             PasteboardColour => "pasteboard_colour",
             GroupSelection => "group_selection",
             UngroupSelection => "ungroup_selection",
@@ -697,6 +737,8 @@ command_table! {
             ExpandFill => "expand_fill",
             SmoothSelection => "smooth_selection",
             StraightenSelection => "straighten_selection",
+            EvenLines => "even_lines",
+            RemoveBackgroundSpecks => "remove_background_specks",
             RecogniseShape => "recognise_shape",
             FlipHorizontal => "flip_horizontal",
             FlipVertical => "flip_vertical",
@@ -850,11 +892,12 @@ command_table! {
 }
 
 /// Every panel, for naming one in a command's args.
-const ALL_PANELS: [super::workspace::PanelId; 21] = {
+const ALL_PANELS: [super::workspace::PanelId; 22] = {
     use super::workspace::PanelId::*;
     [
         Tools, ToolOptions, Layers, Properties, Color, Swatches, Depth, Rig, Filters, Lighting,
         Sound, Library, Assets, Cast, Timeline, Sequence, Actions, Story, MotionEditor, Tasks, Ai,
+        Storyboard,
     ]
 };
 
@@ -1022,6 +1065,13 @@ impl Command {
             SendToBuzzEdit => "Send to BuzzEdit\u{2026}",
             ImportScriptFromStudio => "Import Script from Studio\u{2026}",
             ProduceEpisode => "Produce Episode\u{2026}",
+            NewEpisode => "New Episode\u{2026}",
+            StoryToScreenplay => "Story to Screenplay\u{2026}",
+            Casting => "Casting\u{2026}",
+            ProducerPanel => "Producer\u{2026}",
+            StoryboardMake => "Make Storyboard",
+            StoryboardEdit => "Edit Storyboard\u{2026}",
+            StoryboardExport => "Export Storyboard Sheets",
 
             Undo => "Undo",
             Redo => "Redo",
@@ -1044,6 +1094,7 @@ impl Command {
             ToggleGuides => "Guides",
             ToggleSnapping => "Snap to Objects",
             TogglePasteboard => "Pasteboard",
+            ToggleNeighbours => "Show Neighbours",
             PasteboardColour => "Pasteboard Colour\u{2026}",
 
             GroupSelection => "Group",
@@ -1068,6 +1119,8 @@ impl Command {
             ExpandFill => "Expand Fill…",
             SmoothSelection => "Smooth",
             StraightenSelection => "Straighten",
+            EvenLines => "Even Out Lines\u{2026}",
+            RemoveBackgroundSpecks => "Remove Background Specks",
             RecogniseShape => "Recognise Shape",
             FlipHorizontal => "Flip Horizontal",
             FlipVertical => "Flip Vertical",
@@ -1290,6 +1343,7 @@ impl Command {
             ToggleGuides => sc(ctrl_semicolon(), Key::Semicolon),
             ToggleSnapping => sc(ctrl_shift, Key::U),
             TogglePasteboard => sc(ctrl_shift, Key::W),
+            ToggleNeighbours => None,
 
             GroupSelection => sc(ctrl, Key::G),
             UngroupSelection => sc(ctrl_shift, Key::G),
@@ -1310,6 +1364,8 @@ impl Command {
             SmoothSelection => None,
             RecogniseShape => None,
             StraightenSelection => None,
+            EvenLines => None,
+            RemoveBackgroundSpecks => None,
             // Animate's own: Ctrl+Shift+9 and Ctrl+Shift+7 rotate; the flips
             // have no default there, and none is invented here.
             FlipHorizontal | FlipVertical => None,
@@ -1464,7 +1520,11 @@ impl Command {
             // No Animate binding to follow: they reach other apps.
             TranscribeWithBuzzEdit | SendToBuzzEdit | ImportScriptFromStudio => None,
             // A dialog with a whole form behind it.
-            ProduceEpisode => None,
+            ProduceEpisode | NewEpisode | StoryToScreenplay | Casting => None,
+            // The Producer window (B4).
+            ProducerPanel => None,
+            // The Storyboard panel's buttons.
+            StoryboardMake | StoryboardEdit | StoryboardExport => None,
             AiModels | AiCharacterFromImage | AiIdentifyAssets | AiRigVectorCharacter | AiRigLayers | AiSceneFromImage | AiDirectStory | AiMouthChart => None,
         }
     }
@@ -1555,6 +1615,7 @@ pub fn palette_commands() -> Vec<Command> {
         ToggleGuides,
         ToggleSnapping,
         TogglePasteboard,
+        ToggleNeighbours,
         PasteboardColour,
         GroupSelection,
         UngroupSelection,
@@ -1571,6 +1632,8 @@ pub fn palette_commands() -> Vec<Command> {
         ExpandFill,
         SmoothSelection,
         StraightenSelection,
+        EvenLines,
+        RemoveBackgroundSpecks,
         RecogniseShape,
         FlipHorizontal,
         FlipVertical,
@@ -1689,6 +1752,13 @@ pub fn palette_commands() -> Vec<Command> {
         SendToBuzzEdit,
         ImportScriptFromStudio,
         ProduceEpisode,
+        NewEpisode,
+        StoryToScreenplay,
+        Casting,
+        ProducerPanel,
+        StoryboardMake,
+        StoryboardEdit,
+        StoryboardExport,
         ImportSound,
         ImportImage,
         AttachSound,
@@ -1785,6 +1855,7 @@ mod tests {
             ToggleGuides,
             ToggleSnapping,
             TogglePasteboard,
+            ToggleNeighbours,
             PasteboardColour,
             GroupSelection,
             UngroupSelection,
@@ -1802,6 +1873,8 @@ mod tests {
             ExpandFill,
             SmoothSelection,
             StraightenSelection,
+            EvenLines,
+            RemoveBackgroundSpecks,
             RecogniseShape,
             FlipHorizontal,
             FlipVertical,
@@ -2018,7 +2091,7 @@ mod tests {
             assert!(seen.insert(c.id()), "duplicate id {}", c.id());
             assert_eq!(Command::from_id(c.id(), &serde_json::Value::Null), Ok(c));
         }
-        assert_eq!(Command::unit_commands().len() + Command::data_command_hints().len(), 219);
+        assert_eq!(Command::unit_commands().len() + Command::data_command_hints().len(), 229);
     }
 
     #[test]

@@ -1701,6 +1701,51 @@ fn complete_parts_impl(
             eprintln!("outpaint: B1d {} takes back {} px of {} (+{} px of its flank, B4c)", all_parts[p].name, moved, all_parts[c].name, flank);
         }
     }
+    // **SH** (docs/TRACE_SPILL_AND_OUTPAINT_PLAN.md, round 2026-10-27): at every
+    // Chest -> Shoulder and Hips -> Thigh joint, whichever paints over, the limb's
+    // root turns as a disc about its joint: its pixels on the joint side of the cut
+    // farther than `R` (half its band width at the cut, >= 4 px) from the joint go
+    // to the body part with their source colours (`outpaint::take_back_beyond_disc`;
+    // the rest picture is the same pixels, another owner), and its completed picture
+    // gets a disc of radius `R` about the joint where it is hidden
+    // (`outpaint::paint_joint_disc`, read by the completion below). A wide root
+    // under the chest no longer sweeps a hump past the chest outline when it turns.
+    // `R` is capped by the joint's distance to the outside of the body without its
+    // limbs (less 1 px), so the disc stays inside that outline whichever way it
+    // turns; under 3 px no disc is painted (the relabel still runs). The disc is
+    // painted only where the parent covers it at rest.
+    let mut root_disc: Vec<Option<(f32, f32, usize)>> = vec![None; all_parts.len()];
+    let is_limb_part = |l: i32| {
+        l >= 0
+            && all_parts[l as usize].name.split_whitespace().next().is_some_and(|s| {
+                ["shoulder", "elbow", "wrist", "hand", "thigh", "knee", "ankle", "foot"].iter().any(|k| s.eq_ignore_ascii_case(k))
+            })
+    };
+    let body_no_limbs: Vec<bool> = (0..n_px).map(|i| matte_in[i] && label[i] >= 0 && !is_limb_part(label[i])).collect();
+    // Off (2026-10-27): failed its gate twice (Guddu L hump 624 -> 1245 px);
+    // the arms-behind hump comes from B1's tube and round end, see the SH row.
+    const SH_ROOT_DISC: bool = false;
+    for joint in joints.iter().filter(|_| SH_ROOT_DISC) {
+        let (p, c) = (joint.parent, joint.child);
+        let slot = all_parts[c].name.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        if crate::outpaint::is_limb_bone(&all_parts[p].name) || (slot != "shoulder" && slot != "thigh") {
+            continue;
+        }
+        let Some((r, half_band)) = crate::outpaint::root_disc_radius(&joint.cut, &body_no_limbs, wu, hu) else { continue };
+        // The 1.2 × half-band sweep relabel (`Some(1.2 * half_band)`) was measured
+        // 2026-10-27 and grew the hump (the sleeve top stays put as a chest stump): off.
+        let moved = crate::outpaint::take_back_beyond_disc(&mut label, wu, hu, &joint.cut, p as i32, c as i32, r, None);
+        if r >= 3.0 {
+            root_disc[c] = Some((r, joint.cut.t_cut, p));
+        }
+        if log {
+            let head = skel.bone(&all_parts[c].name).map(|b| b.head).unwrap_or((f32::NAN, f32::NAN));
+            eprintln!(
+                "outpaint: SH {} root disc r {:.1} px (half band {:.1}) about ({:.1}, {:.1}), {} px to {}",
+                all_parts[c].name, r, half_band, head.0, head.1, moved, all_parts[p].name
+            );
+        }
+    }
     // **B4c** shoulders, front view: a chest under an arm (the arm paints over it)
     // is completed over that arm's joint disc (`body_discs`, read by the completion
     // below), so the dropped sleeve cap leaves no notch.
@@ -1881,6 +1926,8 @@ fn complete_parts_impl(
 
         // 2. If it's a bone limb, compute capsule completion + joint cap
         if let Some(bone) = bone_opt {
+            // SH: the limb's own visible picture, for its root disc's colours.
+            let root_visible = root_disc[position].map(|_| out_rgba.clone());
             let (x0, y0) = bone.head;
             let (x1, y1) = bone.tail;
             let dx = x1 - x0;
@@ -2035,6 +2082,17 @@ fn complete_parts_impl(
                         }
                     }
                     None => crate::outpaint::nearest_visible_fill(&mut out_rgba, w, h, &hole, dom_color),
+                }
+            }
+            // SH: the disc of radius R about the joint, where the limb is hidden.
+            if let (Some((r, t_cut, parent)), Some(visible)) = (root_disc[position], root_visible.as_ref()) {
+                // Only where the parent covers it at rest.
+                let covers = rank(parent) > (depth, position);
+                let allowed: Vec<bool> = (0..n_px).map(|i| covers && matte_in[i] && label[i] == parent as i32).collect();
+                let mut marks = if extruded.is_empty() { vec![false; n_px] } else { std::mem::take(&mut extruded) };
+                crate::outpaint::paint_joint_disc(&mut out_rgba, &mut marks, visible, &allowed, bone.head, bone.tail, img, r, t_cut);
+                if marks.iter().any(|&e| e) {
+                    extruded = marks;
                 }
             }
         }
@@ -4433,7 +4491,43 @@ pub fn trace_character_whole_with(
         let mut trace_options = options.trace;
         trace_options.mode = buzz_scene::trace::TraceMode::InkAndColour;
         trace_options.drop_background = true;
-        buzz_scene::trace::trace(w, h, &visible_rgba, &trace_options)
+        // A6a: paper between hair curls and body-hair strands is the sheet's
+        // background (the source's border colour), never inside the eyes or
+        // the mouth (their part masks, grown).
+        let background = buzz_scene::trace::sheet_background(w, h, source.as_raw());
+        let feature: Vec<bool> =
+            completed.parts.iter().map(|p| is_eye_part(&p.name) || p.name.to_lowercase().contains("mouth")).collect();
+        // Each feature part's largest piece only: the segmenter's mouth can own
+        // a few stray pixels out in the hair by the jaw (Woman1).
+        let mut own = vec![false; owner.len()];
+        for (id, _) in completed.parts.iter().enumerate().filter(|(id, _)| feature[*id]) {
+            let mask: Vec<bool> = owner.iter().map(|&o| o == id as i32).collect();
+            let (labels, n) = label_components(&mask, w as usize, h as usize);
+            let mut area = vec![0usize; n + 1];
+            for &l in &labels {
+                area[l as usize] += 1;
+            }
+            if let Some(best) = (1..=n).max_by_key(|&l| area[l]) {
+                for (o, &l) in own.iter_mut().zip(&labels) {
+                    *o |= l as usize == best;
+                }
+            }
+        }
+        let protect = own.iter().any(|&b| b).then(|| dilate_square(&own, w as usize, h as usize, PROTECT_GROW_PX));
+        if std::env::var_os("BUZZ_TRACE_POCKETS_LOG").is_some() {
+            for (id, part) in completed.parts.iter().enumerate().filter(|(id, _)| feature[*id]) {
+                let (mut x0, mut y0, mut x1, mut y1, mut n) = (u32::MAX, u32::MAX, 0, 0, 0usize);
+                for (i, &o) in owner.iter().enumerate() {
+                    if o == id as i32 {
+                        let (x, y) = (i as u32 % w, i as u32 / w);
+                        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                        n += 1;
+                    }
+                }
+                eprintln!("trace_character_whole: pockets never in {:?}: {n} px, box {x0},{y0}..{x1},{y1}", part.name);
+            }
+        }
+        buzz_scene::trace::trace_with_background(w, h, &visible_rgba, &trace_options, background, protect.as_deref())
     });
     let (fill_source, ink_report) = if options.outline_strokes || use_ink_colour {
         (std::borrow::Cow::Borrowed(&visible_rgba[..]), None)

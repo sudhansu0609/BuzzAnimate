@@ -1,0 +1,15 @@
+{
+  "id": "BuzzAnimate",
+  "name": "BuzzAnimate",
+  "description": "GPU-accelerated vector animation editor",
+  "version": "0.1.0",
+  "launch_target": "%WINDIR%\\System32\\wscript.exe",
+  "launch_args": "\"{root}\\BuzzAnimate.vbs\"",
+  "icon": "assets\\buzzanimate.ico",
+  "setup_script": "installer\\setup_env.ps1",
+  "env_summary": "Rust toolchain, release build (Vello/wgpu GPU renderer); ~5 GB",
+  "estimated_mb": 5000,
+  "health_paths": [
+    "target\\release\\buzzanimate.exe"
+  ]
+}

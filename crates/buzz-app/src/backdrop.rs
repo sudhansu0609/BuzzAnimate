@@ -157,15 +157,53 @@ pub fn bind_workflow(workflow: &mut Value, prompt: &str, seed: u64, size: (u32, 
     Ok(())
 }
 
+/// F4: the location's wide picture re-angled by Qwen Image Edit 2509 with his
+/// camera-angle LoRA (the flow of `multiple_scene_angles-v1.0.json`), so the
+/// place stays the same one. Cached like [`generate`].
+pub fn generate_angle(client: &ComfyClient, wide_png: &Path, prompt: &str, seed: u64, out_png: &Path) -> Result<PathBuf, String> {
+    if out_png.is_file() {
+        return Ok(out_png.to_path_buf());
+    }
+    let bytes = std::fs::read(wide_png).map_err(|e| format!("{}: {e}", wide_png.display()))?;
+    let name = format!("buzzanimate-wide-{}.png", crate::comfy_profile::short_hash(&bytes));
+    let uploaded = client.upload_image(&name, &bytes)?;
+    let graph = crate::comfy_profile::qwen_angle_graph(&uploaded, prompt, seed, "buzzanimate-angle");
+    let id = client.queue(graph)?;
+    let outputs = client.wait(&id, GENERATE_TIMEOUT)?;
+    let first = outputs.first().ok_or("ComfyUI returned no picture")?;
+    let picture = image::load_from_memory(&client.view(first)?).map_err(|e| format!("{}: {e}", first.filename))?;
+    if let Some(dir) = out_png.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    picture.to_rgba8().save(out_png).map_err(|e| format!("{}: {e}", out_png.display()))?;
+    Ok(out_png.to_path_buf())
+}
+
+/// F4: the Qwen model files the angle pictures need that ComfyUI does not have.
+pub fn missing_angle_models(client: &ComfyClient) -> Result<Vec<String>, String> {
+    let g = crate::comfy_profile::qwen_angle_graph("x.png", "", 0, "x");
+    Ok(crate::comfy_profile::missing_models(&client.object_info()?, &g))
+}
+
 /// Generate `prompt` at `seed` into `out_png`. Cached: an existing file is reused.
 pub fn generate(client: &ComfyClient, prompt: &str, seed: u64, out_png: &Path) -> Result<PathBuf, String> {
     if out_png.is_file() {
         return Ok(out_png.to_path_buf());
     }
-    let path = workflow_path().ok_or("no Z-Image workflow found (COMFY_WORKFLOWS or <estate>/BuzzEdit/workflows)")?;
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut workflow: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    bind_workflow(&mut workflow, prompt, seed, BASE_SIZE)?;
+    let workflow = match crate::comfy_profile::bound_for_active(client, crate::comfy_profile::Kind::Background, prompt, seed, None) {
+        Ok(Some(w)) => w,
+        Err(e) if e.starts_with(crate::comfy_profile::MISSING_PREFIX) => return Err(e),
+        other => {
+            if let Err(e) = other {
+                tracing::warn!("series ComfyUI profile unusable, using the Z-Image default: {e}");
+            }
+            let path = workflow_path().ok_or("no Z-Image workflow found (COMFY_WORKFLOWS or <estate>/BuzzEdit/workflows)")?;
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let mut workflow: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+            bind_workflow(&mut workflow, prompt, seed, BASE_SIZE)?;
+            workflow
+        }
+    };
     let id = client.queue(workflow)?;
     let outputs = client.wait(&id, GENERATE_TIMEOUT)?;
     let first = outputs.first().ok_or("ComfyUI returned no picture")?;
@@ -256,11 +294,26 @@ pub struct PeopleTry {
     /// Person heights found (fractions of the picture's height); `None` when
     /// the check could not run.
     pub people: Option<Vec<f32>>,
+    /// AN7: variance of the Laplacian (see [`crate::definition::sharpness`]).
+    pub sharpness: Option<f64>,
+    /// AN7: the picture was upscaled by this call.
+    pub upscaled: bool,
+    /// AN7: why the upscale was skipped or failed (the original was kept).
+    pub upscale_note: Option<String>,
+    /// AN7: the picture is at least the trace size.
+    pub size_ok: bool,
 }
 
 impl PeopleTry {
+    /// People-free (or unchecked), sharp enough and big enough.
+    pub fn definition_ok(&self) -> bool {
+        self.people.as_ref().is_none_or(|p| p.is_empty())
+            && self.size_ok
+            && self.sharpness.is_none_or(|s| s >= crate::definition::SHARPNESS_MIN)
+    }
+
     pub fn describe(&self, n: usize) -> String {
-        match &self.people {
+        let people = match &self.people {
             Some(p) if p.is_empty() => format!("try {n} (seed {}) found 0 people", self.seed),
             Some(p) => format!(
                 "try {n} (seed {}) found {} {} ({})",
@@ -270,16 +323,27 @@ impl PeopleTry {
                 p.iter().map(|f| format!("{:.0} %", f * 100.0)).collect::<Vec<_>>().join(", ")
             ),
             None => format!("try {n} (seed {}): people check unavailable", self.seed),
-        }
+        };
+        let sharp = self.sharpness.map(|s| format!(", sharpness {s:.0}")).unwrap_or_default();
+        let up = if self.upscaled {
+            ", upscaled".to_string()
+        } else {
+            self.upscale_note.as_ref().map(|n| format!(", not upscaled ({n})")).unwrap_or_default()
+        };
+        format!("{people}{sharp}{up}{}", if self.size_ok { "" } else { ", below the trace size" })
     }
 }
 
-/// [`generate`] with a **people check**: each picture is looked at by DWPose,
-/// and one with a person [`PERSON_MIN_HEIGHT`] or taller is drawn again with
-/// the next seed, up to `tries` pictures. The one with the fewest (then the
-/// smallest) people is copied to `out_png`. Each try is cached beside it as
-/// `<stem>.try<n>.png`; `client` is only needed for a try not yet on disk.
-/// With `check` off this is one try, unchecked.
+/// [`generate`] with a **people check** and the **definition gate** (AN7):
+/// each picture is upscaled to the trace size through ComfyUI (a failure keeps
+/// the original), measured for sharpness and looked at by DWPose. One that is
+/// soft, too small or has a person [`PERSON_MIN_HEIGHT`] or taller is drawn
+/// again with the next seed, up to `tries` pictures (the producer passes 3:
+/// the first and two more). The best is copied to `out_png`: a passing one,
+/// else the fewest (then smallest) people, then the sharpest. Each try is
+/// cached beside it as `<stem>.try<n>.png`; `client` is only needed for a try
+/// not yet on disk (or one not yet at the trace size). With `check` off this
+/// is one try, no people check.
 pub fn generate_checked(
     client: Option<&ComfyClient>,
     prompt: &str,
@@ -288,6 +352,20 @@ pub fn generate_checked(
     tries: usize,
     check: bool,
     progress: &mut dyn FnMut(&str),
+) -> Result<(PathBuf, Vec<PeopleTry>), String> {
+    generate_checked_by(client, seed, out_png, tries, check, progress, &|c, s, path| generate(c, prompt, s, path).map(|_| ()))
+}
+
+/// [`generate_checked`] with the picture made by `make(client, seed, path)`
+/// (the angle pictures re-angle the wide instead of drawing from a prompt).
+pub fn generate_checked_by(
+    client: Option<&ComfyClient>,
+    seed: u64,
+    out_png: &Path,
+    tries: usize,
+    check: bool,
+    progress: &mut dyn FnMut(&str),
+    make: &dyn Fn(&ComfyClient, u64, &Path) -> Result<(), String>,
 ) -> Result<(PathBuf, Vec<PeopleTry>), String> {
     let stem = out_png.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "bg".into());
     let dir = out_png.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -298,21 +376,38 @@ pub fn generate_checked(
         if !path.is_file() {
             let client = client.ok_or("ComfyUI is not running")?;
             progress(&format!("try {}: generating (seed {s})\u{2026}", n + 1));
-            generate(client, prompt, s, &path)?;
+            make(client, s, &path)?;
         }
-        let people = if check {
-            match image::open(&path) {
-                Ok(img) => people_in(&img.to_rgba8()).ok(),
-                Err(_) => None,
+        // AN7: upscale (never fails the run), then measure.
+        let mut upscaled = false;
+        let mut upscale_note = None;
+        match client {
+            Some(c) => {
+                progress(&format!("try {}: upscaling\u{2026}", n + 1));
+                match crate::definition::upscale_in_place(c, &path) {
+                    Ok(did) => upscaled = did,
+                    Err(e) => {
+                        tracing::warn!("upscale of {} skipped: {e}", path.display());
+                        upscale_note = Some(e.chars().take(120).collect::<String>());
+                    }
+                }
             }
-        } else {
-            None
+            None => upscale_note = Some("ComfyUI is not running".into()),
+        }
+        let loaded = image::open(&path).ok().map(|i| i.to_rgba8());
+        let (sharpness, size_ok) = match &loaded {
+            Some(img) => (
+                Some(crate::definition::sharpness(img)),
+                img.width() >= crate::definition::TRACE_SIZE.0 && img.height() >= crate::definition::TRACE_SIZE.1,
+            ),
+            None => (None, false),
         };
-        let t = PeopleTry { seed: s, png: path, people };
+        let people = if check { loaded.as_ref().and_then(|img| people_in(img).ok()) } else { None };
+        let t = PeopleTry { seed: s, png: path, people, sharpness, upscaled, upscale_note, size_ok };
         progress(&t.describe(n + 1));
-        let clean = t.people.as_ref().is_none_or(|p| p.is_empty());
+        let passes = t.definition_ok();
         done.push(t);
-        if !check || clean {
+        if !check || passes {
             break;
         }
     }
@@ -324,7 +419,12 @@ pub fn generate_checked(
         .iter()
         .min_by(|a, b| {
             let (sa, sb) = (score(a), score(b));
-            sa.0.cmp(&sb.0).then(sa.1.total_cmp(&sb.1))
+            // A passing try first, then the fewest people, then the sharpest.
+            (!a.definition_ok())
+                .cmp(&!b.definition_ok())
+                .then(sa.0.cmp(&sb.0))
+                .then(sa.1.total_cmp(&sb.1))
+                .then(b.sharpness.unwrap_or(0.0).total_cmp(&a.sharpness.unwrap_or(0.0)))
         })
         .ok_or("no picture")?;
     std::fs::copy(&best.png, out_png).map_err(|e| format!("{}: {e}", out_png.display()))?;
@@ -1187,4 +1287,81 @@ pub fn save_asset(scene: &Scene, library: &mut AssetLibrary, path: &str, png: Op
         std::fs::copy(png, &beside).map_err(|e| format!("{}: {e}", beside.display()))?;
     }
     Ok(asset)
+}
+
+/// [`save_asset`] with AN3's cut objects added first: each a symbol on its own layer
+/// above its plate. Returns the asset and what was placed.
+pub fn save_asset_with_objects(
+    scene: &mut Scene,
+    cut: &crate::bg_objects::ObjectCut,
+    location: &str,
+    size: (u32, u32),
+    library: &mut AssetLibrary,
+    path: &str,
+    png: Option<&Path>,
+) -> Result<(Asset, Vec<crate::bg_objects::Placed>), String> {
+    let placed = crate::bg_objects::add_to_scene(cut, scene, location, size);
+    save_asset(scene, library, path, png).map(|a| (a, placed))
+}
+
+// ------------------------------------------------------------------ AN9: one picture per angle
+
+/// Most angles drawn for one location (wide plus three others).
+pub const MAX_ANGLES: usize = 4;
+
+/// The cache key / asset name of a location's picture at an angle: the
+/// location itself for the wide (so older runs stay valid), else
+/// `<location>__<camera>`.
+pub fn angle_key(location: &str, camera: &str) -> String {
+    let c = camera.trim();
+    if c.is_empty() || c == "wide" { location.trim().to_string() } else { format!("{}__{c}", location.trim()) }
+}
+
+/// The cameras to draw for a location from the cameras its shots use, in shot
+/// order: `wide` always, then the most used angle cameras, at most [`MAX_ANGLES`]
+/// in all. Medium and close are the episode's own camera framing of the wide
+/// picture (F1), so they get no picture; only reverse, low_angle, high_angle
+/// and over_shoulder do.
+pub fn plan_angles<'a>(cameras: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for c in cameras {
+        let c = c.trim();
+        if !matches!(c, "reverse" | "low_angle" | "high_angle" | "over_shoulder") {
+            continue;
+        }
+        match counts.iter_mut().find(|(k, _)| k == c) {
+            Some(e) => e.1 += 1,
+            None => counts.push((c.to_string(), 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1)); // stable: ties keep shot order
+    let mut out = vec!["wide".to_string()];
+    out.extend(counts.into_iter().take(MAX_ANGLES - 1).map(|(c, _)| c));
+    out
+}
+
+/// The picture (library asset path) of a location at a camera angle, from
+/// `backgrounds.json`'s value (`{"backgrounds": {key: {"asset": ..}}}`). An
+/// angle that was not drawn or failed falls back to the location's wide.
+pub fn background_for(backgrounds: &Value, location: &str, camera: &str) -> Option<String> {
+    let map = backgrounds.get("backgrounds").unwrap_or(backgrounds);
+    [angle_key(location, camera), angle_key(location, "wide")]
+        .iter()
+        .find_map(|k| map.get(k.as_str()).and_then(|e| e["asset"].as_str()).map(String::from))
+}
+
+#[cfg(test)]
+mod angle_tests {
+    use super::*;
+    #[test]
+    fn angles_bounded_and_looked_up() {
+        let p = plan_angles(["wide", "close", "low_angle", "close", "reverse", "high_angle", "medium", "reverse"]);
+        assert_eq!(p, vec!["wide", "reverse", "low_angle", "high_angle"]);
+        assert_eq!(plan_angles(["medium", "close"]), vec!["wide"]);
+        let v = serde_json::json!({"backgrounds": {"tea": {"asset": "B/s/tea"}, "tea__close": {"asset": "B/s/tea__close"}}});
+        assert_eq!(background_for(&v, "tea", "close").as_deref(), Some("B/s/tea__close"));
+        assert_eq!(background_for(&v, "tea", "reverse").as_deref(), Some("B/s/tea"));
+        assert_eq!(background_for(&v, "tea", "medium").as_deref(), Some("B/s/tea"));
+        assert_eq!(background_for(&v, "tea", "wide").as_deref(), Some("B/s/tea"));
+    }
 }

@@ -55,11 +55,16 @@ pub fn args_hint(command: Command) -> Option<&'static str> {
         CleanUpLayers => "{scope?: timeline|whole_scene (timeline = the timeline being edited; whole_scene = the stage and every library symbol), empty?: bool (true: delete layers with no artwork and no sound), trim?: bool (true: trim blank keyframes after each layer's last content, never below the longest content end), folders?: bool (true: remove folders with no children, including ones this run empties)} -> Clean Up Layers: never deletes a folder with children, a layer something files under or follows, a mask/guide with its run, an audio-guide layer, or the last layer; one undo step; returns {layers_deleted, frames_trimmed, folders_removed, symbols_touched}",
         ArrangeLayers => "{} -> Arrange Layers on the timeline being edited: deletes empty layers, then files top-level layers into folders (one per character with its layer-parenting chain, Background, FX, Props, Audio at the bottom), reusing same-named folders; a layer whose artwork overlaps a layer it would have to pass stays where it is, so the picture never changes; one undo step (none when already tidy); returns {folders_made, layers_moved, layers_left_in_place, emptied}",
         RepairLayerRigs => "{scope?: timeline|whole_scene (timeline = the timeline being edited; whole_scene = the stage and every library symbol)} -> Repair Layer Rigs: rewires layer-parenting rigs built with the old Bones -> Layers wiring (each part's front-most layer leads, the slot's other pieces and its child parts follow it), rebaking every keyframe so no frame changes; an already-correct rig is left alone; one undo step (none when nothing changes); returns {rigs, links_changed, keys_rebaked}",
+        EvenLines => "{element?: id of a shape or instance (its symbol, recursively; default the selection, else the symbol being edited, else the whole stage), face_width?: 0.25..12 px, body_width?: 0.25..12 px (defaults: the measured median width of the face / body ink), keep_weight?: bool (true: each line keeps its measured weight relative to the median, 0.5-2x the width), straighten?: 0..1 (0), solid_above?: 0.5..40 px (ink deeper than this radius stays a filled area; default 1.25x the measured width)} -> Even Out Lines (Modify > Shape): filled ink shapes on \"Ink\" layers (and dark filled shapes that come out as line) on every keyframe of every layer become strokes of one width along each line, face lines (eyes, brows, lids, mouth, nose, moustache, head/face layers or symbols) and body lines each at their own width; solid areas stay fills; one undo step; returns {face_lines, body_lines, solids, face_width, body_width}",
+        RemoveBackgroundSpecks => "{element?: id of a shape or instance (its symbol and every symbol inside; default the selection, else the symbol being edited, else the whole stage), colour?: \"#rrggbb\" (the sheet's paper colour; default: guessed from the light grey fills that touch the outside), reach?: 0..200 units (12: a speck lies wholly within this of the outline, or touches the outside), max_area?: 0..100000 square units (600: larger light fills are kept)} -> Remove Background Specks (Modify > Shape): fills of the paper colour (mean within dE 10) trapped between hair curls and body-hair strands near the character's outline are deleted (or cut out of a shape with other pieces) on every keyframe of every layer, in the symbols inside too; eyes, eyelids and mouths (by layer, symbol or object name) and larger light areas (a white shirt, a vest) are kept; one undo step; returns {shapes_removed, shapes_clipped, area, keyframes, colour, keyframes_not_judged}",
         RigHead => "{symbol?: head symbol name|id (or a character symbol: the head inside it), element?: instance id on stage (its symbol, same rule); default the selected instance, else the symbol being edited, else the head on the stage} -> Rig Head (Modify > Timeline): a head symbol whose face parts are separate layers or named objects is rebuilt like the user's heads, top first: eyeLid (7-frame blink symbol, resting open on frame 0, single frame), eyeMask (mask: the eye whites' fill without outline), eyeBall (masked: both irises/pupils, a cut iris completed as a circle; gaze = move this instance), eyeWhite (whites + outlines), rightEyebrow, leftEyebrow, extras, mouth (a symbol; an existing mouth-shape symbol is kept), Nose, hair, base; no layer parenting; rest picture unchanged; one undo step; an already rigged head is left alone; returns {head, view, layers, eyes, irises_completed, eye_white, eye_mask, eye_ball, eye_lid, mouth, skin, ink, already_rigged, notes}",
         PasteMotion | PasteMotionSpecial => "{relative?: bool (default true: each key is the change from the copied motion's first key, applied about the target's own transformation point, so it keeps its starting place; false writes the copied transforms as they are), parts?: [position|scale|rotation|colour|timing] (default all; rotation includes skew, colour is the colour effect and alpha, timing an instance's first frame and looping), stretch?: 0.25..4 (1; key offsets scaled and rounded, keys landing on one frame merged)} -> Paste Motion: the motion taken by copy_motion onto every selected object, each on its own layer, starting at the playhead, keyframes at the copied offsets with the copied tweens; frames outside the pasted span keep what they showed; works inside a symbol being edited; one undo step; returns {pasted, relative, parts, stretch}",
         PastePose => "{parts?: [slot names] (default every copied slot; any naming: Shoulder R, Upper Arm R, rightArm...)} -> Paste Pose: the joint angles taken by copy_pose (the selected rig at the playhead: a bone rig, a layer rig part, or a character instance with a rig inside its symbol) onto every selected rig, bone or layer, matched by slot name; angles only, each joint relative to its parent, so the target keeps its limb lengths and where its root stands; keyed at the playhead (inside an instance at the inner frame it shows; Protect Other Keyframes forks a shared symbol as a hand edit would); one undo step; returns {pasted: [slots], skipped: [copied slots the target lacks]}",
         CopyPerformance => "{from?: element id of the character that performs (a bone rig, any part of a layer rig, or an instance with a rig inside; default the selection), to?: element id of the character to paste onto (without it the performance is only copied), range?: [first, last] frames of the source (default the timeline's frame span when it covers the source, else its keyed span), offset?: the frame the paste starts on (default the playhead), stretch?: 0.25..4 (1), travel?: bool (true: also the source instance's own travel, relative, onto the target instance), scale_travel?: bool (true: that travel's change of place scaled by the target/source hip height; 1:1 with a note when not measurable)} -> Copy Performance, then Paste Performance onto 'to': the source's joint angles per key over the range, by slot name (Shoulder R = Upper Arm R = rightArm), keyed on the target's layers or armature with the source's key frames (scaled by stretch) and tweens; angles only, so the target keeps its limb lengths; the root's travel inside the rig scaled by the target/source hip height; layer and bone rigs in any combination; inside an instance through the in-place edit (Protect Other Keyframes forks a shared symbol); one undo step 'Paste Performance'; returns {keys_written, frames, slots, skipped, hip_ratio, travel_keys, notes}",
         PastePerformance | PastePerformanceSpecial => "{range?: [first, last] offsets within the copied performance (default all), offset?: the frame the paste starts on (default the playhead), stretch?: 0.25..4 (1), travel?: bool (true), scale_travel?: bool (true)} -> Paste Performance: the performance taken by copy_performance onto every selected rigged character (see copy_performance); one undo step; returns {keys_written, frames, slots, skipped, hip_ratio, travel_keys, notes}",
+        StoryboardMake => "{episode: folder holding script.txt and casting.json (or buzz/casting.json), scenes?: \"4,5\" | \"1-3\" | [4,5] (default every scene), out?: folder for the board (default <casting folder>/storyboard), look?: auto|a|b (auto: A, the real scene setup, when every character has a Cast rig and the set is built; B, an AI sketch from ComfyUI, otherwise; a B that ComfyUI cannot draw falls back to A and says so), breakdown?: path of a breakdown.json to use as it is (no model is asked), offline?: bool (the breakdown from the script's own rules, no model)} -> Storyboard panel's Make, waited for: the breakdown (else LM Studio / the saved Claude model), the scenes built headless, storyboard.json merged with the one on disk (the user's edits kept), a picture per panel in out/panels (a medium/close framed on its subject); returns {board, panels:[{index, id, scene, shot, kind, on, duration_s, look_line, framing}], warnings}",
+        StoryboardEdit => "{board?: path of a storyboard.json (default the Storyboard panel's), panel: panel id | 0-based index, kind?: wide|medium|close, on?: character name (\"\" for nobody), action?: text, notes?: text, duration_s?: 0.1..600, look?: auto|a|b, dialogue?: [[speaker, text]], move?: up|down|0-based index, add_after?: bool (a new panel of the user's own after it), split?: bool (two panels, lines and time shared out), delete?: bool (a made panel stays deleted when the board is made again), regenerate?: bool (draw it again as it is now, waited for)} -> edits storyboard.json at once (field edits are kept by a re-made board); returns {index, panel, panels}",
+        StoryboardExport => "{board?: path of a storyboard.json (default the Storyboard panel's)} -> Storyboard panel's Export sheets, waited for: pages of six panels with captions (board_p01.png...) and board.pdf beside the board, from the pictures already drawn; returns {pages, pdf, warnings}",
         _ => return None,
     })
 }
@@ -195,10 +200,15 @@ pub fn run(app: &mut App, command: Command, a: &Value) -> AgentResult {
         Command::ArrangeLayers => arrange_layers(app, a),
         Command::RepairLayerRigs => repair_layer_rigs(app, a),
         Command::RigHead => rig_head(app, a),
+        Command::EvenLines => even_lines(app, a),
+        Command::RemoveBackgroundSpecks => remove_background_specks(app, a),
         Command::PasteMotion | Command::PasteMotionSpecial => paste_motion(app, id, a),
         Command::PastePose => paste_pose(app, id, a),
         Command::CopyPerformance => copy_performance(app, id, a),
         Command::PastePerformance | Command::PastePerformanceSpecial => paste_performance(app, id, a),
+        Command::StoryboardMake => storyboard_make(app, a),
+        Command::StoryboardEdit => storyboard_edit(app, a),
+        Command::StoryboardExport => storyboard_export(app, a),
         _ => AgentResult::err(format!("needs_dialog {id}")),
     }
 }
@@ -553,6 +563,99 @@ fn rig_head(app: &mut App, a: &Value) -> AgentResult {
         return AgentResult::ok(value);
     }
     finish(app, "rig_head", before, value)
+}
+
+/// Even Out Lines dialog -> `Editor::even_out_lines` (`docs/EVEN_LINES_PLAN.md` E2).
+fn even_lines(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["element", "face_width", "body_width", "keep_weight", "straighten", "solid_above"]) {
+        return AgentResult::err(e);
+    }
+    let parsed = (|| -> Result<crate::editor::EvenLinesRequest, String> {
+        Ok(crate::editor::EvenLinesRequest {
+            face_width: num(a, "face_width", 0.25, 12.0)?,
+            body_width: num(a, "body_width", 0.25, 12.0)?,
+            keep_weight: flag(a, "keep_weight")?,
+            straighten: num(a, "straighten", 0.0, 1.0)?,
+            solid_above: num(a, "solid_above", 0.5, 40.0)?,
+        })
+    })();
+    let request = match parsed {
+        Ok(r) => r,
+        Err(e) => return AgentResult::err(e),
+    };
+    let element = match given(a, "element") {
+        Some(v) => {
+            let Some(id) = v.as_u64() else { return AgentResult::err("'element' needs an element id") };
+            if app.agent_editor().doc.scene().find_object(ObjectId(id)).is_none() {
+                return AgentResult::err(format!("no element {id} in this scene"));
+            }
+            Some(ObjectId(id))
+        }
+        None => None,
+    };
+    let before = depth(app);
+    let report = match app.agent_editor_mut().even_out_lines(element, request) {
+        Ok(report) => report,
+        Err(e) => return AgentResult::err(e),
+    };
+    let value = json!({
+        "face_lines": report.face_lines,
+        "body_lines": report.body_lines,
+        "solids": report.solids,
+        "face_width": report.face_width,
+        "body_width": report.body_width,
+    });
+    finish(app, "even_lines", before, value)
+}
+
+/// Remove Background Specks -> `Editor::remove_background_specks` (A6b of
+/// `docs/TRACE_SPILL_AND_OUTPAINT_PLAN.md`).
+fn remove_background_specks(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["element", "colour", "reach", "max_area"]) {
+        return AgentResult::err(e);
+    }
+    let parsed = (|| -> Result<crate::editor::SpecksRequest, String> {
+        let colour = match text(a, "colour")? {
+            Some(t) => {
+                let c = parse_hex(t).ok_or("'colour' needs a colour like \"#rrggbb\"")?.to_rgba8();
+                Some([c.r, c.g, c.b])
+            }
+            None => None,
+        };
+        Ok(crate::editor::SpecksRequest {
+            colour,
+            reach: num(a, "reach", 0.0, 200.0)?,
+            max_area: num(a, "max_area", 0.0, 100000.0)?,
+        })
+    })();
+    let request = match parsed {
+        Ok(r) => r,
+        Err(e) => return AgentResult::err(e),
+    };
+    let element = match given(a, "element") {
+        Some(v) => {
+            let Some(id) = v.as_u64() else { return AgentResult::err("'element' needs an element id") };
+            if app.agent_editor().doc.scene().find_object(ObjectId(id)).is_none() {
+                return AgentResult::err(format!("no element {id} in this scene"));
+            }
+            Some(ObjectId(id))
+        }
+        None => None,
+    };
+    let before = depth(app);
+    let report = match app.agent_editor_mut().remove_background_specks(element, request) {
+        Ok(report) => report,
+        Err(e) => return AgentResult::err(e),
+    };
+    let value = json!({
+        "shapes_removed": report.shapes_removed,
+        "shapes_clipped": report.shapes_clipped,
+        "area": report.area,
+        "keyframes": report.keyframes,
+        "colour": report.colour.map(|c| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])),
+        "keyframes_not_judged": report.keyframes_not_judged,
+    });
+    finish(app, "remove_background_specks", before, value)
 }
 
 /// Clean Up Layers dialog -> `Editor::clean_up_layers`.
@@ -1878,5 +1981,244 @@ mod mouth_chart_tests {
         app.agent_editor_mut().doc.undo();
         app.agent_editor_mut().doc.undo();
         assert_eq!(frames_of(&app, hero), 10);
+    }
+}
+
+// -- the storyboard (`docs/STORYBOARD_PLAN.md` S3) ----------------------------------
+
+/// How long a storyboard call waits for the panel's worker.
+const STORYBOARD_WAIT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+fn storyboard_panels(app: &mut App) -> Value {
+    let sb = app.storyboard_mut();
+    let Some(board) = &sb.board else { return json!([]) };
+    let rows: Vec<Value> = board
+        .panels
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let (look_line, framing) = sb.picture_note(&p.id).unwrap_or_default();
+            json!({"index": i, "id": p.id, "scene": p.scene, "shot": p.shot, "kind": p.kind, "on": p.on,
+                   "duration_s": p.duration_s, "look_line": look_line, "framing": framing})
+        })
+        .collect();
+    Value::Array(rows)
+}
+
+/// Load `args.board` into the panel when it names another board.
+fn storyboard_board_arg(app: &mut App, a: &Value) -> Result<(), String> {
+    let Some(path) = text(a, "board")? else { return Ok(()) };
+    let path = std::path::PathBuf::from(path);
+    let sb = app.storyboard_mut();
+    if sb.board_path.as_deref() != Some(path.as_path()) {
+        sb.load(Some(&path))?;
+        sb.wait(STORYBOARD_WAIT)?;
+    }
+    Ok(())
+}
+
+/// Storyboard panel's Make -> `StoryboardPanel::make`, waited for.
+fn storyboard_make(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["episode", "scenes", "out", "look", "breakdown", "offline"]) {
+        return AgentResult::err(e);
+    }
+    let parsed = (|| -> Result<(String, String, String, String, crate::storyboard::LookChoice, bool), String> {
+        let episode = text(a, "episode")?.ok_or("missing required args: episode")?.to_string();
+        let scenes = match given(a, "scenes") {
+            None => String::new(),
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|v| v.as_u64().map(|n| n.to_string()).ok_or("'scenes' needs scene numbers"))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(","),
+            Some(_) => return Err("'scenes' needs text like \"4,5\" or a list of numbers".into()),
+        };
+        let look = match text(a, "look")? {
+            None | Some("auto") => crate::storyboard::LookChoice::Auto,
+            Some("a") | Some("A") => crate::storyboard::LookChoice::A,
+            Some("b") | Some("B") => crate::storyboard::LookChoice::B,
+            Some(other) => return Err(format!("'look' must be auto, a or b, not '{other}'")),
+        };
+        Ok((
+            episode,
+            scenes,
+            text(a, "out")?.unwrap_or("").to_string(),
+            text(a, "breakdown")?.unwrap_or("").to_string(),
+            look,
+            flag(a, "offline")?.unwrap_or(false),
+        ))
+    })();
+    let (episode, scenes, out, breakdown, look, offline) = match parsed {
+        Ok(p) => p,
+        Err(e) => return AgentResult::err(e),
+    };
+    app.reveal_storyboard();
+    let sb = app.storyboard_mut();
+    if sb.busy() {
+        let _ = sb.wait(STORYBOARD_WAIT);
+    }
+    sb.episode = episode;
+    sb.scenes = scenes;
+    sb.out = out;
+    sb.breakdown = breakdown;
+    sb.look = look;
+    sb.offline = offline;
+    if let Err(e) = sb.make() {
+        return AgentResult::err(e);
+    }
+    if let Err(e) = sb.wait(STORYBOARD_WAIT) {
+        return AgentResult::err(format!("storyboard_make: {e}"));
+    }
+    let board = sb.board_path.as_ref().map(|p| p.display().to_string());
+    let status = sb.status.clone();
+    let panels = storyboard_panels(app);
+    AgentResult::ok(json!({"board": board, "status": status, "panels": panels}))
+}
+
+/// Storyboard panel's fields and buttons -> `StoryboardPanel::edit` and friends.
+fn storyboard_edit(app: &mut App, a: &Value) -> AgentResult {
+    const KEYS: [&str; 14] = [
+        "board", "panel", "kind", "on", "action", "notes", "duration_s", "look", "dialogue", "move", "add_after", "split", "delete", "regenerate",
+    ];
+    if let Err(e) = check_keys(a, &KEYS) {
+        return AgentResult::err(e);
+    }
+    if let Err(e) = storyboard_board_arg(app, a) {
+        return AgentResult::err(e);
+    }
+    let Some(which) = given(a, "panel").cloned() else { return missing(&["panel"]) };
+    let result = (|| -> Result<usize, String> {
+        let sb = app.storyboard_mut();
+        let board = sb.board.as_ref().ok_or("no board: storyboard_make first, or pass board")?;
+        let index = match &which {
+            Value::Number(n) => n.as_u64().map(|n| n as usize).filter(|n| *n < board.panels.len()).ok_or(format!("no panel {which}"))?,
+            Value::String(id) => board.panels.iter().position(|p| p.id == *id).ok_or(format!("no panel '{id}'"))?,
+            _ => return Err("'panel' needs a panel id or a 0-based index".into()),
+        };
+        let kind = text(a, "kind")?.map(str::to_string);
+        if let Some(k) = &kind
+            && !["wide", "medium", "close"].contains(&k.as_str())
+        {
+            return Err(format!("'kind' must be wide, medium or close, not '{k}'"));
+        }
+        let look = match text(a, "look")? {
+            None => None,
+            Some("auto") => Some(crate::storyboard::Look::Auto),
+            Some("a") | Some("A") => Some(crate::storyboard::Look::Real),
+            Some("b") | Some("B") => Some(crate::storyboard::Look::Sketch),
+            Some(other) => return Err(format!("'look' must be auto, a or b, not '{other}'")),
+        };
+        let dialogue = match given(a, "dialogue") {
+            None => None,
+            Some(Value::Array(rows)) => Some(
+                rows.iter()
+                    .map(|r| match r.as_array().map(|x| x.as_slice()) {
+                        Some([w, t]) => Ok((w.as_str().unwrap_or("").to_string(), t.as_str().unwrap_or("").to_string())),
+                        _ => Err("'dialogue' needs [[speaker, text], …]".to_string()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Some(_) => return Err("'dialogue' needs [[speaker, text], …]".into()),
+        };
+        let on = text(a, "on")?.map(str::to_string);
+        let action = text(a, "action")?.map(str::to_string);
+        let notes = text(a, "notes")?.map(str::to_string);
+        let duration = num(a, "duration_s", 0.1, 600.0)?;
+        let mv = given(a, "move").cloned();
+        let (add_after, split, delete, regenerate) =
+            (flag(a, "add_after")?.unwrap_or(false), flag(a, "split")?.unwrap_or(false), flag(a, "delete")?.unwrap_or(false), flag(a, "regenerate")?.unwrap_or(false));
+        sb.edit(index, |p| {
+            if let Some(k) = kind {
+                p.kind = k;
+            }
+            if let Some(o) = on {
+                p.on = o;
+            }
+            if let Some(t) = action {
+                p.action = t;
+            }
+            if let Some(t) = notes {
+                p.notes = t;
+            }
+            if let Some(d) = duration {
+                p.duration_s = d;
+            }
+            if let Some(l) = look {
+                p.look = l;
+            }
+            if let Some(d) = dialogue {
+                p.dialogue = d;
+            }
+        })?;
+        let mut index = index;
+        if let Some(m) = mv {
+            let to = match &m {
+                Value::String(s) if s == "up" => index.saturating_sub(1),
+                Value::String(s) if s == "down" => index + 1,
+                Value::Number(n) => n.as_u64().ok_or("'move' needs up, down or a 0-based index")? as usize,
+                _ => return Err("'move' needs up, down or a 0-based index".into()),
+            };
+            index = sb.move_panel(index, to)?;
+        }
+        if split {
+            sb.split(index)?;
+        }
+        if add_after {
+            index = sb.add_after(index)?;
+        }
+        if regenerate {
+            sb.regenerate(index)?;
+            sb.wait(STORYBOARD_WAIT)?;
+        }
+        if delete {
+            sb.delete(index)?;
+            return Ok(usize::MAX);
+        }
+        Ok(index)
+    })();
+    match result {
+        Ok(index) => {
+            let sb = app.storyboard_mut();
+            let panel = sb.board.as_ref().and_then(|b| b.panels.get(index)).map(|p| {
+                let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+                if let Some(m) = v.as_object_mut() {
+                    m.remove("generated");
+                }
+                v
+            });
+            let panels = storyboard_panels(app);
+            AgentResult::ok(json!({"index": if index == usize::MAX { Value::Null } else { json!(index) }, "panel": panel, "panels": panels}))
+        }
+        Err(e) => AgentResult::err(e),
+    }
+}
+
+/// Storyboard panel's Export sheets -> `StoryboardPanel::export`, waited for.
+fn storyboard_export(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["board"]) {
+        return AgentResult::err(e);
+    }
+    if let Err(e) = storyboard_board_arg(app, a) {
+        return AgentResult::err(e);
+    }
+    let sb = app.storyboard_mut();
+    if sb.busy() {
+        let _ = sb.wait(STORYBOARD_WAIT);
+    }
+    sb.last_export = None;
+    if let Err(e) = sb.export() {
+        return AgentResult::err(e);
+    }
+    if let Err(e) = sb.wait(STORYBOARD_WAIT) {
+        return AgentResult::err(format!("storyboard_export: {e}"));
+    }
+    match &sb.last_export {
+        Some(o) => AgentResult::ok(json!({
+            "pages": o.pages.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "pdf": o.pdf.as_ref().map(|p| p.display().to_string()),
+            "warnings": o.warnings,
+        })),
+        None => AgentResult::err("storyboard_export: no sheets were written"),
     }
 }

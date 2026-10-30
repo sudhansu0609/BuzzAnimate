@@ -21,3 +21,4 @@ pub mod breakdown;
 pub mod siglip;
 pub mod transcribe;
 pub mod voice;
+pub mod story;

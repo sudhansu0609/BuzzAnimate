@@ -213,6 +213,30 @@ pub struct ColourTuning {
     // within `FRINGE_INK_PX`: the matte's light anti-alias skirt outside a
     // line (luma ≈ 190), which otherwise became a thin light fill.
     pub fringe_px: f32,
+    /// How close (ΔE) to the sheet's background colour a patch inside the figure must be to count as paper showing through (between hair curls or body-hair strands); 0 keeps every patch.
+    // A6a (`docs/TRACE_SPILL_AND_OUTPAINT_PLAN.md`): a light patch (pixels
+    // within twice this ΔE of the background, 4-connected) whose mean colour
+    // is within this ΔE, that is no larger than `background_pocket_max_px2`
+    // and lies within `background_pocket_reach_px` of the outside (or touches
+    // it), is transparent from step 1 on. The background is the picture's
+    // border (Trace Bitmap) or the source sheet's (Character from Image).
+    pub background_pocket_de: f32,
+    /// A paper-coloured patch lying wholly within this distance (px) of the figure's edge, or touching the outside, is left out as background.
+    pub background_pocket_reach_px: f32,
+    /// Paper-coloured patches larger than this (px²) are always kept: a white shirt, a vest, a dhoti.
+    pub background_pocket_max_px2: usize,
+    /// Width (px) of the edge band where a colour between the outline's ink and the paper (the source's anti-aliasing, traced as grey dashes along hair tips) is left out as background; 0 keeps it.
+    // A6d: an opaque pixel reachable from the outside through such pixels,
+    // within this distance of the outside, whose Lab colour lies within
+    // `blend_rim_de` of the segment from the darkest pixel within
+    // `BLEND_RIM_INK_PX` (when that is ink-dark) to the sheet colour, at least
+    // `blend_rim_min_t` of the way towards the paper. Same sheet colour and
+    // protection as A6a; only with `drop_background`.
+    pub blend_rim_px: f32,
+    /// How far (ΔE) off the ink-to-paper blend an edge pixel may be and still count as the outline's anti-aliasing against the paper.
+    pub blend_rim_de: f32,
+    /// How far towards the paper (0 = the ink, 1 = the paper) an edge pixel's colour must be to count as the outline's anti-aliasing; darker stays with the ink.
+    pub blend_rim_min_t: f32,
 }
 
 impl Default for ColourTuning {
@@ -233,6 +257,12 @@ impl Default for ColourTuning {
             ink_grow_px: 1,
             exterior_fill_reach: 0.5,
             fringe_px: 1.5,
+            background_pocket_de: 10.0,
+            background_pocket_reach_px: 12.0,
+            background_pocket_max_px2: 600,
+            blend_rim_px: 3.0,
+            blend_rim_de: 8.0,
+            blend_rim_min_t: 0.3,
         }
     }
 }

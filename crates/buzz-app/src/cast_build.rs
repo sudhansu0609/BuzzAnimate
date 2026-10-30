@@ -203,7 +203,83 @@ pub fn scan(dir: &Path) -> Vec<CharacterArt> {
             add(&mut found, capitalise(&name.join(" ")), path.clone());
         }
     }
-    found
+    // AN4: `Guddu_sitting.png` beside a `Guddu` folder is a picture of Guddu.
+    let names: Vec<String> = found.iter().map(|a| a.name.clone()).collect();
+    let mut merged: Vec<CharacterArt> = Vec::new();
+    for art in found {
+        let first = art.name.split_whitespace().next().unwrap_or_default().to_string();
+        let owner = names
+            .iter()
+            .find(|n| art.name.split_whitespace().count() > 1 && norm(n) == norm(&first) && **n != art.name)
+            .cloned();
+        let target = owner.unwrap_or_else(|| art.name.clone());
+        match merged.iter_mut().find(|m| m.name == target) {
+            Some(a) => a.images.extend(art.images),
+            None => merged.push(CharacterArt { name: target, images: art.images }),
+        }
+    }
+    merged
+}
+
+// ------------------------------------------------------------------ pose pictures (AN4)
+
+/// Words in a picture's name that are not a pose.
+const NOT_POSE: &[&str] = &[
+    "front", "view", "tpose", "t", "pose", "base", "main", "sheet", "chart", "hero", "turnaround", "character", "ref",
+    "reference", "final", "new", "old", "image", "img", "picture", "pic",
+];
+
+/// The pose a picture is named for: `sitting.png`, `Guddu_scared.png` ->
+/// `sitting`, `scared`. `None` for a view picture (back / side / 3-4), a
+/// T-pose or the character's plain name.
+pub fn pose_of_file(stem: &str, cast_name: &str) -> Option<String> {
+    if View::of_file(stem).is_some() {
+        return None;
+    }
+    let name_words = words(cast_name);
+    let rest: Vec<String> = words(stem)
+        .into_iter()
+        .filter(|w| !name_words.contains(w) && !NOT_POSE.contains(&w.as_str()) && !w.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    if rest.is_empty() { None } else { Some(rest.join("_")) }
+}
+
+/// `Guddu Pose sitting`: the Cast rig of one pose variant.
+pub fn pose_rig_name(cast_name: &str, pose: &str) -> String {
+    format!("{cast_name} Pose {pose}")
+}
+
+/// Whether a Cast rig is a pose variant: its character's name and the pose.
+pub fn pose_of_rig(rig: &str) -> Option<(&str, &str)> {
+    rig.split_once(" Pose ").filter(|(b, p)| !b.is_empty() && !p.is_empty())
+}
+
+/// A character's pictures split into base pictures (views, T-poses) and
+/// `(pose, picture)` pairs, one per pose. Pose pictures count only beside a
+/// base picture: a folder of nothing but named files stays as it was.
+pub fn split_pose_images(images: &[PathBuf], cast_name: &str) -> (Vec<PathBuf>, Vec<(String, PathBuf)>) {
+    let mut base: Vec<PathBuf> = Vec::new();
+    let mut poses: Vec<(String, PathBuf)> = Vec::new();
+    for p in images {
+        let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        match pose_of_file(&stem, cast_name) {
+            Some(pose) => {
+                if !poses.iter().any(|(q, _)| *q == pose) {
+                    poses.push((pose, p.clone()));
+                }
+            }
+            None => base.push(p.clone()),
+        }
+    }
+    if base.is_empty() {
+        return (images.to_vec(), Vec::new());
+    }
+    (base, poses)
+}
+
+/// `(pose, Cast rig name)` for every pose picture of a character.
+pub fn pose_rigs_of(art: &CharacterArt) -> Vec<(String, String)> {
+    split_pose_images(&art.images, &art.name).1.into_iter().map(|(pose, _)| (pose.clone(), pose_rig_name(&art.name, &pose))).collect()
 }
 
 // ------------------------------------------------------------------ the cast
@@ -260,6 +336,10 @@ pub fn build_cast(assets: &AssetLibrary, req: &CastRequest, progress: &mut dyn F
                 }
             }
         };
+
+        // AN4: pictures named by pose (`sitting.png`, `Guddu_scared.png`) are
+        // pose variants of this character, built apart from the views.
+        let (images, pose_images) = if generated { (images, Vec::new()) } else { split_pose_images(&images, &cast_name) };
 
         // --- One picture per view, judged from its pose.
         let mut judged: Vec<Judged> = Vec::new();
@@ -328,8 +408,22 @@ pub fn build_cast(assets: &AssetLibrary, req: &CastRequest, progress: &mut dyn F
             }
         }
 
-        for (view, pick) in chosen {
-            let rig_name = view.rig_name(&cast_name);
+        let mut jobs: Vec<(String, Judged)> = chosen.into_iter().map(|(v, p)| (v.rig_name(&cast_name), p)).collect();
+        for (pose, image) in &pose_images {
+            progress(&format!("{cast_name}: looking at the {pose} pose picture {}", image.display()));
+            match judge(image) {
+                Ok(mut j) => match &j.skip {
+                    Some(why) => report.skipped.push((brief.name.clone(), format!("{}: {why}", image.display()))),
+                    None => {
+                        j.why = format!("pose picture {pose}; {}", j.why);
+                        jobs.push((pose_rig_name(&cast_name, pose), j));
+                    }
+                },
+                Err(e) => report.skipped.push((brief.name.clone(), format!("{}: {e}", image.display()))),
+            }
+        }
+
+        for (rig_name, pick) in jobs {
             let image = pick.image.clone();
             report.views.push((rig_name.clone(), image.clone(), pick.why.clone()));
             let exists = library.assets().iter().any(|a| a.folder == "Cast" && a.name == rig_name);
@@ -403,15 +497,24 @@ pub fn generate_sheet(client: &ComfyClient, prompt: &str, seed: u64, out_png: &P
     if out_png.is_file() {
         return Ok(out_png.to_path_buf());
     }
-    let path = crate::backdrop::workflow_path()
-        .ok_or("no Z-Image workflow found (COMFY_WORKFLOWS or <estate>/BuzzEdit/workflows)")?;
     let size = (1024, 1024);
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut workflow: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    crate::backdrop::bind_workflow(&mut workflow, prompt, seed, size)?;
-    if let Some(inputs) = workflow.get_mut("9").and_then(|n| n.get_mut("inputs")).and_then(Value::as_object_mut) {
-        inputs.insert("filename_prefix".into(), Value::from("buzzanimate-char"));
-    }
+    let workflow = match crate::comfy_profile::bound_for_active(client, crate::comfy_profile::Kind::Character, prompt, seed, Some(size)) {
+        Ok(Some(w)) => w,
+        other => {
+            if let Err(e) = other {
+                tracing::warn!("series ComfyUI profile unusable, using the Z-Image default: {e}");
+            }
+            let path = crate::backdrop::workflow_path()
+                .ok_or("no Z-Image workflow found (COMFY_WORKFLOWS or <estate>/BuzzEdit/workflows)")?;
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let mut workflow: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+            crate::backdrop::bind_workflow(&mut workflow, prompt, seed, size)?;
+            if let Some(inputs) = workflow.get_mut("9").and_then(|n| n.get_mut("inputs")).and_then(Value::as_object_mut) {
+                inputs.insert("filename_prefix".into(), Value::from("buzzanimate-char"));
+            }
+            workflow
+        }
+    };
     let id = client.queue(workflow)?;
     let outputs = client.wait(&id, SHEET_TIMEOUT)?;
     let first = outputs.first().ok_or("ComfyUI returned no picture")?;

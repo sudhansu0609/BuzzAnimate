@@ -106,6 +106,7 @@ fn main() -> Result<()> {
         known_characters: list(arg_value("--known")),
         series: arg_value("--series").unwrap_or_else(|| play.title.clone()),
         world: arg_value("--world").unwrap_or_default(),
+        ..Default::default()
     };
     println!("{}: {} scenes", play.title, play.scenes.len());
 

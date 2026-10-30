@@ -18,7 +18,7 @@ Everything below is relative to the repo root `B:\youtubeProjects\Buzzcaf_Media\
 
 1. Open `target\release\buzzanimate.exe`.
 2. **File ▸ AI ▸ Produce Episode…**
-3. Fill in: Script, Audio (optional), Characters folder (optional), Style, Series name, World (e.g. `rural Bihar, India, late 1990s` — filled in for you when the series is Chirailiya), Scenes (blank = all, or `4,5` / `4-6`), Output folder, tick "Generate backgrounds with ComfyUI" and "Start ComfyUI if it is not running".
+3. Fill in: Script, Audio (optional), Characters folder (optional), Style, Series name, World (e.g. `rural Bihar, India, late 1990s` — filled in for you when the series is Chirailiya: a semi-rural small town in North India, 2010s), Scenes (blank = all, or `4,5` / `4-6`), Output folder, tick "Generate backgrounds with ComfyUI" and "Start ComfyUI if it is not running".
 4. **Produce**. It runs as a task in the Tasks panel (Cancel works at every step, including mid-LLM call). When it finishes the `.buzz` opens in the app.
 
 ## 3. Run it from the command line

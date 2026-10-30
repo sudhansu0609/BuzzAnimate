@@ -173,6 +173,23 @@ pub struct PlaceSpec {
     pub cast: Option<String>,
     /// Or with a different asset.
     pub asset: Option<String>,
+    /// AN11: placed by hand on the stage (stage_pins); angle cuts do not re-stage it.
+    pub pinned: bool,
+    /// AN13: the pose a `[Name: pose]` tag asked for (`sitting`).
+    pub pose: Option<String>,
+}
+
+/// AN11: one shot's own camera and background, from the breakdown.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ShotBackground {
+    /// Index among the scene's dialogue lines; the angle starts as that line starts.
+    pub at_line: usize,
+    pub camera: String,
+    /// The background asset for that angle (the wide one when it has no picture).
+    pub background: String,
+    /// Where that picture's horizon is, `0..1` down the frame.
+    pub horizon_row: Option<f64>,
 }
 
 /// A prop on the set.
@@ -231,6 +248,11 @@ pub struct SceneSet {
     /// P5: the key light, mapped onto the built set's lights. Absent: the
     /// setting's own lights, unchanged.
     pub lighting: Option<Lighting>,
+    /// AN11: each shot's camera and background, in line order. Absent: one
+    /// background for the whole scene.
+    pub shot_backgrounds: Vec<ShotBackground>,
+    /// AN11: the wide background's horizon, `0..1` down the frame.
+    pub wide_horizon: Option<f64>,
 }
 
 /// P5: a scene's shots, `"auto"` or a list.
@@ -292,6 +314,9 @@ pub struct Casting {
     /// Open every scene with a `FadeUp` title card over its first 2 s.
     /// Default off.
     pub title_cards: bool,
+    /// AN10: whether a character who is not speaking still blinks and breathes.
+    /// Absent = true; `false` holds them dead still outside their own lines.
+    pub still_extras: Option<bool>,
 }
 
 /// What a name resolves to.
@@ -416,6 +441,8 @@ pub struct BuildOptions {
     /// empty-layer cleanup) on every built scene, inside the same
     /// "Build Scene N" undo step. On by default.
     pub tidy_layers: bool,
+    /// AN13: write the caption layer. Off for story channels (no captions or cards).
+    pub captions: bool,
 }
 
 impl Default for BuildOptions {
@@ -430,6 +457,7 @@ impl Default for BuildOptions {
             index: None,
             audio: None,
             tidy_layers: true,
+            captions: true,
         }
     }
 }
@@ -449,6 +477,19 @@ pub struct CastNote {
     pub blinks: bool,
     pub enters: bool,
     pub exits: bool,
+    /// The object that stands for the character (an armature, or a layer
+    /// rig's root part): what a storyboard frames a shot on.
+    pub body: Option<ObjectId>,
+}
+
+/// AN10: one stretch of a character's mouth moving, and whose it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LipSpan {
+    pub speaker: String,
+    pub start: u32,
+    pub end: u32,
+    /// `"audio"` (from the recording's mouth shapes) or `"text"` (from the words).
+    pub source: &'static str,
 }
 
 /// One gesture a line was given.
@@ -488,6 +529,22 @@ pub struct SceneReport {
     pub notes: Vec<String>,
     /// P5: the camera's cuts, in order. Empty with no `shots`.
     pub shots: Vec<ShotCut>,
+    /// AN10: every lip-sync span with its speaker. Nobody else's mouth moves.
+    pub lipsync: Vec<LipSpan>,
+    /// AN11: per angle, its camera and the background it used.
+    pub angles: Vec<AngleNote>,
+}
+
+/// AN11: one angle of a scene, for the report.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AngleNote {
+    pub start: u32,
+    pub end: u32,
+    pub camera: String,
+    /// The background asset shown in this span.
+    pub background: String,
+    /// How the cast was re-staged for it (`""` for none).
+    pub restaged: String,
 }
 
 /// The report for a build, as markdown.
@@ -547,6 +604,35 @@ pub fn report_markdown(title: &str, reports: &[SceneReport], fps: f64) -> String
                     g.frame,
                     g.action.label(),
                     g.why
+                ));
+            }
+        }
+        if r.lipsync.is_empty() {
+            out.push_str("* **Lip sync:** no mouth moves in this scene\n");
+        } else {
+            out.push_str("* **Lip sync** (only the speaker's mouth moves, narration none):\n");
+            for l in &r.lipsync {
+                out.push_str(&format!(
+                    "  * {} \u{2014} frames {}\u{2013}{} ({:.1}\u{2013}{:.1} s), from {}\n",
+                    l.speaker,
+                    l.start,
+                    l.end,
+                    l.start as f64 / fps.max(1e-6),
+                    l.end as f64 / fps.max(1e-6),
+                    l.source
+                ));
+            }
+        }
+        if !r.angles.is_empty() {
+            out.push_str("* **Angles** (per shot: camera, background used):\n");
+            for a in &r.angles {
+                out.push_str(&format!(
+                    "  * frames {}\u{2013}{} \u{2014} {} \u{2014} background {}{}\n",
+                    a.start,
+                    a.end,
+                    a.camera,
+                    if a.background.is_empty() { "(scene's)" } else { a.background.as_str() },
+                    if a.restaged.is_empty() { String::new() } else { format!(" \u{2014} {}", a.restaged) }
                 ));
             }
         }
@@ -645,6 +731,16 @@ fn movement_of(clause_lower: &str) -> Movement {
         }
     }
     Movement::None
+}
+
+/// Storyboard S1: whether an action line moves someone on or off, by the
+/// builder's own phrases: `Some(true)` an entrance, `Some(false)` an exit.
+pub fn action_moves(action_text: &str) -> Option<bool> {
+    clauses(action_text).iter().find_map(|c| match movement_of(c) {
+        Movement::Enter => Some(true),
+        Movement::Exit { .. } => Some(false),
+        Movement::None => None,
+    })
 }
 
 /// The clauses of an action line, lower-case. Split at the words that start a
@@ -878,6 +974,28 @@ struct Member {
     enter_item: Option<usize>,
     exit: Option<(usize, bool)>,
     lines: Vec<Line>,
+    /// AN10: moves the action lines ask of this character (stand, sit, point,
+    /// turn) that no spoken line of theirs already carries.
+    moves: Vec<Move>,
+    /// AN10: blinks and breathing while not speaking ([`Casting::still_extras`]).
+    extras: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Move {
+    start: u32,
+    cue: Cue,
+}
+
+/// AN10: the body moves an action line may ask of its subject at its own time.
+fn move_cue(clause: &str) -> Option<Cue> {
+    if let Some(c) = action_cue(clause)
+        && matches!(c.action, Action::Stand | Action::Sit | Action::Point)
+    {
+        return Some(c);
+    }
+    let words = buzz_act::direct::words_of(clause);
+    stem_word(&words, &["turn"]).map(|w| Cue { action: Action::Turn, amount: 1.0, why: w, asked: true })
 }
 
 fn snap_even(frame: u32) -> u32 {
@@ -923,6 +1041,8 @@ fn roster(
             enter_item: None,
             exit: None,
             lines: Vec::new(),
+            moves: Vec::new(),
+            extras: casting.still_extras != Some(false),
         });
         members.len() - 1
     }
@@ -970,6 +1090,23 @@ fn roster(
                             members[i].first_item = index;
                         }
                         let is_subject = subject.as_deref() == Some(key.as_str());
+                        // AN10: an action line that says they stand / sit / point /
+                        // turn moves them at its own time, unless a line of theirs
+                        // right beside it already carries the move.
+                        if is_subject && matches!(movement, Movement::None) {
+                            let beside = |n: Option<usize>| {
+                                n.and_then(|n| src.items.get(n)).is_some_and(|it| {
+                                    matches!(it, Item::Dialogue(d) if d.voice == Voice::OnScreen
+                                        && casting.character(&d.speaker).map(|(k, _)| k) == Some(key.clone()))
+                                })
+                            };
+                            if !beside(index.checked_sub(1))
+                                && !beside(Some(index + 1))
+                                && let Some(cue) = move_cue(&clause)
+                            {
+                                members[i].moves.push(Move { start: snap_even(slot.start), cue });
+                            }
+                        }
                         match movement {
                             Movement::Enter if is_subject && first_time => {
                                 members[i].enter_item = Some(index);
@@ -1368,6 +1505,14 @@ struct Actor {
     layer_eyes: Vec<(ObjectId, [buzz_scene::SymbolId; 3])>,
     /// Blinking comes with the character (a puppet's eyes carry the modifier).
     blinks: bool,
+    /// AN11: the layers to move and scale (empty for a puppet), and every layer
+    /// the asset brought.
+    top: Vec<LayerId>,
+    layers: Vec<LayerId>,
+    /// AN11: a pose-variant instance; shown only in `pose_spans`, while the
+    /// base instance of the same character is hidden.
+    variant: bool,
+    pose_spans: Vec<(u32, u32)>,
 }
 
 impl Actor {
@@ -1632,6 +1777,21 @@ pub fn build_scene(
     let fps = opts.fps;
     let stage = scene.stage().stage_rect();
     let set = casting.scene_set(src.number);
+    // AN11: where each dialogue line starts, and each shot's angle over them.
+    let line_starts: Vec<u32> = src
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| matches!(i, Item::Dialogue(_)))
+        .filter_map(|(ix, _)| schedule.slots.get(ix).map(|s| s.start))
+        .collect();
+    let mut segments = angle_segments(&set, &line_starts, total);
+    if set.background.is_empty() {
+        for s in &mut segments {
+            s.background.clear();
+        }
+    }
+    let mut angle_gates: Vec<(Vec<LayerId>, Vec<(u32, u32)>)> = Vec::new();
 
     let mut report = SceneReport {
         number: src.number,
@@ -1657,6 +1817,7 @@ pub fn build_scene(
     let mut front_props: Vec<&PropSpec> = Vec::new();
     if !set.background.is_empty() {
         let mut used = Vec::new();
+        let mut base_layers: Vec<LayerId> = Vec::new();
         for name in &set.background {
             // `Backgrounds/<series>/<key>` (the producer's) names its folder too.
             let found = match name.trim().trim_matches('/').rsplit_once('/') {
@@ -1670,6 +1831,7 @@ pub fn build_scene(
                             transform_layers(scene, &placed.top, cover(b, stage));
                         }
                         used.push(name.clone());
+                        base_layers.extend(placed.all.iter().copied());
                     }
                     Err(e) => report.warnings.push(e),
                 },
@@ -1677,6 +1839,38 @@ pub fn build_scene(
                     .skipped
                     .push(format!("background {name:?}: no such asset in the library")),
             }
+        }
+        // AN11: each other angle's picture on layers of its own, shown only in
+        // its shots; the wide one is hidden in those shots.
+        let base_name = set.background[0].clone();
+        let mut base_hidden: Vec<(u32, u32)> = Vec::new();
+        let mut others: Vec<String> = Vec::new();
+        for s in &segments {
+            if !s.background.eq_ignore_ascii_case(&base_name) && !others.iter().any(|o| o.eq_ignore_ascii_case(&s.background)) {
+                others.push(s.background.clone());
+            }
+        }
+        for other in others {
+            let spans: Vec<(u32, u32)> = segments
+                .iter()
+                .filter(|s| s.background.eq_ignore_ascii_case(&other))
+                .map(|s| (s.start, s.end))
+                .collect();
+            match place_cover(scene, assets, &other, stage) {
+                Ok(layers) => {
+                    base_hidden.extend(spans.iter().copied());
+                    angle_gates.push((layers, complement(&spans, total)));
+                }
+                Err(e) => {
+                    report.warnings.push(format!("{e}; the wide background is kept for those shots"));
+                    for s in segments.iter_mut().filter(|s| s.background.eq_ignore_ascii_case(&other)) {
+                        s.background = base_name.clone();
+                    }
+                }
+            }
+        }
+        if !base_hidden.is_empty() {
+            angle_gates.push((base_layers, base_hidden));
         }
         report.set = format!("background: {}", used.join(", "));
         // P8-C1: the breakdown's props from the index, on the ground in front
@@ -1884,9 +2078,31 @@ pub fn build_scene(
     let unspecified = members.iter().filter(|m| m.place.x.is_none()).count();
     let mut spread_index = 0usize;
     let mut actors: Vec<Actor> = Vec::new();
+    let mut variants: Vec<Actor> = Vec::new();
     // P5: each staged actor's feet, for framing a shot on them.
     let mut feet: Vec<(String, f64)> = Vec::new();
-    for member in members {
+    for mut member in members {
+        // AN13: a tagged pose with no pose picture falls back to the rig's own Sit
+        // (held until a Stand), else stays standing and says so under Skipped.
+        let tagged_pose = member.place.pose.clone().filter(|p| {
+            !p.trim().is_empty()
+                && !member.place.cast.as_deref().is_some_and(|c| crate::cast_build::pose_of_rig(c).is_some())
+        });
+        let mut tagged_note: Option<String> = None;
+        if let Some(pose) = &tagged_pose {
+            let name = member.entry.cast.clone().unwrap_or_else(|| member.key.clone());
+            let word = pose.replace('_', " ");
+            if pose_stem_of(pose) == "sit" {
+                member.moves.insert(
+                    0,
+                    Move { start: 0, cue: Cue { action: Action::Sit, amount: 1.0, why: format!("tagged {word}"), asked: true } },
+                );
+                tagged_note = Some(format!("{}: no {word} picture for {name}; the rig's own Sit is held", member.key));
+            } else {
+                tagged_note = Some(format!("{}: no {word} picture for {name}; standing", member.key));
+                report.skipped.push(format!("{}: no {word} picture for {name}", member.key));
+            }
+        }
         let x_fraction = match member.place.x {
             Some(x) => x.clamp(-0.5, 1.5),
             None => {
@@ -1905,11 +2121,38 @@ pub fn build_scene(
             .clamp(0.05, 1.5);
         let height = stage.height() * height_fraction;
         let key = member.key.clone();
+        let member_copy = member.clone();
         if let Some(actor) = stage_actor(
             scene, assets, member, mark_x, feet_y, height, stage, total, &mut report,
         ) {
+            let performs = actor.body.is_some();
+            if let Some(n) = tagged_note.take() {
+                if performs {
+                    if n.contains("Sit is held") {
+                        report.notes.push(n);
+                    }
+                } else if n.contains("Sit is held") {
+                    report.skipped.push(format!("{}: no sitting picture and the figure has no rig to sit", key));
+                }
+            }
             actors.push(actor);
-            feet.push((key, feet_y));
+            feet.push((key.clone(), feet_y));
+            // AN11: pose variants, shown in their beats only.
+            if performs {
+                for (rig, spans) in pose_swaps(src, &schedule, casting, assets, &member_copy, total, timing.frames(timing.line_gap)) {
+                    let mut variant_member = member_copy.clone();
+                    variant_member.place.cast = Some(rig.clone());
+                    let mut scratch = SceneReport::default();
+                    match stage_actor(scene, assets, variant_member, mark_x, feet_y, height, stage, total, &mut scratch) {
+                        Some(mut v) if v.body.is_some() => {
+                            v.variant = true;
+                            v.pose_spans = spans;
+                            variants.push(v);
+                        }
+                        _ => report.skipped.push(format!("{key}: pose rig {rig:?} could not be staged")),
+                    }
+                }
+            }
         }
     }
 
@@ -1917,12 +2160,21 @@ pub fn build_scene(
     for actor in &mut actors {
         perform_actor(scene, actor, src, &schedule, stage, &timing, total, &mut report);
     }
+    // AN11: a pose variant plays the same performance; its notes are the base's.
+    let mut variant_report = SceneReport::default();
+    for actor in &mut variants {
+        perform_actor(scene, actor, src, &schedule, stage, &timing, total, &mut variant_report);
+    }
 
     // -- the blinks, then the mouths ------------------------------------------------------
     //
     // In that order: each pass keys every frame the rig has, so the one that
     // runs second carries the first's work on the keys it adds.
-    for actor in &mut actors {
+    for actor in actors.iter_mut().chain(variants.iter_mut()) {
+        // AN10: `still_extras` off: only speakers blink.
+        if !actor.member.extras && actor.member.lines.is_empty() {
+            continue;
+        }
         if actor.body.is_some() && !actor.eyes.is_empty() {
             blink_rig(scene, actor, total, fps);
         }
@@ -1932,6 +2184,9 @@ pub fn build_scene(
     }
     for actor in &mut actors {
         sync_mouth(scene, actor, total, fps, audio.as_ref(), &mut report);
+    }
+    for actor in &mut variants {
+        sync_mouth(scene, actor, total, fps, audio.as_ref(), &mut variant_report);
     }
     if let Some(a) = &audio {
         attach_scene_sound(scene, a, src, fps, &mut report);
@@ -1945,6 +2200,9 @@ pub fn build_scene(
     let gap = timing.frames(timing.line_gap);
     let mut captions: Vec<Caption> = Vec::new();
     for (index, item) in src.items.iter().enumerate() {
+        if !opts.captions {
+            break;
+        }
         let Item::Dialogue(Dialogue { speaker, voice, text }) = item else {
             continue;
         };
@@ -1988,8 +2246,22 @@ pub fn build_scene(
     // -- shots (P5) ---------------------------------------------------------------------------
     if let Some(shots) = &set.shots {
         let cast = ShotCast { actors: &actors, feet: &feet };
-        let plan = plan_shots(shots, src, &schedule, casting, &cast, stage, &timing, total, &mut report);
+        let mut plan = plan_shots(shots, src, &schedule, casting, &cast, stage, &timing, total, &mut report);
+        // AN13: a shot inside an angle picture keeps that picture's full frame.
+        apply_angle_framing(&mut plan, &segments, stage, total);
         write_shots(scene, &plan, total, &mut report);
+    }
+
+    // -- AN11: each shot's angle: pictures cut at the shot, the cast re-staged, poses swapped --
+    for (layers, hidden) in &angle_gates {
+        hide_during(scene, layers, hidden, total);
+    }
+    restage_angles(scene, &segments, &actors, &variants, &feet, src, casting, stage, set.wide_horizon, total, &mut report);
+    for v in &variants {
+        if let Some(base) = actors.iter().find(|a| a.member.key == v.member.key) {
+            hide_during(scene, &base.layers, &v.pose_spans, total);
+        }
+        hide_during(scene, &v.layers, &complement(&v.pose_spans, total), total);
     }
 
     // Every layer reaches the end, so nothing vanishes mid-shot.
@@ -2014,9 +2286,427 @@ pub fn build_scene(
             blinks: a.blinks,
             enters: a.member.enter_item.is_some(),
             exits: a.member.exit.is_some(),
+            body: a.body,
         });
     }
     report
+}
+
+// -- angle cuts, re-staging and pose swaps (AN11) -----------------------------------------
+
+/// One stretch of a scene shot from one camera angle.
+#[derive(Debug, Clone, PartialEq)]
+struct AngleSeg {
+    start: u32,
+    end: u32,
+    at_line: usize,
+    camera: String,
+    /// The background asset shown: the angle's own picture, else the scene's wide one.
+    background: String,
+    horizon: Option<f64>,
+}
+
+/// The scene's angles in frames. wide / medium / close keep the wide
+/// background; the others use their own picture when the casting gave one.
+fn angle_segments(set: &SceneSet, line_starts: &[u32], total: u32) -> Vec<AngleSeg> {
+    if set.shot_backgrounds.is_empty() || total == 0 {
+        return Vec::new();
+    }
+    let base = set.background.first().cloned().unwrap_or_default();
+    let mut list: Vec<&ShotBackground> = set.shot_backgrounds.iter().collect();
+    list.sort_by_key(|s| s.at_line);
+    let mut segs: Vec<AngleSeg> = Vec::new();
+    for s in list {
+        let start = if s.at_line == 0 {
+            0
+        } else {
+            match line_starts.get(s.at_line) {
+                Some(&f) => f.min(total - 1),
+                None => continue,
+            }
+        };
+        let camera = s.camera.trim().to_lowercase();
+        let own = !matches!(camera.as_str(), "" | "wide" | "medium" | "close");
+        let background = if own && !s.background.trim().is_empty() { s.background.clone() } else { base.clone() };
+        if segs.last().is_some_and(|l| l.start == start) {
+            segs.pop();
+        }
+        segs.push(AngleSeg {
+            start,
+            end: total,
+            at_line: s.at_line,
+            camera: if camera.is_empty() { "wide".into() } else { camera },
+            background,
+            horizon: if own { s.horizon_row } else { None },
+        });
+    }
+    if segs.first().is_none_or(|s| s.start > 0) {
+        segs.insert(0, AngleSeg { start: 0, end: total, at_line: 0, camera: "wide".into(), background: base, horizon: None });
+    }
+    for i in 0..segs.len() {
+        segs[i].end = segs.get(i + 1).map_or(total, |n| n.start);
+    }
+    segs.retain(|s| s.end > s.start);
+    segs
+}
+
+/// **AN13: an angle picture is framed whole.** Inside a reverse / over-the-shoulder /
+/// low / high segment the camera sits at x1.0 on the stage centre (no extra
+/// zoom on a soft picture, the listener's shoulder stays in frame); the shot
+/// that was in force resumes where the segment ends. One shot list: the
+/// report's Camera and Angles sections both read this plan.
+fn apply_angle_framing(plan: &mut Vec<Shot>, segments: &[AngleSeg], stage: Rect, total: u32) {
+    for seg in segments {
+        if !matches!(seg.camera.as_str(), "reverse" | "over_shoulder" | "low_angle" | "high_angle") {
+            continue;
+        }
+        let resume = plan.iter().rev().find(|s| s.start < seg.end).cloned();
+        plan.retain(|s| !(s.start >= seg.start && s.start < seg.end));
+        if seg.end < total && !plan.iter().any(|s| s.start == seg.end) {
+            if let Some(mut r) = resume {
+                r.start = seg.end;
+                plan.push(r);
+            }
+        }
+        plan.push(Shot { start: seg.start, kind: seg.camera.clone(), on: None, center: stage.center(), zoom: 1.0, push: false });
+        plan.sort_by_key(|s| s.start);
+    }
+}
+
+/// How far down the frame (pixels) the cast's ground line moves for a low or
+/// high angle: the angle picture's horizon against the wide one's, else a default.
+fn angle_dy(seg: &AngleSeg, wide_horizon: Option<f64>, stage: Rect) -> f64 {
+    let h = stage.height();
+    let valid = |x: f64| x > 0.0 && x < 1.0;
+    match seg.camera.as_str() {
+        "low_angle" | "high_angle" => match (seg.horizon, wide_horizon) {
+            (Some(a), Some(w)) if valid(a) && valid(w) => ((a - w) * h).clamp(-0.2 * h, 0.2 * h),
+            _ if seg.camera == "low_angle" => 0.05 * h,
+            _ => -0.08 * h,
+        },
+        _ => 0.0,
+    }
+}
+
+/// The frames of `0..total` that `spans` do not cover.
+fn complement(spans: &[(u32, u32)], total: u32) -> Vec<(u32, u32)> {
+    let mut sorted: Vec<(u32, u32)> = spans.iter().copied().filter(|(a, b)| a < b).collect();
+    sorted.sort();
+    let mut out = Vec::new();
+    let mut at = 0u32;
+    for (a, b) in sorted {
+        if a > at {
+            out.push((at, a.min(total)));
+        }
+        at = at.max(b);
+    }
+    if at < total {
+        out.push((at, total));
+    }
+    out.retain(|(a, b)| a < b);
+    out
+}
+
+/// A background asset on layers of its own, covering the stage.
+fn place_cover(scene: &mut Scene, assets: &AssetLibrary, name: &str, stage: Rect) -> Result<Vec<LayerId>, String> {
+    let found = match name.trim().trim_matches('/').rsplit_once('/') {
+        Some((folder, base)) => find_asset(assets, base, Some(folder), false),
+        None => find_asset(assets, name, None, false),
+    };
+    let asset = found.ok_or_else(|| format!("background {name:?}: no such asset in the library"))?;
+    let placed = place_asset(scene, assets, asset)?;
+    if let Some(b) = placed.bounds {
+        transform_layers(scene, &placed.top, cover(b, stage));
+    }
+    Ok(placed.all)
+}
+
+/// Draw nothing on `layers` over `ranges`: keys at each edge, blank inside.
+fn hide_during(scene: &mut Scene, layers: &[LayerId], ranges: &[(u32, u32)], total: u32) {
+    let ranges: Vec<(u32, u32)> = ranges.iter().map(|&(a, b)| (a, b.min(total))).filter(|(a, b)| a < b).collect();
+    if ranges.is_empty() || total == 0 {
+        return;
+    }
+    for id in layers {
+        scene.update_layer(*id, |l| {
+            if l.frames.length() < total {
+                l.frames.insert_frame(total - 1);
+            }
+            for &(a, b) in &ranges {
+                l.frames.insert_keyframe(a);
+                if b < total {
+                    l.frames.insert_keyframe(b);
+                }
+            }
+            let starts: Vec<u32> = l.frames.keyframes().iter().map(|k| k.start).collect();
+            for s in starts {
+                if ranges.iter().any(|&(a, b)| s >= a && s < b) {
+                    l.frames.set_objects(s, Vec::new());
+                }
+            }
+        });
+    }
+}
+
+/// Apply `t` to everything on `layers` over `a..b` (keys at both edges).
+fn transform_during(scene: &mut Scene, layers: &[LayerId], a: u32, b: u32, t: Affine, total: u32) {
+    let b = b.min(total);
+    if a >= b {
+        return;
+    }
+    for id in layers {
+        scene.update_layer(*id, |l| {
+            if l.frames.length() < total {
+                l.frames.insert_frame(total - 1);
+            }
+            l.frames.insert_keyframe(a);
+            if b < total {
+                l.frames.insert_keyframe(b);
+            }
+            for k in l.frames.keyframes_mut() {
+                if k.start >= a && k.start < b {
+                    for object in Arc::make_mut(&mut k.objects).iter_mut() {
+                        let o = Arc::make_mut(object);
+                        o.transform = t * o.transform;
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Role {
+    Speaker,
+    Listener,
+    Other,
+}
+
+/// **Re-stage one character for an angle.** `reverse` mirrors them about the
+/// stage centre (position and facing); `over_shoulder` puts the listener large at
+/// the frame edge (`side` -1 left / +1 right) and the speaker at mid-depth on the
+/// other side; `low_angle` / `high_angle` move the ground line by `dy`.
+fn angle_restage(camera: &str, role: Role, side: f64, stage: Rect, mark_x: f64, feet_y: f64, dy: f64) -> Option<Affine> {
+    let (w, h) = (stage.width(), stage.height());
+    match camera {
+        "reverse" => Some(mirror_about(stage.center().x)),
+        "over_shoulder" => {
+            let (target_x, target_y, scale) = match role {
+                Role::Listener => {
+                    let edge = if side < 0.0 { stage.x0 + 0.12 * w } else { stage.x1 - 0.12 * w };
+                    (edge, feet_y + 0.06 * h, 1.35)
+                }
+                Role::Speaker => (stage.center().x - side * 0.12 * w, feet_y - 0.03 * h, 0.92),
+                Role::Other => return None,
+            };
+            Some(Affine::translate((target_x, target_y)) * Affine::scale(scale) * Affine::translate((-mark_x, -feet_y)))
+        }
+        "low_angle" | "high_angle" if dy != 0.0 => Some(Affine::translate((0.0, dy))),
+        _ => None,
+    }
+}
+
+/// Re-stage the cast in each angle's span and write the angles to the report.
+#[allow(clippy::too_many_arguments)]
+fn restage_angles(
+    scene: &mut Scene,
+    segments: &[AngleSeg],
+    actors: &[Actor],
+    variants: &[Actor],
+    feet: &[(String, f64)],
+    src: &ScriptScene,
+    casting: &Casting,
+    stage: Rect,
+    wide_horizon: Option<f64>,
+    total: u32,
+    report: &mut SceneReport,
+) {
+    let speakers: Vec<Option<String>> = src
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Dialogue(Dialogue { speaker, voice, .. }) => {
+                Some(if *voice == Voice::VoiceOver { None } else { casting.character(speaker).map(|(k, _)| k) })
+            }
+            _ => None,
+        })
+        .collect();
+    let staged = |k: &str| actors.iter().any(|a| a.member.key == k && !a.top.is_empty());
+    for seg in segments {
+        let mut how: Vec<String> = Vec::new();
+        let speaker = speakers.get(seg.at_line).cloned().flatten();
+        let differs = |k: &&String| Some(k.as_str()) != speaker.as_deref() && staged(k);
+        let listener = speakers
+            .iter()
+            .take(seg.at_line + 1)
+            .rev()
+            .flatten()
+            .find(differs)
+            .or_else(|| speakers.iter().skip(seg.at_line + 1).flatten().find(differs))
+            .cloned()
+            .or_else(|| {
+                actors
+                    .iter()
+                    .find(|a| Some(a.member.key.as_str()) != speaker.as_deref() && !a.top.is_empty())
+                    .map(|a| a.member.key.clone())
+            });
+        let side = listener
+            .as_ref()
+            .and_then(|k| actors.iter().find(|a| &a.member.key == k))
+            .map_or(-1.0, |a| if a.mark_x < stage.center().x { -1.0 } else { 1.0 });
+        let dy = angle_dy(seg, wide_horizon, stage);
+        for a in actors.iter().chain(variants.iter()) {
+            if a.top.is_empty() {
+                continue;
+            }
+            let role = if Some(a.member.key.as_str()) == speaker.as_deref() {
+                Role::Speaker
+            } else if Some(&a.member.key) == listener.as_ref() {
+                Role::Listener
+            } else {
+                Role::Other
+            };
+            let Some(&(_, feet)) = feet.iter().find(|(k, _)| *k == a.member.key) else { continue };
+            let Some(t) = angle_restage(&seg.camera, role, side, stage, a.mark_x, feet, dy) else {
+                continue;
+            };
+            if a.member.place.pinned {
+                if !a.variant {
+                    how.push(format!("{} pinned, kept", a.member.key));
+                }
+                continue;
+            }
+            transform_during(scene, &a.top, seg.start, seg.end, t, total);
+            if !a.variant {
+                how.push(a.member.key.clone());
+            }
+        }
+        let verb = match seg.camera.as_str() {
+            "reverse" => "mirrored",
+            "over_shoulder" => "over the shoulder",
+            "low_angle" | "high_angle" => "ground line moved",
+            _ => "",
+        };
+        report.angles.push(AngleNote {
+            start: seg.start,
+            end: seg.end,
+            camera: seg.camera.clone(),
+            background: seg.background.clone(),
+            restaged: if how.is_empty() || verb.is_empty() { String::new() } else { format!("{verb}: {}", how.join(", ")) },
+        });
+    }
+}
+
+/// The part of a pose word that action lines inflect (`sitting` -> `sit`).
+fn pose_stem_of(pose: &str) -> String {
+    let lower = pose.to_lowercase();
+    let word = lower.split('_').next().unwrap_or_default();
+    let mut stem = word;
+    for suffix in ["ing", "ed", "e"] {
+        if let Some(x) = stem.strip_suffix(suffix) {
+            if x.len() >= 3 {
+                stem = x;
+            }
+            break;
+        }
+    }
+    let mut chars: Vec<char> = stem.chars().collect();
+    if chars.len() > 3 && chars[chars.len() - 1] == chars[chars.len() - 2] {
+        chars.pop();
+    }
+    chars.into_iter().collect()
+}
+
+/// **Pose swaps for one character**: each action line that gives them a pose
+/// among their Cast folder's variants ("Guddu sits ..." -> `Guddu Pose sitting`)
+/// shows that rig from the line's start to the end of the next spoken line, and
+/// the base pose again after, unless the next beat keeps the same rig.
+fn pose_swaps(
+    src: &ScriptScene,
+    schedule: &Schedule,
+    casting: &Casting,
+    assets: &AssetLibrary,
+    member: &Member,
+    total: u32,
+    gap: u32,
+) -> Vec<(String, Vec<(u32, u32)>)> {
+    let Some(base_rig) = member.place.cast.clone().or_else(|| member.entry.cast.clone()) else {
+        return Vec::new();
+    };
+    let base_name = crate::cast_build::pose_of_rig(&base_rig).map_or(base_rig.as_str(), |(b, _)| b).to_string();
+    let variants: Vec<(String, String)> = assets
+        .assets()
+        .iter()
+        .filter_map(|a| {
+            let (b, p) = crate::cast_build::pose_of_rig(&a.name)?;
+            (b.eq_ignore_ascii_case(&base_name) && !a.name.eq_ignore_ascii_case(&base_rig)).then(|| (p.to_string(), a.name.clone()))
+        })
+        .collect();
+    pose_beats(src, schedule, &casting.stage_names(), &member.key, &variants, total, gap)
+}
+
+/// The pure part of [`pose_swaps`]: `variants` is `(pose, rig name)`.
+fn pose_beats(
+    src: &ScriptScene,
+    schedule: &Schedule,
+    names: &[(String, String)],
+    key: &str,
+    variants: &[(String, String)],
+    total: u32,
+    gap: u32,
+) -> Vec<(String, Vec<(u32, u32)>)> {
+    let mut beats: Vec<(String, u32, u32)> = Vec::new();
+    for (i, item) in src.items.iter().enumerate() {
+        let Item::Action(text) = item else { continue };
+        let about = clauses_about(text, key, names);
+        if about.is_empty() {
+            continue;
+        }
+        let Some(slot) = schedule.slots.get(i) else { continue };
+        for (pose, rig) in variants {
+            let stem = pose_stem_of(pose);
+            if stem.len() < 3 {
+                continue;
+            }
+            let hit = about
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|w| w.starts_with(&stem) && w.len() <= stem.len() + 4);
+            if hit {
+                let end = src
+                    .items
+                    .iter()
+                    .enumerate()
+                    .skip(i + 1)
+                    .find(|(_, it)| matches!(it, Item::Dialogue(_)))
+                    .and_then(|(j, _)| schedule.slots.get(j).map(|s| s.end()))
+                    .unwrap_or_else(|| slot.end());
+                beats.push((rig.clone(), slot.start, end.max(slot.start + 1).min(total)));
+                break;
+            }
+        }
+    }
+    beats.sort_by_key(|b| b.1);
+    let mut merged: Vec<(String, u32, u32)> = Vec::new();
+    for b in beats {
+        if let Some(last) = merged.last_mut() {
+            if last.0 == b.0 && b.1 <= last.2 + gap {
+                last.2 = last.2.max(b.2);
+                continue;
+            }
+            if b.1 < last.2 {
+                last.2 = b.1;
+            }
+        }
+        merged.push(b);
+    }
+    let mut out: Vec<(String, Vec<(u32, u32)>)> = Vec::new();
+    for (rig, a, b) in merged.into_iter().filter(|(_, a, b)| a < b) {
+        match out.iter_mut().find(|(r, _)| *r == rig) {
+            Some((_, spans)) => spans.push((a, b)),
+            None => out.push((rig, vec![(a, b)])),
+        }
+    }
+    out
 }
 
 // -- shots and lights (P5) ----------------------------------------------------------------
@@ -2724,6 +3414,10 @@ fn stage_actor(
                 eyes: Vec::new(),
                 layer_eyes: Vec::new(),
                 blinks: spec.blink_rate > 0.0,
+                top: Vec::new(),
+                layers: Vec::new(),
+                variant: false,
+                pose_spans: Vec::new(),
                 member,
             })
         }
@@ -2797,6 +3491,10 @@ fn stage_actor(
                 eyes,
                 layer_eyes,
                 blinks,
+                top: placed.top.clone(),
+                layers: placed.all.clone(),
+                variant: false,
+                pose_spans: Vec::new(),
                 member,
             };
             if let Some(body) = placed.body {
@@ -3447,6 +4145,44 @@ fn perform_actor(
         }
         i = j;
     }
+    // AN10: the moves action lines ask for, where nothing else is happening.
+    // (TODO pose variants: a sit/stand could swap to the matching AN4 pose rig
+    // at this frame; today the one-shot move is performed on the same rig.)
+    let moves = std::mem::take(&mut actor.member.moves);
+    for mv in &moves {
+        if exit_from.is_some_and(|gone| mv.start >= gone) {
+            continue;
+        }
+        if mv.cue.action.needs_head() && !has_head_bone(scene, body) {
+            report.warnings.push(format!(
+                "{}: the rig has no head bone, so the {} at frame {} (\"{}\") is left out",
+                actor.member.key,
+                mv.cue.action.label().to_lowercase(),
+                mv.start,
+                mv.cue.why
+            ));
+            continue;
+        }
+        let frames = (gesture_seconds(mv.cue.action) * fps).round() as u32;
+        let range = mv.start..(mv.start + frames).min(total);
+        // AN13: a tagged pose wins over the talk it overlaps (not over a walk).
+        if mv.cue.why.starts_with("tagged ") {
+            segs.retain(|s| !(overlaps(&s.range, &range) && matches!(s.kind, SegKind::Talk { .. } | SegKind::Gesture { .. })));
+        }
+        if range.end < range.start + 6 || segs.iter().any(|s| overlaps(&s.range, &range)) {
+            continue;
+        }
+        report.gestures.push(GestureNote {
+            speaker: actor.member.key.clone(),
+            frame: range.start,
+            action: mv.cue.action,
+            why: mv.cue.why.clone(),
+        });
+        segs.push(Seg {
+            range,
+            kind: SegKind::Gesture { action: mv.cue.action, amount: mv.cue.amount },
+        });
+    }
     // Stable, so a talk is written before a gesture over it.
     segs.sort_by_key(|s| s.range.start);
     actor.member.lines = kept;
@@ -3468,8 +4204,17 @@ fn perform_actor(
         }
     };
 
+    // AN13: once seated (Sit) the body is held: no talk, idle or other gesture
+    // writes the standing rest pose over it until a Stand or an exit.
+    let mut seated = false;
     for seg in &segs {
-        if seg.range.start > cursor + 3 {
+        let stands = matches!(seg.kind, SegKind::Gesture { action: Action::Stand, .. } | SegKind::Exit { .. });
+        if seated && !stands {
+            cursor = cursor.max(seg.range.end);
+            continue;
+        }
+        // AN10: with `still_extras` off a gap holds the pose (no breathing).
+        if actor.member.extras && !seated && seg.range.start > cursor + 3 {
             run(
                 scene,
                 Performance {
@@ -3546,9 +4291,19 @@ fn perform_actor(
                 }
             }
         }
+        if let SegKind::Gesture { action, .. } = &seg.kind {
+            match action {
+                Action::Sit => seated = true,
+                Action::Stand => seated = false,
+                _ => {}
+            }
+        }
+        if matches!(seg.kind, SegKind::Exit { .. }) {
+            seated = false;
+        }
         cursor = cursor.max(seg.range.end);
     }
-    if !actor.offstage && cursor + 3 < total {
+    if actor.member.extras && !actor.offstage && !seated && cursor + 3 < total {
         run(
             scene,
             Performance {
@@ -3699,6 +4454,18 @@ fn sync_mouth(
         .collect();
     if spoken.is_empty() && actor.member.lines.iter().all(|l| heard(l).is_none()) {
         return;
+    }
+    // AN10: the report lists every span this character's mouth moves.
+    for l in &actor.member.lines {
+        match heard(l) {
+            Some(r) => report.lipsync.push(LipSpan { speaker: actor.member.key.clone(), start: r.start, end: r.end, source: "audio" }),
+            None => report.lipsync.push(LipSpan {
+                speaker: actor.member.key.clone(),
+                start: l.start,
+                end: l.start + l.frames,
+                source: "text",
+            }),
+        }
     }
     let mut track = textsync::line_track(total, fps, &spoken);
     if let Some(a) = audio {
@@ -4027,6 +4794,59 @@ mod tests {
         assert_eq!(members.iter().find(|m| m.key == "GUDDU").unwrap().lines[0].amount, 1.0);
     }
 
+    /// AN11: a reverse shot mirrors the cast's positions about the stage centre.
+    #[test]
+    fn a_reverse_shot_mirrors_positions() {
+        let stage = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let t = angle_restage("reverse", Role::Other, -1.0, stage, 300.0, 900.0, 0.0).expect("reverse re-stages");
+        let p = t * Point::new(300.0, 500.0);
+        assert!((p.x - 1620.0).abs() < 1e-9 && (p.y - 500.0).abs() < 1e-9, "{p:?}");
+        assert!(angle_restage("wide", Role::Other, -1.0, stage, 300.0, 900.0, 0.0).is_none());
+    }
+
+    /// AN13: a shot inside an angle picture keeps the picture's full frame.
+    #[test]
+    fn an_angle_picture_shot_keeps_the_camera_at_full_frame() {
+        let stage = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let mut plan = vec![
+            wide_shot(0, stage),
+            Shot { start: 30, kind: "medium".into(), on: Some("AMMA".into()), center: Point::new(400.0, 500.0), zoom: 2.16, push: true },
+        ];
+        let segs = vec![
+            AngleSeg { start: 0, end: 30, at_line: 0, camera: "wide".into(), background: "W".into(), horizon: None },
+            AngleSeg { start: 30, end: 90, at_line: 1, camera: "over_shoulder".into(), background: "O".into(), horizon: None },
+        ];
+        apply_angle_framing(&mut plan, &segs, stage, 90);
+        let inside: Vec<&Shot> = plan.iter().filter(|s| s.start >= 30).collect();
+        assert!(!inside.is_empty() && inside.iter().all(|s| s.zoom <= 1.03 && s.kind == "over_shoulder"), "{plan:?}");
+    }
+
+    /// AN11: an angle's background is drawn only in its own span.
+    #[test]
+    fn an_angle_picture_is_visible_only_in_its_span() {
+        let mut set = SceneSet::default();
+        set.background = vec!["Wide".into()];
+        set.shot_backgrounds = vec![
+            ShotBackground { at_line: 0, camera: "wide".into(), background: "Wide".into(), horizon_row: None },
+            ShotBackground { at_line: 1, camera: "low_angle".into(), background: "Low".into(), horizon_row: None },
+        ];
+        let segs = angle_segments(&set, &[0, 12], 24);
+        assert_eq!(segs.len(), 2);
+        assert_eq!((segs[1].start, segs[1].end, segs[1].background.as_str()), (12, 24, "Low"));
+        let mut scene = Scene::default();
+        let layer = scene.add_layer("Low", buzz_scene::LayerKind::Normal);
+        let id = scene.next_object_id();
+        scene.add_object(layer, Object::group(id, Vec::new())).expect("object");
+        hide_during(&mut scene, &[layer], &complement(&[(12, 24)], 48), 48);
+        let l = scene.layers().get(layer).expect("layer").clone();
+        for f in [0, 11, 24, 47] {
+            assert!(l.objects_at(f).is_empty(), "hidden at {f}");
+        }
+        for f in [12, 23] {
+            assert!(!l.objects_at(f).is_empty(), "shown at {f}");
+        }
+    }
+
     /// A Cast-like rig: the image pipeline's seventeen bones, by name and in
     /// order — or, with no head, just a hips and a chest.
     fn rig(scene: &mut Scene, head: bool) -> ObjectId {
@@ -4082,6 +4902,10 @@ mod tests {
             eyes: Vec::new(),
             layer_eyes: Vec::new(),
             blinks: false,
+            top: Vec::new(),
+            layers: Vec::new(),
+            variant: false,
+            pose_spans: Vec::new(),
         };
         let stage = Rect::new(0.0, 0.0, 1920.0, 1080.0);
         let total = schedule.total_frames;
@@ -4176,5 +5000,30 @@ mod tests {
         assert!((feet.x - 960.0).abs() < 1e-9 && (feet.y - 972.0).abs() < 1e-9, "{feet:?}");
         let head = t * Point::new(200.0, 200.0);
         assert!((head.y - 572.0).abs() < 1e-9, "{head:?}");
+    }
+
+    /// AN10: only the speaker has lines (so only their mouth is written), the
+    /// narrator has none, and an action line's move lands on its subject.
+    #[test]
+    fn only_the_speaker_has_mouth_lines_and_narration_none() {
+        let casting = r#"{"characters": {"RAJU": {"asset": "r"}, "GUDDU": {"asset": "g"},
+                          "NARRATOR": {"voice_only": true}}}"#;
+        let text = "**NARRATOR (V.O.)**\nRaju aur Guddu bus ka intezaar karte hain.\n\n\
+                    **RAJU**\nBus late hai.\n\nGuddu sits on the bench.\n\n\
+                    **NARRATOR (V.O.)**\nAur phir bus aayi.\n";
+        let members = members_of(text, casting);
+        assert!(members.iter().all(|m| m.key != "NARRATOR"), "the narrator is never on stage");
+        let raju = members.iter().find(|m| m.key == "RAJU").expect("raju");
+        let guddu = members.iter().find(|m| m.key == "GUDDU").expect("guddu");
+        assert_eq!(raju.lines.len(), 1);
+        assert!(guddu.lines.is_empty(), "the non-speaker has no mouth lines");
+        // The action line moves Guddu (Sit); Raju is not asked to move.
+        assert_eq!(guddu.moves.len(), 1);
+        assert_eq!(guddu.moves[0].cue.action, Action::Sit);
+        assert!(raju.moves.is_empty());
+        assert!(raju.extras && guddu.extras);
+        // `still_extras: false` is carried to every member.
+        let off = casting.replace("{\"characters\"", "{\"still_extras\": false, \"characters\"");
+        assert!(members_of(text, &off).iter().all(|m| !m.extras));
     }
 }

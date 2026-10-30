@@ -330,7 +330,7 @@ pub fn build_tools_with(allow_all: bool) -> Vec<ToolSpec> {
                     "characters": {"type": "string", "description": "a folder with one sub-folder of pictures per character"},
                     "style": {"type": "string", "description": "comic, painterly, inked, or free words"},
                     "series": {"type": "string", "description": "the series name"},
-                    "world": {"type": "string", "description": "where and when the story lives (default for Chirailiya: rural Bihar, India, late 1990s)"}
+                    "world": {"type": "string", "description": "where and when the story lives (default for Chirailiya: a semi-rural small town in North India, 2010s: smartphones, motorbikes, small shops and tea stalls of that decade)"}
                 },
                 "required": ["script", "out"]
             }),

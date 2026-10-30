@@ -80,6 +80,11 @@ pub enum PanelId {
     /// Identify & Rename, Transcribe and the running AI tasks, as sections.
     /// Hidden until asked for; its home is the outer right column.
     Ai,
+    /// **The storyboard** (`docs/STORYBOARD_PLAN.md` S3): the episode's
+    /// panels as a grid of pictures with their captions, edited, reordered,
+    /// redrawn and exported as sheets. Hidden until asked for (Window >
+    /// Storyboard); its home is the bottom, beside the Timeline.
+    Storyboard,
 }
 
 impl PanelId {
@@ -107,6 +112,7 @@ impl PanelId {
             Self::MotionEditor => "Motion Editor",
             Self::Tasks => "Tasks",
             Self::Ai => "AI",
+            Self::Storyboard => "Storyboard",
         }
     }
 
@@ -137,7 +143,7 @@ impl PanelId {
         !matches!(self, Self::Tools | Self::Timeline | Self::Sequence | Self::Ai)
     }
 
-    pub const ALL: [PanelId; 21] = [
+    pub const ALL: [PanelId; 22] = [
         PanelId::Tools,
         PanelId::ToolOptions,
         PanelId::Layers,
@@ -159,6 +165,7 @@ impl PanelId {
         PanelId::MotionEditor,
         PanelId::Tasks,
         PanelId::Ai,
+        PanelId::Storyboard,
     ];
 }
 
@@ -1293,6 +1300,9 @@ impl Workspace {
                 // command); opens in the outer right column, which the one
                 // tab stack otherwise leaves empty.
                 slot(PanelId::Ai, Dock::Hidden, 4, Dock::RightOuter),
+                // Closed until asked for (Window > Storyboard); a row of
+                // pictures wants the width under the stage.
+                slot(PanelId::Storyboard, Dock::Hidden, 5, Dock::Bottom),
             ],
             locked: false,
             theme: crate::theme::Theme::default(),

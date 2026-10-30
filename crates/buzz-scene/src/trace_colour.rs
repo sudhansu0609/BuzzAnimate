@@ -317,6 +317,297 @@ fn segmenter_fringe(opaque: &[bool], ink: &[bool], w: usize, h: usize, fringe_px
     fringe
 }
 
+/// A6a: a patch touching the outside is at most this far (px, pixel centre to
+/// pixel centre) from an exterior pixel.
+const POCKET_TOUCH_PX: f64 = 1.5;
+
+/// A6a: the border ring of an opaque sheet counts as its background colour
+/// only when at least this share of it is opaque…
+const SHEET_BORDER_OPAQUE_SHARE: f64 = 0.9;
+/// … and this share of it lies within [`SHEET_BORDER_DE`] of its median.
+const SHEET_BORDER_UNIFORM_SHARE: f64 = 0.8;
+const SHEET_BORDER_DE: f64 = 6.0;
+
+/// **The sheet's background colour** (A6a): the per-channel median of the
+/// picture's 1 px border ring, when that ring is opaque
+/// ([`SHEET_BORDER_OPAQUE_SHARE`]) and plain ([`SHEET_BORDER_UNIFORM_SHARE`]
+/// within ΔE [`SHEET_BORDER_DE`] of the median): a character sheet's paper.
+/// `None` for a cut-out (transparent border) or a photograph.
+pub fn sheet_background(width: u32, height: u32, pixels: &[u8]) -> Option<[u8; 3]> {
+    let (w, h) = (width as usize, height as usize);
+    if w < 2 || h < 2 || pixels.len() < w * h * 4 {
+        return None;
+    }
+    let mut ring: Vec<usize> = Vec::with_capacity(2 * (w + h));
+    ring.extend((0..w).map(|x| x));
+    ring.extend((0..w).map(|x| (h - 1) * w + x));
+    ring.extend((1..h - 1).map(|y| y * w));
+    ring.extend((1..h - 1).map(|y| y * w + w - 1));
+    let opaque: Vec<[u8; 3]> = ring
+        .iter()
+        .filter(|&&i| pixels[i * 4 + 3] > OPAQUE_MIN_ALPHA)
+        .map(|&i| [pixels[i * 4], pixels[i * 4 + 1], pixels[i * 4 + 2]])
+        .collect();
+    if (opaque.len() as f64) < SHEET_BORDER_OPAQUE_SHARE * ring.len() as f64 {
+        return None;
+    }
+    let median = |c: usize| {
+        let mut v: Vec<u8> = opaque.iter().map(|p| p[c]).collect();
+        v.sort_unstable();
+        v[v.len() / 2]
+    };
+    let bg = [median(0), median(1), median(2)];
+    let bg_lab = srgb_to_lab(bg);
+    let plain = opaque.iter().filter(|&&p| crate::trace::delta_e(srgb_to_lab(p), bg_lab) <= SHEET_BORDER_DE).count();
+    ((plain as f64) >= SHEET_BORDER_UNIFORM_SHARE * opaque.len() as f64).then_some(bg)
+}
+
+/// **A6a: background pockets** — the sheet's paper showing through inside
+/// the figure (between hair curls, between body-hair strands), as a mask of
+/// pixels to treat as transparent.
+///
+/// A *light patch* is a 4-connected set of opaque pixels within
+/// 2 × `background_pocket_de` of `background` (so a vest's highlight joins the
+/// rest of the vest rather than standing alone). It is a pocket when its mean
+/// colour is within `background_pocket_de` of `background`, it holds at most
+/// `background_pocket_max_px2` pixels, no pixel of it is `protect`ed, it does
+/// not touch the picture's border (that is the sheet itself) and either it
+/// lies wholly within `background_pocket_reach_px` of the exterior or it
+/// touches the exterior ([`POCKET_TOUCH_PX`]). The exterior is the
+/// transparent pixels plus the light patches that touch the picture's border.
+/// All `false` when `background_pocket_de` is 0.
+pub fn background_pockets(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    background: [u8; 3],
+    protect: Option<&[bool]>,
+    ct: &ColourTuning,
+) -> Vec<bool> {
+    let (w, h) = (width as usize, height as usize);
+    let mut out = vec![false; w * h];
+    let de = ct.background_pocket_de as f64;
+    if !(de > 0.0) || w == 0 || h == 0 || pixels.len() < w * h * 4 {
+        return out;
+    }
+    let bg = srgb_to_lab(background);
+    let opaque: Vec<bool> = (0..w * h).map(|i| pixels[i * 4 + 3] > OPAQUE_MIN_ALPHA).collect();
+    let lab: Vec<[f64; 3]> = (0..w * h)
+        .into_par_iter()
+        .map(|i| srgb_to_lab([pixels[i * 4], pixels[i * 4 + 1], pixels[i * 4 + 2]]))
+        .collect();
+    let light: Vec<bool> =
+        (0..w * h).map(|i| opaque[i] && crate::trace::delta_e(lab[i], bg) <= 2.0 * de).collect();
+    // 4-connected light patches.
+    let mut label = vec![NONE; w * h];
+    let mut patches: Vec<Vec<usize>> = Vec::new();
+    for s in 0..w * h {
+        if !light[s] || label[s] != NONE {
+            continue;
+        }
+        let id = patches.len() as u32;
+        let mut px = vec![s];
+        label[s] = id;
+        let mut k = 0;
+        while k < px.len() {
+            let i = px[k];
+            k += 1;
+            let (x, y) = (i % w, i / w);
+            let n4 = [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)];
+            for j in n4.into_iter().flatten() {
+                if light[j] && label[j] == NONE {
+                    label[j] = id;
+                    px.push(j);
+                }
+            }
+        }
+        patches.push(px);
+    }
+    let on_border = |i: usize| {
+        let (x, y) = (i % w, i / w);
+        x == 0 || y == 0 || x + 1 == w || y + 1 == h
+    };
+    let sheet: Vec<bool> = patches.iter().map(|px| px.iter().any(|&i| on_border(i))).collect();
+    let exterior: Vec<bool> = (0..w * h).map(|i| !opaque[i] || (label[i] != NONE && sheet[label[i] as usize])).collect();
+    if !exterior.iter().any(|&e| e) {
+        return out;
+    }
+    let d_ext = distance_to(&exterior, w, h);
+    let reach = ct.background_pocket_reach_px as f64;
+    let max_px = ct.background_pocket_max_px2;
+    // `BUZZ_TRACE_POCKETS_AT=x,y`: why the light patch at that pixel is or is not a pocket.
+    if let Some((x, y)) = std::env::var("BUZZ_TRACE_POCKETS_AT").ok().and_then(|v| {
+        let (a, b) = v.split_once(',')?;
+        Some((a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?))
+    }) {
+        let i = y.min(h - 1) * w + x.min(w - 1);
+        if label[i] == NONE {
+            eprintln!("pockets at ({x}, {y}): not light (opaque {}, dE {:.1})", opaque[i], crate::trace::delta_e(lab[i], bg));
+        } else {
+            let px = &patches[label[i] as usize];
+            let mut mean = [0.0f64; 3];
+            let (mut d_min, mut d_max) = (f64::INFINITY, 0.0f64);
+            for &j in px {
+                for c in 0..3 {
+                    mean[c] += lab[j][c] / px.len() as f64;
+                }
+                d_min = d_min.min(d_ext[j]);
+                d_max = d_max.max(d_ext[j]);
+            }
+            eprintln!(
+                "pockets at ({x}, {y}): patch of {} px, sheet {}, protected {}, mean dE {:.1}, d_ext {d_min:.1}..{d_max:.1}",
+                px.len(),
+                sheet[label[i] as usize],
+                protect.is_some_and(|m| px.iter().any(|&j| m[j])),
+                crate::trace::delta_e(mean, bg)
+            );
+        }
+    }
+    for (p, px) in patches.iter().enumerate() {
+        if sheet[p] || px.len() > max_px {
+            continue;
+        }
+        if protect.is_some_and(|m| px.iter().any(|&i| m[i])) {
+            continue;
+        }
+        let mut mean = [0.0f64; 3];
+        let (mut d_min, mut d_max) = (f64::INFINITY, 0.0f64);
+        for &i in px {
+            for c in 0..3 {
+                mean[c] += lab[i][c];
+            }
+            d_min = d_min.min(d_ext[i]);
+            d_max = d_max.max(d_ext[i]);
+        }
+        let n = px.len() as f64;
+        let mean = [mean[0] / n, mean[1] / n, mean[2] / n];
+        if crate::trace::delta_e(mean, bg) > de {
+            continue;
+        }
+        if d_max <= reach || d_min <= POCKET_TOUCH_PX {
+            if std::env::var_os("BUZZ_TRACE_POCKETS_LOG").is_some_and(|v| v == "2") {
+                let (x, y) = (px[0] % w, px[0] / w);
+                eprintln!(
+                    "pocket at ({x}, {y}): {} px, mean dE {:.1}, d_ext {d_min:.1}..{d_max:.1}",
+                    px.len(),
+                    crate::trace::delta_e(mean, bg)
+                );
+            }
+            for &i in px {
+                out[i] = true;
+            }
+        }
+    }
+    out
+}
+
+/// A6d: an edge pixel's ink is the darkest pixel within this distance (px,
+/// Chebyshev) …
+const BLEND_RIM_INK_PX: usize = 3;
+/// … when that is at most this light (L*): ink, not a dark fill's shading.
+const BLEND_RIM_INK_MAX_L: f64 = 45.0;
+
+/// **Where `c` lies on the blend from `ink` to `paper`** (Lab): `(t, d)`, `t`
+/// the share of the way towards the paper (0 = the ink, 1 = the paper,
+/// clamped) and `d` the ΔE from `c` to that point of the segment. The source's
+/// anti-aliasing of a line drawn on paper lies on it (A6d).
+pub fn ink_paper_blend(c: [f64; 3], ink: [f64; 3], paper: [f64; 3]) -> (f64, f64) {
+    let seg = [paper[0] - ink[0], paper[1] - ink[1], paper[2] - ink[2]];
+    let len2 = seg[0] * seg[0] + seg[1] * seg[1] + seg[2] * seg[2];
+    let t = if len2 > 1e-9 {
+        (((c[0] - ink[0]) * seg[0] + (c[1] - ink[1]) * seg[1] + (c[2] - ink[2]) * seg[2]) / len2).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let p = [ink[0] + t * seg[0], ink[1] + t * seg[1], ink[2] + t * seg[2]];
+    (t, crate::trace::delta_e(c, p))
+}
+
+/// **A6d: ink–paper rims** — the source's anti-aliasing of an outline
+/// against the paper at the figure's outer edge (light-grey dashes along hair
+/// tips), as a mask of pixels to treat as transparent. A rim pixel is opaque,
+/// not `protect`ed, within `blend_rim_px` of the exterior (`!opaque`) and
+/// reachable from it through rim pixels (4-connected), and its colour lies on
+/// the blend from its ink to `background` ([`ink_paper_blend`]: at least
+/// `blend_rim_min_t` towards the paper, at most `blend_rim_de` off the
+/// segment), its ink being the darkest pixel within [`BLEND_RIM_INK_PX`] when
+/// that is at most [`BLEND_RIM_INK_MAX_L`]. All `false` when `blend_rim_px`
+/// is 0.
+pub fn blend_rims(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    opaque: &[bool],
+    background: [u8; 3],
+    protect: Option<&[bool]>,
+    ct: &ColourTuning,
+) -> Vec<bool> {
+    let (w, h) = (width as usize, height as usize);
+    let mut out = vec![false; w * h];
+    let reach = ct.blend_rim_px as f64;
+    if !(reach > 0.0) || w == 0 || h == 0 || pixels.len() < w * h * 4 || opaque.len() != w * h {
+        return out;
+    }
+    let exterior: Vec<bool> = opaque.iter().map(|&o| !o).collect();
+    if !exterior.iter().any(|&e| e) {
+        return out;
+    }
+    let d_ext = distance_to(&exterior, w, h);
+    let near: Vec<usize> = (0..w * h).filter(|&i| opaque[i] && d_ext[i] <= reach).collect();
+    if near.is_empty() {
+        return out;
+    }
+    let paper = srgb_to_lab(background);
+    let rgb = |i: usize| [pixels[i * 4], pixels[i * 4 + 1], pixels[i * 4 + 2]];
+    let r = BLEND_RIM_INK_PX as i64;
+    let (de, min_t) = (ct.blend_rim_de as f64, ct.blend_rim_min_t as f64);
+    let rim_colour: Vec<(usize, bool)> = near
+        .par_iter()
+        .map(|&i| {
+            if protect.is_some_and(|m| m[i]) {
+                return (i, false);
+            }
+            let (x, y) = ((i % w) as i64, (i / w) as i64);
+            let mut darkest: Option<[f64; 3]> = None;
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                        continue;
+                    }
+                    let j = ny as usize * w + nx as usize;
+                    if !opaque[j] {
+                        continue;
+                    }
+                    let l = srgb_to_lab(rgb(j));
+                    if darkest.is_none_or(|d| l[0] < d[0]) {
+                        darkest = Some(l);
+                    }
+                }
+            }
+            let Some(ink) = darkest.filter(|d| d[0] <= BLEND_RIM_INK_MAX_L) else { return (i, false) };
+            let (t, d) = ink_paper_blend(srgb_to_lab(rgb(i)), ink, paper);
+            (i, t >= min_t && d <= de)
+        })
+        .collect();
+    let mut cand = vec![false; w * h];
+    for (i, c) in rim_colour {
+        cand[i] = c;
+    }
+    let mut stack: Vec<usize> = (0..w * h).filter(|&i| exterior[i]).collect();
+    while let Some(i) = stack.pop() {
+        let (x, y) = (i % w, i / w);
+        let n4 = [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)];
+        for j in n4.into_iter().flatten() {
+            if cand[j] && !out[j] {
+                out[j] = true;
+                stack.push(j);
+            }
+        }
+    }
+    out
+}
+
 /// **A1: fills stop at the outer ink's centreline.** `exterior` is
 /// transparent, or a non-ink pixel of the dropped background region (ink is
 /// never exterior, whichever region donated it); an ink pixel that is not a
@@ -1943,6 +2234,21 @@ fn region_path(
 /// **Trace `pixels` into colour fills with the ink on top.** Dispatched from
 /// [`crate::trace::trace`] for `TraceMode::InkAndColour`. See the module docs.
 pub(crate) fn trace_ink_and_colour(width: u32, height: u32, pixels: &[u8], options: &TraceOptions) -> TraceReport {
+    trace_ink_and_colour_with(width, height, pixels, options, None, None)
+}
+
+/// [`trace_ink_and_colour`] with A6a's background pockets taken against
+/// `background` (default: [`sheet_background`] of `pixels`), never inside
+/// `protect`. Only with `drop_background`: a trace that keeps the paper keeps
+/// its pockets too.
+pub(crate) fn trace_ink_and_colour_with(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    options: &TraceOptions,
+    background: Option<[u8; 3]>,
+    protect: Option<&[bool]>,
+) -> TraceReport {
     let (w, h) = (width as usize, height as usize);
     if w == 0 || h == 0 || pixels.len() < w * h * 4 {
         return TraceReport {
@@ -1958,11 +2264,62 @@ pub(crate) fn trace_ink_and_colour(width: u32, height: u32, pixels: &[u8], optio
     // The ink the ink stage will actually emit: a dark-red plaid dash or a
     // bangle that it drops as a colour mark must stay a colour here, or it
     // is under-painted away and lost from both stages.
-    let ink = grown_ink(&native_ink_mask(&analysis, pixels, w, h, it), &opaque, w, h, ct);
+    let mut ink = grown_ink(&native_ink_mask(&analysis, pixels, w, h, it), &opaque, w, h, ct);
     drop(analysis);
+    // A6a. The sheet's paper showing through inside the figure is transparent
+    // from here on, like the outside (and A2 below then takes the soft rim
+    // round it).
+    if options.drop_background && ct.background_pocket_de > 0.0 {
+        if let Some(bg) = background.or_else(|| sheet_background(width, height, pixels)) {
+            let pockets = background_pockets(width, height, pixels, bg, protect, ct);
+            let n = pockets.iter().filter(|&&p| p).count();
+            if n > 0 {
+                for (i, p) in pockets.into_iter().enumerate() {
+                    if p {
+                        opaque[i] = false;
+                        ink[i] = false;
+                    }
+                }
+            }
+            if std::env::var_os("BUZZ_TRACE_POCKETS_LOG").is_some() {
+                eprintln!("trace: background {bg:?}, {n} px of background pockets left out");
+            }
+        }
+    }
+    // A6d. The outline's anti-aliasing against the paper at the outer edge
+    // (and round the pockets just left out) is transparent too.
+    if options.drop_background && ct.blend_rim_px > 0.0 {
+        if let Some(bg) = background.or_else(|| sheet_background(width, height, pixels)) {
+            let rims = blend_rims(width, height, pixels, &opaque, bg, protect, ct);
+            let mut n = 0usize;
+            for (i, r) in rims.into_iter().enumerate() {
+                if r {
+                    opaque[i] = false;
+                    ink[i] = false;
+                    n += 1;
+                }
+            }
+            if std::env::var_os("BUZZ_TRACE_POCKETS_LOG").is_some() {
+                eprintln!("trace: {n} px of ink-paper rims left out");
+            }
+        }
+    }
     // A2. The segmenter's anti-alias fringe outside the ink is transparent
     // from here on: it donates nothing and gets no cell.
     let fringe = segmenter_fringe(&opaque, &ink, w, h, ct.fringe_px);
+    if let Ok(dir) = std::env::var("BUZZ_COLOUR_DEBUG_DIR") {
+        let dir = std::path::Path::new(&dir);
+        let _ = std::fs::create_dir_all(dir);
+        let _ = image::save_buffer(dir.join(format!("input_{w}x{h}.png")), &pixels[..w * h * 4], w as u32, h as u32, image::ExtendedColorType::Rgba8);
+        // edge.png: R = opaque after pockets, G = ink, B = A2 fringe.
+        let mut e = vec![0u8; w * h * 3];
+        for i in 0..w * h {
+            e[i * 3] = if opaque[i] { 255 } else { 0 };
+            e[i * 3 + 1] = if ink[i] { 255 } else { 0 };
+            e[i * 3 + 2] = if fringe[i] { 255 } else { 0 };
+        }
+        let _ = image::save_buffer(dir.join(format!("edge_{w}x{h}.png")), &e, w as u32, h as u32, image::ExtendedColorType::Rgb8);
+    }
     for (o, f) in opaque.iter_mut().zip(fringe) {
         if f {
             *o = false;

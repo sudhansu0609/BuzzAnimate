@@ -450,6 +450,48 @@ fn tuning_section_open(ui: &mut Ui, tuning: &mut TraceTuning, show_colour: bool,
                             .on_hover_text("Width (px) of the segmenter's soft edge outside the outline that is treated as background; 0 keeps it as fill.")
                             .changed();
                         ui.end_row();
+
+                        ui.label("Paper pockets: colour");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut colour.background_pocket_de, 0.0..=30.0).step_by(0.5).suffix(" ΔE").clamping(egui::SliderClamping::Edits).max_decimals(1))
+                            .on_hover_text("How close (ΔE) to the sheet's background colour a patch inside the figure must be to count as paper showing through (between hair curls or body-hair strands); 0 keeps every patch.")
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Paper pockets: reach");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut colour.background_pocket_reach_px, 0.0..=40.0).step_by(0.5).suffix(" px").clamping(egui::SliderClamping::Edits).max_decimals(1))
+                            .on_hover_text("A paper-coloured patch lying wholly within this distance (px) of the figure's edge, or touching the outside, is left out as background.")
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Paper pockets: largest");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut colour.background_pocket_max_px2, 0..=10000).suffix(" px²").clamping(egui::SliderClamping::Edits))
+                            .on_hover_text("Paper-coloured patches larger than this (px²) are always kept: a white shirt, a vest, a dhoti.")
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Ink-paper rims: width");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut colour.blend_rim_px, 0.0..=8.0).step_by(0.5).suffix(" px").clamping(egui::SliderClamping::Edits).max_decimals(1))
+                            .on_hover_text("Width (px) of the edge band where a colour between the outline's ink and the paper (the source's anti-aliasing, traced as grey dashes along hair tips) is left out as background; 0 keeps it.")
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Ink-paper rims: colour");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut colour.blend_rim_de, 0.0..=30.0).step_by(0.5).suffix(" ΔE").clamping(egui::SliderClamping::Edits).max_decimals(1))
+                            .on_hover_text("How far (ΔE) off the ink-to-paper blend an edge pixel may be and still count as the outline's anti-aliasing against the paper.")
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("Ink-paper rims: lightness");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut colour.blend_rim_min_t, 0.0..=1.0).step_by(0.05).clamping(egui::SliderClamping::Edits).max_decimals(2))
+                            .on_hover_text("How far towards the paper (0 = the ink, 1 = the paper) an edge pixel's colour must be to count as the outline's anti-aliasing; darker stays with the ink.")
+                            .changed();
+                        ui.end_row();
                     });
             });
         }

@@ -257,13 +257,45 @@ struct EyeFound {
     area: f64,
     /// Made from an eye hole: the hole's outline.
     hole: Option<BezPath>,
+    /// A darker shape (iris/pupil) is drawn over the white and lies in it.
+    iris: bool,
+    /// A see-through eye hole, its outline not worked out yet.
+    socket: Option<Hole>,
 }
 
-/// The whites: light fills with a darker shape drawn over them and lying in
-/// them, of an eye's size and shape.
-fn find_whites(shapes: &[ShapeData], regions: &[(BezPath, FillMode)], areas: &[f64], head: Rect) -> Vec<EyeFound> {
+/// Is a shape's region walled in by other paint all round (most points
+/// just outside its edge covered by another shape)? An eye white is (by the
+/// skin or its outline); a light patch on the drawing's edge (a scarf, a
+/// collar) is not.
+fn enclosed(own: usize, regions: &[(BezPath, FillMode)], boxes: &[Rect]) -> bool {
+    let r = &regions[own];
+    let b = boxes[own];
+    let centre = b.center();
+    let pts = boundary_points(&r.0, (b.width() + b.height()) / 60.0);
+    let step = (b.width().max(b.height()) * 0.08).max(0.5);
+    let (mut n, mut covered) = (0usize, 0usize);
+    for p in pts.iter().step_by((pts.len() / 48).max(1)) {
+        let v = *p - centre;
+        let len = v.hypot();
+        if len <= 1e-9 {
+            continue;
+        }
+        let q = *p + v * (step / len);
+        n += 1;
+        if (0..regions.len()).any(|j| j != own && boxes[j].contains(q) && contains(&regions[j].0, regions[j].1, q)) {
+            covered += 1;
+        }
+    }
+    n > 0 && covered as f64 >= 0.9 * n as f64
+}
+
+/// The eye candidates: light fills of an eye's size and shape walled in by
+/// the drawing, with a darker shape drawn over them and lying in them (the
+/// iris/pupil) or blank (an eye with no pupil, `iris` false; at least 0.2 %
+/// of the head), and see-through eye holes (`socket`).
+fn find_eyes(shapes: &[ShapeData], regions: &[(BezPath, FillMode)], areas: &[f64], head: Rect) -> Vec<EyeFound> {
     let boxes: Vec<Rect> = regions.iter().map(|r| r.0.bounding_box()).collect();
-    let mut cands: Vec<usize> = Vec::new();
+    let mut cands: Vec<(usize, bool)> = Vec::new();
     for i in 0..shapes.len() {
         let s = &shapes[i];
         if s.fill.is_none() || !paint_colour(s).is_some_and(is_light) {
@@ -284,35 +316,40 @@ fn find_whites(shapes: &[ShapeData], regions: &[(BezPath, FillMode)], areas: &[f
                 && (0.02 * a..=0.95 * a).contains(&areas[j])
                 && share_inside(&regions[j], &regions[i]) >= 0.5
         });
-        if iris {
-            cands.push(i);
+        if (iris || a >= 0.002 * head.area()) && enclosed(i, regions, &boxes) {
+            cands.push((i, iris));
         }
     }
     // Pieces of one white (a traced eye) go together.
     let mut eyes: Vec<EyeFound> = Vec::new();
-    for i in cands {
+    for (i, iris) in cands {
         match eyes.iter_mut().find(|e| overlaps(e.bounds, boxes[i])) {
             Some(e) => {
                 e.white.push(i);
                 e.bounds = e.bounds.union(boxes[i]);
                 e.area += areas[i];
+                e.iris |= iris;
             }
-            None => eyes.push(EyeFound { white: vec![i], bounds: boxes[i], area: areas[i], hole: None }),
+            None => eyes.push(EyeFound { white: vec![i], bounds: boxes[i], area: areas[i], hole: None, iris, socket: None }),
         }
+    }
+    for h in find_holes(regions, head) {
+        if eyes.iter().any(|e| overlaps(e.bounds, h.bounds)) {
+            continue;
+        }
+        eyes.push(EyeFound { white: Vec::new(), bounds: h.bounds, area: h.area, hole: None, iris: false, socket: Some(h) });
     }
     eyes
 }
 
-/// The two eyes of a front head (side by side, of a size), else the biggest
-/// eye alone.
-fn pick_eyes(mut eyes: Vec<EyeFound>) -> Vec<EyeFound> {
-    if eyes.len() <= 1 {
-        return eyes;
-    }
+/// The two eyes of a front head: the best pair (side by side, of a size;
+/// a pair with no pupil at all also symmetric about the face's midline
+/// `mid`), else the biggest eye with a pupil alone (a side head).
+fn pick_eyes(mut eyes: Vec<EyeFound>, mid: f64) -> Vec<EyeFound> {
     let mut best: Option<(usize, usize, f64)> = None;
     for a in 0..eyes.len() {
         for b in a + 1..eyes.len() {
-            if let Some(score) = pair_score(&eyes[a], &eyes[b]) {
+            if let Some(score) = pair_score(&eyes[a], &eyes[b], mid) {
                 if best.is_none_or(|(_, _, s)| score > s) {
                     best = Some((a, b, score));
                 }
@@ -326,6 +363,7 @@ fn pick_eyes(mut eyes: Vec<EyeFound>) -> Vec<EyeFound> {
             vec![ea, eb]
         }
         None => {
+            eyes.retain(|e| e.iris);
             eyes.sort_by(|a, b| b.area.total_cmp(&a.area));
             eyes.truncate(1);
             eyes
@@ -333,13 +371,22 @@ fn pick_eyes(mut eyes: Vec<EyeFound>) -> Vec<EyeFound> {
     }
 }
 
-fn pair_score(a: &EyeFound, b: &EyeFound) -> Option<f64> {
+fn pair_score(a: &EyeFound, b: &EyeFound, mid: f64) -> Option<f64> {
     let ratio = a.area.min(b.area) / a.area.max(b.area).max(1e-9);
     let (ca, cb) = (a.bounds.center(), b.bounds.center());
     let w = a.bounds.width().max(b.bounds.width());
     let h = a.bounds.height().max(b.bounds.height());
     let (dx, dy) = ((ca.x - cb.x).abs(), (ca.y - cb.y).abs());
-    (ratio >= 0.3 && dy <= 0.75 * h + 0.1 * w && dx >= 0.8 * w && dx <= 6.0 * w).then_some(a.area + b.area)
+    if !(ratio >= 0.3 && dy <= 0.75 * h + 0.1 * w && dx >= 0.8 * w && dx <= 6.0 * w) {
+        return None;
+    }
+    // Off the face's midline, in eye spacings.
+    let off = ((ca.x + cb.x) / 2.0 - mid).abs() / dx.max(1e-9);
+    let irises = a.iris as u8 + b.iris as u8;
+    if irises == 0 && off > 1.0 {
+        return None;
+    }
+    Some((a.area + b.area) * (1.0 + 0.5 * irises as f64) / (1.0 + off))
 }
 
 /// An enclosed see-through hole in the drawing.
@@ -575,46 +622,104 @@ pub(super) fn eye_holes_in(scene: &Scene, head: SymbolId) -> usize {
     let regions: Vec<(BezPath, FillMode)> = d.shapes.iter().map(painted_region).collect();
     let areas: Vec<f64> = regions.iter().map(region_area).collect();
     let hb = regions.iter().map(|r| r.0.bounding_box()).reduce(|a, b| a.union(b)).unwrap_or_default();
-    let eyes = pick_eyes(find_whites(&d.shapes, &regions, &areas, hb));
-    if eyes.len() >= 2 {
-        return 0;
-    }
-    hole_eyes(&eyes, find_holes(&regions, hb)).len()
+    pick_eyes(find_eyes(&d.shapes, &regions, &areas, hb), hb.center().x).iter().filter(|e| e.socket.is_some()).count()
 }
 
-/// The holes that are eyes: the one beside the drawn eye, or the pair.
-fn hole_eyes(eyes: &[EyeFound], holes: Vec<Hole>) -> Vec<Hole> {
-    let as_eye = |h: &Hole| EyeFound { white: Vec::new(), bounds: h.bounds, area: h.area, hole: None };
-    match eyes.len() {
-        0 => {
-            let mut best: Option<(usize, usize, f64)> = None;
-            for a in 0..holes.len() {
-                for b in a + 1..holes.len() {
-                    if let Some(s) = pair_score(&as_eye(&holes[a]), &as_eye(&holes[b])) {
-                        if best.is_none_or(|(_, _, t)| s > t) {
-                            best = Some((a, b, s));
-                        }
-                    }
-                }
-            }
-            let Some((a, b, _)) = best else { return Vec::new() };
-            let mut holes = holes;
-            let hb = holes.swap_remove(b);
-            let ha = holes.swap_remove(a);
-            vec![ha, hb]
-        }
-        1 => {
-            let e = &eyes[0];
-            holes
-                .into_iter()
-                .filter(|h| !overlaps(h.bounds, e.bounds))
-                .filter_map(|h| pair_score(e, &as_eye(&h)).map(|s| (h, s)))
-                .max_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(h, _)| vec![h])
-                .unwrap_or_default()
-        }
-        _ => Vec::new(),
+/// A brow drawn into the hair: the dark mass's lower edge found straight
+/// above the eye (marching up from the eye's top, at most two eye heights,
+/// across the eye's width), and a band a third of an eye high along it cut
+/// off every dark shape there (hair, its ink, a brow joined with a strand).
+/// Per shape cut: (index, the band, what is left of it). Empty when no dark
+/// mass lies over most of the eye's width.
+fn brow_band(
+    e: &EyeFound,
+    shapes: &[ShapeData],
+    regions: &[(BezPath, FillMode)],
+    areas: &[f64],
+    boxes: &[Rect],
+    part: &[Option<Cut>],
+    remainder: &[Option<ShapeData>],
+) -> Vec<(usize, ShapeData, Option<ShapeData>)> {
+    let (w, h) = (e.bounds.width(), e.bounds.height());
+    if w <= 0.0 || h <= 0.0 {
+        return Vec::new();
     }
+    let step = (h / 40.0).max(0.02);
+    let thick = 0.3 * h;
+    let dark = |i: usize| paint_colour(&shapes[i]).is_some_and(|c| luma(c) < 0.35 && !is_reddish(c) && !is_skin_like(c));
+    // Dark shapes there not taken as a brow of their own: the hair, its
+    // ink, or a brow joined with a strand of it (no specks).
+    let mass = |i: usize| part[i].is_none() && dark(i) && areas[i] >= 0.12 * e.area;
+    let n = 24;
+    let mut edge: Vec<Option<f64>> = Vec::with_capacity(n + 1);
+    for k in 0..=n {
+        let x = e.bounds.x0 - 0.05 * w + 1.1 * w * k as f64 / n as f64;
+        let mut y = e.bounds.y0 - step;
+        let mut found = None;
+        // The topmost shape at a point.
+        let topmost = |q: Point| {
+            (0..shapes.len()).rev().find(|j| {
+                (shapes[*j].fill.is_some() || shapes[*j].stroke.is_some())
+                    && boxes[*j].contains(q)
+                    && contains(&regions[*j].0, regions[*j].1, q)
+            })
+        };
+        while y >= e.bounds.y0 - 2.0 * h {
+            let (here, above) = (topmost(Point::new(x, y)), topmost(Point::new(x, y - 0.15 * h)));
+            // A band, not a thin line (the eye's own rim in the ink).
+            if here.is_some_and(mass) && above.is_some_and(dark) {
+                found = Some(y);
+                break;
+            }
+            y -= step;
+        }
+        edge.push(found);
+    }
+    // The longest run of columns with the mass over them.
+    let (mut best, mut run) = ((0usize, 0usize), (0usize, 0usize));
+    for (k, v) in edge.iter().enumerate() {
+        if v.is_some() {
+            run = if run.1 == 0 { (k, 1) } else { (run.0, run.1 + 1) };
+            if run.1 > best.1 {
+                best = run;
+            }
+        } else {
+            run = (0, 0);
+        }
+    }
+    if best.1 < n / 2 + 1 {
+        return Vec::new();
+    }
+    let cols: Vec<(f64, f64)> = (best.0..best.0 + best.1)
+        .map(|k| (e.bounds.x0 - 0.05 * w + 1.1 * w * k as f64 / n as f64, edge[k].unwrap_or(e.bounds.y0)))
+        .collect();
+    let mut strip = BezPath::new();
+    strip.move_to(Point::new(cols[0].0, cols[0].1 + step));
+    for (x, y) in cols.iter().skip(1) {
+        strip.line_to(Point::new(*x, *y + step));
+    }
+    for (x, y) in cols.iter().rev() {
+        strip.line_to(Point::new(*x, *y - thick));
+    }
+    strip.close_path();
+    let sb = strip.bounding_box();
+    let mut out = Vec::new();
+    for i in 0..shapes.len() {
+        if !mass(i) || !overlaps(boxes[i], sb) {
+            continue;
+        }
+        let current = remainder[i].clone().unwrap_or_else(|| shapes[i].clone());
+        if current.path.elements().is_empty() {
+            continue;
+        }
+        let Some(band) = clip_shape(&current, &strip, BoolOp::Intersect) else { continue };
+        if region_area(&painted_region(&band)) < 0.01 * region_area(&(strip.clone(), FillMode::NonZero)) {
+            continue;
+        }
+        let rest = clip_shape(&current, &strip, BoolOp::Difference);
+        out.push((i, band, rest));
+    }
+    out
 }
 
 /// **Cut** the head symbol `head`, drawn in one piece, into part layers that
@@ -630,20 +735,25 @@ pub(super) fn cut_merged_head(scene: &mut Scene, head: SymbolId, style: &HeadSty
     let hb = boxes.iter().copied().reduce(|a, b| a.union(b)).unwrap_or_default();
     let mut out = HeadCut::default();
 
-    // The eyes: drawn, else (or for the missing one) made from eye holes.
-    let mut eyes = pick_eyes(find_whites(shapes, &regions, &areas, hb));
-    if eyes.len() < 2 {
-        for h in hole_eyes(&eyes, find_holes(&regions, hb)) {
-            if let Some(outline) = hole_outline(&h, &regions) {
-                let bounds = outline.bounding_box();
-                let area = region_area(&(outline.clone(), FillMode::NonZero));
-                eyes.push(EyeFound { white: Vec::new(), bounds, area, hole: Some(outline) });
+    // The eyes: drawn (with or without a pupil) or see-through eye holes,
+    // paired about the face's midline.
+    let mut eyes: Vec<EyeFound> = Vec::new();
+    for mut e in pick_eyes(find_eyes(shapes, &regions, &areas, hb), hb.center().x) {
+        match e.socket.take() {
+            Some(h) => {
+                if let Some(outline) = hole_outline(&h, &regions) {
+                    e.bounds = outline.bounding_box();
+                    e.area = region_area(&(outline.clone(), FillMode::NonZero));
+                    e.hole = Some(outline);
+                    eyes.push(e);
+                }
             }
+            None => eyes.push(e),
         }
     }
     if eyes.is_empty() {
         return Err(format!(
-            "Rig Head: '{name}' has no separate eye parts and no eyes found in its drawing (no eye white with a pupil, no eye hole)"
+            "Rig Head: '{name}' has no separate eye parts and no eyes found in its drawing (no pair of eye whites, no eye white with a pupil, no eye hole)"
         ));
     }
     eyes.sort_by(|a, b| a.bounds.center().x.total_cmp(&b.bounds.center().x));
@@ -730,23 +840,31 @@ pub(super) fn cut_merged_head(scene: &mut Scene, head: SymbolId, style: &HeadSty
     };
     let free = |part: &[Option<Cut>], i: usize| part[i].is_none();
 
-    // Brows: a dark elongated fill above each eye, with what lies on it.
+    // Brows: a dark elongated fill above each eye, with what lies on it;
+    // else (a brow drawn into the hair mass) a band cut off the dark mass's
+    // lower edge right above the eye.
     let mut brow_colours: Vec<Color> = Vec::new();
-    let mut brows: Vec<(f64, Vec<usize>)> = Vec::new();
+    let mut brows: Vec<(f64, Vec<usize>, Vec<usize>)> = Vec::new();
+    // Band pieces: (shape index, the band), and what is left of a shape a
+    // band was cut off.
+    let mut bands: Vec<(usize, ShapeData)> = Vec::new();
+    let mut remainder: Vec<Option<ShapeData>> = vec![None; shapes.len()];
     for e in &eyes {
         let (cx, top, w) = (e.bounds.center().x, e.bounds.y0, e.bounds.width());
         let reach = e.bounds.height().max(0.35 * w);
         let seed = (0..shapes.len())
-            .filter(|i| free(&part, *i) && shapes[*i].fill.is_some())
+            .filter(|i| free(&part, *i) && (shapes[*i].fill.is_some() || shapes[*i].stroke.is_some()))
             .filter(|i| paint_colour(&shapes[*i]).is_some_and(|c| luma(c) < 0.5 && !is_reddish(c) && !is_skin_like(c)))
             .filter(|i| {
                 let b = boxes[*i];
                 let c = b.center();
+                // Elongated: wide, or a thin arch (little of its box filled).
                 (0.5 * w..=2.2 * w).contains(&b.width())
-                    && b.width() >= 1.8 * b.height()
+                    && (b.width() >= 1.4 * b.height() || (b.width() >= 0.8 * b.height() && areas[*i] <= 0.4 * b.area()))
                     && c.y <= top + 0.2 * e.bounds.height()
-                    && c.y >= top - 3.0 * reach
+                    && c.y >= top - 1.5 * reach
                     && (c.x - cx).abs() <= 0.7 * w
+                    && areas[*i] >= 0.12 * e.area
                     && areas[*i] <= 3.0 * e.area.max(1e-9)
                     && areas[*i] <= 0.03 * hb.area()
             })
@@ -754,7 +872,30 @@ pub(super) fn cut_merged_head(scene: &mut Scene, head: SymbolId, style: &HeadSty
                 let score = |i: usize| areas[i] / (1.0 + (boxes[i].center().y - (top - 0.8 * reach)).abs() / reach);
                 score(*a).total_cmp(&score(*b))
             });
-        let Some(seed) = seed else { continue };
+        let Some(seed) = seed else {
+            let cut = brow_band(e, shapes, &regions, &areas, &boxes, &part, &remainder);
+            if cut.is_empty() {
+                continue;
+            }
+            let mut mine = Vec::new();
+            let mut xs = Rect::ZERO;
+            for (i, band, rest) in cut {
+                if let Some(c) = paint_colour(&band) {
+                    brow_colours.push(c);
+                }
+                let bb = band.path.bounding_box();
+                xs = if mine.is_empty() { bb } else { xs.union(bb) };
+                remainder[i] = Some(rest.unwrap_or_else(|| {
+                    let mut empty = shapes[i].clone();
+                    empty.path = BezPath::new();
+                    empty
+                }));
+                mine.push(bands.len());
+                bands.push((i, band));
+            }
+            brows.push((xs.center().x, Vec::new(), mine));
+            continue;
+        };
         let sb = boxes[seed];
         let grown = sb.inflate(sb.width() * 0.1, sb.height() * 0.25);
         let mut members = vec![seed];
@@ -773,16 +914,21 @@ pub(super) fn cut_merged_head(scene: &mut Scene, head: SymbolId, style: &HeadSty
                 brow_colours.push(c);
             }
         }
-        brows.push((sb.center().x, members));
+        brows.push((sb.center().x, members, Vec::new()));
     }
     // Screen sides, as H1 names them: the right brow is the one further right
     // (a lone brow: right of the head's middle).
     let head_mid = hb.center().x;
-    let max_x = brows.iter().map(|(x, _)| *x).fold(f64::MIN, f64::max);
-    for (x, members) in &brows {
+    let max_x = brows.iter().map(|(x, _, _)| *x).fold(f64::MIN, f64::max);
+    let mut band_parts: Vec<Cut> = vec![Cut::BrowL; bands.len()];
+    for (x, members, cut) in &brows {
         let right = if brows.len() >= 2 { *x >= max_x } else { *x >= head_mid };
+        let side = if right { Cut::BrowR } else { Cut::BrowL };
         for &i in members {
-            part[i] = Some(if right { Cut::BrowR } else { Cut::BrowL });
+            part[i] = Some(side);
+        }
+        for &k in cut {
+            band_parts[k] = side;
         }
     }
 
@@ -933,8 +1079,16 @@ pub(super) fn cut_merged_head(scene: &mut Scene, head: SymbolId, style: &HeadSty
     let mut pieces: Vec<Piece> = shapes
         .iter()
         .enumerate()
-        .map(|(i, s)| Piece { shape: s.clone(), order: i as f64, part: part[i].unwrap_or(Cut::Base), seed: part[i].is_some() })
+        .map(|(i, s)| Piece {
+            shape: remainder[i].clone().unwrap_or_else(|| s.clone()),
+            order: i as f64,
+            part: part[i].unwrap_or(Cut::Base),
+            seed: part[i].is_some(),
+        })
         .collect();
+    for ((i, band), p) in bands.into_iter().zip(band_parts) {
+        pieces.push(Piece { shape: band, order: i as f64, part: p, seed: true });
+    }
     for (k, s) in generated.into_iter().enumerate() {
         pieces.push(Piece { shape: s, order: 1e9 + k as f64, part: Cut::Eyes, seed: true });
     }

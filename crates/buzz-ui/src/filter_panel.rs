@@ -253,6 +253,28 @@ pub fn filter_panel(
                     });
                     ui.close();
                 }
+                // A slow eerie lift, wind blowing up and to the right: still air,
+                // a wave every few seconds. See `Modifier::HairFlow`.
+                if ui
+                    .button("Hair Flow")
+                    .on_hover_text(
+                        "Hair in moving air: the root edge stays pinned and the drawing \
+                         bends more the further it is from it, in a wave that runs to \
+                         the tips; the tips trail when the head moves. Put it on the \
+                         hair artwork.",
+                    )
+                    .clicked()
+                {
+                    out.add_modifier = Some(Modifier::HairFlow {
+                        strength: 0.08,
+                        rate: 0.2,
+                        wavelength: 0.6,
+                        wind: -60.0,
+                        lag: 0.18,
+                        root: 0.0,
+                    });
+                    ui.close();
+                }
                 if ui
                     .button("Drift")
                     .on_hover_text(
@@ -420,6 +442,88 @@ pub fn filter_panel(
                                  formation.",
                             )
                             .changed();
+                    }
+                    Modifier::HairFlow {
+                        strength,
+                        rate,
+                        wavelength,
+                        wind,
+                        lag,
+                        root,
+                    } => {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(strength)
+                                    .prefix("tip ")
+                                    .speed(0.005)
+                                    .range(-2.0..=2.0),
+                            )
+                            .on_hover_text(
+                                "How far the tips are blown at a full gust, as a share of \
+                                 the hair's length. 0.05 is a slow lift, 0.2 a gale.",
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(rate)
+                                    .prefix("Hz ")
+                                    .speed(0.01)
+                                    .range(0.0..=20.0),
+                            )
+                            .on_hover_text("How fast the wave runs along the hair. 0.15 is still air.")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(wavelength)
+                                    .prefix("wave ")
+                                    .speed(0.02)
+                                    .range(0.05..=8.0),
+                            )
+                            .on_hover_text(
+                                "Length of the wave as a share of the hair. Above 1 the \
+                                 whole lock swings together; 0.4 ripples.",
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(wind)
+                                    .prefix("wind ")
+                                    .suffix("\u{b0}")
+                                    .speed(1.0),
+                            )
+                            .on_hover_text(
+                                "Where the air blows, in degrees: 0 right, 90 down, -90 up.",
+                            )
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(lag)
+                                    .prefix("lag ")
+                                    .suffix("s")
+                                    .speed(0.01)
+                                    .range(0.0..=2.0),
+                            )
+                            .on_hover_text(
+                                "How long the tips trail behind when the head moves or \
+                                 turns. 0 switches follow-through off.",
+                            )
+                            .changed();
+                        let mut end = root.round().clamp(0.0, 4.0) as usize;
+                        egui::ComboBox::from_id_salt(("hair_root", i))
+                            .selected_text(["top", "bottom", "left", "right", "pivot"][end])
+                            .width(60.0)
+                            .show_ui(ui, |ui| {
+                                for (k, name) in
+                                    ["top", "bottom", "left", "right", "pivot"].iter().enumerate()
+                                {
+                                    if ui.selectable_value(&mut end, k, *name).changed() {
+                                        changed = true;
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text("Which edge of the drawing is pinned (the root)");
+                        *root = end as f64;
                     }
                     Modifier::Sway { amount, rate } => {
                         changed |= ui

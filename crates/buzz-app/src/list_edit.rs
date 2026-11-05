@@ -213,6 +213,6 @@ impl Editor {
         self.trace_dialog = None;
         self.workspace.trace = options;
         self.workspace.save();
-        self.trace_with(options);
+        self.trace_in_background(options);
     }
 }

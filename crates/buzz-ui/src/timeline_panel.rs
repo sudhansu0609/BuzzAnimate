@@ -221,6 +221,8 @@ pub struct MoveFrames {
 /// `(row rect, x of frame 0's left edge, cell width)`. Recorded every frame a
 /// row is drawn so a headless test can press on a given frame cell.
 pub const ROW_GEOMETRY: &str = "timeline-row-geometry";
+/// The camera row's rect, stored for tests that drive it with pointer events.
+pub(crate) const CAMERA_ROW_RECT: &str = "timeline-camera-row-rect";
 
 /// Temp-data key of the [`FrameMoveDrag`] in progress.
 const FRAME_MOVE_DRAG: &str = "timeline_frame_move_drag";
@@ -2597,6 +2599,8 @@ fn camera_row(
         egui::vec2(LAYER_COLUMN, height),
     );
     let grid_left = rect.min.x + LAYER_COLUMN;
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(egui::Id::new(CAMERA_ROW_RECT), rect));
 
     // The camera's keyframe cells scroll with the grid, clipped right of the
     // pinned name column.
@@ -2713,6 +2717,33 @@ fn camera_row(
             }
         }
     }
+    // **The camera's frame menu**, the same one a layer's frames get: the
+    // frame under the pointer is captured when it opens (M1), the camera row
+    // is selected and the playhead moved there first, so the command that
+    // follows lands on that frame. The editor routes frame commands to the
+    // camera's keys while the camera row is selected.
+    let menu_frame_id = ui.id().with("timeline-camera-menu-frame");
+    if response.secondary_clicked() {
+        let frame = ui
+            .ctx()
+            .input(|i| i.pointer.interact_pos())
+            .filter(|p| p.x >= grid_left)
+            .map(|p| (((p.x - grid_left) / cell_width) as u32).min(columns.saturating_sub(1)));
+        ui.ctx().data_mut(|d| d.insert_temp(menu_frame_id, frame));
+    }
+    response.context_menu(|ui| {
+        let frame = ui
+            .ctx()
+            .data(|d| d.get_temp::<Option<u32>>(menu_frame_id))
+            .flatten();
+        out.select_camera = true;
+        if let Some(frame) = frame
+            && out.scrub_to.is_none()
+        {
+            out.scrub_to = Some(frame);
+        }
+        frame_context_menu(ui, scene, out);
+    });
 }
 
 /// The drag payload of a light's row — kept apart from a layer's
@@ -3483,11 +3514,15 @@ fn layer_row(
             .ctx()
             .input(|i| i.pointer.interact_pos())
             .is_some_and(|pos| pos.x < grid_edge);
+        // Read the pointer *before* taking the data lock: `clicked_frame`
+        // reads input, and doing that inside `data_mut` deadlocks egui's
+        // context lock — the frame menu never opened.
+        let frame = clicked_frame(ui);
         ui.ctx().data_mut(|d| {
             d.insert_temp(
                 menu_target_id,
                 MenuTarget {
-                    frame: clicked_frame(ui),
+                    frame,
                     in_name_column,
                 },
             )
@@ -4059,7 +4094,7 @@ fn draw_waveform(
 ) {
     let middle = row.center().y;
     let half = (height * 0.5 - 2.0).max(1.0);
-    let colour = Color32::from_rgba_unmultiplied(120, 215, 255, 150);
+    let colour = Color32::from_rgb(220, 30, 30);
 
     // Only the trimmed section of the clip is drawn, laid out from the sound's
     // start frame: timeline frame `start_frame + i` shows clip level
@@ -4094,7 +4129,7 @@ fn draw_waveform(
         painter.rect_filled(
             egui::Rect::from_min_max(
                 egui::pos2(x + 0.5, middle - amplitude),
-                egui::pos2(x + cell_width - 0.5, middle + amplitude),
+                egui::pos2((x + cell_width - 0.5).max(x + 1.0), middle + amplitude),
             ),
             0.0,
             colour,
@@ -5265,6 +5300,82 @@ mod tests {
         let _ = ctx.run_ui(Default::default(), |ui| {
             let _ = timeline_panel(ui, &scene, &selected);
         });
+    }
+
+    /// Right-click a frame cell in `timeline_panel`; returns every text drawn
+    /// once the popup is up.
+    fn right_click_texts(scene: &Scene, st: &TimelineState, camera_row: bool) -> Vec<String> {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let screen = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(screen(), |ui| {
+            let _ = timeline_panel(ui, scene, st);
+        });
+        let target = if camera_row {
+            // The camera row is the first row under the ruler.
+            let r: egui::Rect = ctx
+                .data(|d| d.get_temp(egui::Id::new(CAMERA_ROW_RECT)))
+                .expect("camera row drawn");
+            egui::pos2(LAYER_COLUMN + 60.0, r.center().y)
+        } else {
+            let id = scene.layers().iter().next().unwrap().id;
+            let (row, grid_left, cell) = ctx
+                .data(|d| d.get_temp::<(egui::Rect, f32, f32)>(egui::Id::new((ROW_GEOMETRY, id))))
+                .expect("row drawn");
+            egui::pos2(grid_left + 3.5 * cell, row.center().y)
+        };
+        let mut texts = Vec::new();
+        let mut step = |events: Vec<egui::Event>| {
+            let mut input = screen();
+            input.events = events;
+            let out = ctx.run_ui(input, |ui| {
+                let _ = timeline_panel(ui, scene, st);
+            });
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+        };
+        let mods = egui::Modifiers::default();
+        step(vec![egui::Event::PointerMoved(target)]);
+        for pressed in [true, false] {
+            step(vec![egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: mods,
+            }]);
+        }
+        step(vec![]);
+        step(vec![]);
+        texts
+    }
+
+    #[test]
+    fn right_click_on_a_layer_frame_opens_the_frame_menu() {
+        let mut scene = Scene::empty();
+        scene.add_layer("One", LayerKind::Normal);
+        let texts = right_click_texts(&scene, &state(), false);
+        assert!(texts.iter().any(|t| t == "Insert Keyframe"), "{texts:?}");
+    }
+
+    #[test]
+    fn right_click_on_a_camera_frame_opens_the_frame_menu() {
+        let mut scene = Scene::empty();
+        scene.add_layer("One", LayerKind::Normal);
+        scene.camera_mut().enabled = true;
+        let texts = right_click_texts(&scene, &state(), true);
+        assert!(texts.iter().any(|t| t == "Insert Keyframe"), "{texts:?}");
     }
 
     /// A response starts with nothing selected, so drawing the panel cannot

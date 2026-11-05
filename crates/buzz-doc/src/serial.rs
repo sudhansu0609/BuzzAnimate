@@ -1275,6 +1275,9 @@ pub struct LayerDto {
     /// an ordinary layer, which is every layer of every older document.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub audio_guide: bool,
+    /// Where a lifted Cast character came from (see `Layer::cast_source`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_source: Option<String>,
     /// Filters applied to the whole layer. Version 9.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<FilterDto>,
@@ -1526,6 +1529,15 @@ pub struct ModifierDto {
     pub y: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<f64>,
+    /// Hair Flow: wave length as a fraction of the hair, wind direction in
+    /// degrees, follow-through time constant in seconds. `amount` carries the
+    /// strength, `frequency` the rate and `root` the pinned end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wavelength: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wind: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag: Option<f64>,
 }
 
 impl ModifierDto {
@@ -1544,6 +1556,9 @@ impl ModifierDto {
             x: None,
             y: None,
             amount: None,
+            wavelength: None,
+            wind: None,
+            lag: None,
         };
         match *m {
             Modifier::Wiggle {
@@ -1612,6 +1627,23 @@ impl ModifierDto {
                 amount: Some(round),
                 ..base
             },
+            Modifier::HairFlow {
+                strength,
+                rate,
+                wavelength,
+                wind,
+                lag,
+                root,
+            } => Self {
+                kind: "hairflow".to_string(),
+                amount: Some(strength),
+                frequency: Some(rate),
+                wavelength: Some(wavelength),
+                wind: Some(wind),
+                lag: Some(lag),
+                root: Some(root.max(0.0) as u64),
+                ..base
+            },
             // `x`/`y` are the velocity and `amount` the wrap distance — the
             // same three fields the older kinds already carry, used for what
             // they say rather than a new pair nothing else would ever write.
@@ -1667,6 +1699,14 @@ impl ModifierDto {
             }),
             "turn" => Some(Modifier::Turn {
                 round: self.amount.unwrap_or(1.0),
+            }),
+            "hairflow" => Some(Modifier::HairFlow {
+                strength: self.amount.unwrap_or(0.08),
+                rate: self.frequency.unwrap_or(0.2),
+                wavelength: self.wavelength.unwrap_or(0.6),
+                wind: self.wind.unwrap_or(0.0),
+                lag: self.lag.unwrap_or(0.18),
+                root: self.root.unwrap_or(0) as f64,
             }),
             "drift" => Some(Modifier::Drift {
                 dx: self.x.unwrap_or(0.0),
@@ -2519,6 +2559,7 @@ impl LayerDto {
             depth: layer.depth,
             collapsed: layer.collapsed,
             audio_guide: layer.audio_guide,
+            cast_source: layer.cast_source.clone(),
             filters: layer.filters.iter().map(FilterDto::from_filter).collect(),
             length: layer.frames.length(),
             keyframes: layer
@@ -2586,6 +2627,7 @@ impl LayerDto {
         };
         layer.collapsed = self.collapsed;
         layer.audio_guide = self.audio_guide;
+        layer.cast_source = self.cast_source.clone();
         layer.brightness = self.brightness;
         if let Some(t) = &self.tint {
             layer.tint = color_from_hex(t).unwrap_or(peniko::Color::WHITE);

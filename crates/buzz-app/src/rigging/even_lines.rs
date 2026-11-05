@@ -21,8 +21,8 @@
 //! again and again over its own preview).
 
 use super::head_rig::{Part, classify, flatten_stack_placed};
-use buzz_geom::{Affine, Rect, Shape as _};
-use buzz_scene::even_lines::{EvenLines, EvenLinesOptions, even_lines_within, measured_line_width};
+use buzz_geom::{Affine, BezPath, Rect, Shape as _};
+use buzz_scene::even_lines::{EvenLines, EvenLinesOptions, even_lines_within_boxed, measured_line_width, Coverage};
 use buzz_scene::{Layer, LayerId, LayerStack, Object, ObjectId, ObjectKind, Paint, Scene, ShapeData, SymbolId};
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -56,6 +56,11 @@ pub struct EvenLinesSettings {
     pub keep_weight: bool,
     pub straighten: f64,
     pub solid_above: f64,
+    /// T15: **bold outlines** like the FLA files: every ink line one width in
+    /// black (`body_width`, the plan's [`EvenLinesPlan::bold_width`] to start
+    /// with), a short one at half of it, and on a picture an outline wherever
+    /// two neighbouring colours differ.
+    pub bold: bool,
 }
 
 /// What was done.
@@ -78,6 +83,13 @@ struct SetJob {
     objects: Vec<ObjectId>,
     /// In the timeline's space (each object's transform applied).
     shapes: Vec<ShapeData>,
+    /// The measured line width of `shapes` (set by the plan).
+    measured: Option<f64>,
+    /// The box of `shapes` (set by the plan).
+    bounds: Option<Rect>,
+    /// 2 x area / perimeter of `shapes`: a ribbon's width, a blob's bulk (set
+    /// by the plan; a ridge median alone calls a jagged crescent a line).
+    thickness: f64,
 }
 
 /// One keyframe with ink on it.
@@ -94,6 +106,48 @@ struct KeyJob {
     /// E1d: every filled shape of the timeline at this keyframe's time (all
     /// its layers), in the timeline's space: the character's silhouette.
     silhouette: Arc<Vec<ShapeData>>,
+    /// The silhouette shapes' bounding boxes (measured once, not per set).
+    silhouette_boxes: Arc<Vec<Rect>>,
+    /// Where the silhouette covers, to leave it out for ink deep inside it.
+    coverage: Option<Arc<Coverage>>,
+    /// T12c: the shapes beside the ink with a stroke that traps under it.
+    trapped: Arc<std::collections::HashMap<ObjectId, Arc<Object>>>,
+    /// T15: the outlines between colour regions of this keyframe's picture, at
+    /// the plan's bold width (found the first time bold outlines are asked for).
+    edges: Arc<std::sync::OnceLock<Arc<Vec<ShapeData>>>>,
+}
+
+/// T15: the colour difference (CIELAB delta E) that draws an outline between two regions.
+const BOLD_CONTRAST: f64 = 18.0;
+
+impl KeyJob {
+    /// T15: the outline strokes between the colour regions of this keyframe's
+    /// shapes at `width` (the ink's own pixels painted over from the colour
+    /// beside them), found once. Nothing on an "Ink" layer: a character's
+    /// colours are lined by its ink.
+    fn bold_edges(&self, width: f64) -> Arc<Vec<ShapeData>> {
+        self.edges
+            .get_or_init(|| {
+                if self.ink_layer {
+                    return Arc::new(Vec::new());
+                }
+                let members: std::collections::HashSet<ObjectId> = self.sets.iter().flat_map(|s| s.objects.iter().copied()).collect();
+                let fills: Vec<ShapeData> = self
+                    .original
+                    .iter()
+                    .filter(|o| !members.contains(&o.id))
+                    .filter_map(|o| match &o.kind {
+                        ObjectKind::Shape(sd) if opaque_fill(sd) => Some(ShapeData { path: o.transform * sd.path.clone(), ..sd.clone() }),
+                        _ => None,
+                    })
+                    .collect();
+                let ink: Vec<ShapeData> = self.sets.iter().flat_map(|s| s.shapes.iter().cloned()).collect();
+                let bounds = fills.iter().chain(&ink).map(|s| s.path.bounding_box()).reduce(|a, b| a.union(b));
+                let Some(bounds) = bounds else { return Arc::new(Vec::new()) };
+                Arc::new(buzz_scene::trace_bold::edge_strokes(&fills, &ink, bounds, width, buzz_scene::trace_bold::bold_colour(), BOLD_CONTRAST))
+            })
+            .clone()
+    }
 }
 
 /// E1e: does this shape's fill count for the silhouette? "Out of the
@@ -194,6 +248,9 @@ pub struct EvenLinesPlan {
     /// How many ink shapes were left as drawn: filled forms clearly thicker
     /// than their set's lines (E1c b).
     pub kept_fills: usize,
+    /// T15: the bold line width for this scope's picture: 3 px per 1920 px of
+    /// the longest side of its shapes.
+    pub bold_width: f64,
 }
 
 impl EvenLinesPlan {
@@ -205,6 +262,13 @@ impl EvenLinesPlan {
     }
     pub fn has_body(&self) -> bool {
         self.keys.iter().any(|k| !k.face)
+    }
+    /// T15: find the outlines between the picture's colour regions now (they
+    /// are found once, on the first Bold outlines preview otherwise).
+    pub fn prepare_bold(&self) {
+        self.keys.par_iter().for_each(|k| {
+            k.bold_edges(self.bold_width);
+        });
     }
 }
 
@@ -293,13 +357,15 @@ fn walk(
         if !layer.kind.holds_artwork() || layer.kind.is_mask() {
             continue;
         }
-        let face = face || is_face(&layer.name);
+        // A layer name only says "face" inside a character's symbol: on the
+        // stage a layer called "Base" or "Lid" is a picture's, not a head's.
+        let face = face || (matches!(owner, Owner::Symbol(_)) && is_face(&layer.name));
         let ink_layer = layer.name.trim().eq_ignore_ascii_case("ink");
         if ink_layer && only.is_none() {
             *ink_seen = true;
         }
         for kf in layer.frames.keyframes() {
-            let mut ink = SetJob { objects: Vec::new(), shapes: Vec::new() };
+            let mut ink = SetJob { objects: Vec::new(), shapes: Vec::new(), measured: None, bounds: None, thickness: 0.0 };
             let mut sets: Vec<SetJob> = Vec::new();
             for object in kf.objects.iter() {
                 if only.is_some_and(|only| !only.contains(&object.id)) {
@@ -319,7 +385,7 @@ fn walk(
                             ink.objects.push(object.id);
                             ink.shapes.push(shape);
                         } else if luma(colour) <= DARK_LUMA {
-                            sets.push(SetJob { objects: vec![object.id], shapes: vec![shape] });
+                            sets.push(SetJob { objects: vec![object.id], shapes: vec![shape], measured: None, bounds: None, thickness: 0.0 });
                         }
                     }
                     _ if recurse => {
@@ -350,6 +416,10 @@ fn walk(
                     original: kf.objects.clone(),
                     sets,
                     silhouette: Arc::new(silhouette_at(layers, kf.start)),
+                    silhouette_boxes: Arc::new(Vec::new()),
+                    coverage: None,
+                    trapped: Arc::default(),
+                    edges: Arc::default(),
                 });
             }
         }
@@ -468,7 +538,7 @@ pub fn plan_even_lines(scene: &Scene, scope: &EvenLinesScope) -> EvenLinesPlan {
         keys.retain(|k| k.ink_layer);
     }
     // E1c (b): filled forms stay as drawn.
-    let kept_fills: usize = keys
+    let mut kept_fills: usize = keys
         .par_iter_mut()
         .map(|k| {
             let n: usize = k.sets.par_iter_mut().map(keep_filled_forms).sum();
@@ -478,12 +548,68 @@ pub fn plan_even_lines(scene: &Scene, scope: &EvenLinesScope) -> EvenLinesPlan {
         .sum();
     keys.retain(|k| !k.sets.is_empty());
     // E1e: every key's silhouette seen in context.
-    keys.par_iter_mut().for_each(|k| k.silhouette = Arc::new(in_context(k, &contexts)));
+    keys.par_iter_mut().for_each(|k| {
+        k.silhouette = Arc::new(in_context(k, &contexts));
+        k.silhouette_boxes = Arc::new(k.silhouette.par_iter().map(|s| s.path.bounding_box()).collect());
+        k.coverage = Coverage::new(&k.silhouette, &k.silhouette_boxes).map(Arc::new);
+    });
 
+    keys.par_iter_mut().for_each(|k| {
+        k.sets.par_iter_mut().for_each(|s| {
+            s.measured = measured_line_width(&s.shapes);
+            s.bounds = s.shapes.iter().map(|sd| sd.path.bounding_box()).reduce(|a, b| a.union(b));
+            let area: f64 = s.shapes.iter().map(|sd| sd.path.area().abs()).sum();
+            let perimeter: f64 = s.shapes.iter().map(|sd| sd.path.perimeter(0.25)).sum();
+            s.thickness = if perimeter > 0.0 { 2.0 * area / perimeter } else { 0.0 };
+        });
+    });
+    // T12c: with no Ink layer every dark shape is a set of its own, and a big
+    // dark region (a building, a doorway) is a filled form, not a line: one
+    // whose width is over [`FILLED_FORM_RATIO`] x the picture's typical line
+    // stays as drawn (E1c b measured against the whole scope, not its set).
+    if !keys.iter().any(|k| k.ink_layer) {
+        let line = median(keys.iter().flat_map(|k| k.sets.iter().filter_map(|s| s.measured)).collect());
+        if let Some(line) = line {
+            for k in keys.iter_mut() {
+                let before = k.sets.len();
+                k.sets.retain(|s| s.measured.is_none_or(|m| m <= FILLED_FORM_RATIO * line) && s.thickness <= FILLED_FORM_RATIO * line);
+                kept_fills += before - k.sets.len();
+            }
+            keys.retain(|k| !k.sets.is_empty());
+        }
+    }
+    // T12c: on a plain trace nothing lies under the ink, so a line thinned or
+    // moved shows the paper. Every solid shape beside the ink gets a stroke of
+    // its own colour as wide as the ink (it grows half that under the ink: a
+    // trap), so what shows is the neighbour's own colour.
+    keys.par_iter_mut().filter(|k| !k.ink_layer).for_each(|k| {
+        let mut widths: Vec<f64> = k.sets.iter().filter_map(|s| s.measured).collect();
+        widths.sort_by(|a, b| a.total_cmp(b));
+        let Some(&width) = widths.get(widths.len() / 2) else { return };
+        let width = width.clamp(0.5, 3.0);
+        let members: std::collections::HashSet<ObjectId> = k.sets.iter().flat_map(|s| s.objects.iter().copied()).collect();
+        let trapped = k
+            .original
+            .iter()
+            .filter(|o| !members.contains(&o.id))
+            .filter_map(|o| {
+                let ObjectKind::Shape(sd) = &o.kind else { return None };
+                if !opaque_fill(sd) || sd.stroke.is_some() {
+                    return None;
+                }
+                let colour = ink_colour(sd)?;
+                let mut object = (**o).clone();
+                if let ObjectKind::Shape(sd) = &mut object.kind {
+                    sd.stroke = Some(buzz_scene::StrokeSpec::new(colour, width));
+                }
+                Some((o.id, Arc::new(object)))
+            })
+            .collect();
+        k.trapped = Arc::new(trapped);
+    });
     let measured: Vec<(bool, Option<f64>)> = keys
-        .par_iter()
-        .flat_map_iter(|k| k.sets.iter().map(move |s| (k.face, s)))
-        .map(|(face, s)| (face, measured_line_width(&s.shapes)))
+        .iter()
+        .flat_map(|k| k.sets.iter().map(move |s| (k.face, s.measured)))
         .collect();
     let pick = |want: Option<bool>| {
         median(
@@ -494,7 +620,13 @@ pub fn plan_even_lines(scene: &Scene, scope: &EvenLinesScope) -> EvenLinesPlan {
                 .collect(),
         )
     };
+    let long_edge = keys
+        .iter()
+        .flat_map(|k| k.silhouette_boxes.iter().copied())
+        .reduce(|a, b| a.union(b))
+        .map_or(1920.0, |b| b.width().max(b.height()));
     EvenLinesPlan {
+        bold_width: buzz_scene::trace_bold::bold_width(long_edge),
         face_measured: pick(Some(true)),
         body_measured: pick(Some(false)),
         ink_measured: pick(None),
@@ -548,7 +680,16 @@ pub fn retrace_even_lines(
                     if let Some(t) = kept.iter().rev().find(|t| t.serves(straighten, solid_above, draft)) {
                         return (t.result.clone(), kept);
                     }
-                    let result = even_lines_within(&s.shapes, &k.silhouette, &options);
+                    // Ink with the silhouette well all round it has no edge to
+                    // be measured against: the silhouette is left out.
+                    let deep = s.bounds.zip(k.coverage.as_ref()).is_some_and(|(b, c)| {
+                        c.covers(b, 4.0 * s.measured.unwrap_or(2.0) + 1.0)
+                    });
+                    let result = if deep {
+                        even_lines_within_boxed(&s.shapes, &[], None, s.measured, &options)
+                    } else {
+                        even_lines_within_boxed(&s.shapes, &k.silhouette, Some(&k.silhouette_boxes), s.measured, &options)
+                    };
                     kept.push(Traced { straighten, solid_above, draft, result: result.clone() });
                     if kept.len() > CACHE_PER_SET {
                         kept.remove(0);
@@ -560,6 +701,38 @@ pub fn retrace_even_lines(
         .collect();
     let (results, cache) = done.into_iter().map(|sets| sets.into_iter().unzip()).unzip();
     EvenLinesTrace { results, cache, straighten, solid_above, draft }
+}
+
+/// T12c: do `result`'s strokes and solid areas cover at least [`MIN_COVER`] of
+/// the ink they replace? On a plain trace a dark region wider than a line
+/// comes out as a few thin strokes and a hole; that ink stays as drawn.
+fn covers_ink(set: &SetJob, result: &EvenLines) -> bool {
+    let ink: f64 = set.shapes.iter().map(|s| s.path.area().abs()).sum();
+    if ink <= 0.0 {
+        return true;
+    }
+    let got: f64 = result
+        .shapes
+        .iter()
+        .map(|s| match &s.stroke {
+            Some(stroke) => s.path.perimeter(0.5) * stroke.width,
+            None => s.path.area().abs(),
+        })
+        .sum();
+    got >= MIN_COVER * ink
+}
+
+/// The share of its ink a replaced set must cover (T12c).
+const MIN_COVER: f64 = 0.4;
+
+/// T15: a bold line: black, `width` wide, or the detail weight when a stub.
+fn bold_stroke(shape: &mut ShapeData, width: f64) {
+    if let Some(stroke) = shape.stroke.as_mut() {
+        let length = buzz_scene::trace_bold::path_length(&shape.path);
+        // Only a stub is detail: the plate's brick dashes are its ink.
+        stroke.width = if length < 4.0 * width { buzz_scene::trace_bold::detail_width(width) } else { width };
+        stroke.paint = Paint::Solid(buzz_scene::trace_bold::bold_colour());
+    }
 }
 
 /// **Write a traced plan into `scene`** at `settings`' widths: each set that
@@ -579,12 +752,19 @@ pub fn apply_even_lines(
     for (key, results) in plan.keys.iter().zip(trace.results.iter_mut()) {
         let width = if key.face { settings.face_width } else { settings.body_width };
         // Which set each replaced object belongs to.
-        let mut member: Vec<(ObjectId, usize)> = Vec::new();
+        let mut member: std::collections::HashMap<ObjectId, usize> = std::collections::HashMap::new();
         for (index, (set, result)) in key.sets.iter().zip(results.iter_mut()).enumerate() {
             if result.strokes == 0 {
                 continue;
             }
-            result.set_widths(width, settings.keep_weight);
+            if settings.bold {
+                result.set_widths_centred(width, false);
+            } else {
+                result.set_widths(width, settings.keep_weight);
+            }
+            if !key.ink_layer && !covers_ink(set, result) {
+                continue;
+            }
             if key.face {
                 report.face_lines += result.strokes;
             } else {
@@ -594,20 +774,40 @@ pub fn apply_even_lines(
             report.kept_as_drawn += result.kept;
             member.extend(set.objects.iter().map(|&id| (id, index)));
         }
+        // The trap only matters once some set is replaced by strokes.
+        let none = std::collections::HashMap::new();
+        let trapped = if member.is_empty() { &none } else { &*key.trapped };
         let mut placed = vec![false; key.sets.len()];
         let mut out: Vec<Arc<Object>> = Vec::with_capacity(key.original.len());
         for object in key.original.iter() {
-            match member.iter().find(|(id, _)| *id == object.id) {
-                Some(&(_, index)) => {
+            match member.get(&object.id) {
+                Some(&index) => {
                     if !placed[index] {
                         placed[index] = true;
                         for shape in &results[index].shapes {
                             let id = scene.next_object_id();
-                            out.push(Arc::new(Object::shape(id, shape.clone())));
+                            let mut shape = shape.clone();
+                            if settings.bold {
+                                bold_stroke(&mut shape, width);
+                            }
+                            out.push(Arc::new(Object::shape(id, shape)));
                         }
                     }
                 }
-                None => out.push(object.clone()),
+                None => out.push(trapped.get(&object.id).unwrap_or(object).clone()),
+            }
+        }
+        // T15: the outlines between colour regions, on top of the ink's lines.
+        if settings.bold && !member.is_empty() && !key.ink_layer {
+            let found = key.bold_edges(plan.bold_width);
+            let ratio = width / plan.bold_width.max(1e-9);
+            for edge in found.iter() {
+                let id = scene.next_object_id();
+                let mut edge = edge.clone();
+                if let Some(stroke) = edge.stroke.as_mut() {
+                    stroke.width *= ratio;
+                }
+                out.push(Arc::new(Object::shape(id, edge)));
             }
         }
         let start = key.start;

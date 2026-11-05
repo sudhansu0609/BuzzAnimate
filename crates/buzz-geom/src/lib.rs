@@ -27,7 +27,7 @@ pub use brush::{
 pub use camera::{Camera, RebasedTransform, RenderSplit};
 pub use clip::RenderClip;
 pub use edit::{
-    StrokeStyle, expand_fill, outline_stroke, smooth, split_disjoint, straighten, turns_backwards,
+    StrokeStyle, expand_fill, optimize_path, outline_stroke, smooth, split_disjoint, straighten, turns_backwards,
     wound_forward,
 };
 pub use hit::{

@@ -329,6 +329,18 @@ fn prune_library(scene: &mut Scene) {
     }
 }
 
+/// A copy of `scene` holding only the stage `keep` layers, with only the symbols they need.
+pub fn layers_scene(scene: &Scene, keep: &[buzz_scene::LayerId]) -> Scene {
+    let mut mini = scene.clone();
+    mini.edit_document();
+    let drop: Vec<buzz_scene::LayerId> = mini.stage_layers().iter().map(|l| l.id).filter(|id| !keep.contains(id)).collect();
+    for id in drop {
+        mini.remove_layer(id);
+    }
+    prune_library(&mut mini);
+    mini
+}
+
 /// A copy of `scene` whose stage is one layer holding `objects` (fresh ids),
 /// with only the symbols they need.
 fn scene_holding(scene: &Scene, name: &str, objects: Vec<Object>) -> Scene {

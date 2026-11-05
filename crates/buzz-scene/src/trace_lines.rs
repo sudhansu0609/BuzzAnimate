@@ -79,7 +79,7 @@ pub(crate) fn trace_lines(width: u32, height: u32, pixels: &[u8], options: &Trac
 /// Decide between LineArt and colour by measuring ink: the fraction of dark
 /// pixels whose distance-transform radius is <= max_line_radius. More than 60%
 /// of dark pixels thin means inked line art; otherwise colour art.
-pub(crate) fn is_ink_drawing(w: usize, h: usize, pixels: &[u8], options: &TraceOptions) -> bool {
+pub fn is_ink_drawing(w: usize, h: usize, pixels: &[u8], options: &TraceOptions) -> bool {
     let mut ink = ink_mask_with(w, h, pixels, options);
     clean(&mut ink, w, h, options.speckle.max(1));
     let total_dark = ink.iter().filter(|&&v| v).count();
@@ -382,6 +382,7 @@ fn trace_core_inner(
             strokes,
             fills: fill_count,
             message,
+            blurs: Vec::new(),
         },
         deepest,
     )

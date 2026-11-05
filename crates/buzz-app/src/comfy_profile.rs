@@ -24,6 +24,11 @@ pub fn set_series(series: &str) {
     }
 }
 
+/// Whether the running series fills background object holes smoothly (profile `smooth_hole_fill`).
+pub fn smooth_hole_fill_active() -> bool {
+    profile_for(&active_series()).is_some_and(|p| p.smooth_hole_fill)
+}
+
 fn active_series() -> String {
     ACTIVE_SERIES.lock().map(|s| s.clone()).unwrap_or_default()
 }
@@ -78,6 +83,12 @@ pub struct Profile {
     pub angle_workflow: String,
     pub base_size: (u32, u32),
     pub style_text: String,
+    /// The series' mood for the breakdown (`"dark folk horror, moody"`); empty: the producer's default ("light humour").
+    pub tone: String,
+    /// Every built scene gets empty `Voice` and `SFX` layers with a marker on each spoken line / sound cue.
+    pub audio_layers: bool,
+    /// Background object holes are filled by a smooth blend, not the nearest pixel's colour.
+    pub smooth_hole_fill: bool,
     /// AN3: cut the background's objects into symbols (`None`: the series default).
     pub objects_as_symbols: Option<bool>,
     /// AN13: captions on the episode (`None`: the series default).
@@ -107,6 +118,9 @@ pub fn profile_for(series: &str) -> Option<Profile> {
         angle_workflow: s("angle_workflow"),
         base_size: size.unwrap_or((1280, 720)),
         style_text: s("style_text"),
+        tone: s("tone"),
+        audio_layers: v.get("audio_layers").and_then(Value::as_bool).unwrap_or(false),
+        smooth_hole_fill: v.get("smooth_hole_fill").and_then(Value::as_bool).unwrap_or(false),
         objects_as_symbols: v.get("objects_as_symbols").and_then(Value::as_bool),
         captions: v.get("captions").and_then(Value::as_bool),
         cast_sources: v.get("cast_sources").map(|c| {
@@ -236,6 +250,24 @@ pub fn bound_for_active(
     strip_upscale(&mut api);
     saves_into_comfy_output(&mut api, prefix);
     Ok(Some(api))
+}
+
+/// [`bound_for_active`] for the named series (the editor's Generate Background
+/// draws in a series' look without being a Producer run); the run's own active
+/// series is put back afterwards.
+pub fn bound_for_series(
+    client: &ComfyClient,
+    series: &str,
+    kind: Kind,
+    prompt: &str,
+    seed: u64,
+    size: Option<(u32, u32)>,
+) -> Result<Option<Value>, String> {
+    let before = active_series();
+    set_series(series);
+    let out = bound_for_active(client, kind, prompt, seed, size);
+    set_series(&before);
+    out
 }
 
 /// Start of the error `bound_for_active` returns when model files are missing
@@ -468,6 +500,60 @@ pub fn ui_to_api(ui: &Value, info: &Value) -> Result<Value, String> {
         let id = node.get("id").and_then(Value::as_u64).ok_or("a node has no id")?;
         let mode = node.get("mode").and_then(Value::as_u64).unwrap_or(0);
         if UI_ONLY.contains(&class) || mode == 2 || mode == 4 {
+            continue;
+        }
+        // WAS "Image Save" (not installed here) = ComfyUI's own SaveImage; `bind` sets the prefix.
+        if class == "Image Save" {
+            let images = node
+                .get("inputs")
+                .and_then(Value::as_array)
+                .and_then(|a| a.iter().find(|i| i.get("name").and_then(Value::as_str) == Some("images")))
+                .and_then(|i| i.get("link"))
+                .and_then(Value::as_u64);
+            if let Some(link) = images {
+                let src = match resolve(ui, link)? {
+                    Source::Node(s, o) => json!([s.to_string(), o]),
+                    Source::Value(v) => v,
+                };
+                api.insert(id.to_string(), json!({"class_type": "SaveImage", "inputs": {"images": src, "filename_prefix": "ComfyUI"}}));
+            }
+            continue;
+        }
+        // rgthree's "Lora Loader Stack" (not installed here) = one LoraLoader per named LoRA, chained;
+        // the last keeps the node's id so whatever read the stack reads the chain's end.
+        if class == "Lora Loader Stack (rgthree)" {
+            let values = node.get("widgets_values").and_then(Value::as_array).cloned().unwrap_or_default();
+            let active: Vec<(String, f64)> = values
+                .chunks(2)
+                .filter_map(|c| {
+                    let name = c.first()?.as_str()?;
+                    let s = c.get(1)?.as_f64()?;
+                    if name.is_empty() || name == "None" { None } else { Some((name.to_string(), s)) }
+                })
+                .collect();
+            let mut src = [Value::Null, Value::Null];
+            for (slot, name) in ["model", "clip"].iter().enumerate() {
+                let link = node
+                    .get("inputs")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.iter().find(|i| i.get("name").and_then(Value::as_str) == Some(name)))
+                    .and_then(|i| i.get("link"))
+                    .and_then(Value::as_u64);
+                if let Some(link) = link {
+                    src[slot] = match resolve(ui, link)? {
+                        Source::Node(s, o) => json!([s.to_string(), o]),
+                        Source::Value(v) => v,
+                    };
+                }
+            }
+            for (i, (name, s)) in active.iter().enumerate() {
+                let nid = if i + 1 == active.len() { id.to_string() } else { format!("{id}00{i}") };
+                api.insert(
+                    nid.clone(),
+                    json!({"class_type": "LoraLoader", "inputs": {"model": src[0], "clip": src[1], "lora_name": name, "strength_model": s, "strength_clip": s}}),
+                );
+                src = [json!([nid.clone(), 0]), json!([nid, 1])];
+            }
             continue;
         }
         let mut inputs = Map::new();

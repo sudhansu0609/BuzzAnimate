@@ -43,7 +43,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::bucket::{Grid, simplify, trace_contours};
-use crate::object::ShapeData;
+use crate::gradient::Gradient;
+use crate::object::{Paint, ShapeData};
 use buzz_geom::{Affine, BezPath, FillMode, Point, Vec2};
 use peniko::Color;
 use rayon::prelude::*;
@@ -205,6 +206,46 @@ pub struct TraceOptions {
     /// a touch. Negative values thin every line by that much per side, but
     /// never erode a shape too thin to survive it.
     pub ink_bold: f64,
+    /// **Trace translucency as translucency** (`Outline` colour regions).
+    ///
+    /// Off (the default), a pixel is either clear (alpha < 128) or fully
+    /// opaque, which is what the backdrop plates and the character pipeline
+    /// expect. On, only alpha < 8 is clear, alpha is part of what splits a
+    /// region from its neighbour, and each region's fill carries the mean
+    /// alpha of its pixels. A fully opaque picture traces the same either way.
+    pub keep_alpha: bool,
+    /// **Smooth soft tones** (`Outline` colour regions). Off (the default), a haze
+    /// or a glow comes out as a stack of flat bands. On, neighbouring regions with
+    /// no edge between them in the source become one shape with a fitted gradient
+    /// fill (colour and alpha), where that fits better; hard edges stay hard.
+    pub soft_tones: bool,
+    /// **Optimize after trace** (T13). The caller (the editor's trace job, not
+    /// [`trace`]) refits every path with fewer curve segments, merges touching
+    /// shapes of one colour and absorbs tiny ones, at the mild setting. Off by
+    /// default; Trace Bitmap and the dialog's starting options turn it on.
+    pub optimize_after: bool,
+    /// **Even lines on a colour trace** (`Outline` colour regions). `None` (the
+    /// default) traces colour only. `Some(0.0)` also finds the thin dark ridges
+    /// (local contrast, so a dark doorway is not ink), takes them out of the
+    /// colours and strokes them at one width, the median measured; `Some(w)` is
+    /// `w` picture pixels. See [`crate::trace_even`].
+    pub even_lines: Option<f64>,
+    /// **Bold outlines** (T15, `Outline` / `ColourLines` / `Auto` colour regions):
+    /// thick black lines like the FLA files. The ink as strokes of one weight
+    /// (`uniform_width`, else 3 px per 1920 px of the picture) in `line_colour`
+    /// (else black), plus an outline wherever neighbouring colour regions differ
+    /// by `outline_contrast`; beads and other small loops get none, thin things the
+    /// detail weight. See [`crate::trace_bold`].
+    pub bold_outlines: bool,
+    /// **Keep textures** (T16, `Outline` / `ColourLines` / `Auto` colour regions):
+    /// a large region (over 1 % of the picture: a sky, a wall, the ground) whose
+    /// source is textured or graded beyond what a flat colour or a fitted gradient
+    /// matches is filled with the **source pixels** as an image fill clipped by
+    /// the traced outline, instead of a flat colour. Small and flat regions stay
+    /// flat. The image fills carry a placeholder [`crate::ImageId`]
+    /// ([`TEXTURE_PLACEHOLDER`]); the caller puts them in the scene's library with
+    /// [`adopt_texture_images`]. Off by default; the Bold preset turns it on.
+    pub keep_textures: bool,
     /// **The tracer's look knobs** (ink and colour stages). See
     /// [`crate::trace_tuning`]; the default is the tracer as it always was.
     pub tuning: crate::trace_tuning::TraceTuning,
@@ -231,6 +272,12 @@ impl Default for TraceOptions {
             ink_masses: true,
             uniform_width: None,
             ink_bold: 0.0,
+            keep_alpha: false,
+            soft_tones: false,
+            optimize_after: false,
+            even_lines: None,
+            bold_outlines: false,
+            keep_textures: false,
             tuning: crate::trace_tuning::TraceTuning::default(),
         }
     }
@@ -281,6 +328,23 @@ impl TraceOptions {
         }
     }
 
+    /// **Bold outlines like the FLA files**: a colour trace with the ink and the
+    /// object edges drawn as thick black lines (T15), soft tones and the optimize
+    /// pass as in Trace Bitmap.
+    pub fn bold() -> Self {
+        Self {
+            mode: TraceMode::Outline,
+            colours: 24,
+            keep_alpha: true,
+            soft_tones: true,
+            optimize_after: true,
+            even_lines: Some(0.0),
+            bold_outlines: true,
+            keep_textures: true,
+            ..Self::default()
+        }
+    }
+
     /// These options with the user's saved tuning
     /// ([`crate::trace_tuning::TraceTuning::load_or_default`]: the app's
     /// `trace_tuning.json`, or `BUZZ_TRACE_TUNING`) in place of
@@ -314,6 +378,17 @@ pub struct TraceReport {
     pub fills: usize,
     /// What to put in the status bar.
     pub message: String,
+    /// Soft-edged shapes (`soft_tones`): `(index into shapes, blur radius)` in
+    /// the picture's pixels. The caller puts a Blur filter on that object.
+    pub blurs: Vec<(usize, f64)>,
+}
+
+impl TraceReport {
+    /// The Blur filter for a soft-edged shape of [`TraceReport::blurs`], `radius`
+    /// in the stage's units.
+    pub fn blur_filter(radius: f64) -> buzz_fx::Filter {
+        buzz_fx::Filter::new(buzz_fx::FilterKind::Blur { x: radius, y: radius, quality: buzz_fx::Quality::Low })
+    }
 }
 
 /// **Trace `pixels` into shapes**, in pixel coordinates.
@@ -346,11 +421,19 @@ pub fn trace(width: u32, height: u32, pixels: &[u8], options: &TraceOptions) -> 
             } else {
                 let mut opts = *options;
                 opts.mode = TraceMode::ColourLines;
-                trace_regions_upsampled(width, height, pixels, &opts)
+                if opts.bold_outlines {
+                    crate::trace_even::trace(width, height, pixels, &opts)
+                } else {
+                    trace_regions_upsampled(width, height, pixels, &opts)
+                }
             }
         }
         TraceMode::Outline | TraceMode::ColourLines => {
-            trace_regions_upsampled(width, height, pixels, options)
+            if options.even_lines.is_some() || options.bold_outlines {
+                crate::trace_even::trace(width, height, pixels, options)
+            } else {
+                trace_regions_upsampled(width, height, pixels, options)
+            }
         }
         TraceMode::LineArt => crate::trace_lines::trace_lines(width, height, pixels, options),
         TraceMode::Both => {
@@ -445,6 +528,12 @@ pub struct InkComponents {
     /// The typical pen width in px (source resolution), the median over components of
     /// twice their median distance-transform radius, clamped to [1.5, 6].
     pub line_width_typical: f64,
+}
+
+/// The colour regions of `pixels` (and, in `ColourLines` mode, the outlines between
+/// them) without the even-lines pass: what [`crate::trace_even`] traces under its ink.
+pub(crate) fn trace_regions_only(width: u32, height: u32, pixels: &[u8], options: &TraceOptions) -> TraceReport {
+    trace_regions_upsampled(width, height, pixels, options)
 }
 
 /// **Classify the ink of `pixels` as line or mass by compactness** (T9e). The ink is
@@ -554,6 +643,17 @@ fn trace_regions_upsampled(
         if let Some(ref mut stroke) = shape.stroke {
             stroke.width /= factor as f64;
         }
+        if let Some(fill) = shape.fill.as_mut() {
+            match &fill.paint {
+                Paint::Gradient(g) => fill.paint = Paint::Gradient(Arc::new(g.transformed(down))),
+                Paint::Image(image) => {
+                    let mut image = image.clone();
+                    image.transform = down * image.transform;
+                    fill.paint = Paint::Image(image);
+                }
+                _ => {}
+            }
+        }
     }
     if report.regions > 0 || report.specks > 0 {
         report.message = format!("{} (upscaled {factor}\u{00d7} for detail)", report.message);
@@ -586,14 +686,24 @@ fn trace_regions(
     }
 
     let colours = options.colours.clamp(2, 64);
-    let palette = quantise_scaled(pixels, w, h, colours, factor);
-    if palette.is_empty() {
+    // **Alpha mode** (`keep_alpha` on a picture that really has translucent
+    // pixels): only alpha < ALPHA_EMPTY is clear, and a region is a colour *and*
+    // an alpha band. Anything else traces exactly as it always did.
+    let alpha_mode = options.keep_alpha
+        && pixels[..w * h * 4]
+            .chunks_exact(4)
+            .any(|p| p[3] >= ALPHA_EMPTY && p[3] < ALPHA_SOLID);
+    let min_alpha = if alpha_mode { ALPHA_EMPTY } else { 128 };
+    let rgb_palette = quantise_min_alpha(pixels, w, h, colours, factor, min_alpha);
+    if rgb_palette.is_empty() {
         return TraceReport {
             message: "That picture is entirely transparent".into(),
             ..Default::default()
         };
     }
-    let palette_lab: Vec<[f64; 3]> = palette.iter().map(|&c| srgb_to_lab(c)).collect();
+    let colour_count = rgb_palette.len();
+    let mut palette = rgb_palette.clone();
+    let mut palette_lab: Vec<[f64; 3]> = palette.iter().map(|&c| srgb_to_lab(c)).collect();
 
     // Every pixel's own CIELAB colour, and its nearest palette entry — or
     // `None` where it is transparent.
@@ -601,7 +711,7 @@ fn trace_regions(
     let mut index: Vec<Option<u8>> = Vec::with_capacity(w * h);
     for i in 0..w * h {
         let px = &pixels[i * 4..i * 4 + 4];
-        if px[3] < 128 {
+        if px[3] < min_alpha {
             lab.push([0.0; 3]);
             index.push(None);
             continue;
@@ -611,13 +721,60 @@ fn trace_regions(
         index.push(Some(nearest_lab(&palette_lab, c) as u8));
     }
 
+    // **Alpha bands.** Each (colour, alpha band) pair that occurs becomes one
+    // palette entry (at most 255, most frequent kept; the rest follow the
+    // nearest kept entry), so the flood below splits regions by alpha too.
+    if alpha_mode {
+        let np = rgb_palette.len();
+        let mut combo_count = vec![0usize; np * ALPHA_BANDS];
+        for i in 0..w * h {
+            if let Some(c) = index[i] {
+                combo_count[c as usize * ALPHA_BANDS + alpha_band(pixels[i * 4 + 3])] += 1;
+            }
+        }
+        let mut kept: Vec<usize> = (0..np * ALPHA_BANDS).filter(|&k| combo_count[k] > 0).collect();
+        kept.sort_by(|&a, &b| combo_count[b].cmp(&combo_count[a]).then(a.cmp(&b)));
+        kept.truncate(255);
+        kept.sort_unstable();
+        let mut slot = vec![u8::MAX; np * ALPHA_BANDS];
+        for (s, &k) in kept.iter().enumerate() {
+            slot[k] = s as u8;
+        }
+        for i in 0..w * h {
+            if let Some(c) = index[i] {
+                let b = alpha_band(pixels[i * 4 + 3]);
+                let k = c as usize * ALPHA_BANDS + b;
+                let s = if slot[k] != u8::MAX {
+                    slot[k]
+                } else {
+                    let best = kept
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, o)| {
+                            let o = **o;
+                            let (oc, ob) = (o / ALPHA_BANDS, o % ALPHA_BANDS);
+                            (if oc == c as usize { 0 } else { 1000 }) + ob.abs_diff(b)
+                        })
+                        .map(|(s, _)| s)
+                        .unwrap_or(0);
+                    best as u8
+                };
+                index[i] = Some(s);
+            }
+        }
+        palette = kept.iter().map(|&k| rgb_palette[k / ALPHA_BANDS]).collect();
+        palette_lab = palette.iter().map(|&c| srgb_to_lab(c)).collect();
+    }
+
     // **Anti-aliased pixels join a neighbour, not a speck.** A pixel whose
     // colour sits near the blend line between two palette colours present
     // right around it is an edge's antialiasing, not a colour of its own;
     // reassigning it to the nearer of the two keeps the speck rule for
     // genuinely isolated regions, instead of the fringe of one-pixel dither
     // a soft edge leaves everywhere it turns.
-    reassign_blended_pixels(&mut index, &lab, &palette_lab, w, h);
+    if !alpha_mode {
+        reassign_blended_pixels(&mut index, &lab, &palette_lab, w, h);
+    }
 
     let mut counts = vec![0usize; palette.len()];
     for idx in index.iter().flatten() {
@@ -724,7 +881,7 @@ fn trace_regions(
     // merged cells are appended after it, and the region's colour comes from
     // its own cells only. Each merged speck is also recorded (host region,
     // cells) so a contrasting one can be put back on top as its own shape.
-    let own_lens: Vec<usize> = region_list.iter().map(|(_, cells)| cells.len()).collect();
+    let mut own_lens: Vec<usize> = region_list.iter().map(|(_, cells)| cells.len()).collect();
     let mut merged_specks: Vec<(u32, Vec<usize>)> = Vec::new();
     let (merged, dropped) = merge_specks(
         &mut region_list,
@@ -736,24 +893,198 @@ fn trace_regions(
     );
     let specks = merged + dropped;
 
+    // **Soft tones.** Bands with no edge between them become one region with a
+    // fitted gradient (see [`crate::trace_soft`]); `gradients` is per region.
+    let mut gradients: Vec<Option<Gradient>> = vec![None; region_list.len()];
+    // **Keep textures** (T16): regions to be filled with the source pixels.
+    let mut textured: Vec<bool> = vec![false; region_list.len()];
+    if options.soft_tones {
+        let texture_px = (options.keep_textures && !alpha_mode).then(|| w as f64 * h as f64 * TEXTURE_MIN_SHARE);
+        let groups = crate::trace_soft::plan(&region_list, &region_of, pixels, w, h, factor, texture_px);
+        if !groups.is_empty() {
+            let old_n = region_list.len();
+            let mut group_of = vec![usize::MAX; old_n];
+            for (g, group) in groups.iter().enumerate() {
+                for &m in &group.members {
+                    group_of[m] = g;
+                }
+            }
+            let mut old = std::mem::take(&mut region_list);
+            let mut remap = vec![0u32; old_n];
+            let mut new_gradients: Vec<Option<Gradient>> = Vec::new();
+            let mut new_textured: Vec<bool> = Vec::new();
+            let mut new_own: Vec<usize> = Vec::new();
+            let mut group_slot = vec![u32::MAX; groups.len()];
+            // A group over a background region (a haze on the sky) is painted
+            // over it, so the region under must reach under the whole group.
+            let mut under: Vec<Vec<usize>> = vec![Vec::new(); old_n];
+            for group in &groups {
+                if let Some(b) = group.under {
+                    for &m in &group.members {
+                        under[b].extend_from_slice(&old[m].1);
+                    }
+                }
+            }
+            let mut tail_extra: Vec<usize> = Vec::new();
+            for i in 0..old_n {
+                let g = group_of[i];
+                if g == usize::MAX {
+                    remap[i] = region_list.len() as u32;
+                    let mut cells = std::mem::take(&mut old[i].1);
+                    tail_extra.push(under[i].len());
+                    cells.extend_from_slice(&under[i]);
+                    region_list.push((old[i].0, cells));
+                    new_own.push(own_lens[i]);
+                    new_gradients.push(None);
+                    new_textured.push(false);
+                } else if group_slot[g] == u32::MAX {
+                    // The group's own cells first, then every member's merged specks.
+                    let members = &groups[g].members;
+                    let mut own: Vec<usize> = Vec::new();
+                    let mut rest: Vec<usize> = Vec::new();
+                    for &m in members {
+                        let cells = std::mem::take(&mut old[m].1);
+                        let split = own_lens[m].min(cells.len());
+                        own.extend_from_slice(&cells[..split]);
+                        rest.extend_from_slice(&cells[split..]);
+                    }
+                    let slot = region_list.len() as u32;
+                    group_slot[g] = slot;
+                    new_own.push(own.len());
+                    own.extend(rest);
+                    tail_extra.push(0);
+                    region_list.push((old[i].0, own));
+                    new_gradients.push(groups[g].gradient.clone());
+                    new_textured.push(groups[g].textured);
+                    remap[i] = slot;
+                } else {
+                    remap[i] = group_slot[g];
+                }
+            }
+            region_of.iter_mut().for_each(|r| *r = u32::MAX);
+            for (ri, (_, cells)) in region_list.iter().enumerate() {
+                for &c in &cells[..cells.len() - tail_extra[ri]] {
+                    region_of[c] = ri as u32;
+                }
+            }
+            for (host, _) in merged_specks.iter_mut() {
+                *host = remap[*host as usize];
+            }
+            own_lens = new_own;
+            gradients = new_gradients;
+            textured = new_textured;
+        }
+    }
+
     // **Each region's outline, colour and fill, built independently of every
     // other region.** The flood above has to be one sequential scan over
     // shared state; once a region's own pixels are known, tracing its
     // boundary touches nothing that belongs to any other region, which is
     // exactly the shape of work rayon is for.
+    //
+    // **Stacked regions (no seams).** Paint order is largest first, so each
+    // region's cell set also grows `SEAM_OVERLAP_PX` into the cells of regions
+    // painted *later* (above it): the upper region's edge stays exact and the
+    // one beneath reaches under it, so smoothing the two outlines apart can
+    // never open a gap. Growth never enters clear or unowned cells, and in alpha
+    // mode only goes under regions that are opaque.
+    let mut paint_order: Vec<usize> = (0..region_list.len()).collect();
+    paint_order.sort_by(|&a, &b| region_list[b].1.len().cmp(&region_list[a].1.len()).then(a.cmp(&b)));
+    let mut rank = vec![0u32; region_list.len()];
+    for (r, &i) in paint_order.iter().enumerate() {
+        rank[i] = r as u32;
+    }
+    let solid: Vec<bool> = region_list
+        .par_iter()
+        .enumerate()
+        .map(|(i, (_, cells))| {
+            if !alpha_mode {
+                return true;
+            }
+            let own = &cells[..own_lens[i].clamp(1, cells.len())];
+            let sum: u64 = own.iter().map(|&at| pixels[at * 4 + 3] as u64).sum();
+            sum / own.len() as u64 >= 240
+        })
+        .collect();
+    let grow_steps = ((SEAM_OVERLAP_PX * factor).ceil() as usize).max(1);
+    // **Soft edges**: a region whose boundary is soft in the source gets a Blur
+    // (radius in grid pixels), and reaches that far under what is over it.
+    let blur_px: Vec<f64> = if options.soft_tones && !alpha_mode {
+        let skip: Vec<bool> = gradients.iter().map(|g| g.is_some()).collect();
+        crate::trace_soft::blur_radii(&region_list, &region_of, pixels, w, h, factor, &skip)
+    } else {
+        vec![0.0; region_list.len()]
+    };
+    // ... and a region reaches under a blurred neighbour painted over it by
+    // that neighbour's blur radius, so the fade shows it and not the stage.
+    let mut reach = vec![0usize; region_list.len()];
+    if blur_px.iter().any(|&b| b > 0.0) {
+        let mut note = |a: u32, b: u32| {
+            if a != b && a != u32::MAX && b != u32::MAX && rank[b as usize] > rank[a as usize] {
+                let need = blur_px[b as usize].ceil() as usize;
+                if need > reach[a as usize] {
+                    reach[a as usize] = need;
+                }
+            }
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let a = region_of[y * w + x];
+                if x + 1 < w {
+                    let b = region_of[y * w + x + 1];
+                    note(a, b);
+                    note(b, a);
+                }
+                if y + 1 < h {
+                    let b = region_of[(y + 1) * w + x];
+                    note(a, b);
+                    note(b, a);
+                }
+            }
+        }
+    }
     let built: Vec<(usize, usize, ShapeData, [u8; 3])> = region_list
         .par_iter()
         .enumerate()
         .filter_map(|(i, (_, cells))| {
-            build_region_shape(cells, own_lens[i], pixels, w, options, factor)
-                .map(|(n, shape, rgb)| (i, n, shape, rgb))
+            let steps = grow_steps.max(blur_px[i].ceil() as usize).max(reach[i]);
+            let extra = grow_under(cells, i as u32, &rank, &region_of, &solid, w, h, steps);
+            build_region_shape(cells, &extra, own_lens[i], pixels, w, options, factor, alpha_mode)
+                .map(|(n, mut shape, rgb)| {
+                    if let (Some(g), Some(fill)) = (&gradients[i], shape.fill.as_mut()) {
+                        fill.paint = Paint::Gradient(Arc::new(g.clone()));
+                    }
+                    (i, n, shape, rgb)
+                })
         })
         .collect();
+    let mut built = built;
+    if options.keep_textures && !alpha_mode {
+        // A large region no flat colour matches (and no soft group already judged)
+        // is textured too.
+        let min_cells = (w * h) as f64 * TEXTURE_MIN_SHARE;
+        for (i, _, _, rgb) in &built {
+            if textured[*i] || gradients[*i].is_some() {
+                continue;
+            }
+            let cells = &region_list[*i].1;
+            let own = &cells[..own_lens[*i].clamp(1, cells.len())];
+            if (own.len() as f64) < min_cells {
+                continue;
+            }
+            let (mean, bad) = crate::trace_soft::flat_error(own, pixels, *rgb);
+            if crate::trace_soft::is_textured(mean, bad) {
+                textured[*i] = true;
+            }
+        }
+        let mut picked: Vec<&mut ShapeData> = built.iter_mut().filter(|(i, ..)| textured[*i]).map(|(_, _, s, _)| s).collect();
+        fill_with_source(&mut picked, pixels, w, h);
+    }
     let mut host_rgb: Vec<Option<[u8; 3]>> = vec![None; region_list.len()];
-    let mut regions: Vec<(usize, ShapeData)> = Vec::with_capacity(built.len());
+    let mut regions: Vec<(usize, ShapeData, f64)> = Vec::with_capacity(built.len());
     for (i, n, shape, rgb) in built {
         host_rgb[i] = Some(rgb);
-        regions.push((n, shape));
+        regions.push((n, shape, blur_px[i] / factor));
     }
 
     // **Largest first**, so the picture assembles back to front the way it
@@ -770,7 +1101,7 @@ fn trace_regions(
     let mut detail: Vec<(usize, ShapeData)> = merged_specks
         .par_iter()
         .filter_map(|(host, cells)| {
-            if cells.len() < detail_min {
+            if alpha_mode || cells.len() < detail_min {
                 return None;
             }
             let host = host_rgb[*host as usize]?;
@@ -778,7 +1109,7 @@ fn trace_regions(
             if delta_e(srgb_to_lab(own), srgb_to_lab(host)) <= 20.0 {
                 return None;
             }
-            build_region_shape(cells, cells.len(), pixels, w, options, factor)
+            build_region_shape(cells, &[], cells.len(), pixels, w, options, factor, false)
                 .map(|(n, shape, _)| (n, shape))
         })
         .collect();
@@ -786,7 +1117,14 @@ fn trace_regions(
     let detail_count = detail.len();
 
     let kept = regions.len() + detail_count;
-    let mut shapes: Vec<ShapeData> = regions.into_iter().map(|(_, s)| s).collect();
+    let mut blurs: Vec<(usize, f64)> = Vec::new();
+    let mut shapes: Vec<ShapeData> = Vec::with_capacity(kept);
+    for (_, s, radius) in regions {
+        if radius > 0.0 {
+            blurs.push((shapes.len(), radius));
+        }
+        shapes.push(s);
+    }
     shapes.extend(detail.into_iter().map(|(_, s)| s));
     let mut stroke_count = 0;
 
@@ -810,7 +1148,7 @@ fn trace_regions(
             format!("Everything in that picture was smaller than the speck size ({n} regions)")
         }
         (k, _) => {
-            let mut m = format!("Traced {k} shapes in {} colours", palette.len());
+            let mut m = format!("Traced {k} shapes in {} colours", colour_count);
             if merged > 0 {
                 m.push_str(&format!(", merged {merged} specks into their neighbours"));
             }
@@ -840,6 +1178,107 @@ fn trace_regions(
         strokes: stroke_count,
         fills: 0,
         message,
+        blurs,
+    }
+}
+
+/// A region of at least this share of the picture can be filled with the source
+/// pixels (`TraceOptions::keep_textures`).
+const TEXTURE_MIN_SHARE: f64 = 0.01;
+/// The longest side of the picture a texture fill stores (it is smooth by nature).
+const TEXTURE_MAX_SIDE: u32 = 2560;
+/// The id a texture fill's image has until [`adopt_texture_images`] gives it a real one.
+pub const TEXTURE_PLACEHOLDER: crate::ImageId = crate::ImageId(u64::MAX);
+
+/// **Fill `shapes` with the source pixels** (T16): one image, the crop of `pixels`
+/// the shapes' outlines cover (stored once, whatever the count), laid under every
+/// shape in the grid's own coordinates; each shape's outline clips it. Opaque
+/// crops are stored as a JPEG (a painted texture as a PNG is tens of megabytes),
+/// anything with transparency as a PNG.
+fn fill_with_source(shapes: &mut [&mut ShapeData], pixels: &[u8], w: usize, h: usize) {
+    use kurbo::Shape as _;
+    if shapes.is_empty() {
+        return;
+    }
+    let bounds = shapes.iter().map(|s| s.path.bounding_box()).reduce(|a, b| a.union(b)).unwrap_or_default();
+    let (x0, y0) = (bounds.x0.floor().max(0.0) as usize, bounds.y0.floor().max(0.0) as usize);
+    let (x1, y1) = ((bounds.x1.ceil() as usize).min(w), (bounds.y1.ceil() as usize).min(h));
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let (cw, ch) = (x1 - x0, y1 - y0);
+    let mut crop = Vec::with_capacity(cw * ch * 4);
+    for y in y0..y1 {
+        crop.extend_from_slice(&pixels[(y * w + x0) * 4..(y * w + x1) * 4]);
+    }
+    let opaque = crop.chunks_exact(4).all(|p| p[3] == 255);
+    let Some(image) = ::image::RgbaImage::from_raw(cw as u32, ch as u32, crop) else { return };
+    let long = cw.max(ch) as u32;
+    let image = if long > TEXTURE_MAX_SIDE {
+        let k = TEXTURE_MAX_SIDE as f64 / long as f64;
+        ::image::imageops::resize(
+            &image,
+            ((cw as f64 * k).round() as u32).max(1),
+            ((ch as f64 * k).round() as u32).max(1),
+            ::image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image
+    };
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    let encoded = if opaque {
+        let rgb = ::image::DynamicImage::ImageRgba8(image).to_rgb8();
+        ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 92).encode_image(&rgb)
+    } else {
+        image.write_to(&mut bytes, ::image::ImageFormat::Png)
+    };
+    if encoded.is_err() {
+        return;
+    }
+    let Ok(asset) = crate::ImageAsset::decode(TEXTURE_PLACEHOLDER, "Trace texture", &bytes.into_inner()) else { return };
+    let asset = Arc::new(asset);
+    let place = Affine::translate((x0 as f64, y0 as f64)) * Affine::scale_non_uniform(cw as f64, ch as f64);
+    for shape in shapes.iter_mut() {
+        if let Some(fill) = shape.fill.as_mut() {
+            fill.paint = Paint::Image(Box::new(crate::ImageFill {
+                asset: Arc::clone(&asset),
+                transform: place,
+                smooth: true,
+                tile: false,
+            }));
+        }
+    }
+}
+
+/// Is `asset` the image a trace's Keep-textures regions wear (as opposed to a picture)?
+pub fn is_trace_texture(asset: &crate::ImageAsset) -> bool {
+    asset.name.starts_with("Trace texture")
+}
+
+/// **Put a trace's texture images in the scene's library** (T16): every shape whose
+/// image fill still has [`TEXTURE_PLACEHOLDER`]'s id gets a real asset (one per
+/// image, shared by the shapes that wear it). Call it on the shapes about to be
+/// added to `scene`.
+pub fn adopt_texture_images(shapes: &mut [ShapeData], scene: &mut crate::Scene) {
+    let mut adopted: Vec<(Arc<crate::ImageAsset>, Arc<crate::ImageAsset>)> = Vec::new();
+    for shape in shapes {
+        let Some(fill) = shape.fill.as_mut() else { continue };
+        let Paint::Image(image) = &mut fill.paint else { continue };
+        if image.asset.id != TEXTURE_PLACEHOLDER {
+            continue;
+        }
+        let real = match adopted.iter().find(|(from, _)| Arc::ptr_eq(from, &image.asset)) {
+            Some((_, real)) => Arc::clone(real),
+            None => {
+                let mut asset = (*image.asset).clone();
+                asset.id = scene.next_image_id();
+                asset.name = scene.images().unique_name("Trace texture");
+                let real = scene.images_mut().insert(asset);
+                adopted.push((Arc::clone(&image.asset), Arc::clone(&real)));
+                real
+            }
+        };
+        image.asset = real;
     }
 }
 
@@ -941,15 +1380,17 @@ fn merge_specks(
 /// colour.
 fn build_region_shape(
     cells: &[usize],
+    extra: &[usize],
     own_len: usize,
     pixels: &[u8],
     w: usize,
     options: &TraceOptions,
     factor: f64,
+    alpha_mode: bool,
 ) -> Option<(usize, ShapeData, [u8; 3])> {
     let (mut x0, mut y0) = (usize::MAX, usize::MAX);
     let (mut x1, mut y1) = (0usize, 0usize);
-    for &at in cells {
+    for &at in cells.iter().chain(extra) {
         let (x, y) = (at % w, at / w);
         x0 = x0.min(x);
         y0 = y0.min(y);
@@ -963,16 +1404,28 @@ fn build_region_shape(
         grid.set(x - x0, y - y0);
     }
 
+    // The fill colour is read off the region's own cells (eroded by its own
+    // edge) *before* the stacked-under cells are added to the grid.
+    let own = &cells[..own_len.clamp(1, cells.len())];
+    let rgba = region_fill_colour(own, pixels, w, &grid, x0, y0, alpha_mode);
+    let colour_rgb = [rgba[0], rgba[1], rgba[2]];
+    for &at in extra {
+        let (x, y) = (at % w, at / w);
+        grid.set(x - x0, y - y0);
+    }
+
     let path = outline_colour(&grid, options, factor)?;
     // Translate back out of the region's own local grid into picture space.
     let path = Affine::translate((x0 as f64, y0 as f64)) * path;
     // let path = expand_fill(&path, 0.5 * factor, BooleanOptions::default());
 
-    let own = &cells[..own_len.clamp(1, cells.len())];
-    let colour_rgb = region_fill_colour(own, pixels, w, &grid, x0, y0);
     let mut shape = ShapeData::filled(
         path,
-        Color::from_rgb8(colour_rgb[0], colour_rgb[1], colour_rgb[2]),
+        if alpha_mode {
+            Color::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3])
+        } else {
+            Color::from_rgb8(colour_rgb[0], colour_rgb[1], colour_rgb[2])
+        },
     );
     // **Non-zero, because the tracer winds holes the other way.** The outer
     // loops and the interior loops come back with opposite directions, which
@@ -1009,7 +1462,8 @@ fn region_fill_colour(
     grid: &Grid,
     x0: usize,
     y0: usize,
-) -> [u8; 3] {
+    alpha_mode: bool,
+) -> [u8; 4] {
     let interior: Vec<usize> = cells
         .iter()
         .copied()
@@ -1028,6 +1482,23 @@ fn region_fill_colour(
         .collect();
     let source = if interior.is_empty() { cells } else { &interior };
 
+    let n = source.len() as u64;
+    if alpha_mode {
+        // Alpha-weighted straight colour (a faint pixel's RGB counts for
+        // little) and the plain mean alpha.
+        let mut sum = [0u64; 3];
+        let mut a_tot = 0u64;
+        for &at in source {
+            let px = &pixels[at * 4..at * 4 + 4];
+            let a = px[3] as u64;
+            sum[0] += px[0] as u64 * a;
+            sum[1] += px[1] as u64 * a;
+            sum[2] += px[2] as u64 * a;
+            a_tot += a;
+        }
+        let d = a_tot.max(1);
+        return [(sum[0] / d) as u8, (sum[1] / d) as u8, (sum[2] / d) as u8, (a_tot / n) as u8];
+    }
     let mut sum = [0u64; 3];
     for &at in source {
         let px = &pixels[at * 4..at * 4 + 4];
@@ -1035,8 +1506,88 @@ fn region_fill_colour(
         sum[1] += px[1] as u64;
         sum[2] += px[2] as u64;
     }
-    let n = source.len() as u64;
-    [(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8]
+    [(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8, 255]
+}
+
+/// Cells within `steps` (8-connected) of `cells` that belong to a region painted
+/// later than `me` (and `solid`). Empty when nothing is above it.
+fn grow_under(
+    cells: &[usize],
+    me: u32,
+    rank: &[u32],
+    region_of: &[u32],
+    solid: &[bool],
+    w: usize,
+    h: usize,
+    steps: usize,
+) -> Vec<usize> {
+    if cells.is_empty() {
+        return Vec::new();
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+    for &at in cells {
+        let (x, y) = (at % w, at / w);
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    let (x0, y0) = (x0.saturating_sub(steps), y0.saturating_sub(steps));
+    let (x1, y1) = ((x1 + steps).min(w - 1), (y1 + steps).min(h - 1));
+    let bw = x1 - x0 + 1;
+    let mut mask = vec![false; bw * (y1 - y0 + 1)];
+    for &at in cells {
+        mask[(at / w - y0) * bw + (at % w - x0)] = true;
+    }
+    let my_rank = rank[me as usize];
+    let mut extra: Vec<usize> = Vec::new();
+    let mut frontier: Vec<usize> = cells.to_vec();
+    for _ in 0..steps {
+        let mut next: Vec<usize> = Vec::new();
+        for &at in &frontier {
+            let (x, y) = (at % w, at / w);
+            for dy in -1i64..=1 {
+                for dx in -1i64..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+                    if nx < x0 as i64 || ny < y0 as i64 || nx > x1 as i64 || ny > y1 as i64 {
+                        continue;
+                    }
+                    let (nx, ny) = (nx as usize, ny as usize);
+                    let m = (ny - y0) * bw + (nx - x0);
+                    if mask[m] {
+                        continue;
+                    }
+                    let r = region_of[ny * w + nx];
+                    if r != u32::MAX && rank[r as usize] > my_rank && solid[r as usize] {
+                        mask[m] = true;
+                        extra.push(ny * w + nx);
+                        next.push(ny * w + nx);
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+    extra
+}
+
+/// How far (in picture pixels) a region reaches under the regions painted over it.
+const SEAM_OVERLAP_PX: f64 = 1.0;
+/// Alpha below this is clear (alpha mode); at or above [`ALPHA_SOLID`] is opaque.
+const ALPHA_EMPTY: u8 = 8;
+const ALPHA_SOLID: u8 = 248;
+/// Opaque band 0, then six translucent bands of 40 alpha levels each.
+const ALPHA_BANDS: usize = 7;
+
+fn alpha_band(a: u8) -> usize {
+    if a >= ALPHA_SOLID {
+        0
+    } else {
+        1 + ((247 - a as usize) / 40).min(5)
+    }
 }
 
 /// **A blended pixel joins whichever of its neighbourhood's two colours it is
@@ -1407,7 +1958,7 @@ struct OutlineWorkEdge {
     points: Vec<Point>,
 }
 
-fn build_outline_strokes(
+pub(crate) fn build_outline_strokes(
     region_list: &[(u8, Vec<usize>)],
     w: usize,
     h: usize,
@@ -1579,18 +2130,30 @@ fn build_outline_strokes(
     }
     junction_nodes.sort_unstable();
 
+    // Edges keep their slot (a spliced pair leaves two empty slots and a new
+    // one at the end) and each node lists its slots, so a junction finds its
+    // edges without scanning them all (T15: a picture's raster has thousands).
+    let mut slots: Vec<Option<OutlineWorkEdge>> = work_edges.into_iter().map(Some).collect();
+    let mut at_node: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, slot) in slots.iter().enumerate() {
+        if let Some(we) = slot {
+            at_node.entry(we.node_a).or_default().push(i);
+            if we.node_b != we.node_a {
+                at_node.entry(we.node_b).or_default().push(i);
+            }
+        }
+    }
+
     for node in junction_nodes {
         loop {
-            let incident: Vec<usize> = (0..work_edges.len())
-                .filter(|&i| work_edges[i].node_a == node || work_edges[i].node_b == node)
-                .collect();
+            let incident: Vec<usize> = at_node.get(&node).cloned().unwrap_or_default();
             if incident.len() < 2 {
                 break;
             }
 
             let k_dist = (4.0 * factor).round().max(2.0) as usize;
             let tangent = |idx: usize| -> Vec2 {
-                let we = &work_edges[idx];
+                let we = slots[idx].as_ref().expect("incident slot is filled");
                 let from_a = we.node_a == node;
                 let pts = &we.points;
                 let k = k_dist.min(pts.len() - 1);
@@ -1623,8 +2186,8 @@ fn build_outline_strokes(
             let ia = incident[a];
             let ib = incident[b];
 
-            let ea = &work_edges[ia];
-            let eb = &work_edges[ib];
+            let ea = slots[ia].as_ref().expect("incident slot is filled");
+            let eb = slots[ib].as_ref().expect("incident slot is filled");
             let mut pts_a = if ea.node_b == node {
                 ea.points.clone()
             } else {
@@ -1650,10 +2213,21 @@ fn build_outline_strokes(
                 points: pts_a,
             };
 
-            let (lo, hi) = (ia.min(ib), ia.max(ib));
-            work_edges.remove(hi);
-            work_edges.remove(lo);
-            work_edges.push(spliced);
+            for gone in [ia, ib] {
+                if let Some(old) = slots[gone].take() {
+                    for n in [old.node_a, old.node_b] {
+                        if let Some(list) = at_node.get_mut(&n) {
+                            list.retain(|&s| s != gone);
+                        }
+                    }
+                }
+            }
+            let slot = slots.len();
+            at_node.entry(spliced.node_a).or_default().push(slot);
+            if spliced.node_b != spliced.node_a {
+                at_node.entry(spliced.node_b).or_default().push(slot);
+            }
+            slots.push(Some(spliced));
         }
     }
 
@@ -1676,8 +2250,45 @@ fn build_outline_strokes(
     let stroke_width = stroke_width_source * factor;
     let tol = (0.4 * factor * options.detail.max(0.1)).max(0.1);
 
+    // T15: a thin region (a garland string, a pole) has edges of the detail
+    // weight; the thickness is 2 x area / perimeter (pixels).
+    let thin: Vec<bool> = if options.bold_outlines {
+        let mut id = vec![u32::MAX; w * h];
+        for (ri, (_, cells)) in region_list.iter().enumerate() {
+            for &at in cells {
+                id[at] = ri as u32;
+            }
+        }
+        let mut perimeter = vec![0usize; region_list.len()];
+        for at in 0..w * h {
+            let r = id[at];
+            if r == u32::MAX {
+                continue;
+            }
+            let (x, y) = (at % w, at / w);
+            let other = |nx: Option<usize>, ny: Option<usize>| match (nx, ny) {
+                (Some(nx), Some(ny)) if nx < w && ny < h => id[ny * w + nx] != r,
+                _ => true,
+            };
+            perimeter[r as usize] += other(x.checked_sub(1), Some(y)) as usize
+                + other(Some(x + 1), Some(y)) as usize
+                + other(Some(x), y.checked_sub(1)) as usize
+                + other(Some(x), Some(y + 1)) as usize;
+        }
+        let limit = crate::trace_bold::is_thin_limit(stroke_width);
+        let thick: Vec<bool> = region_list
+            .iter()
+            .zip(&perimeter)
+            .map(|((_, cells), &p)| p > 0 && 2.0 * cells.len() as f64 / p as f64 >= limit)
+            .collect();
+        // Per pixel: is its region thin?
+        (0..w * h).map(|at| id[at] != u32::MAX && !thick[id[at] as usize]).collect()
+    } else {
+        Vec::new()
+    };
+
     let mut shapes = Vec::new();
-    for edge in work_edges {
+    for edge in slots.into_iter().flatten() {
         let pts = edge.points;
         if pts.len() < 2 {
             continue;
@@ -1690,6 +2301,29 @@ fn build_outline_strokes(
         let is_closed = edge.node_a == edge.node_b
             && (pts[0] - pts[pts.len() - 1]).hypot() < 1e-6
             && pts.len() >= 4;
+
+        // T15: bold outlines drop specks and weigh each chain on its own: the
+        // detail weight for a short chain, or one beside a thin region.
+        let stroke_width = if options.bold_outlines {
+            let beside_thin = {
+                let mut hits = 0usize;
+                let mut total = 0usize;
+                for p in pts.iter().step_by(3) {
+                    let (vx, vy) = (p.x as usize, p.y as usize);
+                    let near = [(0usize, 0usize), (1, 0), (0, 1), (1, 1)].iter().any(|&(dx, dy)| {
+                        let (px, py) = ((vx + dx).wrapping_sub(1), (vy + dy).wrapping_sub(1));
+                        px < w && py < h && thin[py * w + px]
+                    });
+                    hits += near as usize;
+                    total += 1;
+                }
+                total > 0 && hits * 2 > total
+            };
+            let Some(width) = crate::trace_bold::edge_width(total_len / factor, is_closed, stroke_width_source) else { continue };
+            (if beside_thin { crate::trace_bold::detail_width(stroke_width_source).min(width) } else { width }) * factor
+        } else {
+            stroke_width
+        };
 
         if is_closed {
             let loop_pts: Vec<(usize, usize)> = pts[..pts.len() - 1]
@@ -1902,6 +2536,17 @@ pub fn quantise_scaled(
     want: usize,
     factor: f64,
 ) -> Vec<[u8; 3]> {
+    quantise_min_alpha(pixels, width, height, want, factor, 128)
+}
+
+fn quantise_min_alpha(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    want: usize,
+    factor: f64,
+    min_alpha: u8,
+) -> Vec<[u8; 3]> {
     let want = want.max(1);
     if width == 0 || height == 0 || pixels.len() < width * height * 4 {
         return Vec::new();
@@ -1914,7 +2559,7 @@ pub fn quantise_scaled(
     let mut opaque = vec![false; count];
     for i in 0..count {
         let px = &pixels[i * 4..i * 4 + 4];
-        if px[3] >= 128 {
+        if px[3] >= min_alpha {
             lab[i] = srgb_to_lab([px[0], px[1], px[2]]);
             opaque[i] = true;
         }
@@ -3320,5 +3965,54 @@ mod tests {
             "ColourLines should have produced outline strokes: {:?}",
             colour_report.message
         );
+    }
+
+    /// A 200x200 picture: a noisy, graded sky over a flat dark ground.
+    fn sky_and_ground() -> Vec<u8> {
+        picture(200, 200, |x, y| {
+            if y >= 120 {
+                return [40, 30, 20, 255];
+            }
+            let noise = ((x * 7 + y * 13) % 17) as i32 * 2;
+            let v = (60 + y as i32 / 2 + noise).clamp(0, 255) as u8;
+            [v / 2, v, 255.min(v as i32 + 60) as u8, 255]
+        })
+    }
+
+    #[test]
+    fn keep_textures_fills_a_textured_sky_with_the_source_and_leaves_flat_ground() {
+        let pixels = sky_and_ground();
+        let on = TraceOptions { mode: TraceMode::Outline, colours: 8, soft_tones: true, keep_textures: true, ..TraceOptions::default() };
+        let report = trace(200, 200, &pixels, &on);
+        let images: Vec<_> = report
+            .shapes
+            .iter()
+            .filter(|s| matches!(s.fill.as_ref().map(|f| &f.paint), Some(Paint::Image(_))))
+            .collect();
+        assert!(!images.is_empty(), "the textured sky should wear the source: {}", report.message);
+        let Some(Paint::Image(image)) = images[0].fill.as_ref().map(|f| &f.paint) else { unreachable!() };
+        assert_eq!(image.asset.id, TEXTURE_PLACEHOLDER);
+        assert!(report.shapes.iter().any(|s| matches!(s.fill.as_ref().map(|f| &f.paint), Some(Paint::Solid(_)))), "the flat ground stays a colour");
+
+        let off = TraceOptions { keep_textures: false, ..on };
+        let plain = trace(200, 200, &pixels, &off);
+        assert!(plain.shapes.iter().all(|s| !matches!(s.fill.as_ref().map(|f| &f.paint), Some(Paint::Image(_)))));
+    }
+
+    #[test]
+    fn texture_images_move_into_the_scene_library_once() {
+        let pixels = sky_and_ground();
+        let on = TraceOptions { mode: TraceMode::Outline, colours: 8, soft_tones: true, keep_textures: true, ..TraceOptions::default() };
+        let mut shapes = trace(200, 200, &pixels, &on).shapes;
+        let mut scene = crate::Scene::default();
+        adopt_texture_images(&mut shapes, &mut scene);
+        assert_eq!(scene.images().len(), 1, "one image, however many shapes wear it");
+        for s in &shapes {
+            if let Some(Paint::Image(i)) = s.fill.as_ref().map(|f| &f.paint) {
+                assert_ne!(i.asset.id, TEXTURE_PLACEHOLDER);
+                assert!(is_trace_texture(&i.asset));
+                assert!(scene.images().get(i.asset.id).is_some());
+            }
+        }
     }
 }

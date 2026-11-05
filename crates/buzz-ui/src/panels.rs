@@ -160,11 +160,11 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             });
             item(ui, Command::SaveAsTemplate, true, &mut raised);
             ui.separator();
+            // The only two imports: each takes scenes, pictures and sound
+            // (docs/MENU_CLEANUP_PLAN.md M1).
             for c in [Command::ImportToStage, Command::ImportToLibrary] {
                 item(ui, c, true, &mut raised);
             }
-            item(ui, Command::ImportImage, true, &mut raised);
-            item(ui, Command::ImportSound, true, &mut raised);
             // Animate keeps Export in a submenu of File, one entry per output.
             ui.menu_button("Export", |ui| {
                 for c in [
@@ -184,15 +184,6 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             // Studio writes the script (`docs/ECOSYSTEM_BRIDGE_PLAN.md`).
             item(ui, Command::SendToBuzzEdit, true, &mut raised);
             item(ui, Command::ImportScriptFromStudio, true, &mut raised);
-            // The producer (PRODUCER_PLAN P6): script, audio and art in, an
-            // episode out.
-            ui.menu_button("AI", |ui| {
-                item(ui, Command::NewEpisode, true, &mut raised);
-                ui.separator();
-                item(ui, Command::StoryToScreenplay, true, &mut raised);
-                item(ui, Command::Casting, true, &mut raised);
-                item(ui, Command::ProduceEpisode, true, &mut raised);
-            });
             ui.separator();
             for c in [Command::Save, Command::SaveAs] {
                 item(ui, c, true, &mut raised);
@@ -211,7 +202,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::Undo, can_undo, &mut raised);
             item(ui, Command::Redo, can_redo, &mut raised);
             ui.separator();
-            for c in [Command::Cut, Command::Copy, Command::Paste, Command::Delete] {
+            for c in [Command::Cut, Command::Copy, Command::Paste, Command::Delete, Command::DeleteAndFill] {
                 let enabled = c == Command::Paste || has_selection;
                 item(ui, c, enabled, &mut raised);
             }
@@ -534,7 +525,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 item(ui, Command::DuplicateScene, true, &mut raised);
                 ui.separator();
                 item(ui, Command::SetScene, true, &mut raised);
-                item(ui, Command::DirectScene, true, &mut raised);
+                // Direct a Story… lives in the AI menu, beside Direct Story
+                // with LLM… (docs/MENU_CLEANUP_PLAN.md M2).
                 item(ui, Command::SceneryFor, true, &mut raised);
                 item(ui, Command::AddPerson, true, &mut raised);
                 ui.separator();
@@ -701,6 +693,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             }
             item(ui, Command::ReapplyMasterAudio, sequence.master_audio_mode, &mut raised);
             ui.separator();
+            item(ui, Command::LipSyncAllCharacters, true, &mut raised);
+            ui.separator();
             item(ui, Command::MakeSetupFromScene, true, &mut raised);
             ui.add_enabled_ui(!sequence.setups.is_empty(), |ui| {
                 ui.menu_button("New Shot from Setup", |ui| {
@@ -798,6 +792,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::RunScript, true, &mut raised);
             item(ui, Command::ClearScriptOutput, true, &mut raised);
             ui.separator();
+            // The user's Animate scripts, one item each (JSFL_COMMANDS_PLAN J1).
+            crate::jsfl_menu::show(ui);
+            ui.separator();
             ui.label(
                 RichText::new("Write scripts in the Actions panel")
                     .small()
@@ -810,6 +807,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             // Insert — Insert's entry is New Symbol, which is a different
             // thing: one wraps a selection, the other starts from nothing.
             item(ui, Command::ConvertToSymbol, has_selection, &mut raised);
+            item(ui, Command::AddLifeToAllCharacters, true, &mut raised);
             ui.menu_button("Symbol", |ui| {
                 // The selected instance's symbol, else the Library's.
                 item(ui, Command::ClearAllKeyframes, true, &mut raised);
@@ -905,14 +903,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             }
             ui.separator();
             item(ui, Command::BrushFromSelection, has_selection, &mut raised);
-            ui.separator();
-            ui.label(RichText::new("Bitmap").small().weak());
-            for c in [
-                Command::TraceBitmapOptions,
-                Command::TraceLineArt,
-            ] {
-                item(ui, c, has_selection, &mut raised);
-            }
+            // Trace Bitmap, Line Art and Bold + Split are in the AI menu now
+            // (Trace Picture…, Split Picture into Layers…).
             ui.separator();
             ui.label(RichText::new("Rig").small().weak());
             item(ui, Command::ExtendPart, has_selection, &mut raised);
@@ -931,6 +923,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             }
             // Nothing selected: the symbol being edited, else the stage.
             item(ui, Command::EvenLines, true, &mut raised);
+            item(ui, Command::OptimizeShapes, true, &mut raised);
             item(ui, Command::RemoveBackgroundSpecks, true, &mut raised);
 
             // Animate keeps these in a Transform submenu of Modify.
@@ -955,11 +948,19 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             egui::Button::new("AI").min_size(egui::vec2(24.0, 0.0)),
         )
         .ui(ui, |ui| {
-            item(ui, Command::AiModels, true, &mut raised);
-            item(ui, Command::VoicePushToTalk, true, &mut raised);
-            item(ui, Command::VoiceMute, true, &mut raised);
+            // **One place for everything that uses a model**
+            // (docs/MENU_CLEANUP_PLAN.md M2), in groups. Tracing a picture and
+            // splitting it into layers are here, not under Modify; the
+            // producer's steps are here, not under File.
+            ui.label(RichText::new("Picture").small().weak());
+            item(ui, Command::TraceBitmapOptions, has_selection, &mut raised);
+            item(ui, Command::AiSplitPictureIntoLayers, true, &mut raised);
+            item(ui, Command::AiRemoveObject, true, &mut raised);
+            item(ui, Command::AiGenerateBackground, true, &mut raised);
+            item(ui, Command::AiSceneFromImage, true, &mut raised);
+            ui.separator();
+            ui.label(RichText::new("Characters").small().weak());
             item(ui, Command::AiCharacterFromImage, true, &mut raised);
-            item(ui, Command::AiIdentifyAssets, true, &mut raised);
             item(ui, Command::AiRigVectorCharacter, true, &mut raised);
             let instance_selected = selection
                 .iter()
@@ -967,8 +968,21 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 .and_then(|id| scene.find_object(id))
                 .is_some_and(|(_, o)| o.instance().is_some());
             item(ui, Command::AiRigLayers, instance_selected || library_symbol, &mut raised);
-            item(ui, Command::AiSceneFromImage, true, &mut raised);
+            item(ui, Command::AiIdentifyAssets, true, &mut raised);
+            ui.separator();
+            ui.label(RichText::new("Story & episode").small().weak());
+            item(ui, Command::NewEpisode, true, &mut raised);
+            item(ui, Command::StoryToScreenplay, true, &mut raised);
+            item(ui, Command::Casting, true, &mut raised);
+            item(ui, Command::ProduceEpisode, true, &mut raised);
+            // The Story panel's own Direct, and the LLM's: side by side.
+            item(ui, Command::DirectScene, true, &mut raised);
             item(ui, Command::AiDirectStory, true, &mut raised);
+            ui.separator();
+            ui.label(RichText::new("Settings").small().weak());
+            item(ui, Command::AiModels, true, &mut raised);
+            item(ui, Command::VoicePushToTalk, true, &mut raised);
+            item(ui, Command::VoiceMute, true, &mut raised);
         });
 
         // Last, as it is everywhere.
@@ -1337,6 +1351,210 @@ fn single_selected_instance(scene: &Scene, selection: &Selection) -> Option<buzz
     object.instance().map(|_| id)
 }
 
+/// **Pose** of a Cast character unpacked onto the stage: picks the pose from the
+/// playhead on (`buzz_act::pose::switch_lifted_pose`).
+fn lifted_pose_properties(ui: &mut Ui, scene: &mut Scene, folder: buzz_scene::LayerId, at: EditAt) -> bool {
+    let poses = buzz_act::pose::poses_of(scene, folder);
+    if poses.len() < 2 {
+        return false;
+    }
+    let shown = buzz_act::pose::shown_pose(scene, folder, at.frame).unwrap_or_default();
+    let mut picked: Option<buzz_scene::SymbolId> = None;
+    property_section(ui, "lifted-pose-section", "Character", true, |ui| {
+        let hover = "Turn this character to another pose, from this frame on. Earlier frames keep the current one.";
+        property_row(ui, "Pose", Some(hover), |ui| {
+            egui::ComboBox::from_id_salt("lifted-pose")
+                .selected_text(&shown)
+                .show_ui(ui, |ui| {
+                    for (sid, name) in &poses {
+                        if ui.selectable_label(*name == shown, name).clicked() && *name != shown {
+                            picked = Some(*sid);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(hover);
+        });
+    });
+    match picked {
+        Some(pose) => buzz_act::pose::switch_lifted_pose(scene, folder, at.frame, pose).is_ok_and(|r| r.changed),
+        None => false,
+    }
+}
+
+/// Every selected object that is a symbol instance, when two or more are
+/// selected and nothing else is (Color Effect then sets them all).
+fn multi_selected_instances(scene: &Scene, selection: &Selection) -> Vec<buzz_scene::ObjectId> {
+    let ids: Vec<_> = selection.iter().collect();
+    if ids.len() < 2 {
+        return Vec::new();
+    }
+    let all = ids
+        .iter()
+        .all(|id| scene.find_object(*id).is_some_and(|(_, o)| o.instance().is_some()));
+    if all { ids } else { Vec::new() }
+}
+
+/// Animate's Color Effect: Style None / Brightness / Tint / Advanced / Alpha.
+/// Returns the new transform when the user changed it (live while dragging).
+fn color_effect_section(
+    ui: &mut Ui,
+    key: egui::Id,
+    current: buzz_scene::ColorTransform,
+) -> Option<buzz_scene::ColorTransform> {
+    use buzz_scene::{ColorEffect, ColorTransform};
+    let mut out: Option<ColorTransform> = None;
+    let derived = ColorEffect::from_transform(&current);
+    // Advanced is not recoverable from the numbers once they look like a
+    // named effect, so choosing it is remembered here.
+    let forced_key = key.with("advanced");
+    let forced: bool = ui.data(|d| d.get_temp(forced_key)).unwrap_or(false);
+    let advanced = forced || matches!(derived, ColorEffect::Advanced);
+    let label = if advanced { "Advanced" } else { derived.label() };
+
+    ui.add_space(Tokens::SPACE_1);
+    ui.label(RichText::new("Color Effect").small().weak());
+
+    property_row(ui, "Style", None, |ui| {
+        egui::ComboBox::from_id_salt(key)
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                let options = [
+                    ColorEffect::None,
+                    ColorEffect::Brightness(0.0),
+                    ColorEffect::Tint {
+                        color: Color::from_rgba8(0xFF, 0x00, 0x00, 0xFF),
+                        amount: 0.5,
+                    },
+                    ColorEffect::Advanced,
+                    ColorEffect::Alpha(1.0),
+                ];
+                for option in options {
+                    let selected = option.label() == label;
+                    if ui.selectable_label(selected, option.label()).clicked() && !selected {
+                        let is_adv = matches!(option, ColorEffect::Advanced);
+                        ui.data_mut(|d| d.insert_temp(forced_key, is_adv));
+                        // Advanced keeps the current numbers, ready to edit.
+                        out = Some(option.to_transform().unwrap_or(current));
+                    }
+                }
+            });
+    });
+
+    if advanced {
+        let mut t = current;
+        let mut changed = false;
+        for (i, name) in ["Red", "Green", "Blue", "Alpha"].into_iter().enumerate() {
+            property_row(ui, name, None, |ui| {
+                let mut pct = t.multiply[i] * 100.0;
+                if ui
+                    .add(egui::Slider::new(&mut pct, -100.0..=100.0).suffix("%"))
+                    .changed()
+                {
+                    t.multiply[i] = pct / 100.0;
+                    changed = true;
+                }
+                let mut off = t.add[i] * 255.0;
+                if ui
+                    .add(egui::DragValue::new(&mut off).range(-255.0..=255.0).speed(1.0))
+                    .on_hover_text("Offset, -255 to 255")
+                    .changed()
+                {
+                    t.add[i] = off / 255.0;
+                    changed = true;
+                }
+            });
+        }
+        if changed {
+            out = Some(t);
+        }
+        return out;
+    }
+
+    match derived {
+        ColorEffect::Brightness(amount) => {
+            property_row(ui, "Brightness", None, |ui| {
+                let mut percent = amount * 100.0;
+                if ui
+                    .add(egui::Slider::new(&mut percent, -100.0..=100.0).suffix("%"))
+                    .changed()
+                {
+                    out = Some(ColorTransform::brightness(percent / 100.0));
+                }
+            });
+        }
+        ColorEffect::Alpha(amount) => {
+            property_row(ui, "Alpha", None, |ui| {
+                let mut percent = amount * 100.0;
+                if ui
+                    .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
+                    .changed()
+                {
+                    out = Some(ColorTransform::alpha(percent / 100.0));
+                }
+            });
+        }
+        ColorEffect::Tint { color, amount } => {
+            let mut tint = to_egui(color);
+            let mut percent = amount * 100.0;
+            property_row(ui, "Tint", None, |ui| {
+                if ui.color_edit_button_srgba(&mut tint).changed() {
+                    out = Some(ColorTransform::tint(from_egui(tint), percent / 100.0));
+                }
+            });
+            property_row(ui, "Amount", None, |ui| {
+                if ui
+                    .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
+                    .changed()
+                {
+                    out = Some(ColorTransform::tint(from_egui(tint), percent / 100.0));
+                }
+            });
+        }
+        ColorEffect::None | ColorEffect::Advanced => {}
+    }
+    out
+}
+
+/// Color Effect for two or more selected instances: shows the first one's
+/// effect and writes any change to all of them.
+fn multi_instance_color_effect(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    ids: &[buzz_scene::ObjectId],
+    at: EditAt,
+) -> bool {
+    let Some(first) = ids.first().copied() else {
+        return false;
+    };
+    let current = scene
+        .find_object(first)
+        .and_then(|(l, earliest)| {
+            scene
+                .layers()
+                .get(l)
+                .and_then(|l| l.frames.objects_at(at.frame).iter().find(|o| o.id == first))
+                .or(Some(earliest))
+        })
+        .and_then(|o| o.instance().map(|i| i.color))
+        .unwrap_or_default();
+    let mut result = None;
+    property_section(ui, "multi-instance-section", "Symbol Instances", true, |ui| {
+        result = color_effect_section(ui, egui::Id::new("multi-instance-effect"), current);
+    });
+    let Some(t) = result else {
+        return false;
+    };
+    for id in ids {
+        scene.update_object_where(at, *id, |o| {
+            if let buzz_scene::ObjectKind::Instance(i) = &mut o.kind {
+                i.color = t;
+            }
+        });
+    }
+    true
+}
+
 /// Animate's Properties panel for a symbol instance.
 ///
 /// Everything here is a property of the *placement*, not of the symbol: two
@@ -1348,7 +1566,7 @@ fn instance_properties(
     id: buzz_scene::ObjectId,
     at: EditAt,
 ) -> bool {
-    use buzz_scene::{ColorEffect, LoopMode};
+    use buzz_scene::LoopMode;
 
     let Some((layer, earliest)) = scene.find_object(id) else {
         return false;
@@ -1453,9 +1671,14 @@ fn instance_properties(
 
     // Same frame / From frame 1, remembered between selections and sessions.
     let start_key = egui::Id::new("symbol-set-start");
+    // A Cast character's set is its poses: the owner and members named
+    // `<Character> <Pose>` (CAST_POSES_PLAN C2). It is labelled Pose, and walks
+    // start from their own first frame by default.
+    let is_character = set.len() > 1 && set.iter().skip(1).all(|(_, n)| n.starts_with(&set[0].1));
+    let set_label = if is_character { "Pose" } else { "Set" };
     let mut from_start: bool = ui
         .data_mut(|d| d.get_persisted(start_key))
-        .unwrap_or(false);
+        .unwrap_or(is_character);
     let mut picked: Option<buzz_scene::SymbolId> = None;
     let mut include: Option<buzz_scene::SymbolId> = None;
     let mut remove: Option<buzz_scene::SymbolId> = None;
@@ -1570,7 +1793,7 @@ fn instance_properties(
         if !set.is_empty() {
             let hover = "Swap this instance to another symbol in its set, from this frame on. \
                          Earlier frames keep the current one.";
-            property_row(ui, "Set", Some(hover), |ui| {
+            property_row(ui, set_label, Some(hover), |ui| {
                 egui::ComboBox::from_id_salt("instance-set")
                     .selected_text(&shown_name)
                     .show_ui(ui, |ui| {
@@ -1666,98 +1889,9 @@ fn instance_properties(
         );
 
         // -- colour effect ---------------------------------------------------
-        let effect = ColorEffect::from_transform(&instance.color);
-
-        ui.add_space(Tokens::SPACE_1);
-        ui.label(RichText::new("Color Effect").small().weak());
-
-        property_row(ui, "Style", None, |ui| {
-            egui::ComboBox::from_id_salt("instance-effect")
-                .selected_text(effect.label())
-                .show_ui(ui, |ui| {
-                    // Switching style starts that effect at a visible amount,
-                    // rather than at zero where it would look broken.
-                    let options = [
-                        ColorEffect::None,
-                        ColorEffect::Brightness(0.0),
-                        ColorEffect::Tint {
-                            color: Color::from_rgba8(0xFF, 0x00, 0x00, 0xFF),
-                            amount: 0.5,
-                        },
-                        ColorEffect::Alpha(1.0),
-                    ];
-                    for option in options {
-                        let selected =
-                            std::mem::discriminant(&option) == std::mem::discriminant(&effect);
-                        if ui.selectable_label(selected, option.label()).clicked()
-                            && !selected
-                            && let Some(t) = option.to_transform()
-                        {
-                            new_color = t;
-                            edited = true;
-                        }
-                    }
-                });
-        });
-
-        match effect {
-            ColorEffect::Brightness(amount) => {
-                property_row(ui, "Brightness", None, |ui| {
-                    let mut percent = amount * 100.0;
-                    if ui
-                        .add(egui::Slider::new(&mut percent, -100.0..=100.0).suffix("%"))
-                        .changed()
-                    {
-                        new_color = buzz_scene::ColorTransform::brightness(percent / 100.0);
-                        edited = true;
-                    }
-                });
-            }
-            ColorEffect::Alpha(amount) => {
-                property_row(ui, "Alpha", None, |ui| {
-                    let mut percent = amount * 100.0;
-                    if ui
-                        .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
-                        .changed()
-                    {
-                        new_color = buzz_scene::ColorTransform::alpha(percent / 100.0);
-                        edited = true;
-                    }
-                });
-            }
-            ColorEffect::Tint { color, amount } => {
-                let mut tint = to_egui(color);
-                let mut percent = amount * 100.0;
-
-                property_row(ui, "Tint", None, |ui| {
-                    if ui.color_edit_button_srgba(&mut tint).changed() {
-                        new_color =
-                            buzz_scene::ColorTransform::tint(from_egui(tint), percent / 100.0);
-                        edited = true;
-                    }
-                });
-
-                property_row(ui, "Amount", None, |ui| {
-                    if ui
-                        .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
-                        .changed()
-                    {
-                        new_color =
-                            buzz_scene::ColorTransform::tint(from_egui(tint), percent / 100.0);
-                        edited = true;
-                    }
-                });
-            }
-            ColorEffect::Advanced => {
-                property_row(ui, "Advanced", None, |ui| {
-                    ui.label(RichText::new("Set by a tween or an import").small().weak())
-                        .on_hover_text(
-                            "This colour effect is not one of Animate's four named ones. \
-                         Choosing a style above replaces it.",
-                        );
-                });
-            }
-            ColorEffect::None => {}
+        if let Some(t) = color_effect_section(ui, egui::Id::new(("instance-effect", id.0)), instance.color) {
+            new_color = t;
+            edited = true;
         }
     });
 
@@ -3353,6 +3487,18 @@ pub fn properties_panel(
     // so the section only appears for one.
     if let Some(id) = single_selected_instance(scene, selection) {
         changed |= instance_properties(ui, scene, id, at);
+    }
+    let multi = multi_selected_instances(scene, selection);
+    if !multi.is_empty() {
+        changed |= multi_instance_color_effect(ui, scene, &multi, at);
+    }
+
+    // A part of a Cast character unpacked onto the stage (or its folder): the
+    // Pose dropdown turns the whole character from the playhead on.
+    if let Some((layer, _)) = selection.iter().next().and_then(|id| scene.find_object(id))
+        && let Some(folder) = buzz_act::pose::character_folder_of(scene, layer)
+    {
+        changed |= lifted_pose_properties(ui, scene, folder, at);
     }
 
     // Which way the selection faces in space. Animate keeps this for movie
@@ -5628,6 +5774,61 @@ mod tests {
                 &mut view,
                 EditAt::exact(0),
             );
+        });
+    }
+
+    /// Two selected instances get one Color Effect that sets both; Advanced
+    /// shows its editor without panicking.
+    #[test]
+    fn color_effect_sets_every_selected_instance() {
+        use buzz_geom::Affine;
+        use buzz_scene::SymbolKind;
+
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().unwrap().id;
+        let symbol = scene.add_symbol("Hero", SymbolKind::Graphic, None);
+        let a = scene.add_instance_at(layer, 0, symbol, Affine::IDENTITY).unwrap();
+        let b = scene.add_instance_at(layer, 0, symbol, Affine::translate((50.0, 0.0))).unwrap();
+        let mut selection = Selection::new();
+        selection.set([a, b]);
+        assert_eq!(multi_selected_instances(&scene, &selection), vec![a, b]);
+
+        let fx = buzz_scene::ColorTransform::alpha(0.3);
+        let mut changed = false;
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            // Drive the write half directly: the widget itself needs a click.
+            let ids = multi_selected_instances(&scene, &selection);
+            for id in &ids {
+                scene.update_object_where(EditAt::exact(0), *id, |o| {
+                    if let buzz_scene::ObjectKind::Instance(i) = &mut o.kind {
+                        i.color = fx;
+                    }
+                });
+            }
+            changed = true;
+            let mut style = DrawStyle::default();
+            let mut view = ViewSettings::default();
+            let _ = properties_panel(ui, &mut scene, &selection, &mut style, &mut view, EditAt::exact(0));
+        });
+        assert!(changed);
+        for id in [a, b] {
+            let (_, o) = scene.find_object(id).unwrap();
+            assert_eq!(o.instance().unwrap().color, fx);
+        }
+
+        // Advanced: an uneven transform shows the editor.
+        scene.update_object_where(EditAt::exact(0), a, |o| {
+            if let buzz_scene::ObjectKind::Instance(i) = &mut o.kind {
+                i.color.multiply = [0.5, 0.8, 1.0, 1.0];
+            }
+        });
+        selection.select_one(a);
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let mut style = DrawStyle::default();
+            let mut view = ViewSettings::default();
+            let _ = properties_panel(ui, &mut scene, &selection, &mut style, &mut view, EditAt::exact(0));
         });
     }
 

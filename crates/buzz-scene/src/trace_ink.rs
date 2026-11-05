@@ -1270,6 +1270,7 @@ pub(crate) fn trace_ink_with(
         strokes: 0,
         fills: 0,
         message: format!("Traced {n} ink shapes"),
+        blurs: Vec::new(),
     }
 }
 

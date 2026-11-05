@@ -65,17 +65,15 @@
         get: function () {
           var info = elementInfo(id, frame);
           if (!info.libraryItemName) return null;
-          return {
-            name: info.libraryItemName,
-            itemType: info.libraryItemType,
-            // Only `.frameCount` is real: a nested `Timeline` over the
-            // symbol's own layers is not exposed here, and no ported
-            // command reads more than this one number off it.
-            timeline: { frameCount: info.libraryFrameCount },
-          };
+          return libraryItemOf(info.libraryItemName, info.libraryItemType);
         },
         enumerable: true,
       },
+      // The element's bounding box on its timeline, transform included.
+      left: bound(0),
+      top: bound(1),
+      width: bound(2),
+      height: bound(3),
       x: {
         get: function () { return elementInfo(id, frame).x; },
         set: function (v) { host.setElementXY(id, frame, Number(v), NaN); },
@@ -107,14 +105,180 @@
         set: function (v) { host.setElementFirstFrame(id, frame, Number(v)); },
         enumerable: true,
       },
+      // The matrix, as Animate reports it: scale is the length of each
+      // column, rotation the angle of the first. Setting one rebuilds the
+      // matrix with the transformation point held still on the stage.
+      rotation: partOf("rotation"),
+      scaleX: partOf("scaleX"),
+      scaleY: partOf("scaleY"),
+      skewX: partOf("skewX"),
+      skewY: partOf("skewY"),
+      // "loop" | "play once" | "single frame"; "" on anything not an instance.
+      loop: partOf("loop"),
+      name: partOf("name"),
     });
+    // Bounds are asked for only when read: measuring an instance resolves its
+    // whole symbol, which is not worth doing on every `x` or `matrix` access.
+    function bound(i) {
+      return {
+        get: function () {
+          var b = JSON.parse(host.elementBounds(id, frame));
+          return i < 2 ? b[i] : (i === 2 ? b[2] - b[0] : b[3] - b[1]);
+        },
+        enumerable: true,
+      };
+    }
+    function partOf(key) {
+      return {
+        get: function () {
+          var parts = JSON.parse(host.elementTransformParts(id, frame));
+          return parts[key];
+        },
+        set: function (v) {
+          var o = {};
+          o[key] = typeof v === "string" ? v : Number(v);
+          host.setElementTransformParts(id, frame, JSON.stringify(o));
+        },
+        enumerable: true,
+      };
+    }
   }
   Element.prototype.getTransformationPoint = function () {
     return JSON.parse(host.elementTransformationPoint(this.__objectId, this.__frame));
   };
 
+  // ---- a library item, and the timeline inside it ---------------------------
+  //
+  // `libraryItem.timeline` is the symbol's own layers and frames, readable
+  // without entering it (layer names can be written): what a command needs to
+  // look inside a character before it rigs it. Rebuilt from the host on each
+  // access, so it stays live across edits.
+  function libraryItemOf(name, itemType) {
+    var o = { name: name, itemType: itemType };
+    Object.defineProperty(o, "timeline", {
+      get: function () { return new SymbolTimeline(name); },
+      enumerable: true,
+    });
+    return o;
+  }
+  function symLayerList(sym) { return JSON.parse(host.symLayers(sym)); }
+  function SymbolTimeline(sym) {
+    Object.defineProperties(this, {
+      name: { value: sym, enumerable: true },
+      layerCount: { get: function () { return symLayerList(sym).length; }, enumerable: true },
+      frameCount: {
+        get: function () {
+          return symLayerList(sym).reduce(function (m, l) { return Math.max(m, l.frameCount); }, 1);
+        },
+        enumerable: true,
+      },
+      layers: {
+        get: function () {
+          var out = [];
+          var n = symLayerList(sym).length;
+          for (var i = 0; i < n; i++) out.push(new SymbolLayer(sym, i));
+          return out;
+        },
+        enumerable: true,
+      },
+    });
+  }
+  function SymbolLayer(sym, index) {
+    function field(key) { return symLayerList(sym)[index][key]; }
+    Object.defineProperties(this, {
+      index: { value: index, enumerable: true },
+      name: {
+        get: function () { return field("name"); },
+        set: function (v) { host.symSetLayer(sym, index, "name", String(v)); },
+        enumerable: true,
+      },
+      layerType: { get: function () { return field("layerType"); }, enumerable: true },
+      locked: {
+        get: function () { return field("locked"); },
+        set: function (v) { host.symSetLayer(sym, index, "locked", v ? "true" : "false"); },
+        enumerable: true,
+      },
+      visible: {
+        get: function () { return field("visible"); },
+        set: function (v) { host.symSetLayer(sym, index, "visible", v ? "true" : "false"); },
+        enumerable: true,
+      },
+      frameCount: { get: function () { return field("frameCount"); }, enumerable: true },
+      frames: {
+        get: function () {
+          var count = field("frameCount");
+          return new Proxy([], {
+            get: function (target, prop) {
+              if (prop === "length") return count;
+              if (typeof prop === "string" && /^[0-9]+$/.test(prop)) {
+                var f = Number(prop);
+                return f < count ? new SymbolFrame(sym, index, f) : undefined;
+              }
+              if (prop === Symbol.iterator || prop === "forEach" || prop === "map" ||
+                  prop === "slice" || prop === "filter" || prop === "indexOf") {
+                var all = [];
+                for (var g = 0; g < count; g++) all.push(new SymbolFrame(sym, index, g));
+                var v = all[prop];
+                return typeof v === "function" ? v.bind(all) : v;
+              }
+              return target[prop];
+            },
+            has: function (target, prop) {
+              if (typeof prop === "string" && /^[0-9]+$/.test(prop)) return Number(prop) < count;
+              return prop in target;
+            },
+          });
+        },
+        enumerable: true,
+      },
+    });
+  }
+  function SymbolFrame(sym, layerIndex, frame) {
+    var snap = null;
+    function info() {
+      if (snap === null) snap = JSON.parse(host.symFrame(sym, layerIndex, frame));
+      return snap;
+    }
+    Object.defineProperties(this, {
+      startFrame: { get: function () { return info().startFrame; }, enumerable: true },
+      duration: { get: function () { return info().duration; }, enumerable: true },
+      isKeyframe: { get: function () { return info().isKeyframe; }, enumerable: true },
+      tweenType: { get: function () { return info().tweenType; }, enumerable: true },
+      elements: {
+        get: function () { return info().elements.map(function (e) { return new SymbolElement(e); }); },
+        enumerable: true,
+      },
+    });
+  }
+  // An element read out of a symbol: what it was when the frame was read.
+  function SymbolElement(e) {
+    Object.defineProperties(this, {
+      elementType: { value: e.elementType, enumerable: true },
+      symbolType: { value: e.symbolType, enumerable: true },
+      name: { value: e.name, enumerable: true },
+      x: { value: e.x, enumerable: true },
+      y: { value: e.y, enumerable: true },
+      left: { value: e.left, enumerable: true },
+      top: { value: e.top, enumerable: true },
+      width: { value: e.width, enumerable: true },
+      height: { value: e.height, enumerable: true },
+      matrix: {
+        get: function () { return { a: e.a, b: e.b, c: e.c, d: e.d, tx: e.tx, ty: e.ty }; },
+        enumerable: true,
+      },
+      libraryItem: {
+        get: function () {
+          return e.libraryItemName ? libraryItemOf(e.libraryItemName, e.libraryItemType) : null;
+        },
+        enumerable: true,
+      },
+    });
+  }
+
   // ---- one frame, on one layer ----------------------------------------------
   function Frame(layerIndex, frame) {
+    var cached = null;
+    var cachedRev = -1;
     Object.defineProperties(this, {
       isKeyframe: {
         get: function () { return host.frameIsKeyframe(layerIndex, frame); },
@@ -145,11 +309,17 @@
         get: function () { return JSON.parse(host.frameSoundInfo(layerIndex, frame)); },
         enumerable: true,
       },
+      // Cached per document revision: `for (j < frame.elements.length)` asks
+      // for the list on every pass, and a frame can hold thousands.
       elements: {
         get: function () {
+          var rev = host.sceneRevision();
+          if (cached !== null && cachedRev === rev) return cached;
           var ids = JSON.parse(host.frameElementIds(layerIndex, frame));
           var out = [];
           for (var i = 0; i < ids.length; i++) out.push(new Element(ids[i], frame));
+          cached = out;
+          cachedRev = rev;
           return out;
         },
         enumerable: true,
@@ -199,6 +369,17 @@
         },
         enumerable: true,
       },
+      // Animate's layer parenting: the layer this one follows, or null.
+      parentLayer: {
+        get: function () {
+          var p = host.layerFollows(index);
+          return p < 0 ? null : new Layer(p);
+        },
+        set: function (v) {
+          host.setLayerFollows(index, v && typeof v.index === "number" ? v.index : -1, 0);
+        },
+        enumerable: true,
+      },
       // This layer's own frame count, distinct from the timeline's
       // document-wide `frameCount` below.
       frameCount: {
@@ -208,16 +389,68 @@
       // `layer.frames[f]`: one Frame per frame on this layer, rebuilt on
       // each access for the same reason `Timeline.layers` below is.
       frames: {
+        // A lazy array: a layer can hold thousands of frames and a script
+        // usually reads two, so a Frame is only built when it is asked for.
         get: function () {
           var count = host.layerFrameCount(index);
-          var out = [];
-          for (var f = 0; f < count; f++) out.push(new Frame(index, f));
-          return out;
+          return new Proxy([], {
+            get: function (target, prop) {
+              if (prop === "length") return count;
+              if (typeof prop === "string" && /^[0-9]+$/.test(prop)) {
+                var f = Number(prop);
+                return f < count ? new Frame(index, f) : undefined;
+              }
+              if (prop === Symbol.iterator || prop === "forEach" || prop === "map" ||
+                  prop === "slice" || prop === "filter" || prop === "indexOf") {
+                var all = [];
+                for (var g = 0; g < count; g++) all.push(new Frame(index, g));
+                var v = all[prop];
+                return typeof v === "function" ? v.bind(all) : v;
+              }
+              return target[prop];
+            },
+            has: function (target, prop) {
+              if (typeof prop === "string" && /^[0-9]+$/.test(prop)) return Number(prop) < count;
+              return prop in target;
+            },
+          });
         },
         enumerable: true,
       },
     });
   }
+
+  // Layer parenting at a frame. Animate keys the parent per frame; a layer
+  // here follows one layer for good, so the frame only says which pose the link
+  // is made at. `setRigParentAtFrame(parent, frame)` takes a Layer or an index;
+  // the shelf's own unparent spelling `setRigParentAtFrame(0, -1)` and a null /
+  // -1 parent both unlink.
+  Layer.prototype.getRigParentAtFrame = function () {
+    return this.parentLayer;
+  };
+  Layer.prototype.setRigParentAtFrame = function (parent, frame) {
+    var idx = -1;
+    if (parent && typeof parent === "object" && typeof parent.index === "number") {
+      idx = parent.index;
+    } else if (typeof parent === "number" && frame !== -1) {
+      idx = parent;
+    }
+    var at = typeof frame === "number" && frame > 0 ? frame : 0;
+    return host.setLayerFollows(this.index, idx, at);
+  };
+  // A layer's effects, as Animate's "advanced layers" expose them.
+  Layer.prototype.getColorTransformAtFrame = function (frame) {
+    return JSON.parse(host.layerColorTransform(this.index, Number(frame) || 0));
+  };
+  Layer.prototype.setColorTransformAtFrame = function (frame, t) {
+    host.setLayerColorTransform(this.index, Number(frame) || 0, JSON.stringify(t || {}));
+  };
+  Layer.prototype.getFiltersAtFrame = function (frame) {
+    return JSON.parse(host.layerFilters(this.index, Number(frame) || 0));
+  };
+  Layer.prototype.setFiltersAtFrame = function (frame, list) {
+    host.setLayerFilters(this.index, Number(frame) || 0, JSON.stringify(list || []));
+  };
 
   // ---- the timeline -------------------------------------------------------
   function Timeline() {
@@ -235,6 +468,13 @@
         set: function (v) { host.setCurrentFrame(Number(v)); },
         enumerable: true,
       },
+      // The layer `setSelectedLayers` last named (else the front one).
+      currentLayer: {
+        get: function () { return host.currentLayerIndex(); },
+        set: function (v) { host.setSelectedLayers(JSON.stringify([Number(v)])); },
+        enumerable: true,
+      },
+      name: { get: function () { return host.sceneName(host.sceneIndex()); }, enumerable: true },
       // Rebuilt on each access so it reflects layers added since. A cached
       // array would go stale the moment a script called addNewLayer, which is
       // exactly what a script does.
@@ -249,9 +489,15 @@
     });
   }
 
-  Timeline.prototype.addNewLayer = function (name) {
-    host.addNewLayer(name === undefined ? "" : String(name));
-    return 0; // the new layer goes to the front, as in Animate
+  // `addNewLayer(name, layerType, bAddAbove)`: next to the layer that is
+  // current (`setSelectedLayers`), above it unless `bAddAbove` is false, else at
+  // the front. Makes the new layer current and returns its index.
+  Timeline.prototype.addNewLayer = function (name, layerType, bAddAbove) {
+    return host.addNewLayerEx(
+      name === undefined || name === null ? "" : String(name),
+      layerType === undefined || layerType === null ? "normal" : String(layerType),
+      bAddAbove === undefined ? true : !!bAddAbove
+    );
   };
   Timeline.prototype.deleteLayer = function (index) {
     host.deleteLayer(index === undefined ? 0 : Number(index));
@@ -312,7 +558,16 @@
   Timeline.prototype.getSelectedFrames = function () {
     return JSON.parse(host.getSelectedFrames());
   };
-  Timeline.prototype.removeFrames = function () { host.removeFrames(); };
+  // `removeFrames([start [, end]])`: with a range, it acts on that range of the
+  // layer last named (end is exclusive, as Animate documents it); without, on
+  // the selected frames.
+  Timeline.prototype.removeFrames = function (start, end) {
+    if (start !== undefined) {
+      var from = Number(start);
+      host.setSelectedFramesRange(from, end === undefined ? from + 1 : Number(end));
+    }
+    host.removeFrames();
+  };
   Timeline.prototype.clearKeyframes = function () { host.clearKeyframes(); };
   Timeline.prototype.copyFrames = function () { host.copyFrames(); };
   Timeline.prototype.pasteFrames = function () { host.pasteFrames(); };
@@ -324,6 +579,12 @@
 
   // ---- the library --------------------------------------------------------
   function Library() {
+    var selected = null;
+    function item(raw, i) {
+      var o = libraryItemOf(raw.name, raw.itemType);
+      o.index = i;
+      return o;
+    }
     Object.defineProperties(this, {
       itemCount: {
         get: function () { return host.libraryItemCount(); },
@@ -331,15 +592,33 @@
       },
       items: {
         get: function () {
-          var out = [];
-          for (var i = 0; i < host.libraryItemCount(); i++) {
-            out.push({ index: i, name: host.libraryItemName(i) });
-          }
-          return out;
+          return JSON.parse(host.libraryItems()).map(item);
         },
         enumerable: true,
       },
     });
+    this.itemExists = function (name) {
+      return JSON.parse(host.libraryItems()).some(function (r) { return r.name === String(name); });
+    };
+    // Select an item by name; `renameItem` and `editItem` act on it.
+    this.selectItem = function (name) {
+      var ok = this.itemExists(name);
+      selected = ok ? String(name) : null;
+      return ok;
+    };
+    this.getSelectedItems = function () {
+      var all = JSON.parse(host.libraryItems()).map(item);
+      return all.filter(function (r) { return r.name === selected; });
+    };
+    this.renameItem = function (newName) {
+      if (selected === null) return false;
+      var ok = host.libraryRename(selected, String(newName));
+      if (ok) selected = String(newName);
+      return ok;
+    };
+    this.editItem = function (name) {
+      return host.libraryEdit(String(name === undefined ? selected : name));
+    };
   }
 
   // ---- the document -------------------------------------------------------
@@ -445,12 +724,48 @@
     };
     this.exitEditMode = function () { host.exitEditMode(); };
 
-    this.convertToSymbol = function (type, name) {
+    // Modify > Symbol > Swap Symbol, Modify > Transform > Remove Transform.
+    this.swapElement = function (name) { host.swapElement(String(name)); };
+    this.resetTransformation = function () { host.resetTransformation(); };
+    this.setTransformationPoint = function (p) {
+      host.setTransformationPoint(Number(p && p.x) || 0, Number(p && p.y) || 0);
+    };
+    // Tint the selected instances: `colour` is 0xRRGGBB or "#RRGGBB".
+    this.setInstanceTint = function (colour, percent) {
+      var rgb = typeof colour === "string"
+        ? parseInt(colour.replace("#", ""), 16)
+        : Number(colour);
+      host.setInstanceTint(rgb >>> 0, percent === undefined ? 100 : Number(percent));
+    };
+    this.advancedLayersEnabled = true;
+    this.name = "Untitled";
+    // A script works on a copy of the scene, so saving is the host's job once
+    // the run is committed: this asks for it.
+    this.save = function () { host.requestSave(); return true; };
+    // `convertToSymbol(type, name, registrationPoint)`: the registration point
+    // is one of "top left" ... "center" ... "bottom right"; the symbol's origin
+    // goes there on the artwork.
+    this.convertToSymbol = function (type, name, registration) {
       host.convertToSymbol(
         type === undefined ? "graphic" : String(type),
-        name === undefined ? "" : String(name)
+        name === undefined ? "" : String(name),
+        registration === undefined || registration === null ? "" : String(registration)
       );
     };
+    // Modify > Break Apart on the selection: an instance becomes what is in it
+    // (at the frame it shows), a group its members.
+    this.breakApart = function () { host.breakApart(); };
+    // Modify > Bitmap > Trace Bitmap on the selected bitmaps. Whatever
+    // arguments it is given (Animate's threshold, minimum area, curve fit,
+    // corner threshold -- or an options object), BuzzAnimate traces the way its
+    // own Trace Bitmap does (the Bold trace) and leaves the new shapes selected.
+    this.traceBitmap = function () { host.traceBitmap(); };
+    // File > Import. Always puts the picture on the stage, centred, and selects
+    // it (Animate's `importToLibrary = true` would leave it in the library only;
+    // a bitmap here is a shape, so there is no library-only form).
+    this.importFile = function (uri) { return host.importFile(String(uri)); };
+    // XMLUI: `{dismiss: "accept"|"cancel", <control id>: <value>, ...}`.
+    this.xmlPanel = function (uri) { return fl.xmlPanel(uri); };
 
     // ---- animation --------------------------------------------------------
     //
@@ -814,6 +1129,38 @@
       host.runMenuCommand(String(name === undefined ? "" : name));
     },
 
+    // File pickers need a person: with one, a real file dialog (and the file
+    // picked may then be imported); unattended, it is cancelled, which every
+    // command that asks handles (it returns). `null` is a cancel.
+    browseForFileURL: function (kind, title) {
+      var uri = host.browseFile(String(kind) === "save", title === undefined ? "" : String(title));
+      return uri === "" ? null : uri;
+    },
+    // XMLUI dialogs (`fl.xmlPanel(uri)`, `fl.xmlPanelFromString(xml)`).
+    xmlPanel: function (uri) {
+      return JSON.parse(host.xmlPanel(host.readScript(String(uri))));
+    },
+    xmlPanelFromString: function (xml) {
+      return JSON.parse(host.xmlPanel(String(xml)));
+    },
+    getPrefString: function () { return ""; },
+    // Recorded in the trace, since there is no clipboard to fill.
+    clipCopyString: function (text) { host.trace("[clipboard] " + String(text)); },
+    // Animate fires these on document events; commands use them to start a
+    // background auto-save. They are remembered, never fired.
+    addEventListener: function (type, handler) {
+      (fl._listeners[type] = fl._listeners[type] || []).push(handler);
+      return fl._listeners[type].length;
+    },
+    removeEventListener: function (type, handler) {
+      var list = fl._listeners[type] || [];
+      var i = list.indexOf(handler);
+      if (i >= 0) { list.splice(i, 1); return true; }
+      return false;
+    },
+    _listeners: {},
+    saveDocumentAs: function () { host.requestSave(); return true; },
+    saveDocument: function () { host.requestSave(); return true; },
     // Animate dims the whole application while a script runs, so long ones
     // do not look hung. BuzzAnimate already shows its own "running" overlay
     // around the whole script, so this is a no-op rather than a second one.
@@ -823,19 +1170,29 @@
   // sometimes call it that way.
   fl.outputPanel = { trace: fl.trace, clear: function () {} };
 
-  // A script cannot reach the file system — that is the sandbox, and it
-  // stays — so `FLfile` only ever sees the same one folder `fl.runScript`
-  // does. None of the six ported commands call anything on `FLfile` but
-  // `.exists`, from a helper function none of them actually reaches; the
-  // rest are stubs so a shelf that does reach them fails on what it tried to
-  // do rather than on `FLfile` not existing at all.
+  // A script reaches files only through these, and only inside the Commands
+  // folder (read), the asset library and BuzzAnimate's script data folder
+  // (read and write) -- the sandbox. Writes meant for Animate's Configuration
+  // folder land in BuzzAnimate's overlay of it; see `shelf.rs`.
   globalThis.FLfile = {
     exists: function (uri) {
-      return host.scriptExists(String(uri === undefined ? "" : uri));
+      return host.fileExists(String(uri === undefined ? "" : uri));
     },
-    uriToPlatformPath: function (uri) { return String(uri === undefined ? "" : uri); },
-    platformPathToURI: function (path) { return String(path === undefined ? "" : path); },
-    listFolder: function () { return []; },
+    read: function (uri) { return host.fileRead(String(uri)); },
+    write: function (uri, text, mode) {
+      return host.fileWrite(String(uri), String(text), mode === "append");
+    },
+    remove: function (uri) { return host.fileRemove(String(uri)); },
+    createFolder: function (uri) { return host.fileCreateFolder(String(uri)); },
+    listFolder: function (uri, kind) {
+      return JSON.parse(host.fileList(String(uri), kind === undefined ? "" : String(kind)));
+    },
+    uriToPlatformPath: function (uri) { return host.uriToPath(String(uri === undefined ? "" : uri)); },
+    platformPathToURI: function (path) { return host.pathToUri(String(path === undefined ? "" : path)); },
+    // No shell: a command line is a way out of the sandbox.
+    runCommandLine: function (cmd) {
+      throw new Error("FLfile.runCommandLine is not available: scripts cannot start programs (" + String(cmd) + ")");
+    },
   };
 
   // ---- the dialogs a JSFL script expects ----------------------------------
@@ -862,7 +1219,9 @@
   // back in, one per call, in the order the script asks them.
   globalThis.prompt = function (message, initial) {
     var fallback = initial === undefined || initial === null ? "" : String(initial);
-    return host.prompt(message === undefined ? "" : String(message), fallback);
+    var answer = host.prompt(message === undefined ? "" : String(message), fallback);
+    // A closed dialog is `null`, as in Animate.
+    return answer === undefined ? null : answer;
   };
 
   // **Yes, because No means the script does nothing.** These are the user's
@@ -870,11 +1229,12 @@
   // would make half a shelf silently no-op, which is a worse answer than
   // doing the work and saying it was asked.
   globalThis.confirm = function (message) {
-    host.askedWith(message === undefined ? "" : String(message), "yes");
-    return true;
+    return host.confirmAsk(message === undefined ? "" : String(message));
   };
 
   globalThis.fl = fl;
+  // Newer Animate's name for the same object; some commands use it.
+  globalThis.an = fl;
   // `document` is what nearly every JSFL script assigns first.
   globalThis.document = theDocument;
 })();

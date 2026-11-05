@@ -741,6 +741,148 @@ pub fn ai_panel(ui: &mut Ui, ctx: &Context, view: AiPanelView<'_>) -> Vec<AiPane
     actions
 }
 
+/// What the progress window asked for this frame.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ProgressWindowOut {
+    /// The task whose Stop was pressed.
+    pub cancel: Option<u64>,
+    /// Where the user dropped the window (top-left, points), to remember.
+    pub moved: Option<[f32; 2]>,
+}
+
+/// The id the progress window's position is kept under (egui memory), so a
+/// test can measure where it sits.
+pub const PROGRESS_WINDOW_ID: &str = "progress_window";
+
+/// **Quiet actions** (Q2): the movable progress window for every long
+/// operation. One row per running task (drawn like the Tasks panel's). It
+/// opens centred on `stage` the first time, or at `saved` (where the user last
+/// dropped it); drag it by the title bar. The dash collapses it to a slim bar
+/// (`hidden`), "Show" restores it. Nothing is drawn when `rows` is empty, so it
+/// closes itself when the work ends.
+pub fn progress_window(
+    ctx: &Context,
+    rows: &[TaskRow],
+    stage: egui::Rect,
+    saved: Option<[f32; 2]>,
+    hidden: &mut bool,
+) -> ProgressWindowOut {
+    let mut out = ProgressWindowOut::default();
+    if rows.is_empty() {
+        return out;
+    }
+    const WIDTH: f32 = 280.0;
+    let estimate = egui::vec2(WIDTH, 44.0 + 46.0 * rows.len() as f32);
+    let start = match saved {
+        Some([x, y]) => egui::pos2(x, y),
+        None => stage.center() - estimate * 0.5,
+    };
+    let shown = egui::Window::new("Working")
+        .id(egui::Id::new(PROGRESS_WINDOW_ID))
+        .collapsible(false)
+        .resizable(false)
+        .default_pos(start)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            ui.set_width(WIDTH);
+            if *hidden {
+                ui.horizontal(|ui| {
+                    let n = rows.len();
+                    ui.label(format!("{n} task{} running", if n == 1 { "" } else { "s" }));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Show").clicked() {
+                            *hidden = false;
+                        }
+                    });
+                });
+                return;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                if ui.small_button("\u{2014}").on_hover_text("Hide to a slim bar").clicked() {
+                    *hidden = true;
+                }
+            });
+            for row in rows {
+                if let Some(crate::tasks_panel::TaskAction::Cancel(id)) = crate::tasks_panel::running_row(ui, row) {
+                    out.cancel = Some(id);
+                }
+                ui.add_space(4.0);
+            }
+        });
+    if let Some(shown) = shown {
+        // A drag is the window moving while the button is down; the drop is the
+        // button coming up after that. (Placement on its own never counts.)
+        let min = shown.response.rect.min;
+        let key = egui::Id::new("progress_window_drag");
+        let (last, dragging): (Option<egui::Pos2>, bool) = ctx.data(|d| d.get_temp(key)).unwrap_or((None, false));
+        let down = ctx.input(|i| i.pointer.any_down());
+        let mut dragging = dragging;
+        if down {
+            if last.is_some_and(|l| (l - min).length() > 0.5) {
+                dragging = true;
+            }
+        } else if dragging {
+            out.moved = Some([min.x, min.y]);
+            dragging = false;
+        }
+        ctx.data_mut(|d| d.insert_temp(key, (Some(min), dragging)));
+    }
+    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    out
+}
+
+/// **Quiet AI actions** (Q1): the review a command needs, in a compact window
+/// of its own — Scene from Image, Direct Story, Auto-Rig, Transcript — drawing
+/// the same section bodies the AI panel does. A window shows while its review
+/// is waiting; closing it drops the review. The caller skips this while the
+/// panel is open (the panel shows the same reviews).
+pub fn ai_review_windows(
+    ctx: &Context,
+    panel: &mut AiPanelState,
+    settings: &AiSettings,
+    sounds: &[String],
+    rig_target: Option<&str>,
+) -> Vec<AiPanelAction> {
+    let mut actions = Vec::new();
+    let mut open = panel.scene.is_some();
+    if open {
+        egui::Window::new("Scene from Image").open(&mut open).default_width(380.0).show(ctx, |ui| {
+            actions.extend(section_scene(ui, panel));
+        });
+        if !open {
+            panel.scene = None;
+        }
+    }
+    let mut open = panel.story.is_some();
+    if open {
+        egui::Window::new("Direct Story").open(&mut open).default_width(380.0).show(ctx, |ui| {
+            actions.extend(section_story(ui, panel, settings));
+        });
+        if !open {
+            panel.story = None;
+        }
+    }
+    let mut open = panel.rig.is_some();
+    if open {
+        egui::Window::new("Auto-Rig").open(&mut open).default_width(320.0).show(ctx, |ui| {
+            actions.extend(section_auto_rig(ui, panel, rig_target));
+        });
+        if !open {
+            panel.rig = None;
+        }
+    }
+    let mut open = panel.transcript.is_some();
+    if open {
+        egui::Window::new("Transcript").open(&mut open).default_width(420.0).show(ctx, |ui| {
+            actions.extend(section_transcribe(ui, panel, sounds));
+        });
+        if !open {
+            panel.transcript = None;
+        }
+    }
+    actions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

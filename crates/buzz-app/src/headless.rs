@@ -299,6 +299,8 @@ fn build(job: &RenderJob, report: &mut Vec<String>) -> Result<Document> {
                 .map(|p| p.to_path_buf()),
             // Unattended: every `prompt()` answers with its own default.
             prompt_answers: Vec::new(),
+            hooks: Default::default(),
+            overrides: Vec::new(),
         };
         // **A generous budget, because nobody is waiting on it.** The five
         // seconds a script gets in the editor is right there -- a mistake must

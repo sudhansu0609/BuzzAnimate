@@ -99,7 +99,7 @@ pub fn lip_sync_dialog(
                     ui.label(
                         RichText::new(
                             "There is no sound on the main timeline.\nImport one with \
-                             File ▸ Import Sound, and put it on a keyframe.",
+                             File ▸ Import to Stage, and put it on a keyframe.",
                         )
                         .small()
                         .weak(),

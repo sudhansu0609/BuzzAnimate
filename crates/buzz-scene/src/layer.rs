@@ -256,6 +256,12 @@ pub struct Layer {
     /// and XFL export skip it). `false` for every layer of every older document.
     pub audio_guide: bool,
 
+    /// **Where a lifted Cast character came from** (CAST_POSES_PLAN C2): on the
+    /// layer folder of a character unpacked onto the stage, its Cast asset
+    /// (`Cast/<Series>/<Name>`); on each layer of one of its poses,
+    /// `<asset>|<pose symbol name>`. `None` for every other layer.
+    pub cast_source: Option<String>,
+
     /// Filters applied to everything on this layer, as one subject.
     ///
     /// **Animate has no layer filters** — there, filters belong to a movie clip
@@ -319,6 +325,7 @@ impl Layer {
             depth: 0.0,
             collapsed: false,
             audio_guide: false,
+            cast_source: None,
             filters: Vec::new(),
             frames: LayerTimeline::new(),
         }

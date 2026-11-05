@@ -2477,6 +2477,7 @@ pub(crate) fn trace_ink_and_colour_with(
         strokes: n_lines,
         fills: n_fills,
         message: format!("Traced {n_fills} fills, {n_lines} colour lines and {n_ink} ink shapes"),
+        blurs: Vec::new(),
     }
 }
 

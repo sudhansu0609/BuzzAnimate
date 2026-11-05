@@ -1716,8 +1716,11 @@ fn apply_layers(
     let step = performance.step.max(1);
 
     let last = performance.frames.end.saturating_sub(1);
-    for part in &parts {
-        scene.update_layer(part.layer, |l| {
+    // Every layer the parts inherit from reaches the last frame too (the root may
+    // be no part: a shirt layer the parts hang on), or its motion reads as none
+    // there and the parts would be written without what they inherit.
+    for layer in parts.iter().map(|p| p.layer).chain(std::iter::once(view.root)) {
+        scene.update_layer(layer, |l| {
             if l.frames.length() <= last {
                 l.frames.insert_frame(last);
             }

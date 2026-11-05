@@ -177,6 +177,50 @@ pub enum Modifier {
     /// so a row of trees planted from the same drawing does not sway as one
     /// object — which is exactly what gives a painted background away.
     Sway { amount: f64, rate: f64 },
+    /// **Hair in moving air.** The drawing bends non-rigidly from a pinned
+    /// root: the further along it from the root, the further it moves.
+    ///
+    /// # Why it is not [`Self::Sway`]
+    ///
+    /// A sway is a shear: one number per frame, the whole drawing leaning like a
+    /// post. Hair does not lean, it *flows* -- a wave runs from the scalp to the
+    /// tips, the tips trail the head, and a gust lifts the ends before the
+    /// middle has noticed. That is a different displacement at every point of the
+    /// outline, so this re-draws the drawing's own outline each frame (the way
+    /// [`Self::Turn`] does) rather than prepending a transform.
+    ///
+    /// # What the numbers mean
+    ///
+    /// * `strength` -- how far the **tip** is blown at a full gust, as a
+    ///   fraction of the drawing's length (root to far end). `0.05` is a slow
+    ///   lift, `0.2` a gale. The displacement grows as `d^1.5` along the length
+    ///   (`d` = `0` at the root, `1` at the tip), so the root edge itself does
+    ///   not move at all and the outline leaves it smoothly.
+    /// * `rate` -- the wave's frequency in hertz; `0.15` is still air.
+    /// * `wavelength` -- the wave's length along the hair, as a fraction of the
+    ///   hair's length. Above `1.0` the whole lock swings as one; `0.4` ripples.
+    /// * `wind` -- the direction the air blows, in **degrees** in the drawing's
+    ///   own space: `0` blows to the right, `90` down, `-90` up. Gusts are biased
+    ///   that way, as with [`Self::Sway`]: they push downwind and lull back
+    ///   towards rest rather than waving evenly to both sides.
+    /// * `lag` -- the follow-through time constant in **seconds**. When the head
+    ///   moves or turns the tips trail it by about this long (a low-pass of the
+    ///   head's recent motion, which is what a critically damped spring does and
+    ///   needs no state). `0` switches it off.
+    /// * `root` -- which end is pinned: `0` top, `1` bottom, `2` left, `3`
+    ///   right, `4` the drawing's own origin (its pivot), with the hair radiating
+    ///   from it.
+    ///
+    /// Phase and gusts are seeded from the object's id, so two locks do not
+    /// flutter in step.
+    HairFlow {
+        strength: f64,
+        rate: f64,
+        wavelength: f64,
+        wind: f64,
+        lag: f64,
+        root: f64,
+    },
     /// **A steady drift, wrapping.** The object travels at `(dx, dy)` document
     /// units per second, and every `span` units of travel it is back where it
     /// started.
@@ -229,6 +273,7 @@ impl Modifier {
             Modifier::Blink { .. } => "Blink",
             Modifier::Turn { .. } => "Turn",
             Modifier::Sway { .. } => "Sway",
+            Modifier::HairFlow { .. } => "Hair Flow",
             Modifier::Drift { .. } => "Drift",
         }
     }
@@ -236,7 +281,10 @@ impl Modifier {
     /// Does this modifier change the object's pose/geometry (and so needs an
     /// owned, re-posed copy), rather than only prepending a transform?
     pub fn changes_pose(&self) -> bool {
-        matches!(self, Modifier::Spring { .. } | Modifier::Turn { .. })
+        matches!(
+            self,
+            Modifier::Spring { .. } | Modifier::Turn { .. } | Modifier::HairFlow { .. }
+        )
     }
 }
 
@@ -663,6 +711,436 @@ impl Breath {
     }
 }
 
+/// The settings of a [`Modifier::HairFlow`] that shape the field.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HairFlowParams {
+    pub strength: f64,
+    pub rate: f64,
+    pub wavelength: f64,
+    pub wind: f64,
+    pub root: f64,
+}
+
+/// Which end of the drawing is pinned.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HairRoot {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Pivot,
+}
+
+/// **The hair flow as a field**: one frame's worth of numbers that says where
+/// any point of the drawing (in the drawing's own space) is carried to. Built
+/// once per object per frame; evaluated per point.
+#[derive(Debug, Clone, Copy)]
+pub struct HairField {
+    root: HairRoot,
+    /// Coordinate of the pinned edge along the root axis.
+    edge: f64,
+    /// Centre across the hair (for the phase offset between strands).
+    lateral0: f64,
+    len: f64,
+    /// Tip displacement at a full gust, document units.
+    amp: f64,
+    wind: kurbo::Vec2,
+    inv_wavelength: f64,
+    /// `TAU * rate * t` plus the object's seed phase.
+    phase: f64,
+    /// The gust at the root, a third, two thirds and the tip: it travels.
+    gust: [f64; 4],
+    /// `W(now)^-1 * mean W`, see [`Scene::hair_lag`].
+    lag: Option<Affine>,
+}
+
+impl HairField {
+    /// Build the field for a drawing whose geometry spans `bounds`.
+    pub fn new(
+        params: HairFlowParams,
+        bounds: kurbo::Rect,
+        seed: u64,
+        t_seconds: f64,
+        lag: Option<Affine>,
+    ) -> Option<Self> {
+        use std::f64::consts::TAU;
+        if bounds.width() <= 0.0 && bounds.height() <= 0.0 {
+            return None;
+        }
+        let root = match params.root.round() as i64 {
+            1 => HairRoot::Bottom,
+            2 => HairRoot::Left,
+            3 => HairRoot::Right,
+            4 => HairRoot::Pivot,
+            _ => HairRoot::Top,
+        };
+        let (edge, len, lateral0) = match root {
+            HairRoot::Top => (bounds.y0, bounds.height(), bounds.center().x),
+            HairRoot::Bottom => (bounds.y1, bounds.height(), bounds.center().x),
+            HairRoot::Left => (bounds.x0, bounds.width(), bounds.center().y),
+            HairRoot::Right => (bounds.x1, bounds.width(), bounds.center().y),
+            HairRoot::Pivot => {
+                let far = [
+                    (bounds.x0, bounds.y0),
+                    (bounds.x1, bounds.y0),
+                    (bounds.x0, bounds.y1),
+                    (bounds.x1, bounds.y1),
+                ]
+                .iter()
+                .map(|(x, y)| x.hypot(*y))
+                .fold(0.0, f64::max);
+                (0.0, far, 0.0)
+            }
+        };
+        if len <= 1e-9 {
+            return None;
+        }
+        let rate = params.rate.clamp(0.0, 20.0);
+        let seed_phase = ((splitmix64(seed ^ 0x4841_4952) as f64) / u64::MAX as f64) * TAU;
+        let angle = params.wind.clamp(-3600.0, 3600.0).to_radians();
+        // The gust is sampled at four moments down the hair, 0.4 s apart over
+        // the whole length, so a lift visibly travels from root to tip.
+        let gust_rate = (rate * 0.5).max(0.02);
+        let mut gust = [0.0; 4];
+        for (k, g) in gust.iter_mut().enumerate() {
+            *g = gust_at(seed, gust_rate, t_seconds - 0.4 * k as f64 / 3.0);
+        }
+        Some(Self {
+            root,
+            edge,
+            lateral0,
+            len,
+            amp: params.strength.clamp(-2.0, 2.0) * len,
+            wind: kurbo::Vec2::new(angle.cos(), angle.sin()),
+            inv_wavelength: 1.0 / params.wavelength.clamp(0.05, 8.0),
+            phase: TAU * rate * t_seconds + seed_phase,
+            gust,
+            lag,
+        })
+    }
+
+    /// Where the point `p` of the drawing is carried to.
+    #[inline]
+    pub fn at(&self, p: Point) -> Point {
+        // Distance along the hair from the root, as a fraction of its length;
+        // the unit vector from root to tip there; and the position across it.
+        let (d, a, lateral) = match self.root {
+            HairRoot::Top => ((p.y - self.edge) / self.len, kurbo::Vec2::new(0.0, 1.0), p.x),
+            HairRoot::Bottom => (
+                (self.edge - p.y) / self.len,
+                kurbo::Vec2::new(0.0, -1.0),
+                p.x,
+            ),
+            HairRoot::Left => ((p.x - self.edge) / self.len, kurbo::Vec2::new(1.0, 0.0), p.y),
+            HairRoot::Right => (
+                (self.edge - p.x) / self.len,
+                kurbo::Vec2::new(-1.0, 0.0),
+                p.y,
+            ),
+            HairRoot::Pivot => {
+                let r = p.to_vec2();
+                let dist = r.hypot();
+                (
+                    dist / self.len,
+                    if dist > 1e-9 {
+                        r / dist
+                    } else {
+                        kurbo::Vec2::ZERO
+                    },
+                    0.0,
+                )
+            }
+        };
+        if d <= 0.0 {
+            return p;
+        }
+        let d = d.min(1.0);
+        // `d^1.5`: zero at the root with zero slope, so the outline leaves the
+        // pinned edge smoothly.
+        let grow = d * d.sqrt();
+        let lat = (lateral - self.lateral0) / self.len;
+        let wave =
+            (self.phase - std::f64::consts::TAU * d * self.inv_wavelength + 2.2 * lat).sin();
+        let g = {
+            let x = d * 3.0;
+            let i = (x as usize).min(2);
+            let f = x - i as f64;
+            self.gust[i] * (1.0 - f) + self.gust[i + 1] * f
+        };
+        let s = grow * (0.65 * g + 0.35 * wave);
+        let v = self.wind * (self.amp * s);
+        let along = v.dot(a);
+        let across = v - a * along;
+        // A bend does not stretch hair: what the tip moves sideways it gives up
+        // along the length (arc length kept to first order), and the little
+        // along-length push there is, is mostly absorbed.
+        let m = across.hypot();
+        let shorten = m * m / (2.0 * self.len * d.max(0.05));
+        let mut out = p + across + a * (along * 0.35 - shorten);
+        if let Some(g) = self.lag {
+            out += (g * p - p) * grow;
+        }
+        out
+    }
+}
+
+/// The bounding box of the on-curve points of everything drawable under
+/// `object`, in the space `acc` maps its local space to.
+fn hair_bounds(object: &Object, acc: Affine, out: &mut Option<kurbo::Rect>) {
+    match &object.kind {
+        ObjectKind::Shape(shape) => {
+            let mut grow = |p: Point| {
+                let p = acc * p;
+                *out = Some(match *out {
+                    None => kurbo::Rect::from_points(p, p),
+                    Some(r) => r.union_pt(p),
+                });
+            };
+            for el in shape.path.elements() {
+                match *el {
+                    buzz_geom::PathEl::MoveTo(p) | buzz_geom::PathEl::LineTo(p) => grow(p),
+                    // Only the on-curve end: control points can lie well outside
+                    // the drawing, and would pull the root edge away from it.
+                    buzz_geom::PathEl::QuadTo(_, p) | buzz_geom::PathEl::CurveTo(_, _, p) => {
+                        grow(p)
+                    }
+                    buzz_geom::PathEl::ClosePath => {}
+                }
+            }
+        }
+        ObjectKind::Group(children) => {
+            for child in children {
+                hair_bounds(child, acc * child.transform, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+type HairCut = std::sync::Mutex<HashMap<u64, Arc<buzz_geom::BezPath>>>;
+
+/// Subdivided paths, remembered between frames: the cut depends on the path
+/// alone, and a hair lock is re-flowed every frame. Keyed by a hash of the
+/// path and the piece length, so an edited or tweened path simply misses.
+fn hair_cache() -> &'static HairCut {
+    static CACHE: std::sync::OnceLock<HairCut> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn control_length(points: &[Point]) -> f64 {
+    points.windows(2).map(|w| (w[1] - w[0]).hypot()).sum()
+}
+
+/// Does any segment of `path` run longer than `max_len`?
+fn hair_needs_split(path: &buzz_geom::BezPath, max_len: f64) -> bool {
+    use buzz_geom::PathEl;
+    let (mut start, mut at) = (Point::ORIGIN, Point::ORIGIN);
+    for el in path.elements() {
+        let len = match *el {
+            PathEl::MoveTo(p) => {
+                start = p;
+                at = p;
+                continue;
+            }
+            PathEl::LineTo(p) => {
+                let l = control_length(&[at, p]);
+                at = p;
+                l
+            }
+            PathEl::QuadTo(a, p) => {
+                let l = control_length(&[at, a, p]);
+                at = p;
+                l
+            }
+            PathEl::CurveTo(a, b, p) => {
+                let l = control_length(&[at, a, b, p]);
+                at = p;
+                l
+            }
+            PathEl::ClosePath => {
+                let l = control_length(&[at, start]);
+                at = start;
+                l
+            }
+        };
+        if len > max_len {
+            return true;
+        }
+    }
+    false
+}
+
+/// `path` with every segment longer than `max_len` cut into equal pieces, so
+/// that displacing the points bends the *outline* and not just the corners.
+/// Curves stay curves (pieces are exact sub-segments); lines stay lines.
+pub fn hair_subdivide(path: &buzz_geom::BezPath, max_len: f64) -> buzz_geom::BezPath {
+    use buzz_geom::PathEl;
+    use kurbo::ParamCurve;
+    let pieces = |len: f64| ((len / max_len).ceil() as usize).clamp(1, 48);
+    let mut out = buzz_geom::BezPath::new();
+    let (mut start, mut at) = (Point::ORIGIN, Point::ORIGIN);
+    for el in path.elements() {
+        match *el {
+            PathEl::MoveTo(p) => {
+                out.move_to(p);
+                start = p;
+                at = p;
+            }
+            PathEl::LineTo(p) => {
+                let n = pieces(control_length(&[at, p]));
+                for i in 1..=n {
+                    out.line_to(at.lerp(p, i as f64 / n as f64));
+                }
+                at = p;
+            }
+            PathEl::QuadTo(a, p) => {
+                let n = pieces(control_length(&[at, a, p]));
+                let q = kurbo::QuadBez::new(at, a, p);
+                for i in 0..n {
+                    let s = q.subsegment(i as f64 / n as f64..(i + 1) as f64 / n as f64);
+                    out.quad_to(s.p1, s.p2);
+                }
+                at = p;
+            }
+            PathEl::CurveTo(a, b, p) => {
+                let n = pieces(control_length(&[at, a, b, p]));
+                let c = kurbo::CubicBez::new(at, a, b, p);
+                for i in 0..n {
+                    let s = c.subsegment(i as f64 / n as f64..(i + 1) as f64 / n as f64);
+                    out.curve_to(s.p1, s.p2, s.p3);
+                }
+                at = p;
+            }
+            PathEl::ClosePath => {
+                let n = pieces(control_length(&[at, start]));
+                // The closing line is cut like any other, ending one piece
+                // short of the start; the close itself draws the last one.
+                for i in 1..n {
+                    out.line_to(at.lerp(start, i as f64 / n as f64));
+                }
+                out.close_path();
+                at = start;
+            }
+        }
+    }
+    let _ = at;
+    out
+}
+
+fn hair_path_hash(path: &buzz_geom::BezPath, max_len: f64) -> u64 {
+    let mut h = splitmix64(max_len.to_bits());
+    let mut mix = |v: f64| h = splitmix64(h ^ v.to_bits());
+    for el in path.elements() {
+        match *el {
+            buzz_geom::PathEl::MoveTo(p) => {
+                mix(1.0);
+                mix(p.x);
+                mix(p.y);
+            }
+            buzz_geom::PathEl::LineTo(p) => {
+                mix(2.0);
+                mix(p.x);
+                mix(p.y);
+            }
+            buzz_geom::PathEl::QuadTo(a, p) => {
+                mix(3.0);
+                for q in [a, p] {
+                    mix(q.x);
+                    mix(q.y);
+                }
+            }
+            buzz_geom::PathEl::CurveTo(a, b, p) => {
+                mix(4.0);
+                for q in [a, b, p] {
+                    mix(q.x);
+                    mix(q.y);
+                }
+            }
+            buzz_geom::PathEl::ClosePath => mix(5.0),
+        }
+    }
+    h
+}
+
+/// Flow one path through `field`. `acc` maps the path's own space into the
+/// space the field lives in (identity for the top object).
+pub fn hair_flow_path(
+    path: &buzz_geom::BezPath,
+    acc: Affine,
+    field: &HairField,
+) -> buzz_geom::BezPath {
+    let det = acc.determinant().abs();
+    if det < 1e-12 {
+        return path.clone();
+    }
+    let inv = acc.inverse();
+    let identity = acc == Affine::IDENTITY;
+    // Piece length in this path's own units: a 28th of the hair.
+    let max_len = field.len / 28.0 / det.sqrt();
+    let cut: Arc<buzz_geom::BezPath>;
+    let source: &buzz_geom::BezPath = if hair_needs_split(path, max_len) {
+        let key = hair_path_hash(path, max_len);
+        let hit = hair_cache().lock().ok().and_then(|c| c.get(&key).cloned());
+        cut = match hit {
+            Some(hit) => hit,
+            None => {
+                let made = Arc::new(hair_subdivide(path, max_len));
+                if let Ok(mut c) = hair_cache().lock() {
+                    if c.len() > 2048 {
+                        c.clear();
+                    }
+                    c.insert(key, made.clone());
+                }
+                made
+            }
+        };
+        &cut
+    } else {
+        path
+    };
+    map_path(source, |p| {
+        if identity {
+            field.at(p)
+        } else {
+            inv * field.at(acc * p)
+        }
+    })
+}
+
+/// Flow `object`'s artwork in place.
+pub fn hair_flow_object(
+    object: &mut Object,
+    params: HairFlowParams,
+    seed: u64,
+    t_seconds: f64,
+    lag: Option<Affine>,
+) {
+    let mut bounds = None;
+    hair_bounds(object, Affine::IDENTITY, &mut bounds);
+    let Some(bounds) = bounds else { return };
+    let Some(field) = HairField::new(params, bounds, seed, t_seconds, lag) else {
+        return;
+    };
+    hair_flow_into(object, &field, Affine::IDENTITY);
+}
+
+fn hair_flow_into(object: &mut Object, field: &HairField, acc: Affine) {
+    match &mut object.kind {
+        ObjectKind::Shape(shape) => shape.path = hair_flow_path(&shape.path, acc, field),
+        ObjectKind::Group(children) => {
+            for child in children.iter_mut() {
+                let mut c = (**child).clone();
+                let next = acc * c.transform;
+                hair_flow_into(&mut c, field, next);
+                *child = Arc::new(c);
+            }
+        }
+        // An instance or a rig has no outline here to move; see the note on
+        // `Modifier::Turn`.
+        _ => {}
+    }
+}
+
 /// The result of evaluating an object's modifiers at a frame.
 ///
 /// `prepend` is composed onto the object's own transform in stage space (a
@@ -885,6 +1363,35 @@ impl Scene {
                     let target = posed.get_or_insert_with(|| object.clone());
                     turn_object(target, yaw, round);
                 }
+                Modifier::HairFlow {
+                    strength,
+                    rate,
+                    wavelength,
+                    wind,
+                    lag,
+                    root,
+                } => {
+                    let seconds = time / fps;
+                    let lag_map = if lag > 1e-6 {
+                        self.hair_lag(layer, object, time, fps, lag)
+                    } else {
+                        None
+                    };
+                    let target = posed.get_or_insert_with(|| object.clone());
+                    hair_flow_object(
+                        target,
+                        HairFlowParams {
+                            strength,
+                            rate,
+                            wavelength,
+                            wind,
+                            root,
+                        },
+                        object.id.0,
+                        seconds,
+                        lag_map,
+                    );
+                }
                 Modifier::Drift {
                     dx,
                     dy,
@@ -947,6 +1454,68 @@ impl Scene {
             object: posed,
             breath,
         })
+    }
+
+    /// **The head's recent motion, as the map the tips are still catching up
+    /// to.** `None` when the layer is not in this scene's stack or nothing has
+    /// moved.
+    ///
+    /// The object's world placement (what its layer follows, composed with its
+    /// own keyed transform) is sampled at the frame and at a few moments before
+    /// it, weighted `e^(-age/lag)`; the weighted mean is a low-pass of the
+    /// motion, which is what a critically damped spring follows. Returned as
+    /// `W(now)^-1 * mean(W)` in the object's local space: identity for a still
+    /// head, and for a moving one the map a tip *would* have been carried by had
+    /// it trailed. The caller scales it by the distance from the root.
+    fn hair_lag(
+        &self,
+        layer: LayerId,
+        object: &Object,
+        time: f64,
+        fps: f64,
+        lag: f64,
+    ) -> Option<Affine> {
+        const SAMPLES: usize = 7;
+        let layers = self.layers();
+        let l = layers.get(layer)?;
+        let world = |t: f64| -> Affine {
+            let t = t.max(0.0);
+            let own = l
+                .frames
+                .resolved_at(t)
+                .iter()
+                .find(|o| o.id == object.id)
+                .map_or(object.transform, |o| o.transform);
+            layers.inherited_transform(layer, t) * own
+        };
+        let lag = lag.clamp(0.01, 2.0);
+        let now = world(time);
+        let step = lag * 0.5;
+        let mut sum = [0.0f64; 6];
+        let mut total = 0.0;
+        let mut moved = false;
+        for k in 0..=SAMPLES {
+            let age = k as f64 * step;
+            let w = (-age / lag).exp();
+            let m = if k == 0 { now } else { world(time - age * fps) };
+            let c = m.as_coeffs();
+            if k > 0
+                && c.iter()
+                    .zip(now.as_coeffs())
+                    .any(|(a, b)| (a - b).abs() > 1e-9)
+            {
+                moved = true;
+            }
+            for (acc, v) in sum.iter_mut().zip(c) {
+                *acc += w * v;
+            }
+            total += w;
+        }
+        if !moved || now.determinant().abs() < 1e-12 {
+            return None;
+        }
+        let mean = Affine::new(sum.map(|v| v / total));
+        Some(now.inverse() * mean)
     }
 
     /// The whole modified pose sequence for a spring on `object`'s chain, built
@@ -1811,6 +2380,253 @@ mod tests {
         let lo = leans.iter().copied().fold(f64::INFINITY, f64::min);
         let hi = leans.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         assert!(hi - lo > 2.0, "the top hardly moved: {lo}..{hi}");
+    }
+
+    fn hair_modifier() -> Modifier {
+        Modifier::HairFlow {
+            strength: 0.2,
+            rate: 0.5,
+            wavelength: 0.6,
+            wind: 0.0,
+            lag: 0.0,
+            root: 0.0,
+        }
+    }
+
+    /// The flowed outline of the 100x100 `standing_square`, at `frame`.
+    fn flowed_points(scene: &Scene, layer: LayerId, id: ObjectId, frame: u32) -> Vec<Point> {
+        let obj = resolved(scene, layer, id, frame);
+        let eval = scene.modified_object_at(layer, &obj, frame).unwrap();
+        let posed = eval.object.expect("hair flow re-poses the artwork");
+        let ObjectKind::Shape(shape) = &posed.kind else {
+            panic!("not a shape");
+        };
+        let mut pts = Vec::new();
+        for el in shape.path.elements() {
+            match *el {
+                buzz_geom::PathEl::MoveTo(p) | buzz_geom::PathEl::LineTo(p) => pts.push(p),
+                buzz_geom::PathEl::QuadTo(_, p) | buzz_geom::PathEl::CurveTo(_, _, p) => {
+                    pts.push(p)
+                }
+                buzz_geom::PathEl::ClosePath => {}
+            }
+        }
+        pts
+    }
+
+    /// **Through the scene: the pinned edge keeps its points, the tip moves,
+    /// and the middle moves less than the tip.**
+    #[test]
+    fn hair_flow_pins_the_root_and_moves_the_tip() {
+        let mut scene = Scene::empty();
+        let (layer, id) = standing_square(&mut scene, 14);
+        scene.update_object_across(0, 60, id, |o| o.modifiers.push(hair_modifier()));
+        let rest = flowed_points_rest(&scene, layer, id);
+
+        let (mut tip_move, mut mid_move) = (0.0f64, 0.0f64);
+        for frame in 0..48u32 {
+            let pts = flowed_points(&scene, layer, id, frame);
+            assert!(pts.len() > rest.len(), "the long sides should be subdivided");
+            // The pinned edge (top, y = 0): points stay on it, none displaced
+            // along it by more than rounding.
+            for p in pts.iter().filter(|p| p.y.abs() < 1e-9) {
+                assert!(
+                    (-1e-9..=100.0 + 1e-9).contains(&p.x),
+                    "frame {frame}: root point left the top edge: {p:?}"
+                );
+            }
+            let tip = pts
+                .iter()
+                .filter(|p| p.y > 90.0)
+                .map(|p| p.x)
+                .fold(f64::NEG_INFINITY, f64::max);
+            tip_move = tip_move.max((tip - 100.0).abs());
+            let mid = pts
+                .iter()
+                .filter(|p| (p.y - 50.0).abs() < 4.0)
+                .map(|p| p.x)
+                .fold(f64::NEG_INFINITY, f64::max);
+            mid_move = mid_move.max((mid - 100.0).abs());
+        }
+        assert!(tip_move > 4.0, "the tip hardly moved: {tip_move}");
+        assert!(
+            mid_move < tip_move,
+            "the middle ({mid_move}) should move less than the tip ({tip_move})"
+        );
+    }
+
+
+    fn flowed_points_rest(scene: &Scene, layer: LayerId, id: ObjectId) -> Vec<Point> {
+        let obj = resolved(scene, layer, id, 0);
+        let ObjectKind::Shape(shape) = &obj.kind else {
+            panic!("not a shape");
+        };
+        shape
+            .path
+            .elements()
+            .iter()
+            .filter_map(|el| match *el {
+                buzz_geom::PathEl::MoveTo(p) | buzz_geom::PathEl::LineTo(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// **Root drift measured properly**: map the rest outline point by point
+    /// through the field and look at the points on the pinned edge, at many
+    /// instants.
+    #[test]
+    fn hair_flow_root_edge_does_not_move() {
+        let bounds = kurbo::Rect::new(0.0, 0.0, 100.0, 300.0);
+        let params = HairFlowParams {
+            strength: 0.3,
+            rate: 0.7,
+            wavelength: 0.5,
+            wind: -45.0,
+            root: 0.0,
+        };
+        let mut worst = 0.0f64;
+        let mut tip = 0.0f64;
+        for k in 0..200 {
+            let t = k as f64 * 0.05;
+            let field = HairField::new(params, bounds, 7, t, None).unwrap();
+            for i in 0..=10 {
+                let root = Point::new(i as f64 * 10.0, 0.0);
+                worst = worst.max((field.at(root) - root).hypot());
+                let end = Point::new(i as f64 * 10.0, 300.0);
+                tip = tip.max((field.at(end) - end).hypot());
+            }
+        }
+        assert!(worst < 1e-9, "root moved by {worst}");
+        assert!(tip > 20.0, "tip only moved {tip}");
+    }
+
+    /// **Displacement grows with distance from the root**, monotonically in
+    /// the mean, at a fixed instant.
+    #[test]
+    fn hair_flow_displacement_grows_toward_the_tip() {
+        let bounds = kurbo::Rect::new(0.0, 0.0, 100.0, 400.0);
+        let params = HairFlowParams {
+            strength: 0.25,
+            rate: 0.5,
+            wavelength: 1.0,
+            wind: 0.0,
+            root: 0.0,
+        };
+        // Average over many instants (the wave runs through every phase)
+        // so one instant's sign does not matter.
+        let mut by_d = [0.0f64; 5];
+        for k in 0..400 {
+            let t = k as f64 * 0.37;
+            let field = HairField::new(params, bounds, 3, t, None).unwrap();
+            for (i, slot) in by_d.iter_mut().enumerate() {
+                let p = Point::new(50.0, 400.0 * i as f64 / 4.0);
+                *slot += (field.at(p) - p).hypot();
+            }
+        }
+        assert!(by_d[0] < 1e-9);
+        for i in 1..5 {
+            assert!(by_d[i] > by_d[i - 1], "not growing at {i}: {by_d:?}");
+        }
+    }
+
+    /// **Smooth outline**: long segments are cut, short ones are left, curves
+    /// stay curves and the shape is unchanged until it is displaced.
+    #[test]
+    fn hair_subdivision_cuts_long_segments_only() {
+        let mut path = buzz_geom::BezPath::new();
+        path.move_to((0.0, 0.0));
+        path.line_to((100.0, 0.0));
+        path.curve_to((120.0, 30.0), (120.0, 60.0), (100.0, 90.0));
+        path.line_to((0.0, 90.0));
+        path.close_path();
+        assert!(hair_needs_split(&path, 10.0));
+        assert!(!hair_needs_split(&path, 1000.0));
+        let cut = hair_subdivide(&path, 10.0);
+        assert!(cut.elements().len() > path.elements().len() * 3);
+        // Same area before and after (nothing displaced yet).
+        assert!((cut.area() - path.area()).abs() < 1e-6);
+        // Every segment is now short.
+        assert!(!hair_needs_split(&cut, 10.5));
+    }
+
+    /// **Seeded per object**: two locks do not flutter in step.
+    #[test]
+    fn hair_flow_is_seeded_per_object_and_deterministic() {
+        let bounds = kurbo::Rect::new(0.0, 0.0, 100.0, 300.0);
+        let params = HairFlowParams {
+            strength: 0.2,
+            rate: 0.5,
+            wavelength: 0.6,
+            wind: 0.0,
+            root: 0.0,
+        };
+        let tip = Point::new(50.0, 300.0);
+        let a1 = HairField::new(params, bounds, 1, 2.0, None).unwrap().at(tip);
+        let a2 = HairField::new(params, bounds, 1, 2.0, None).unwrap().at(tip);
+        let b = HairField::new(params, bounds, 2, 2.0, None).unwrap().at(tip);
+        assert_eq!(a1, a2);
+        assert!((a1 - b).hypot() > 0.1, "two seeds moved in step");
+    }
+
+    /// **Follow-through**: a head that moves drags the tips behind it, and a
+    /// still head leaves them alone.
+    #[test]
+    fn hair_flow_tips_lag_a_moving_head() {
+        let mut scene = Scene::empty();
+        let (layer, id) = standing_square(&mut scene, 15);
+        scene.update_layer(layer, |l| {
+            if l.frames.length() <= 40 {
+                l.frames.insert_frame(40);
+            }
+        });
+        scene.ensure_keyframe(layer, 20);
+        scene.update_object_at(20, id, |o| {
+            o.transform = Affine::translate((200.0, 0.0)) * o.transform;
+        });
+        scene.update_layer(layer, |l| {
+            l.frames.set_tween(0, Tween::motion());
+        });
+        scene.update_object_across(0, 40, id, |o| {
+            o.modifiers.push(Modifier::HairFlow {
+                strength: 0.0,
+                rate: 0.5,
+                wavelength: 0.6,
+                wind: 0.0,
+                lag: 0.4,
+                root: 0.0,
+            });
+        });
+        // Mid-move: the head has travelled right, so the tip is dragged back
+        // (left of where it would be); the root edge is not.
+        let obj = resolved(&scene, layer, id, 10);
+        let eval = scene.modified_object_at(layer, &obj, 10).unwrap();
+        let posed = eval.object.unwrap();
+        let ObjectKind::Shape(shape) = &posed.kind else {
+            panic!()
+        };
+        let mut root_x = Vec::new();
+        let mut tip_x = Vec::new();
+        for el in shape.path.elements() {
+            if let buzz_geom::PathEl::LineTo(p) | buzz_geom::PathEl::MoveTo(p) = *el {
+                if p.y == 0.0 {
+                    root_x.push(p.x);
+                }
+                if p.y == 100.0 {
+                    tip_x.push(p.x);
+                }
+            }
+        }
+        assert!(root_x.iter().all(|x| (0.0..=100.0).contains(x)));
+        let tip_min = tip_x.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(tip_min < -3.0, "the tip did not trail: {tip_min}");
+    }
+
+    /// **Hair Flow is labelled and re-poses the artwork.**
+    #[test]
+    fn hair_flow_has_a_label_and_changes_the_artwork() {
+        assert_eq!(hair_modifier().label(), "Hair Flow");
+        assert!(hair_modifier().changes_pose());
     }
 
     /// **A drift loops, and its phase says where in the loop it starts.**

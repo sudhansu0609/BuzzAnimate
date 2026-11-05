@@ -42,6 +42,15 @@ pub struct EvenLinesDialogState {
     /// The scope has face ink / body ink (a slider without any is greyed).
     pub has_face: bool,
     pub has_body: bool,
+    /// The ink is being found or traced off the UI thread: Apply waits.
+    pub working: bool,
+    /// T15: bold outlines like the FLA files: black lines of `bold_width`, and
+    /// on a picture an outline between colours that differ.
+    pub bold: bool,
+    /// The bold line width for the scope's picture, px (3 per 1920 px).
+    pub bold_width: f64,
+    /// The face / body widths to go back to when bold is turned off.
+    saved_widths: (f64, f64),
 }
 
 impl Default for EvenLinesDialogState {
@@ -58,6 +67,10 @@ impl Default for EvenLinesDialogState {
             solids: 0,
             has_face: true,
             has_body: true,
+            working: false,
+            bold: false,
+            bold_width: 3.0,
+            saved_widths: (1.5, 2.0),
         }
     }
 }
@@ -110,18 +123,22 @@ fn body(ui: &mut egui::Ui, state: &mut EvenLinesDialogState) -> EvenLinesAction 
     );
     ui.add_space(4.0);
     egui::Grid::new("even_lines_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-        ui.label("Face lines");
-        let face = ui.add_enabled(
-            state.has_face,
-            egui::Slider::new(&mut state.face_width, 0.25..=12.0).step_by(0.25).suffix(" px"),
-        );
-        remember(ui, widget_id("face"), face.rect);
-        if face.changed() {
-            action = EvenLinesAction::Widths;
+        // A picture has no face and body: one width for every line.
+        let single = !state.has_face;
+        if !single {
+            ui.label("Face lines");
+            let face = ui.add_enabled(
+                state.has_face,
+                egui::Slider::new(&mut state.face_width, 0.25..=12.0).step_by(0.25).suffix(" px"),
+            );
+            remember(ui, widget_id("face"), face.rect);
+            if face.changed() {
+                action = EvenLinesAction::Widths;
+            }
+            ui.end_row();
         }
-        ui.end_row();
 
-        ui.label("Body lines");
+        ui.label(if single { "Line width" } else { "Body lines" });
         let body = ui.add_enabled(
             state.has_body,
             egui::Slider::new(&mut state.body_width, 0.25..=12.0).step_by(0.25).suffix(" px"),
@@ -138,6 +155,22 @@ fn body(ui: &mut egui::Ui, state: &mut EvenLinesDialogState) -> EvenLinesAction 
             .on_hover_text("A thick line stays thicker than a thin one (0.5\u{2013}2\u{d7} the width), each even along its length");
         remember(ui, widget_id("keep"), keep.rect);
         if keep.changed() {
+            action = EvenLinesAction::Widths;
+        }
+        ui.end_row();
+
+        ui.label("");
+        let bold = ui.checkbox(&mut state.bold, "Bold outlines").on_hover_text(
+            "Thick black lines like your FLA files: every line one weight (the width above, 3 px per 1920 px to start with),              short ones thinner, and on a picture an outline between colours that differ",
+        );
+        remember(ui, widget_id("bold"), bold.rect);
+        if bold.changed() {
+            if state.bold {
+                state.saved_widths = (state.face_width, state.body_width);
+                (state.face_width, state.body_width) = (state.bold_width, state.bold_width);
+            } else {
+                (state.face_width, state.body_width) = state.saved_widths;
+            }
             action = EvenLinesAction::Widths;
         }
         ui.end_row();
@@ -162,13 +195,22 @@ fn body(ui: &mut egui::Ui, state: &mut EvenLinesDialogState) -> EvenLinesAction 
         }
         ui.end_row();
     });
-    ui.label(format!(
-        "{} face lines, {} body lines, {} solid areas kept",
-        state.face_lines, state.body_lines, state.solids
-    ));
+    if state.working {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Working\u{2026}");
+        });
+    } else if state.has_face {
+        ui.label(format!(
+            "{} face lines, {} body lines, {} solid areas kept",
+            state.face_lines, state.body_lines, state.solids
+        ));
+    } else {
+        ui.label(format!("{} lines, {} solid areas kept", state.body_lines, state.solids));
+    }
     ui.separator();
     ui.horizontal(|ui| {
-        let apply = ui.button("Apply").on_hover_text("Replace the ink with these lines as one undo step");
+        let apply = ui.add_enabled(!state.working, egui::Button::new("Apply")).on_hover_text("Replace the ink with these lines as one undo step");
         remember(ui, widget_id("apply"), apply.rect);
         if apply.clicked() {
             action = EvenLinesAction::Apply;

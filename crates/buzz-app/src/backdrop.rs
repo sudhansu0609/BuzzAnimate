@@ -456,8 +456,12 @@ const SKY_DELTA: f32 = 18.0;
 const SKY_STEP: f32 = 2.0;
 /// Only a light sky is followed by steps (a dark night sky beside dark trees is not).
 const SKY_CHAIN_LIGHT: f32 = 45.0;
-/// The mean texture (ΔE76 to a neighbour) of a top-row colour that may seed the sky.
-const SKY_SMOOTH: f32 = 3.0;
+/// A top-row run of sky: the largest ΔE76 to a neighbour inside it.
+const SKY_RUN_SMOOTH: f32 = 4.0;
+/// A top-row run seeds the sky when its mean colour is this close (ΔE76) to the longest run's.
+const SKY_SEED_DELTA: f32 = 10.0;
+/// The sky flood stops at a step this strong between neighbours (ΔE76).
+const SKY_EDGE: f32 = 14.0;
 /// How far a gradient sky may drift from the top-row palette (ΔE76).
 const SKY_REACH: f32 = 25.0;
 /// Back plates reach this far under the plates in front, so no seam shows.
@@ -601,39 +605,75 @@ pub fn split_plates(rgba: &RgbaImage) -> Plates {
     let px: Vec<[u8; 4]> = rgba.pixels().map(|p| p.0).collect();
     let labs: Vec<[f32; 3]> = px.par_iter().map(|p| lab([p[0], p[1], p[2]])).collect();
 
-    // Sky palette: the top strip quantised, colours covering ≥ 5 % of it.
-    let strip_rows = (h / 100).max(2).min(h);
-    let strip = &rgba.as_raw()[..w * strip_rows * 4];
-    let candidates: Vec<[f32; 3]> = buzz_scene::quantise(strip, w, strip_rows, 8).into_iter().map(lab).collect();
-    // Texture: the larger ΔE to the right / lower neighbour. A sky is smooth;
-    // foliage reaching the top edge is not, and must not seed the palette.
+    // Sky seeds: the smooth runs of the top edge. A run is a stretch of the top
+    // row with no texture and no step between neighbours; the longest is the sky,
+    // other runs seed it only when their colour is the sky's (buildings that touch
+    // the top edge are smooth too, but another colour).
     let texture = |i: usize| -> f32 {
         let (x, y) = (i % w, i / w);
         let right = if x + 1 < w { dist2(labs[i], labs[i + 1]) } else { 0.0 };
         let down = if y + 1 < h { dist2(labs[i], labs[i + w]) } else { 0.0 };
         right.max(down).sqrt()
     };
-    let mut share = vec![0usize; candidates.len()];
-    let mut rough = vec![0f32; candidates.len()];
-    for i in 0..w * strip_rows {
-        let k = nearest(&candidates, labs[i]).0;
-        share[k] += 1;
-        rough[k] += texture(i);
+    let mut runs: Vec<(usize, usize)> = Vec::new(); // [start, end)
+    {
+        let mut start = 0;
+        for x in 0..=w {
+            let breaks = x == w
+                || texture(x) > SKY_RUN_SMOOTH
+                || (x > start && dist2(labs[x - 1], labs[x]).sqrt() > SKY_RUN_SMOOTH);
+            if breaks {
+                if x > start {
+                    runs.push((start, x));
+                }
+                start = if x < w && texture(x) <= SKY_RUN_SMOOTH { x } else { x + 1 };
+            }
+        }
     }
-    let palette: Vec<[f32; 3]> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(k, _)| share[*k] * 20 >= w * strip_rows && rough[*k] / (share[*k] as f32) < SKY_SMOOTH)
-        .map(|(_, c)| *c)
-        .collect();
-    let near_sky = |i: usize| nearest(&palette, labs[i]).1 <= SKY_DELTA * SKY_DELTA;
+    let run_mean = |r: &(usize, usize)| -> [f32; 3] {
+        let n = (r.1 - r.0) as f32;
+        let mut m = [0f32; 3];
+        for x in r.0..r.1 {
+            for c in 0..3 {
+                m[c] += labs[x][c] / n;
+            }
+        }
+        m
+    };
+    let mut seed_runs: Vec<(usize, usize)> = Vec::new();
+    if let Some(longest) = runs.iter().max_by_key(|r| r.1 - r.0).copied() {
+        let reference = run_mean(&longest);
+        for r in &runs {
+            if r.1 - r.0 >= (w / 100).max(4) && dist2(run_mean(r), reference).sqrt() <= SKY_SEED_DELTA {
+                seed_runs.push(*r);
+            }
+        }
+    }
+    let seed_rgb: Vec<u8> = seed_runs.iter().flat_map(|r| (r.0..r.1).flat_map(|x| rgba.as_raw()[x * 4..x * 4 + 4].to_vec())).collect();
+    let palette: Vec<[f32; 3]> = if seed_rgb.is_empty() {
+        Vec::new()
+    } else {
+        buzz_scene::quantise(&seed_rgb, seed_rgb.len() / 4, 1, 4).into_iter().map(lab).collect()
+    };
+    // The flood's tolerance follows how much the seed pixels themselves vary: a
+    // flat night sky is followed closely (dark road and walls are near it in
+    // Lab), a gradient day sky up to SKY_DELTA.
+    let tolerance = {
+        let mut d: Vec<f32> = seed_runs.iter().flat_map(|r| r.0..r.1).map(|x| nearest(&palette, labs[x]).1.sqrt()).collect();
+        d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p98 = d.get(d.len().saturating_sub(1) * 98 / 100).copied().unwrap_or(0.0);
+        (2.0 * p98 + 4.0).clamp(8.0, SKY_DELTA)
+    };
+    let near_sky = |i: usize| nearest(&palette, labs[i]).1 <= tolerance * tolerance;
 
     let mut owner = vec![NONE; w * h];
     let mut queue = VecDeque::new();
-    for x in 0..w {
-        if near_sky(x) {
-            owner[x] = SKY;
-            queue.push_back(x);
+    for r in &seed_runs {
+        for x in r.0..r.1 {
+            if near_sky(x) {
+                owner[x] = SKY;
+                queue.push_back(x);
+            }
         }
     }
     while let Some(i) = queue.pop_front() {
@@ -642,6 +682,7 @@ pub fn split_plates(rgba: &RgbaImage) -> Plates {
         // sky pixel next to it) while it stays within SKY_REACH of the palette.
         let mut visit = |j: usize| {
             if owner[j] == NONE
+                && dist2(labs[i], labs[j]) <= SKY_EDGE * SKY_EDGE
                 && (near_sky(j)
                     || (labs[j][0] >= SKY_CHAIN_LIGHT
                         && dist2(labs[i], labs[j]) <= SKY_STEP * SKY_STEP
@@ -669,6 +710,22 @@ pub fn split_plates(rgba: &RgbaImage) -> Plates {
         .rev()
         .find(|&y| owner[y * w..(y + 1) * w].iter().filter(|o| **o == SKY).count() * 10 >= w * 3)
         .unwrap_or(0);
+    // A street between tall buildings leaves under 30 % of the width as sky
+    // almost everywhere (the horizon would clamp to the top quarter): then the
+    // horizon is the lowest row where one sky run still spans 10 % of the width.
+    let lowest = if lowest < h / 4 {
+        let run_at = |y: usize| -> usize {
+            let (mut best, mut cur) = (0, 0);
+            for o in &owner[y * w..(y + 1) * w] {
+                cur = if *o == SKY { cur + 1 } else { 0 };
+                best = best.max(cur);
+            }
+            best
+        };
+        (0..h).rev().find(|&y| run_at(y) * 10 >= w).unwrap_or(lowest).max(lowest)
+    } else {
+        lowest
+    };
     let horizon = lowest.clamp(h / 4, h * 3 / 4);
     let ground_line = horizon + h * 2 / 100;
     let far_line = horizon + h * 3 / 100;
@@ -826,11 +883,14 @@ pub struct BackdropOptions {
     pub bold: f64,
     /// Ink over colour (`InkAndColour`) when true, colour regions only (`Outline`) when false.
     pub ink: bool,
+    /// Bold outlines like the FLA files (`TraceOptions::bold()`): thick black
+    /// lines on the ink and the object edges. Wins over `ink`.
+    pub bold_outlines: bool,
 }
 
 impl Default for BackdropOptions {
     fn default() -> Self {
-        Self { colours: 48, smoothness: 0.8, speckle: 24, bold: 0.0, ink: false }
+        Self { colours: 48, smoothness: 0.8, speckle: 24, bold: 0.0, ink: false, bold_outlines: false }
     }
 }
 
@@ -844,6 +904,9 @@ impl BackdropOptions {
     }
 
     pub fn trace_options(&self) -> TraceOptions {
+        if self.bold_outlines {
+            return TraceOptions { drop_background: false, ..TraceOptions::bold() };
+        }
         if self.ink {
             TraceOptions {
                 colours: self.colours,
@@ -893,7 +956,7 @@ pub fn trace_plates(plates: &Plates, opts: &BackdropOptions) -> Scene {
             // what they cannot explain traced, always as colour regions: the
             // sky carries no ink.
             let fit = fit_sky(plate);
-            let sky_options = BackdropOptions { ink: false, ..*opts }.trace_options();
+            let sky_options = BackdropOptions { ink: false, bold_outlines: false, ..*opts }.trace_options();
             let rest = buzz_scene::trace(fit.residual.width(), fit.residual.height(), fit.residual.as_raw(), &sky_options);
             fit.shapes.into_iter().chain(rest.shapes).collect::<Vec<_>>()
         } else {
@@ -1132,6 +1195,15 @@ pub fn fit_sky(plate: &RgbaImage) -> SkyFit {
         let Some(r_end) = (1..=reach).find(|&r| delta(r).is_none_or(|d| d < 2.0)) else {
             continue;
         };
+        // A glow that mostly lies outside the picture is a bright edge (a wall
+        // top, smoke at the border), not a moon: its disc would also widen the
+        // plate's box past the picture.
+        let spill = [(cx - r_end as f64).min(0.0).abs(), (cx + r_end as f64 - w as f64).max(0.0), (cy - r_end as f64).min(0.0).abs(), (cy + r_end as f64 - h as f64).max(0.0)]
+            .into_iter()
+            .fold(0.0f64, f64::max);
+        if spill > 0.5 * r_end as f64 {
+            continue;
+        }
         // The disc's edge: where the lightness falls below half-way between
         // the core and the sky the glow fades into.
         let core = (0..r_end).filter_map(light).fold(f32::MIN, f32::max);

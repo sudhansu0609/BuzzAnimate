@@ -426,3 +426,35 @@ fn a_short_mouth_symbol_is_refused_with_the_numbers() {
     assert!(message.contains("needs"), "{message}");
     assert!(message.contains(&Viseme::COUNT.to_string()), "{message}");
 }
+
+/// **Set Master Audio…** adds the layer before its clip is decoded; the clip
+/// lands later, off-thread, without the document revision moving. The timeline
+/// must still gain the Master Audio waveform once `forget_waveforms` follows the
+/// install (what the app does).
+#[test]
+fn master_audio_waveform_appears_after_off_thread_decode() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("master.wav");
+    std::fs::write(&path, dialogue_wav()).expect("write wav");
+
+    let mut editor = Editor::default();
+    editor.set_master_audio_from_file(&path).expect("master audio");
+
+    // Make the state the app is in: nothing decoded yet, map cached without it.
+    let scene = editor.scene().clone();
+    editor.sound.refresh_cues(&scene);
+    let pending = editor.sound.take_undecoded(&scene);
+    let _ = editor.waveforms();
+
+    let results: Vec<_> = pending
+        .into_iter()
+        .map(|u| (u.id, buzz_audio::Clip::decode(&u.data, &u.name).map_err(|e| e.to_string())))
+        .collect();
+    editor.sound.install_decoded(results, &scene);
+    editor.forget_waveforms();
+
+    let waveforms = editor.waveforms();
+    let wave = waveforms.values().next().expect("the Master Audio layer has a waveform");
+    assert!(!wave.levels.is_empty());
+    assert!(wave.levels.iter().any(|l| *l > 0.1));
+}

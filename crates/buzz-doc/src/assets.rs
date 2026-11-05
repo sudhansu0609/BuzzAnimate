@@ -218,6 +218,10 @@ impl AssetLibrary {
                 if name.starts_with('.') {
                     continue;
                 }
+                // Backups (Start Fresh, Delete, Combine poses) are not assets.
+                if name.starts_with("_cast_backup") {
+                    continue;
+                }
                 let child = if folder.is_empty() {
                     name.to_string()
                 } else {

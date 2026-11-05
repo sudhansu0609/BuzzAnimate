@@ -334,6 +334,37 @@ pub fn build_tools_with(allow_all: bool) -> Vec<ToolSpec> {
                 },
                 "required": ["script", "out"]
             }),
+            "import_cast_fla" => json!({
+                "type": "object",
+                "properties": {
+                    "fla": {"type": "string", "description": "the cast FLA"},
+                    "series": {"type": "string", "description": "the series name"},
+                    "ai_rig": {"type": "boolean", "description": "try AI Layer Rig where mouth/arms are not found (default true)"},
+                    "roles": {"type": "array", "items": {"type": "string"}, "description": "only these roles"}
+                },
+                "required": ["fla", "series"]
+            }),
+            "cast_delete" => json!({
+                "type": "object",
+                "properties": {
+                    "names": {"type": "array", "items": {"type": "string"}, "description": "Cast character names"},
+                    "all_listed": {"type": "boolean", "description": "true: every character the Cast panel lists (its search filter applies)"}
+                }
+            }),
+            "cast_combine_poses" => json!({
+                "type": "object",
+                "properties": {
+                    "names": {"type": "array", "items": {"type": "string"}, "description": "role names to combine (default: all that have separate views)"}
+                }
+            }),
+            "cast_start_fresh" => json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "a Cast character's name"},
+                    "all": {"type": "boolean", "description": "true: every character in the Cast"},
+                    "keep_frame": {"type": "integer", "description": "the frame whose pose is kept (default 0)"}
+                }
+            }),
             "arrange_assets" => json!({
                 "type": "object",
                 "properties": {

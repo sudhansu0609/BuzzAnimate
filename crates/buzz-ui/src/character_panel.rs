@@ -66,8 +66,84 @@ pub enum CastAction {
         name: String,
     },
     Delete(Asset),
+    /// "Delete (n)…" was pressed on a multi-selection: the shell works out which
+    /// of these are cast in a series and opens the confirmation
+    /// ([`CastPanelState::delete_ask`]).
+    AskDelete(Vec<Asset>),
+    /// The multi-delete was confirmed: **move** each file (and its thumbnail) to
+    /// `<library root>/_cast_backup/<stamp>_deleted/`; nothing is hard-deleted.
+    DeleteMany(Vec<Asset>),
+    /// **Combine poses**: merge the selected characters' separate view/pose
+    /// assets (`X`, `X Side`, `X Back`, `X 3-4`, `X Pose walk_front`) into one
+    /// asset per character whose symbol set holds every pose.
+    CombinePoses(Vec<Asset>),
+    /// **Add Pose…** (CAST_POSES_PLAN C2 e1): add a pose named `<Character> <label>`
+    /// to this character's set from `source`; the asset is saved back, backup first.
+    AddPose {
+        asset: Asset,
+        label: String,
+        source: PoseSource,
+    },
+    /// Remove a pose (its full symbol name) from this character; the main pose stays.
+    RemovePose { asset: Asset, pose: String },
+    /// Rename a pose (full symbol name) to `<Character> <label>`.
+    RenamePose { asset: Asset, pose: String, label: String },
+    /// **Save changes to <name>** (C2 e2): write the placed character that was
+    /// edited on the stage back over its Cast asset, backup first.
+    SaveChanges(Asset),
     /// Read the cast folder again.
     Rescan,
+    /// **Start Fresh** was confirmed: clear every keyframe of this character
+    /// (`None`: every character in the cast), keeping the pose at `keep` (`None`:
+    /// the first frame). The shell backs the files up first.
+    StartFresh {
+        asset: Option<Asset>,
+        keep: Option<u32>,
+    },
+}
+
+/// Where a new pose comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PoseSource {
+    /// A symbol of the open document's Library, by name.
+    LibrarySymbol(String),
+    /// A picture of the character in that pose (the cast build's picture route).
+    Picture(std::path::PathBuf),
+    /// One symbol of an FLA, by name.
+    FlaSymbol { fla: std::path::PathBuf, symbol: String },
+}
+
+/// The Add Pose window, open while the user fills it in.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AddPoseAsk {
+    pub asset: Option<Asset>,
+    pub label: String,
+    /// 0 Library symbol, 1 picture, 2 FLA symbol.
+    pub source: usize,
+    pub symbol: String,
+    pub picture: String,
+    pub fla: String,
+    pub fla_symbol: String,
+}
+
+/// The Start Fresh confirmation, open while the user decides.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreshAsk {
+    /// The one character, or `None` for all of them.
+    pub target: Option<Asset>,
+    /// How many characters will be cleared.
+    pub count: usize,
+    /// Keep the first frame (`false`) or the frame in `frame` (`true`).
+    pub use_frame: bool,
+    pub frame: u32,
+}
+
+/// The multi-delete confirmation, open while the user decides.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteAsk {
+    pub assets: Vec<Asset>,
+    /// Names among `assets` that a series' casting.json points at.
+    pub cast_in_series: Vec<String>,
 }
 
 /// Panel state that is neither the document's nor the library's: which
@@ -86,9 +162,34 @@ pub struct CastPanelState {
     /// file on disk with no undo, so the first Delete arms and the second
     /// removes it — the same two-click guard the Assets panel uses.
     pub confirm_delete: Option<std::path::PathBuf>,
+    /// The Start Fresh confirmation, when one is open.
+    pub fresh: Option<FreshAsk>,
+    /// The characters ticked for a bulk action (Ctrl+click, Shift+click, Select all).
+    pub selected: std::collections::BTreeSet<std::path::PathBuf>,
+    /// The last row clicked, where a Shift+click range starts.
+    anchor: Option<std::path::PathBuf>,
+    /// The multi-delete confirmation, when one is open.
+    pub delete_ask: Option<DeleteAsk>,
+    /// The Add Pose window, when one is open.
+    pub add_pose: Option<AddPoseAsk>,
+    /// A pose being renamed on the sheet: its full name and the label typed.
+    renaming_pose: Option<(String, String)>,
+    /// Filled in by the shell each frame: the open document's Library symbols
+    /// (the Add Pose source list), the open character's poses (main first; empty
+    /// when it is a single pose), and the Cast asset the stage selection came from.
+    pub library_symbols: Vec<String>,
+    pub character_poses: Vec<String>,
+    pub save_target: Option<Asset>,
+    /// "Add breath + blinks" is ticked by default: this is its inverse, so a default panel has it on.
+    pub life_off: bool,
 }
 
 impl CastPanelState {
+    /// The characters the list shows now (the search filter applied), in order.
+    pub fn visible<'a>(&self, characters: &'a [Asset]) -> Vec<&'a Asset> {
+        characters.iter().filter(|a| self.matches(&a.name)).collect()
+    }
+
     fn matches(&self, name: &str) -> bool {
         let needle = self.search.trim().to_lowercase();
         needle.is_empty() || name.to_lowercase().contains(&needle)
@@ -130,6 +231,22 @@ pub fn cast_panel(
             {
                 action = Some(CastAction::Rescan);
             }
+            if !characters.is_empty()
+                && ui
+                    .small_button("Start Fresh: all\u{2026}")
+                    .on_hover_text(
+                        "Clear every keyframe of every character in the cast, keeping one pose, \
+                         so they start clean in a new file",
+                    )
+                    .clicked()
+            {
+                state.fresh = Some(FreshAsk {
+                    target: None,
+                    count: characters.len(),
+                    use_frame: false,
+                    frame: 0,
+                });
+            }
         });
     });
 
@@ -140,6 +257,52 @@ pub fn cast_panel(
             state.search.clear();
         }
     });
+
+    // -- selection: Select all / Delete (n)… --
+    state.selected.retain(|p| characters.iter().any(|a| a.path == *p));
+    let select_all_key = !characters.is_empty()
+        && ui.rect_contains_pointer(ui.max_rect())
+        && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A));
+    let mut select_all = select_all_key;
+    ui.horizontal_wrapped(|ui| {
+        if !characters.is_empty()
+            && ui
+                .small_button("Select all")
+                .on_hover_text("Select every character listed (the search filter applies) \u{b7} Ctrl+A")
+                .clicked()
+        {
+            select_all = true;
+        }
+        if !state.selected.is_empty() {
+            if ui.small_button("Select none").clicked() {
+                state.selected.clear();
+            }
+            if ui
+                .small_button("Combine poses")
+                .on_hover_text("Merge the selected characters' separate views and walks into one character that holds all its poses")
+                .clicked()
+            {
+                let chosen: Vec<Asset> = characters.iter().filter(|a| state.selected.contains(&a.path)).cloned().collect();
+                action = Some(CastAction::CombinePoses(chosen));
+            }
+            if ui
+                .small_button(format!("Delete ({})\u{2026}", state.selected.len()))
+                .on_hover_text("Move the selected characters to the _cast_backup folder")
+                .clicked()
+            {
+                let chosen: Vec<Asset> = characters.iter().filter(|a| state.selected.contains(&a.path)).cloned().collect();
+                action = Some(CastAction::AskDelete(chosen));
+            }
+        }
+        ui.label(
+            RichText::new("Ctrl+click toggles \u{b7} Shift+click ranges")
+                .small()
+                .weak(),
+        );
+    });
+    if select_all {
+        state.selected = state.visible(characters).iter().map(|a| a.path.clone()).collect();
+    }
     ui.separator();
 
     if characters.is_empty() {
@@ -157,6 +320,10 @@ pub fn cast_panel(
     } else {
         cast_list(ui, characters, state, &mut action, thumbnail);
     }
+
+    fresh_window(ui, state, &mut action);
+    delete_window(ui, state, &mut action);
+    add_pose_window(ui, state, &mut action);
 
     // The sheet for whoever is open: their wardrobe, and the poses they know.
     if let Some(open) = state.open.clone() {
@@ -178,6 +345,14 @@ pub fn cast_panel(
             .clicked()
         {
             action = Some(CastAction::AddSelection);
+        }
+        if let Some(target) = state.save_target.clone()
+            && ui
+                .add(egui::Button::new(format!("Save changes to {}", target.name)).small())
+                .on_hover_text("Write the edited character on the stage back over its Cast asset (the old file is kept in _cast_backup)")
+                .clicked()
+        {
+            action = Some(CastAction::SaveChanges(target));
         }
         if !can_add {
             ui.label(
@@ -204,11 +379,12 @@ fn cast_list(
         .max_height(180.0)
         .id_salt("cast-list")
         .show(ui, |ui| {
+            let visible: Vec<std::path::PathBuf> = state.visible(characters).iter().map(|a| a.path.clone()).collect();
             for asset in characters {
                 if !state.matches(&asset.name) {
                     continue;
                 }
-                character_row(ui, asset, state, action, thumbnail);
+                character_row(ui, asset, &visible, state, action, thumbnail);
             }
         });
 }
@@ -217,11 +393,13 @@ fn cast_list(
 fn character_row(
     ui: &mut Ui,
     asset: &Asset,
+    visible: &[std::path::PathBuf],
     state: &mut CastPanelState,
     action: &mut Option<CastAction>,
     thumbnail: CastThumbnailSource<'_>,
 ) {
     let open = state.open.as_deref() == Some(asset.path.as_path());
+    let selected = state.selected.contains(&asset.path);
     ui.horizontal(|ui| {
         let edge = 32.0;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(edge, edge), egui::Sense::hover());
@@ -246,14 +424,30 @@ fn character_row(
                 });
             }
         } else {
-            let response = ui.selectable_label(open, RichText::new(&asset.name).strong());
+            let response = ui.selectable_label(open || selected, RichText::new(&asset.name).strong());
             let response = response.on_hover_text(
-                "Click opens the wardrobe \u{b7} double-click renames \u{b7} \
-                 \u{201c}Cast\u{201d} puts them in the shot",
+                "Click opens the wardrobe \u{b7} Ctrl+click selects \u{b7} Shift+click selects a range \u{b7} \
+                 double-click renames \u{b7} \u{201c}Cast\u{201d} puts them in the shot",
             );
-            if response.double_clicked() {
+            let mods = ui.input(|i| i.modifiers);
+            if response.clicked() && mods.shift && state.anchor.is_some() {
+                let here = visible.iter().position(|p| *p == asset.path);
+                let from = state.anchor.as_ref().and_then(|a| visible.iter().position(|p| p == a));
+                if let (Some(a), Some(b)) = (from, here) {
+                    for path in &visible[a.min(b)..=a.max(b)] {
+                        state.selected.insert(path.clone());
+                    }
+                }
+            } else if response.clicked() && mods.command {
+                if !state.selected.remove(&asset.path) {
+                    state.selected.insert(asset.path.clone());
+                }
+                state.anchor = Some(asset.path.clone());
+            } else if response.double_clicked() {
                 state.renaming = Some((asset.path.clone(), asset.name.clone()));
             } else if response.clicked() {
+                state.anchor = Some(asset.path.clone());
+                state.selected.clear();
                 // Clicking an open character closes its sheet again.
                 state.open = if open { None } else { Some(asset.path.clone()) };
                 *action = Some(CastAction::Open(asset.clone()));
@@ -268,12 +462,198 @@ fn character_row(
             {
                 *action = Some(CastAction::Cast(asset.clone()));
             }
+            if ui
+                .small_button("Start Fresh")
+                .on_hover_text(START_FRESH_HINT)
+                .clicked()
+            {
+                state.fresh = Some(FreshAsk {
+                    target: Some(asset.clone()),
+                    count: 1,
+                    use_frame: false,
+                    frame: 0,
+                });
+            }
             if let Some(kind) = asset.rig_kind {
                 ui.label(RichText::new(kind.label()).small().weak())
                     .on_hover_text("How this character is rigged");
             }
         });
     });
+}
+
+const START_FRESH_HINT: &str =
+    "Clear every keyframe of this character, keeping one pose, so it starts clean in a new file";
+
+/// The Start Fresh confirmation: which pose to keep, OK / Cancel. Nothing is
+/// written until OK; the shell backs the files up first.
+fn fresh_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<CastAction>) {
+    let Some(mut ask) = state.fresh.take() else {
+        return;
+    };
+    let mut decided = false;
+    egui::Window::new("Start Fresh")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            match &ask.target {
+                Some(asset) => ui.label(format!("Clear every keyframe of {}?", asset.name)),
+                None => ui.label(format!("Clear every keyframe of all {} characters in the cast?", ask.count)),
+            };
+            ui.label(
+                RichText::new("The file is backed up first, in a _cast_backup folder beside the cast.")
+                    .small()
+                    .weak(),
+            );
+            ui.radio_value(&mut ask.use_frame, false, "Keep the first frame");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut ask.use_frame, true, "Keep frame");
+                ui.add_enabled(ask.use_frame, egui::DragValue::new(&mut ask.frame).range(0..=100_000));
+            });
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked() {
+                    *action = Some(CastAction::StartFresh {
+                        asset: ask.target.clone(),
+                        keep: ask.use_frame.then_some(ask.frame),
+                    });
+                    decided = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    decided = true;
+                }
+            });
+        });
+    if !decided {
+        state.fresh = Some(ask);
+    }
+}
+
+/// The multi-delete confirmation: how many, which are cast in a series, and
+/// where they go. Nothing is hard-deleted.
+fn delete_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<CastAction>) {
+    let Some(ask) = state.delete_ask.take() else {
+        return;
+    };
+    let mut decided = false;
+    egui::Window::new("Delete characters")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            ui.label(format!("Move {} characters out of the Cast?", ask.assets.len()));
+            ui.label(
+                RichText::new("They are moved to a _cast_backup folder beside the cast, not erased.")
+                    .small()
+                    .weak(),
+            );
+            if !ask.cast_in_series.is_empty() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 160, 60),
+                    format!(
+                        "{} of these are cast in a series: {}",
+                        ask.cast_in_series.len(),
+                        ask.cast_in_series.join(", ")
+                    ),
+                );
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Move to backup").clicked() {
+                    *action = Some(CastAction::DeleteMany(ask.assets.clone()));
+                    decided = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    decided = true;
+                }
+            });
+        });
+    if !decided {
+        state.delete_ask = Some(ask);
+    }
+}
+
+/// **Add Pose…**: a name and one of three sources.
+fn add_pose_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<CastAction>) {
+    let Some(mut ask) = state.add_pose.take() else {
+        return;
+    };
+    let library = state.library_symbols.clone();
+    let mut decided = false;
+    egui::Window::new("Add Pose")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            let name = ask.asset.as_ref().map(|a| a.name.clone()).unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.label(name);
+                ui.text_edit_singleline(&mut ask.label)
+                    .on_hover_text("The pose's name, e.g. Sitting \u{2014} it is saved as \u{201c}<Character> <name>\u{201d}");
+            });
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut ask.source, 0, "Library symbol");
+                ui.selectable_value(&mut ask.source, 1, "Picture");
+                ui.selectable_value(&mut ask.source, 2, "FLA symbol");
+            });
+            match ask.source {
+                0 => {
+                    egui::ComboBox::from_id_salt("add-pose-symbol")
+                        .selected_text(if ask.symbol.is_empty() { "choose a symbol" } else { ask.symbol.as_str() })
+                        .show_ui(ui, |ui| {
+                            for s in &library {
+                                ui.selectable_value(&mut ask.symbol, s.clone(), s);
+                            }
+                        });
+                }
+                1 => {
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut ask.picture);
+                        if ui.small_button("Browse\u{2026}").clicked()
+                            && let Some(p) = rfd::FileDialog::new().add_filter("Picture", &["png", "jpg", "jpeg"]).pick_file()
+                        {
+                            ask.picture = p.display().to_string();
+                        }
+                    });
+                }
+                _ => {
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut ask.fla);
+                        if ui.small_button("Browse\u{2026}").clicked()
+                            && let Some(p) = rfd::FileDialog::new().add_filter("FLA", &["fla", "xfl"]).pick_file()
+                        {
+                            ask.fla = p.display().to_string();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Symbol");
+                        ui.text_edit_singleline(&mut ask.fla_symbol);
+                    });
+                }
+            }
+            let source = match ask.source {
+                0 if !ask.symbol.is_empty() => Some(PoseSource::LibrarySymbol(ask.symbol.clone())),
+                1 if !ask.picture.trim().is_empty() => Some(PoseSource::Picture(ask.picture.trim().into())),
+                2 if !ask.fla.trim().is_empty() && !ask.fla_symbol.trim().is_empty() => {
+                    Some(PoseSource::FlaSymbol { fla: ask.fla.trim().into(), symbol: ask.fla_symbol.trim().to_string() })
+                }
+                _ => None,
+            };
+            ui.horizontal(|ui| {
+                let ready = source.is_some() && !ask.label.trim().is_empty();
+                if ui.add_enabled(ready, egui::Button::new("Add")).clicked()
+                    && let (Some(source), Some(asset)) = (source.clone(), ask.asset.clone())
+                {
+                    *action = Some(CastAction::AddPose { asset, label: ask.label.trim().to_string(), source });
+                    decided = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    decided = true;
+                }
+            });
+        });
+    if !decided {
+        state.add_pose = Some(ask);
+    }
 }
 
 /// The open character's sheet: their wardrobe and the poses they know.
@@ -367,7 +747,64 @@ fn character_sheet(
         });
     }
 
+    // -- the character's own poses (its symbol set): add, rename, remove --
     ui.add_space(4.0);
+    ui.label(RichText::new("Character poses").strong());
+    let poses_here = state.character_poses.clone();
+    if poses_here.len() < 2 {
+        ui.label(
+            RichText::new("One pose so far \u{2014} Add Pose\u{2026} makes this a character that can turn.")
+                .small()
+                .weak()
+                .italics(),
+        );
+    }
+    for (i, pose) in poses_here.iter().enumerate() {
+        ui.horizontal(|ui| {
+            let renaming = state.renaming_pose.as_ref().is_some_and(|(p, _)| p == pose);
+            if renaming {
+                let mut done = false;
+                if let Some((_, text)) = state.renaming_pose.as_mut() {
+                    let response = ui.text_edit_singleline(text);
+                    done = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    response.request_focus();
+                }
+                if done && let Some((old, label)) = state.renaming_pose.take() {
+                    *action = Some(CastAction::RenamePose { asset: asset.clone(), pose: old, label });
+                }
+            } else {
+                ui.label(RichText::new(pose).small());
+                if i > 0 {
+                    if ui.small_button("Rename").clicked() {
+                        let label = pose.strip_prefix(&asset.name).unwrap_or(pose).trim().to_string();
+                        state.renaming_pose = Some((pose.clone(), label));
+                    }
+                    if ui.small_button("Remove").on_hover_text("Take this pose out of the character").clicked() {
+                        *action = Some(CastAction::RemovePose { asset: asset.clone(), pose: pose.clone() });
+                    }
+                } else {
+                    ui.label(RichText::new("main").small().weak());
+                }
+            }
+        });
+    }
+    if ui
+        .small_button("Add Pose\u{2026}")
+        .on_hover_text("Add a pose from a Library symbol, a picture or an FLA symbol")
+        .clicked()
+    {
+        state.add_pose = Some(AddPoseAsk { asset: Some(asset.clone()), ..AddPoseAsk::default() });
+    }
+
+    ui.add_space(4.0);
+    let mut life = !state.life_off;
+    if ui
+        .checkbox(&mut life, "Add breath + blinks")
+        .on_hover_text("Give the character breathing and blinks from the playhead to the end of the scene when it is cast in")
+        .changed()
+    {
+        state.life_off = !life;
+    }
     if ui
         .button("Cast into the shot")
         .on_hover_text("Put a copy of this character on the stage")

@@ -1,7 +1,7 @@
 //! Trace a PNG and render the vector result beside the source, for judging
 //! trace quality by eye and by numbers.
 //!
-//! cargo run --release -p buzz-app --example trace_png -- in.png out.png [lineart|outline|both|ink|inkcolour] [uniform_width_px] [--tuning <file>] [--bold <px>]
+//! cargo run --release -p buzz-app --example trace_png -- in.png out.png [lineart|outline|both|ink|inkcolour] [uniform_width_px] [--tuning <file>] [--bold <px>] [--alpha] [--soft] [--even | --even-width <px>] [--bold-outlines]
 //!
 //! The tracer tuning is the saved one (`trace_tuning.json`, or
 //! `BUZZ_TRACE_TUNING`), or `--tuning <file>`; `--bold` overrides `ink_bold`.
@@ -14,12 +14,22 @@ fn main() -> anyhow::Result<()> {
     // `--tuning <file>` and `--bold <px>` anywhere; the rest is positional.
     let mut tuning_file: Option<String> = None;
     let mut bold_flag: Option<f64> = None;
+    let mut keep_alpha = false;
+    let mut soft_tones = false;
+    let mut bold_outlines = false;
+    let mut even_lines: Option<f64> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut raw = std::env::args().skip(1);
     while let Some(a) = raw.next() {
         match a.as_str() {
             "--tuning" => tuning_file = Some(raw.next().ok_or_else(|| anyhow::anyhow!("--tuning needs a file"))?),
             "--bold" => bold_flag = Some(raw.next().ok_or_else(|| anyhow::anyhow!("--bold needs px"))?.parse()?),
+            "--alpha" => keep_alpha = true,
+            "--soft" => soft_tones = true,
+            "--bold-outlines" => bold_outlines = true,
+            // `--even` = auto width; `--even <px>` a fixed width.
+            "--even" => even_lines = Some(0.0),
+            "--even-width" => even_lines = Some(raw.next().ok_or_else(|| anyhow::anyhow!("--even-width needs px"))?.parse()?),
             _ => positional.push(a),
         }
     }
@@ -68,6 +78,10 @@ fn main() -> anyhow::Result<()> {
     if let Some(file) = &tuning_file {
         options.tuning = buzz_scene::TraceTuning::load(std::path::Path::new(file)).map_err(|e| anyhow::anyhow!(e))?;
     }
+    options.keep_alpha = keep_alpha;
+    options.soft_tones = soft_tones;
+    options.even_lines = even_lines;
+    options.bold_outlines = bold_outlines;
     if let Some(bold) = bold_flag {
         options.ink_bold = bold;
     }
@@ -106,13 +120,27 @@ fn main() -> anyhow::Result<()> {
         .map(|v| peniko::Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8))
         .unwrap_or(peniko::Color::WHITE);
     let layer = scene.add_layer("trace", buzz_scene::LayerKind::Normal);
+    let blurs: std::collections::HashMap<usize, f64> = report.blurs.iter().copied().collect();
+    println!("{} soft-edged shapes", blurs.len());
+    let no_blur = std::env::var("TRACE_PNG_NO_BLUR").is_ok();
     for (i, mut shape) in report.shapes.into_iter().enumerate() {
         shape.path = shift * shape.path;
-        scene.add_object(layer, buzz_scene::Object::shape(buzz_scene::ObjectId(1_000_000 + i as u64), shape));
+        let mut object = buzz_scene::Object::shape(buzz_scene::ObjectId(1_000_000 + i as u64), shape);
+        if let Some(&radius) = blurs.get(&i)
+            && !no_blur
+        {
+            object.filters.push(buzz_scene::TraceReport::blur_filter(radius));
+        }
+        scene.add_object(layer, object);
     }
     let settings = buzz_export::ExportSettings::scaled(&scene, scale);
     let mut exporter = buzz_export::Exporter::new(&buzz_render::GpuPreference::default())?;
+    let render_started = std::time::Instant::now();
     let traced = exporter.render(&scene, 0, &settings)?;
+    println!("render {:.0} ms", render_started.elapsed().as_secs_f64() * 1e3);
+    let again = std::time::Instant::now();
+    exporter.render(&scene, 0, &settings)?;
+    println!("render again {:.0} ms", again.elapsed().as_secs_f64() * 1e3);
 
     traced.write_png(std::path::Path::new(&output))?;
     println!("-> {output}");

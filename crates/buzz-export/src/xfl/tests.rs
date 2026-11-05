@@ -442,3 +442,41 @@ fn walk(dir: &std::path::Path, out: &mut Vec<(u64, std::path::PathBuf)>, depth: 
         }
     }
 }
+
+/// An instance's colour effect is written as `<color>` and read back.
+#[test]
+fn an_instances_colour_effect_survives() {
+    use buzz_scene::ColorTransform;
+    let cases = [
+        ColorTransform::brightness(-0.5),
+        ColorTransform::brightness(0.5),
+        ColorTransform::tint(Color::from_rgba8(255, 0, 0, 255), 0.5),
+        ColorTransform::alpha(0.3),
+        ColorTransform { multiply: [0.5, 0.8, 1.0, 0.6], add: [0.1, 0.0, -0.2, 0.0] },
+    ];
+    for fx in cases {
+        let mut scene = Scene::default();
+        let layer = scene.add_layer("Cast", LayerKind::Normal);
+        let symbol = scene.add_symbol("Hero", SymbolKind::Graphic, None);
+        let id = scene
+            .add_instance_at(layer, 0, symbol, Affine::IDENTITY)
+            .unwrap();
+        scene.update_object_at(0, id, |o| {
+            if let ObjectKind::Instance(i) = &mut o.kind {
+                i.color = fx;
+            }
+        });
+        let (bytes, _) = fla_bytes(&scene).expect("writes");
+        let (back, _) = buzz_import_xfl::import_fla_bytes(&bytes).expect("reads");
+        let got = back
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter().cloned())
+            .find_map(|o| o.instance().map(|i| i.color))
+            .expect("an instance came back");
+        for k in 0..4 {
+            assert!((got.multiply[k] - fx.multiply[k]).abs() < 1e-3, "{fx:?} -> {got:?}");
+            assert!((got.add[k] - fx.add[k]).abs() < 1e-2, "{fx:?} -> {got:?}");
+        }
+    }
+}

@@ -150,6 +150,11 @@ launcher that quietly ran last week's binary would be a confusing thing to own.
 
 **macOS & Linux: run `./buzzanimate.sh`** (or double-click `BuzzAnimate.command` on macOS).
 
+On a Mac you need Apple Silicon (M1 or newer) and ffmpeg (`brew install ffmpeg`).
+`bash tools/make-macos-app.sh` makes a `BuzzAnimate.app` you can drag to the Dock
+or /Applications; it uses this folder's assets, so run the script again after
+pulling changes.
+
 ```sh
 # macOS / Linux
 ./buzzanimate.sh                        an empty document

@@ -29,6 +29,16 @@ use buzz_render::GpuPreference;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() -> Result<()> {
+    // **A Mac app opened from Finder starts in `/`.** `assets/` and `.env` are
+    // in the BuzzAnimate folder, so move there first: `BUZZ_HOME` (set by the
+    // bundle's Info.plist, `tools/make-macos-app.sh`) or a folder above the exe.
+    #[cfg(target_os = "macos")]
+    if !std::path::Path::new("assets").is_dir()
+        && let Some(home) = buzz_ai::ai_config::buzz_home()
+    {
+        let _ = std::env::set_current_dir(home);
+    }
+
     // **A person launched this, so the layout on screen is theirs to keep.**
     // Nothing else in the workspace claims it, which is what stops a test run
     // rearranging the panels of whoever is running the suite. See
@@ -161,7 +171,16 @@ fn main() -> Result<()> {
     // A user-event loop so egui (and background installs) can wake it from an
     // idle wait; `ControlFlow::Wait` is the default, and the app raises it to
     // `Poll` only for the frames that actually need it. See `App::wants_frame`.
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let mut event_loop_builder = EventLoop::<UserEvent>::with_user_event();
+    // winit's default macOS menu has a Quit item that sends `terminate:`, which
+    // skips `App::request_quit` (export / unsaved prompts). Without the menu,
+    // ⌘Q reaches egui as COMMAND+Q and runs `Command::Quit`.
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
+        event_loop_builder.with_default_menu(false);
+    }
+    let event_loop = event_loop_builder.build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
 
@@ -241,7 +260,8 @@ fn init_tracing() {
 /// "windows"` (see the module doc) means this build has no console for
 /// `tracing_subscriber`'s default stderr writer to reach — today, a hang or a
 /// crash in the field leaves no evidence at all. S0 in
-/// `docs/BIMARI5_LAG_PLAN.md`: `%LOCALAPPDATA%/BuzzAnimate/logs/last.log`,
+/// `docs/BIMARI5_LAG_PLAN.md`: `%LOCALAPPDATA%/BuzzAnimate/logs/last.log`
+/// (`~/Library/Logs/BuzzAnimate/last.log` on a Mac),
 /// truncated fresh on every launch so it always holds the most recent run
 /// rather than growing without bound. Falls back to the ordinary stderr
 /// subscriber if the file cannot be created — a log that goes nowhere useful
@@ -249,10 +269,17 @@ fn init_tracing() {
 /// diagnostic.
 #[cfg(not(debug_assertions))]
 fn init_tracing() {
+    // Without LOCALAPPDATA (macOS, Linux): `~/Library/Logs/BuzzAnimate` on a
+    // Mac, `~/.config/BuzzAnimate/logs` elsewhere.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let fallback_dir = home.map(|h| h.join("Library").join("Logs").join("BuzzAnimate"));
+    #[cfg(not(target_os = "macos"))]
+    let fallback_dir = home.map(|h| h.join(".config").join("BuzzAnimate").join("logs"));
     let file = std::env::var_os("LOCALAPPDATA")
-        .map(std::path::PathBuf::from)
-        .and_then(|base| {
-            let dir = base.join("BuzzAnimate").join("logs");
+        .map(|base| std::path::PathBuf::from(base).join("BuzzAnimate").join("logs"))
+        .or(fallback_dir)
+        .and_then(|dir| {
             std::fs::create_dir_all(&dir).ok()?;
             // Truncated (not appended): `File::create` — each launch starts
             // this file fresh, so it is always this run's own log rather

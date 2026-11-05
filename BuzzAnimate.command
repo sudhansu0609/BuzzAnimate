@@ -24,6 +24,18 @@ if [ -f "$HOME/.cargo/env" ]; then
 fi
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
+# Intel Macs cannot build BuzzAnimate: the AI runtime (ONNX Runtime) has no Intel-Mac build
+if [ "$(uname -m)" = "x86_64" ]; then
+    echo ""
+    echo "  ==========================================================="
+    echo "  BuzzAnimate needs an Apple Silicon Mac (M1 or newer)."
+    echo "  The AI runtime it uses (ONNX Runtime) has no Intel-Mac build."
+    echo "  ==========================================================="
+    echo ""
+    read -p "Press Enter to close..."
+    exit 1
+fi
+
 PROFILE="release"
 PROFILE_DIR="release"
 CARGO_ARGS=("--release")

@@ -26,3 +26,6 @@
 # local image datasets (staging/storyboard reference stills)
 /dataset2/
 installer/setup.running
+
+# macOS app bundle made by tools/make-macos-app.sh
+/BuzzAnimate.app/

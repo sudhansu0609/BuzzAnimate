@@ -233,9 +233,16 @@ pub fn default_config_dir() -> Option<std::path::PathBuf> {
         candidates.push(dir);
     }
 
-    // Animate's, newest first.
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let adobe = std::path::Path::new(&local).join("Adobe");
+    // Animate's, newest first. On a Mac Adobe keeps them in
+    // `~/Library/Application Support/Adobe`.
+    let adobe_base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let adobe_base = adobe_base.or_else(|| {
+        std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join("Library").join("Application Support"))
+    });
+    if let Some(local) = adobe_base {
+        let adobe = local.join("Adobe");
         let mut versions: Vec<std::path::PathBuf> = std::fs::read_dir(&adobe)
             .into_iter()
             .flatten()
@@ -256,14 +263,14 @@ pub fn default_config_dir() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|path| path.is_dir())
 }
 
-/// `%APPDATA%/BuzzAnimate/Configuration`, if the platform has such a place.
+/// `%APPDATA%/BuzzAnimate/Configuration`, if the platform has such a place
+/// (elsewhere `$XDG_CONFIG_HOME` or `~/.config`, as `buzz_doc::assets::default_root`).
 fn dirs_next_config() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
-    Some(
-        std::path::PathBuf::from(base)
-            .join("BuzzAnimate")
-            .join("Configuration"),
-    )
+    let base = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(base.join("BuzzAnimate").join("Configuration"))
 }
 
 /// A way for the host to stop a script that is already running.

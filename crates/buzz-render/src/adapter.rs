@@ -222,16 +222,19 @@ fn score(info: &Traits<'_>, prefer_integrated: bool) -> (Option<i64>, String) {
 
 /// Enumerate, score and pick a GPU.
 ///
-/// Enumerates DX12 and Vulkan only: on Windows those are the backends that can
-/// actually run Vello's compute pipelines, and including GL would let a weak
-/// fallback win on a machine where the real driver failed to load.
+/// Enumerates DX12 and Vulkan only (Metal on macOS): on Windows those are the
+/// backends that can actually run Vello's compute pipelines, and including GL
+/// would let a weak fallback win on a machine where the real driver failed to
+/// load. A Mac has no DX12 or Vulkan, so there Metal is the one backend asked for.
 pub async fn select(
     instance: &Instance,
     preference: &GpuPreference,
 ) -> Result<Selection, SelectionError> {
-    let adapters = instance
-        .enumerate_adapters(Backends::DX12 | Backends::VULKAN)
-        .await;
+    #[cfg(target_os = "macos")]
+    let backends = Backends::METAL;
+    #[cfg(not(target_os = "macos"))]
+    let backends = Backends::DX12 | Backends::VULKAN;
+    let adapters = instance.enumerate_adapters(backends).await;
 
     if adapters.is_empty() {
         return Err(SelectionError::NoAdapters);

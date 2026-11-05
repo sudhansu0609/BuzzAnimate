@@ -52,10 +52,15 @@ fn jsfl_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Animate's Commands folder: the Animate version with the most scripts in it
-/// (newest on a tie), under `%LOCALAPPDATA%/Adobe`.
+/// (newest on a tie), under `%LOCALAPPDATA%/Adobe` (on a Mac
+/// `~/Library/Application Support/Adobe`).
 pub fn animate_commands_dir() -> Option<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")?;
-    let adobe = PathBuf::from(local).join("Adobe");
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let local = local.or_else(|| {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+    });
+    let adobe = local?.join("Adobe");
     let mut best: Option<(usize, String, PathBuf)> = None;
     for e in std::fs::read_dir(adobe).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().to_string();
@@ -473,10 +478,15 @@ pub fn bind_commands(
 }
 
 /// Animate's active shortcut set: the newest Animate version under
-/// `%APPDATA%/Adobe/Animate`, the set named by `currentShortcutSet` in its
-/// `Settings.xml` (else `Shortcuts.xml`).
+/// `%APPDATA%/Adobe/Animate` (on a Mac `~/Library/Application Support/Adobe/Animate`),
+/// the set named by `currentShortcutSet` in its `Settings.xml` (else `Shortcuts.xml`).
 pub fn animate_shortcuts_file() -> Option<PathBuf> {
-    let base = PathBuf::from(std::env::var_os("APPDATA")?).join("Adobe").join("Animate");
+    let roaming = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let roaming = roaming.or_else(|| {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+    });
+    let base = roaming?.join("Adobe").join("Animate");
     let mut versions: Vec<PathBuf> = std::fs::read_dir(&base)
         .into_iter()
         .flatten()

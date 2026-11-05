@@ -38,6 +38,14 @@ fn overlay_root() -> PathBuf {
         .or_else(|| {
             std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("BuzzAnimate").join("ScriptData"))
         })
+        .or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(|a| PathBuf::from(a).join("BuzzAnimate").join("ScriptData"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".config").join("BuzzAnimate").join("ScriptData"))
+        })
         .unwrap_or_else(|| std::env::temp_dir().join("BuzzAnimate").join("ScriptData"));
     base
 }

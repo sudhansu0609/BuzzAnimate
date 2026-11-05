@@ -19,7 +19,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 
@@ -53,7 +53,7 @@ pub fn concat_segments(segments: &[PathBuf], output: &Path) -> Result<()> {
         }
     }
 
-    let status = Command::new("ffmpeg")
+    let status = crate::video::ffmpeg_cmd()
         .arg("-hide_banner")
         .arg("-y")
         .args(["-f", "concat", "-safe", "0"])

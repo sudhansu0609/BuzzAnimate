@@ -3,7 +3,7 @@
 //! fetch its pictures.
 //!
 //! Mirrors BuzzEdit's Python client (`backend/comfyui_bridge/client.py`):
-//! probe `/system_stats`; scan 8188..8208 at 0.5 s per port; `POST /prompt`
+//! probe `/system_stats`; scan 8188..8208 and 8000 (ComfyUI Desktop) at 0.5 s per port; `POST /prompt`
 //! `{prompt, client_id}` with a generous timeout (ComfyUI blocks its HTTP
 //! server while loading a model); poll `/history/{id}`; read every output
 //! entry; fetch through `GET /view`. A job that sees "connection refused" for
@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 
 /// The ports scanned when `COMFYUI_URL` does not answer.
 const PORTS: std::ops::RangeInclusive<u16> = 8188..=8208;
+/// ComfyUI Desktop's port, probed after `PORTS`.
+const DESKTOP_PORT: u16 = 8000;
 /// How long one probe may take.
 const PROBE: Duration = Duration::from_millis(500);
 /// `POST /prompt`: ComfyUI may not answer while it loads a large model.
@@ -25,6 +27,19 @@ const QUEUE: Duration = Duration::from_secs(120);
 const REFUSED_GIVE_UP: Duration = Duration::from_secs(20);
 /// The portable install, unless `COMFYUI_DIR` says otherwise.
 pub const DEFAULT_COMFYUI_DIR: &str = r"B:\ComfyUI_windows_portable_nvidia_cu118_or_cpu\ComfyUI_windows_portable";
+
+/// The folder to start ComfyUI from when `COMFYUI_DIR` is not set: the portable
+/// install on Windows, `~/ComfyUI` elsewhere.
+fn default_comfyui_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(DEFAULT_COMFYUI_DIR)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("ComfyUI")).unwrap_or_else(|| PathBuf::from("ComfyUI"))
+    }
+}
 const CLIENT_ID: &str = "buzzanimate_client";
 
 /// Where one finished picture is, as ComfyUI's history lists it.
@@ -70,7 +85,7 @@ impl ComfyClient {
     }
 
     /// The first ComfyUI that answers: `COMFYUI_URL` (when local), then
-    /// `127.0.0.1:8188..8208`.
+    /// `127.0.0.1:8188..8208`, then `127.0.0.1:8000`.
     pub fn discover() -> Option<Self> {
         let mut tried = Vec::new();
         if let Ok(url) = std::env::var("COMFYUI_URL") {
@@ -83,6 +98,7 @@ impl ComfyClient {
             }
         }
         PORTS
+            .chain(std::iter::once(DESKTOP_PORT))
             .map(|p| format!("http://127.0.0.1:{p}"))
             .filter(|u| !tried.contains(u))
             .find(|u| probe(u, PROBE))
@@ -101,16 +117,26 @@ impl ComfyClient {
             return Ok(found);
         }
         if !launch {
-            return Err("ComfyUI is not running (nothing answered /system_stats on COMFYUI_URL or 127.0.0.1:8188-8208)".into());
+            return Err("ComfyUI is not running (nothing answered /system_stats on COMFYUI_URL or 127.0.0.1:8188-8208 and 8000)".into());
         }
         let dir = std::env::var("COMFYUI_DIR")
             .ok()
             .filter(|d| !d.trim().is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_COMFYUI_DIR));
+            .unwrap_or_else(default_comfyui_dir);
+        // Windows runs the portable install's launcher; elsewhere ComfyUI's `main.py`.
+        #[cfg(windows)]
         let bat = dir.join("run_nvidia_gpu.bat");
+        #[cfg(not(windows))]
+        let bat = dir.join("main.py");
         if !bat.is_file() {
+            #[cfg(windows)]
             return Err(format!("ComfyUI cannot be started: {} is not there", bat.display()));
+            #[cfg(not(windows))]
+            return Err(format!(
+                "ComfyUI cannot be started: no main.py in {}; start ComfyUI yourself or set COMFYUI_DIR",
+                dir.display()
+            ));
         }
         start_detached(&bat)?;
         let began = Instant::now();
@@ -304,6 +330,25 @@ fn start_detached(bat: &std::path::Path) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err(format!("ComfyUI cannot be started from here: {} is a Windows script", bat.display()))
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        // `bat` is `<dir>/main.py` here: run it with the folder's own Python
+        // environment when it has one.
+        let dir = bat.parent().unwrap_or(std::path::Path::new("."));
+        let python = ["venv/bin/python", ".venv/bin/python"]
+            .iter()
+            .map(|p| dir.join(p))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| PathBuf::from("python3"));
+        std::process::Command::new(python)
+            .arg("main.py")
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("could not start ComfyUI ({}): {e}", bat.display()))
     }
 }

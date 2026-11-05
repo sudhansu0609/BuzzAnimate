@@ -1,0 +1,22 @@
+# Manual trigger only: macOS minutes are billed 10x. The GPU tests are not run
+# because the runner has no usable Metal GPU.
+name: macOS build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+      - name: Check
+        run: cargo check --workspace --all-targets
+      - name: Build
+        run: cargo build --release -p buzz-app
+      - name: Test (crates that need no GPU)
+        run: cargo test -p buzz-geom -p buzz-scene -p buzz-doc -p buzz-text -p buzz-rig --lib

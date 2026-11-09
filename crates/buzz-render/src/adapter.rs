@@ -107,7 +107,7 @@ impl Selection {
 /// Why no adapter could be used.
 #[derive(Debug, thiserror::Error)]
 pub enum SelectionError {
-    #[error("no GPU adapters found; a DX12 or Vulkan capable driver is required")]
+    #[error("no GPU adapters found; a DX12, Vulkan or Metal capable driver is required")]
     NoAdapters,
     #[error("every adapter was disqualified:\n{0}")]
     AllDisqualified(String),
@@ -222,15 +222,16 @@ fn score(info: &Traits<'_>, prefer_integrated: bool) -> (Option<i64>, String) {
 
 /// Enumerate, score and pick a GPU.
 ///
-/// Enumerates DX12 and Vulkan only: on Windows those are the backends that can
-/// actually run Vello's compute pipelines, and including GL would let a weak
-/// fallback win on a machine where the real driver failed to load.
+/// Enumerates DX12, Vulkan and Metal only: those are the backends that can
+/// actually run Vello's compute pipelines (Metal being the only one on macOS),
+/// and including GL would let a weak fallback win on a machine where the real
+/// driver failed to load.
 pub async fn select(
     instance: &Instance,
     preference: &GpuPreference,
 ) -> Result<Selection, SelectionError> {
     let adapters = instance
-        .enumerate_adapters(Backends::DX12 | Backends::VULKAN)
+        .enumerate_adapters(Backends::DX12 | Backends::VULKAN | Backends::METAL)
         .await;
 
     if adapters.is_empty() {

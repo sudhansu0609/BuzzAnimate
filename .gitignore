@@ -26,3 +26,4 @@
 # local image datasets (staging/storyboard reference stills)
 /dataset2/
 installer/setup.running
+/dist

@@ -14651,6 +14651,16 @@ impl App {
         // for this window first is the opening scene, not an empty rectangle.
         active.reveal();
 
+        // egui's texture uploads go in before the surface can turn this frame
+        // away: a delta is handed out once, so one dropped by an Outdated or
+        // Occluded return below loses the font atlas's first full upload, and
+        // the next frame's partial update of it panics in egui-wgpu.
+        for (id, delta) in &output.textures_delta.set {
+            active
+                .egui_renderer
+                .update_texture(&active.gpu.device, &active.gpu.queue, *id, delta);
+        }
+
         use wgpu::CurrentSurfaceTexture as Cst;
         let acquire_started = Instant::now();
         let acquired = active.surface.get_current_texture();
@@ -14879,11 +14889,6 @@ impl App {
             );
         }
 
-        for (id, delta) in &output.textures_delta.set {
-            active
-                .egui_renderer
-                .update_texture(&active.gpu.device, &active.gpu.queue, *id, delta);
-        }
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [w, h],
             pixels_per_point: output.pixels_per_point,

@@ -150,6 +150,11 @@ launcher that quietly ran last week's binary would be a confusing thing to own.
 
 **macOS & Linux: run `./buzzanimate.sh`** (or double-click `BuzzAnimate.command` on macOS).
 
+**macOS app: `installer/macos/build_app.sh --install`** builds `BuzzAnimate.app`
+into `/Applications` (and a `.dmg` into `dist/` for other Macs). Video/GIF export
+needs `brew install ffmpeg`; the AI key's `.env` lives in
+`~/Library/Application Support/BuzzAnimate`.
+
 ```sh
 # macOS / Linux
 ./buzzanimate.sh                        an empty document

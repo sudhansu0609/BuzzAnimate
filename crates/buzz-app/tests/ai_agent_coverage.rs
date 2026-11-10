@@ -1229,6 +1229,8 @@ fn dialog_commands_say_which_args_are_missing_and_change_nothing() {
     expect_err(&cmd(&mut app, "trace_bitmap_options"), "Select a picture");
     expect_err(&cmd(&mut app, "add_follow_through"), "rigged character");
     expect_err(&cmd(&mut app, "add_wiggle"), "select an object");
+    expect_err(&cmd(&mut app, "add_pendulum"), "select an object");
+    expect_err(&cmd(&mut app, "add_hair_motion"), "select an object");
 
     // A typo is refused, never ignored.
     for &c in Command::unit_commands() {
@@ -1378,6 +1380,41 @@ fn perform_follow_through_and_wiggle_run_from_args() {
     let mods = items_of(&edit(&mut app, &target, "modifiers", "get", json!({})));
     assert!(mods.iter().any(|m| m["kind"] == json!("wiggle") && m["amplitude"] == json!(7.0)), "{mods:?}");
     undo_n(&mut app, 1);
+    assert!(items_of(&edit(&mut app, &target, "modifiers", "get", json!({}))).is_empty());
+
+    // A pendulum is always a live modifier; re-adding replaces rather than stacks.
+    for period in [1.2, 2.0] {
+        let r = cmda(&mut app, "add_pendulum", json!({"element": rig, "period": period, "initial_angle": 20}));
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(steps(&r), 1);
+    }
+    let mods = items_of(&edit(&mut app, &target, "modifiers", "get", json!({})));
+    let pendulums: Vec<_> = mods.iter().filter(|m| m["kind"] == json!("pendulum")).collect();
+    assert_eq!(pendulums.len(), 1, "{mods:?}");
+    assert_eq!(pendulums[0]["period"], json!(2.0));
+    assert_eq!(pendulums[0]["initial_angle"], json!(20.0));
+    expect_err(&cmda(&mut app, "add_pendulum", json!({"element": rig, "period": 0})), "period");
+    undo_n(&mut app, 2);
+    assert!(items_of(&edit(&mut app, &target, "modifiers", "get", json!({}))).is_empty());
+
+    // Hair / cloth likewise: live, one undo step, replaces rather than stacks.
+    for side in ["left", "right"] {
+        let r = cmda(&mut app, "add_hair_motion", json!({"element": rig, "side": side, "segments": 8, "wind": 0.5}));
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(steps(&r), 1);
+    }
+    let mods = items_of(&edit(&mut app, &target, "modifiers", "get", json!({})));
+    let hair: Vec<_> = mods.iter().filter(|m| m["kind"] == json!("hair")).collect();
+    assert_eq!(hair.len(), 1, "{mods:?}");
+    assert_eq!(hair[0]["side"], json!(2.0));
+    assert_eq!(hair[0]["segments"], json!(8.0));
+    assert_eq!(hair[0]["wind"], json!(0.5));
+    expect_err(&cmda(&mut app, "add_hair_motion", json!({"element": rig, "side": "middle"})), "side");
+    expect_err(&cmda(&mut app, "add_hair_motion", json!({"element": rig, "segments": 1})), "segments");
+    // The modifiers list edits it too.
+    let r = edit(&mut app, &target, "modifiers", "set", json!({"index": 0, "item": {"lag": 2.0}}));
+    assert!(items_of(&r).iter().any(|m| m["kind"] == json!("hair") && m["lag"] == json!(2.0)), "{r:?}");
+    undo_n(&mut app, 3);
     assert!(items_of(&edit(&mut app, &target, "modifiers", "get", json!({}))).is_empty());
 
     let keys = keyframe_total(&mut app);

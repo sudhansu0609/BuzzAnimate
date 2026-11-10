@@ -1,0 +1,19 @@
+[package]
+name = "buzz-voice"
+description = "Character voices: the creator's own performance re-voiced by pitch, formant, tone and texture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Resampling (the formant shift is a resample) and the clip type takes come in.
+buzz-audio.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+# The demo writes its WAVs; the library itself never touches a file.
+hound = "3.5"

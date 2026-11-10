@@ -1526,6 +1526,34 @@ pub struct ModifierDto {
     pub y: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<f64>,
+    /// Pendulum: natural period in seconds. Absent in files written before
+    /// the pendulum existed, which cannot contain one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period: Option<f64>,
+    /// Pendulum: how much of the object's own motion shakes the pivot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<f64>,
+    /// Pendulum: starting angle in degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle: Option<f64>,
+    /// Pendulum: idle sway in degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sway: Option<f64>,
+    /// Pendulum: hard stop in degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_angle: Option<f64>,
+    /// Hair / cloth: how many links the chain is divided into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segments: Option<u64>,
+    /// Hair / cloth: the pinned side, 0 top, 1 left, 2 right, 3 bottom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<u64>,
+    /// Hair / cloth: wind strength.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wind: Option<f64>,
+    /// Hair / cloth: how much the tip lags the motion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag: Option<f64>,
 }
 
 impl ModifierDto {
@@ -1544,6 +1572,15 @@ impl ModifierDto {
             x: None,
             y: None,
             amount: None,
+            period: None,
+            reaction: None,
+            angle: None,
+            sway: None,
+            max_angle: None,
+            segments: None,
+            side: None,
+            wind: None,
+            lag: None,
         };
         match *m {
             Modifier::Wiggle {
@@ -1628,6 +1665,49 @@ impl ModifierDto {
                 frequency: Some(phase),
                 ..base
             },
+            // The pivot offset rides on the `x`/`y` the look-at already uses.
+            Modifier::Pendulum {
+                period,
+                damping,
+                reaction,
+                initial_angle,
+                sway,
+                max_angle,
+                pivot_dx,
+                pivot_dy,
+            } => Self {
+                kind: "pendulum".to_string(),
+                period: Some(period),
+                damping: Some(damping),
+                reaction: Some(reaction),
+                angle: Some(initial_angle),
+                sway: Some(sway),
+                max_angle: Some(max_angle),
+                x: Some(pivot_dx),
+                y: Some(pivot_dy),
+                ..base
+            },
+            // `stiffness`/`damping` are the link spring, `frequency` the wind's
+            // gusts per second.
+            Modifier::Hair {
+                side,
+                segments,
+                stiffness,
+                damping,
+                wind,
+                wind_rate,
+                lag,
+            } => Self {
+                kind: "hair".to_string(),
+                side: Some(side.index() as u64),
+                segments: Some(segments as u64),
+                stiffness: Some(stiffness),
+                damping: Some(damping),
+                wind: Some(wind),
+                frequency: Some(wind_rate),
+                lag: Some(lag),
+                ..base
+            },
         }
     }
 
@@ -1673,6 +1753,25 @@ impl ModifierDto {
                 dy: self.y.unwrap_or(0.0),
                 span: self.amount.unwrap_or(0.0),
                 phase: self.frequency.unwrap_or(0.0),
+            }),
+            "pendulum" => Some(Modifier::Pendulum {
+                period: self.period.unwrap_or(1.6),
+                damping: self.damping.unwrap_or(0.12),
+                reaction: self.reaction.unwrap_or(0.5),
+                initial_angle: self.angle.unwrap_or(0.0),
+                sway: self.sway.unwrap_or(0.0),
+                max_angle: self.max_angle.unwrap_or(80.0),
+                pivot_dx: self.x.unwrap_or(0.0),
+                pivot_dy: self.y.unwrap_or(0.0),
+            }),
+            "hair" => Some(Modifier::Hair {
+                side: buzz_scene::PinSide::from_index(self.side.unwrap_or(0) as usize),
+                segments: self.segments.unwrap_or(6) as usize,
+                stiffness: self.stiffness.unwrap_or(120.0),
+                damping: self.damping.unwrap_or(10.0),
+                wind: self.wind.unwrap_or(0.0),
+                wind_rate: self.frequency.unwrap_or(0.6),
+                lag: self.lag.unwrap_or(1.0),
             }),
             _ => None,
         }
@@ -3907,6 +4006,25 @@ mod tests {
                 span: 600.0,
                 phase: 0.4,
             });
+            o.modifiers.push(buzz_scene::Modifier::Pendulum {
+                period: 2.2,
+                damping: 0.2,
+                reaction: 0.7,
+                initial_angle: 15.0,
+                sway: 2.0,
+                max_angle: 60.0,
+                pivot_dx: 4.0,
+                pivot_dy: -6.0,
+            });
+            o.modifiers.push(buzz_scene::Modifier::Hair {
+                side: buzz_scene::PinSide::Right,
+                segments: 8,
+                stiffness: 90.0,
+                damping: 7.0,
+                wind: 0.4,
+                wind_rate: 0.8,
+                lag: 1.5,
+            });
         });
 
         let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
@@ -3944,6 +4062,25 @@ mod tests {
                     dy: -1.5,
                     span: 600.0,
                     phase: 0.4
+                },
+                buzz_scene::Modifier::Pendulum {
+                    period: 2.2,
+                    damping: 0.2,
+                    reaction: 0.7,
+                    initial_angle: 15.0,
+                    sway: 2.0,
+                    max_angle: 60.0,
+                    pivot_dx: 4.0,
+                    pivot_dy: -6.0,
+                },
+                buzz_scene::Modifier::Hair {
+                    side: buzz_scene::PinSide::Right,
+                    segments: 8,
+                    stiffness: 90.0,
+                    damping: 7.0,
+                    wind: 0.4,
+                    wind_rate: 0.8,
+                    lag: 1.5,
                 },
             ]
         );

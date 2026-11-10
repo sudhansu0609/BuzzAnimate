@@ -171,3 +171,69 @@ fn a_live_spring_lags_the_rendered_arm() {
         );
     });
 }
+
+/// Slide the sign 150 units to the right over its first twelve frames, so the
+/// pivot / pinned edge is accelerating and the secondary motions have
+/// something to react to.
+fn slide_the_sign(scene: &mut Scene, id: ObjectId) {
+    let layer = scene.find_object(id).expect("the sign").0;
+    scene.ensure_keyframe(layer, 12);
+    scene.update_object_at(12, id, |o| {
+        o.transform = Affine::translate((150.0, 0.0)) * o.transform;
+    });
+    scene.update_layer(layer, |l| {
+        l.frames.set_tween(0, Tween::motion());
+    });
+}
+
+#[test]
+fn a_live_pendulum_swings_the_rendered_object() {
+    with_exporter(|exporter| {
+        let (mut scene, id) = sign_scene();
+        let settings = ExportSettings::for_stage(&scene);
+        let plain = exporter.render(&scene, 6, &settings).expect("frame 6");
+
+        scene.update_object_across(0, u32::MAX, id, |o| {
+            o.modifiers.push(Modifier::Pendulum {
+                period: 1.2,
+                damping: 0.1,
+                reaction: 1.0,
+                initial_angle: 35.0,
+                sway: 0.0,
+                max_angle: 80.0,
+                pivot_dx: 0.0,
+                pivot_dy: 0.0,
+            });
+        });
+        let swung = exporter.render(&scene, 6, &settings).expect("frame 6 again");
+        assert!(
+            changed_pixels(&plain, &swung) > 100,
+            "the live pendulum did not move the object on screen"
+        );
+    });
+}
+
+#[test]
+fn live_hair_bends_the_rendered_drawing_and_reloads_identically() {
+    with_exporter(|exporter| {
+        let (mut scene, id) = sign_scene();
+        slide_the_sign(&mut scene, id);
+        let settings = ExportSettings::for_stage(&scene);
+        let plain = exporter.render(&scene, 4, &settings).expect("frame 4");
+
+        scene.update_object_across(0, u32::MAX, id, |o| {
+            o.modifiers.push(Modifier::hair());
+        });
+        let bent = exporter.render(&scene, 4, &settings).expect("frame 4 again");
+        assert!(
+            changed_pixels(&plain, &bent) > 30,
+            "the hair bend did not deform the drawing on screen"
+        );
+
+        // Through the real .buzz container: the modifier survives the file.
+        let bytes = buzz_doc::format::to_bytes(&scene).expect("save");
+        let loaded = buzz_doc::format::from_bytes(&bytes).expect("load");
+        let after = exporter.render(&loaded, 4, &settings).expect("after load");
+        assert_eq!(changed_pixels(&bent, &after), 0, "the hair modifier did not survive the file");
+    });
+}

@@ -104,3 +104,39 @@ fn a_preset_curve_can_be_set_too() {
     editor.set_ease_curve(Easing::Linear);
     assert_eq!(tween_at(&editor, layer, 3).easing, Easing::Linear);
 }
+
+/// **The new ease families reach the picture**, not just the keyframe: an
+/// elastic-out tween carries the object past its target and back, an
+/// anticipating back-in tween dips behind its start first, and a bounce stays
+/// inside the span.
+#[test]
+fn elastic_back_and_bounce_eases_drive_the_tweened_placement() {
+    use buzz_scene::EaseForm;
+    let (mut editor, layer) = editor_with_motion_tween();
+    editor.doc.edit("move the end key", |scene| {
+        scene.update_object_at(10, first_object(scene, layer), |o| {
+            o.transform = buzz_geom::Affine::translate((100.0, 0.0)) * o.transform;
+        });
+    });
+    let xs = |editor: &Editor| -> Vec<f64> {
+        (0..=10u32)
+            .map(|f| {
+                let l = editor.doc.scene().layers().get(layer).unwrap();
+                l.frames.resolved_at(f).iter().next().unwrap().transform.translation().x
+            })
+            .collect()
+    };
+
+    editor.set_ease_curve(Easing::elastic(EaseForm::Out));
+    assert!(xs(&editor).iter().any(|x| *x > 105.0), "elastic out should overshoot: {:?}", xs(&editor));
+
+    editor.set_ease_curve(Easing::BACK_IN);
+    assert!(xs(&editor).iter().any(|x| *x < -3.0), "back in should anticipate: {:?}", xs(&editor));
+
+    editor.set_ease_curve(Easing::bounce(EaseForm::Out));
+    assert!(xs(&editor).iter().all(|x| (-1e-9..=100.0 + 1e-9).contains(x)), "{:?}", xs(&editor));
+}
+
+fn first_object(scene: &buzz_scene::Scene, layer: LayerId) -> buzz_scene::ObjectId {
+    scene.layers().get(layer).unwrap().frames.resolved_at(10).iter().next().unwrap().id
+}

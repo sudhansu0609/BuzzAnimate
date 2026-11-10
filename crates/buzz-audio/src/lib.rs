@@ -22,6 +22,7 @@
 pub mod analysis;
 pub mod mic;
 pub mod player;
+pub mod recorder;
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -33,6 +34,7 @@ pub use analysis::{
     detect_beats, detect_phrases, phrases_from_levels,
 };
 pub use player::{Player, PlayerState};
+pub use recorder::TakeRecorder;
 
 /// Decoded audio, ready to play, draw and analyse.
 ///
@@ -316,6 +318,32 @@ impl Clip {
                 let min = slice.iter().copied().fold(f32::INFINITY, f32::min);
                 let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 (min, max)
+            })
+            .collect()
+    }
+
+    /// Minimum and maximum of the signal in `per_frame` equal slices of every
+    /// animation frame — [`Self::peaks`] laid out on the frame grid, so a
+    /// timeline can draw the real wave inside each cell and the slices line
+    /// up with [`Self::frame_levels`] exactly.
+    pub fn frame_peaks(&self, fps: f64, per_frame: usize) -> Vec<(f32, f32)> {
+        if fps <= 0.0 || per_frame == 0 {
+            return Vec::new();
+        }
+        let mono = self.mono();
+        let step = (self.sample_rate as f64 / fps / per_frame as f64).max(1.0);
+        let slices = self.duration_frames(fps) as usize * per_frame;
+        (0..slices)
+            .map(|i| {
+                let start = (i as f64 * step) as usize;
+                let end = (((i + 1) as f64 * step) as usize).min(mono.len());
+                if start >= end {
+                    return (0.0, 0.0);
+                }
+                let slice = &mono[start..end];
+                let min = slice.iter().copied().fold(f32::INFINITY, f32::min);
+                let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                (min.clamp(-1.0, 1.0), max.clamp(-1.0, 1.0))
             })
             .collect()
     }

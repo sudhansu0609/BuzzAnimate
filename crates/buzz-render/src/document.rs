@@ -69,6 +69,15 @@ pub struct FrameOptions {
     /// opened, so a head stays on the shoulders it belongs to instead of
     /// jumping to the origin — see [`buzz_scene::Scene::edit_place`].
     pub place: Affine,
+    /// **The colour effect the open symbol is seen through.**
+    ///
+    /// Identity for the document's own timeline. Editing a symbol in place
+    /// from an instance draws its contents through that instance's colour
+    /// effect — and its layer's — as [`buzz_scene::Scene::edit_effect`]
+    /// composes them, so a tinted or faded character looks the same inside as
+    /// it did on the stage it was opened from, the way `place` keeps it where
+    /// it was.
+    pub effect: ColorTransform,
     /// **How far into the frame the shutter is**, in frames, for motion blur.
     ///
     /// Zero — the default, and every pass but one — draws the frame at its own
@@ -148,6 +157,7 @@ impl Default for FrameOptions {
             layer_alpha: false,
             guides: true,
             place: Affine::IDENTITY,
+            effect: ColorTransform::default(),
             subframe: 0.0,
             cull: None,
             stamp_view: None,
@@ -1784,16 +1794,10 @@ fn layer_fx_signature(
             for coefficient in eval.prepend.as_coeffs() {
                 coefficient.to_bits().hash(&mut h);
             }
-            match &eval.breath {
-                Some(breath) => {
-                    for number in [
-                        breath.hips,
-                        breath.shoulders,
-                        breath.centre,
-                        breath.rise,
-                        breath.widen,
-                    ] {
-                        number.to_bits().hash(&mut h);
+            match &eval.deform {
+                Some(deform) => {
+                    for word in deform.fingerprint() {
+                        word.hash(&mut h);
                     }
                 }
                 None => 0u64.hash(&mut h),
@@ -4502,7 +4506,7 @@ fn draw_layer(
             tint,
             faded,
             ghost: layer_alpha,
-            effect: ColorTransform::default(),
+            effect: options.effect,
             adjust: None,
             gradient_map: None,
             blur: None,
@@ -4784,7 +4788,7 @@ fn draw_layer(
                                 elapsed,
                                 &mut silhouette,
                                 0,
-                                eval.breath.as_ref(),
+                                eval.deform.as_ref(),
                                 ctx.stage_frame,
                                 false,
                                 Some(&mut cache.silhouette),
@@ -4921,7 +4925,7 @@ fn draw_layer(
                         None => (None, owner, Affine::IDENTITY, None),
                         Some(eval) => {
                             let owner = if eval.object.is_some() { None } else { owner };
-                            (eval.object, owner, eval.prepend, eval.breath)
+                            (eval.object, owner, eval.prepend, eval.deform)
                         }
                     };
                 // Resolved through the library, because a character is usually
@@ -4930,13 +4934,17 @@ fn draw_layer(
                     Some(owner) => cache.bounds.resolved(owner, ctx.scene),
                     None => ctx.scene.resolved_bounds(held.as_ref().unwrap_or(object)),
                 };
+                // A bending drawing can reach well past its own bounds, so the
+                // box it is culled and sealed by grows with it.
+                let reach = breath.as_ref().map_or(0.0, |d| d.reach());
+                let region = buzz_scene::object::transform_rect(prepend, bounds);
                 placed.push(Placed {
                     held,
                     stored: object,
                     owner,
                     prepend,
                     breath,
-                    region: buzz_scene::object::transform_rect(prepend, bounds),
+                    region: region.inflate(reach, reach),
                 });
             }
 
@@ -5213,7 +5221,7 @@ struct DrawCtx<'a> {
     ///
     /// Here rather than in the modifier because the artwork a breath has to
     /// reach is usually inside a symbol, and the renderer is what expands one.
-    breath: Option<buzz_scene::Breath>,
+    breath: Option<buzz_scene::Deform>,
     /// The depth of the layer being drawn, which sets how far a lamp is from
     /// it and how long its shadow runs.
     layer_depth: f64,
@@ -5321,10 +5329,25 @@ impl DrawCtx<'_> {
         // brightness, tint, alpha — is applied to a recoloured copy instead,
         // made once per picture and effect: barish1's night trees are dimmed
         // this way, and drew in full daylight without it.
-        if let buzz_scene::Paint::Image(fill) = paint
-            && !self.effect.is_identity()
-        {
-            return buzz_scene::Paint::Image(Box::new(recoloured_image(fill, &self.effect)));
+        //
+        // The authoring overlays — a guide's fade, layer transparency and the
+        // onion-skin ghost — ride the same copy, folded in after the effect as
+        // `overlay` applies them to a colour. Without them a picture on a layer
+        // dimmed to 40% stayed solid, since `map_colors` never reaches it.
+        if let buzz_scene::Paint::Image(fill) = paint {
+            let mut overlay = 1.0f32;
+            if self.faded {
+                overlay *= FADE;
+            }
+            if let Some(alpha) = self.ghost {
+                overlay *= alpha as f32;
+            }
+            let effect = self
+                .effect
+                .compose(&buzz_scene::ColorTransform::alpha(overlay));
+            if !effect.is_identity() {
+                return buzz_scene::Paint::Image(Box::new(recoloured_image(fill, &effect)));
+            }
         }
         paint.map_colors(|c| self.colour(c))
     }
@@ -5479,7 +5502,7 @@ struct Placed<'a> {
     owner: Option<&'a Arc<Object>>,
     prepend: Affine,
     /// The breath deforming this object's artwork, if it breathes.
-    breath: Option<buzz_scene::Breath>,
+    breath: Option<buzz_scene::Deform>,
     /// Where it lands in document space, resolved through the library.
     region: buzz_geom::Rect,
 }
@@ -5718,15 +5741,9 @@ impl<'a> FigurePass<'a> {
             // A breath deforms the artwork frame by frame without moving the
             // object, its `Arc` or its placement. With `elapsed` no longer
             // folded in for artwork that holds still, the breath has to be.
-            if let Some(breath) = &member.breath {
-                for number in [
-                    breath.hips,
-                    breath.shoulders,
-                    breath.centre,
-                    breath.rise,
-                    breath.widen,
-                ] {
-                    hash = hash.rotate_left(7) ^ number.to_bits();
+            if let Some(deform) = &member.breath {
+                for word in deform.fingerprint() {
+                    hash = hash.rotate_left(7) ^ word;
                 }
             }
             hash
@@ -6623,6 +6640,10 @@ fn try_stamp_layer(
         return false;
     }
     if options.ghost.is_some() {
+        return false;
+    }
+    // Not in the key: a symbol opened from a tinted instance draws live.
+    if !options.effect.is_identity() {
         return false;
     }
     if options.layer_alpha && layer.alpha < 0.999 {
@@ -7543,7 +7564,7 @@ fn append_silhouette(
     time: f64,
     out: &mut buzz_geom::BezPath,
     depth: usize,
-    breath: Option<&buzz_scene::Breath>,
+    breath: Option<&buzz_scene::Deform>,
     stage_frame: u32,
     synced: bool,
     mut memo: Option<&mut SilhouetteMemo>,

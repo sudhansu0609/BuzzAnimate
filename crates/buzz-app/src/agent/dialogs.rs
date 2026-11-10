@@ -45,6 +45,8 @@ pub fn args_hint(command: Command) -> Option<&'static str> {
         AddFollowThrough => "{element?: rig id (else the selection), root?: bone name|index, stiffness?, damping?, couple?: bool, live?: bool (modifier, default true; false bakes), from_frame?, to_frame?, step?} -> Follow-Through dialog's Add",
         AddTitleCard => "{text: the words (newlines start new lines; Hindi is shaped), font?: family name (default: the system face, or a Hindi face for Devanagari text), size?: 4..1000 (72), color?: \"#rrggbb\" (white), plate?: bool (a rounded backing plate, default false), plate_color?: \"#rrggbb\", plate_opacity?: 0..1 (0.7), preset?: typewriter|pop_words|fade_up|slide_in|stamp (fade_up), hold?: seconds 0..60 (2), position?: centre|lower_third|top (centre), start_frame?: 0-based (default the playhead)} -> Insert > Title Card's Add: a card symbol on a new top layer that ignores the lights, one undo step; returns {layer, symbol, start, frames, units}",
         AddWiggle => "{element?: id (else the selection), amplitude?, frequency?, live?: bool (modifier, default true; false bakes), from_frame?, to_frame?, step?} -> Wiggle dialog's Add",
+        AddHairMotion => "{element?: id (else the selection), side?: top|left|right|bottom (top), segments?: 2..12 (6), stiffness?: 1..1500 (120), damping?: 0..120 (10), wind?: 0..5 (0), wind_rate?: gusts per second 0.05..10 (0.6), lag?: 0..4 (1)} -> Hair/Cloth dialog's Add: a live modifier that bends the drawing along a spring chain from the pinned edge; stays live under bake_modifiers (it deforms, keyframes cannot hold that)",
+        AddPendulum => "{element?: id (else the selection), period?: seconds 0.1..30 (1.6), damping?: ratio 0..2 (0.12), reaction?: 0..4 (0.5), initial_angle?: degrees (0), sway?: degrees 0..45 (0), max_angle?: degrees 1..170 (80), pivot_dx?, pivot_dy?: offset of the pivot from the drawing's top-centre} -> Pendulum dialog's Add: a live pendulum modifier (swings from the pivot, shaken by the object's own keyed motion); bake_modifiers writes it as keyframes",
         AiIdentifyAssets => "{renames?: [{symbol: name|id, name, tags?: [text]}] (applied as the rename dialog's Apply) | start?: true (VLM job, returns {started:true}; review in the AI panel) | apply_proposals?: true (apply the proposals that job produced)}",
         AiRigVectorCharacter => "{symbol: library symbol name|id, element?: instance id on stage} -> {started:true, job}; detects a skeleton on the GPU and rigs it as one undo step when done; call wait_for_jobs for the result",
         AiRigLayers => "{symbol?: library symbol name|id, element?: instance id on stage (its symbol; one of the two is required), frame?: symbol frame the pieces are read at (default 0), overrides?: [{layer: the layer's name now, slot?: slot or display name (Hips, Torso, Head, Upper Arm L, Forearm R, Hand L, Thigh R, Shin L, Foot R, Brow L...) | Extra (stays on its slot, never its lead), name?: new layer name}], apply?: bool (default true), profile?: naming profile name (default My Animate convention: head, body, leftArm, leftWrist = forearm, leftPalm = hand, midCloth, leftThigh, leftShin, leftFoot, screen sides, body/midCloth/thighs are roots, legs folder; Descriptive: Upper Arm R, Forearm R, Hand R, Torso, everything follows the hips; rig_naming.json beside the workspace can override), split_merged?: bool (default: on when a merged drawing is found, i.e. one vector piece covering more than one body part; cuts its fills and strokes along the skeleton into pieces, each child part overlapping its parent across the joint so bends show no gap; off: pieces as drawn)} -> {started:true, job}; AI > Rig Character as Layers: finds the body parts (DWPose when installed, else fitted to the drawings, lower confidence), puts every piece on its own layer inside the symbol named after its body part and rigs them by layer parenting, nothing moving on any frame; an override that moves a piece works the leads and names out again before its own name is used. Call wait_for_jobs: apply:false gives {applied:false, plan:{symbol, frame, source, confidence, low_confidence, pieces:[{layer, new_name, slot, lead, score}], symbol_renames, notes, side_calls, merged_found, split_merged:{drawings, parts, joint_overlaps, unsplit_keys}|null}} and changes nothing; otherwise one undo step and {applied:true, parts, slots, layers_before, layers_after, keys_rebaked, renamed_symbols, undo_steps_added, pieces}",
@@ -188,6 +190,8 @@ pub fn run(app: &mut App, command: Command, a: &Value) -> AgentResult {
         Command::Perform => perform(app, a),
         Command::AddFollowThrough => follow_through(app, a),
         Command::AddWiggle => wiggle(app, a),
+        Command::AddPendulum => pendulum(app, a),
+        Command::AddHairMotion => hair_motion(app, a),
         Command::AddTitleCard => title_card(app, a),
         Command::AiIdentifyAssets => identify_assets(app, a),
         Command::AiRigVectorCharacter => rig_vector_character(app, a),
@@ -1224,6 +1228,141 @@ fn wiggle(app: &mut App, a: &Value) -> AgentResult {
         return AgentResult::err(p);
     }
     finish(app, "add_wiggle", before, json!({}))
+}
+
+/// Pendulum dialog -> `Editor::add_pendulum`.
+fn pendulum(app: &mut App, a: &Value) -> AgentResult {
+    let keys = [
+        "element", "period", "damping", "reaction", "initial_angle", "sway", "max_angle", "pivot_dx", "pivot_dy",
+    ];
+    if let Err(e) = check_keys(a, &keys) {
+        return AgentResult::err(e);
+    }
+    if let Err(e) = select_element(app, a) {
+        return AgentResult::err(e);
+    }
+    let any = {
+        let editor = app.agent_editor();
+        let scene = editor.doc.scene();
+        editor.selection.iter().any(|id| scene.find_object(id).is_some())
+    };
+    if !any {
+        return AgentResult::err("select an object (or pass element: an id) to hang a pendulum from");
+    }
+    let mut state = std::mem::take(&mut app.agent_editor_mut().staging);
+    let built = (|| -> Result<(), String> {
+        state.open_pendulum();
+        if let Some(n) = num(a, "period", 0.1, 30.0)? {
+            state.pendulum_period = n;
+        }
+        if let Some(n) = num(a, "damping", 0.0, 2.0)? {
+            state.pendulum_damping = n;
+        }
+        if let Some(n) = num(a, "reaction", 0.0, 4.0)? {
+            state.pendulum_reaction = n;
+        }
+        if let Some(n) = num(a, "initial_angle", -180.0, 180.0)? {
+            state.pendulum_initial_angle = n;
+        }
+        if let Some(n) = num(a, "sway", 0.0, 45.0)? {
+            state.pendulum_sway = n;
+        }
+        if let Some(n) = num(a, "max_angle", 1.0, 170.0)? {
+            state.pendulum_max_angle = n;
+        }
+        if let Some(n) = num(a, "pivot_dx", -100_000.0, 100_000.0)? {
+            state.pendulum_pivot_dx = n;
+        }
+        if let Some(n) = num(a, "pivot_dy", -100_000.0, 100_000.0)? {
+            state.pendulum_pivot_dy = n;
+        }
+        Ok(())
+    })();
+    let editor = app.agent_editor_mut();
+    if let Err(e) = built {
+        editor.staging = state;
+        return AgentResult::err(e);
+    }
+    let before = editor.doc.history().undo_depth();
+    editor.doc.end_gesture();
+    editor.status = None;
+    editor.add_pendulum(&mut state);
+    let problem = state.problem.take();
+    state.close();
+    editor.staging = state;
+    editor.doc.end_gesture();
+    if let Some(p) = problem {
+        return AgentResult::err(p);
+    }
+    finish(app, "add_pendulum", before, json!({}))
+}
+
+/// Hair / Cloth dialog -> `Editor::add_hair_motion`.
+fn hair_motion(app: &mut App, a: &Value) -> AgentResult {
+    let keys = ["element", "side", "segments", "stiffness", "damping", "wind", "wind_rate", "lag"];
+    if let Err(e) = check_keys(a, &keys) {
+        return AgentResult::err(e);
+    }
+    if let Err(e) = select_element(app, a) {
+        return AgentResult::err(e);
+    }
+    let any = {
+        let editor = app.agent_editor();
+        let scene = editor.doc.scene();
+        editor.selection.iter().any(|id| scene.find_object(id).is_some())
+    };
+    if !any {
+        return AgentResult::err("select an object (or pass element: an id) to add hair / cloth motion to");
+    }
+    let mut state = std::mem::take(&mut app.agent_editor_mut().staging);
+    let built = (|| -> Result<(), String> {
+        state.open_hair();
+        if let Some(side) = a.get("side") {
+            state.hair_side = match side.as_str().map(str::to_ascii_lowercase).as_deref() {
+                Some("top") => buzz_scene::PinSide::Top,
+                Some("left") => buzz_scene::PinSide::Left,
+                Some("right") => buzz_scene::PinSide::Right,
+                Some("bottom") => buzz_scene::PinSide::Bottom,
+                _ => return Err("'side' needs top, left, right or bottom".into()),
+            };
+        }
+        if let Some(n) = int(a, "segments", 2, 12)? {
+            state.hair_segments = n as usize;
+        }
+        if let Some(n) = num(a, "stiffness", 1.0, 1500.0)? {
+            state.hair_stiffness = n;
+        }
+        if let Some(n) = num(a, "damping", 0.0, 120.0)? {
+            state.hair_damping = n;
+        }
+        if let Some(n) = num(a, "wind", 0.0, 5.0)? {
+            state.hair_wind = n;
+        }
+        if let Some(n) = num(a, "wind_rate", 0.05, 10.0)? {
+            state.hair_wind_rate = n;
+        }
+        if let Some(n) = num(a, "lag", 0.0, 4.0)? {
+            state.hair_lag = n;
+        }
+        Ok(())
+    })();
+    let editor = app.agent_editor_mut();
+    if let Err(e) = built {
+        editor.staging = state;
+        return AgentResult::err(e);
+    }
+    let before = editor.doc.history().undo_depth();
+    editor.doc.end_gesture();
+    editor.status = None;
+    editor.add_hair_motion(&mut state);
+    let problem = state.problem.take();
+    state.close();
+    editor.staging = state;
+    editor.doc.end_gesture();
+    if let Some(p) = problem {
+        return AgentResult::err(p);
+    }
+    finish(app, "add_hair_motion", before, json!({}))
 }
 
 /// Title Card dialog -> `Editor::add_title_card`.

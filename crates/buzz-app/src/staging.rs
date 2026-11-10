@@ -517,6 +517,84 @@ impl Editor {
         }
     }
 
+    /// **Hang the selected object from a pivot** so it swings as a pendulum.
+    ///
+    /// Always live: the swing depends on the object's own keyed motion, so a
+    /// modifier that re-integrates it whenever the animation changes is the
+    /// whole point. **Bake Modifiers** writes it down as keyframes. Re-adding
+    /// replaces the existing pendulum rather than stacking a second one.
+    pub fn add_pendulum(&mut self, state: &mut buzz_ui::StagingState) {
+        let object = {
+            let scene = self.doc.scene();
+            self.selection
+                .iter()
+                .find(|id| scene.find_object(*id).is_some())
+        };
+        let Some(object) = object else {
+            state.problem = Some("Select an object first.".into());
+            return;
+        };
+        self.doc.edit("Add Pendulum", |scene| {
+            scene.update_object_across(0, u32::MAX, object, |o| {
+                o.modifiers
+                    .retain(|m| !matches!(m, buzz_scene::Modifier::Pendulum { .. }));
+                o.modifiers.push(buzz_scene::Modifier::Pendulum {
+                    period: state.pendulum_period,
+                    damping: state.pendulum_damping,
+                    reaction: state.pendulum_reaction,
+                    initial_angle: state.pendulum_initial_angle,
+                    sway: state.pendulum_sway,
+                    max_angle: state.pendulum_max_angle,
+                    pivot_dx: state.pendulum_pivot_dx,
+                    pivot_dy: state.pendulum_pivot_dy,
+                });
+            });
+        });
+        self.doc.end_gesture();
+        state.problem = None;
+        state.close();
+        self.select_and_activate(object);
+        self.status = Some("Pendulum added \u{2014} live (Bake Modifiers writes it down)".into());
+    }
+
+    /// **Bend the selected drawing like hair or cloth** from a pinned edge.
+    ///
+    /// Always live, and stays live under Bake Modifiers: it deforms the
+    /// artwork, which a placement keyframe cannot hold. Re-adding replaces the
+    /// existing one.
+    pub fn add_hair_motion(&mut self, state: &mut buzz_ui::StagingState) {
+        let object = {
+            let scene = self.doc.scene();
+            self.selection
+                .iter()
+                .find(|id| scene.find_object(*id).is_some())
+        };
+        let Some(object) = object else {
+            state.problem = Some("Select a drawing first.".into());
+            return;
+        };
+        self.doc.edit("Add Hair/Cloth Motion", |scene| {
+            scene.update_object_across(0, u32::MAX, object, |o| {
+                o.modifiers
+                    .retain(|m| !matches!(m, buzz_scene::Modifier::Hair { .. }));
+                o.modifiers.push(buzz_scene::Modifier::Hair {
+                    side: state.hair_side,
+                    segments: state.hair_segments,
+                    stiffness: state.hair_stiffness,
+                    damping: state.hair_damping,
+                    wind: state.hair_wind,
+                    wind_rate: state.hair_wind_rate,
+                    lag: state.hair_lag,
+                });
+            });
+        });
+        self.doc.end_gesture();
+        state.problem = None;
+        state.close();
+        self.select_and_activate(object);
+        self.status = Some("Hair / cloth motion added \u{2014} live".into());
+    }
+
     /// Select one object and make its layer the active one.
     ///
     /// The pair belongs together: a selection whose layer is not active leaves

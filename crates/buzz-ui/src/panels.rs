@@ -197,6 +197,19 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             for c in [Command::Save, Command::SaveAs] {
                 item(ui, c, true, &mut raised);
             }
+            // Saved documents write themselves back after each change. Ticked
+            // the way the View menu's switches are.
+            {
+                let mark = if workspace.auto_save { "✔ " } else { "   " };
+                if ui
+                    .button(format!("{mark}{}", Command::ToggleAutoSave.label()))
+                    .on_hover_text("Write a saved document back to its file a moment after each change")
+                    .clicked()
+                {
+                    raised.push(Command::ToggleAutoSave);
+                    ui.close();
+                }
+            }
             ui.separator();
             for c in [Command::SaveSnapshot, Command::Snapshots] {
                 item(ui, c, true, &mut raised);
@@ -544,6 +557,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 item(ui, Command::Perform, true, &mut raised);
                 item(ui, Command::AddFollowThrough, true, &mut raised);
                 item(ui, Command::AddWiggle, true, &mut raised);
+                item(ui, Command::AddPendulum, true, &mut raised);
+                item(ui, Command::AddHairMotion, true, &mut raised);
                 item(ui, Command::BakeModifiers, has_selection, &mut raised);
                 item(ui, Command::ClearModifiers, has_selection, &mut raised);
                 ui.separator();
@@ -956,6 +971,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         )
         .ui(ui, |ui| {
             item(ui, Command::AiModels, true, &mut raised);
+            item(ui, Command::AiGenerateImage, true, &mut raised);
             item(ui, Command::VoicePushToTalk, true, &mut raised);
             item(ui, Command::VoiceMute, true, &mut raised);
             item(ui, Command::AiCharacterFromImage, true, &mut raised);
@@ -980,15 +996,29 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         // the moment somebody wants it is the moment the layout has gone
         // wrong on them, and a button at the end of the menu bar is there
         // whatever state the panels are in.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .button("Reset Layout")
-                .on_hover_text("Put every panel back where it started")
-                .clicked()
-            {
-                raised.push(Command::ResetWorkspace);
-            }
-        });
+        //
+        // **Only where it fits.** In a narrow window, or beside a long status
+        // line, the space left after Help is narrower than the button, and a
+        // right-to-left layout then draws it back over Help. There it is
+        // left out; Window ▸ Workspace ▸ Reset Layout is always there.
+        let label = egui::WidgetText::from("Reset Layout").into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Button,
+        );
+        let needed = label.size().x + ui.spacing().button_padding.x * 2.0 + ui.spacing().item_spacing.x * 2.0;
+        if ui.available_width() >= needed {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("Reset Layout")
+                    .on_hover_text("Put every panel back where it started")
+                    .clicked()
+                {
+                    raised.push(Command::ResetWorkspace);
+                }
+            });
+        }
     });
 
     raised
@@ -1275,7 +1305,8 @@ fn tool_button(ui: &mut Ui, tool: ToolId, active: bool) -> egui::Response {
     // doc comment gives — so without this a screen reader has no name for
     // any tool in the strip. The tooltip string already carries the name and
     // the shortcut both.
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ready, tip.clone()));
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ready, tip.clone()));
     response.on_hover_text(tip)
 }
 
@@ -1397,15 +1428,16 @@ fn instance_properties(
     let similar: std::sync::Arc<Vec<(buzz_scene::SymbolId, u32)>> = {
         let cache_key = egui::Id::new("swap-similar-cache");
         let stamp = (instance.symbol.0, scene.library().content_id());
-        let cached: Option<((u64, usize), std::sync::Arc<Vec<(buzz_scene::SymbolId, u32)>>)> =
-            ui.data(|d| d.get_temp(cache_key));
+        let cached: Option<(
+            (u64, usize),
+            std::sync::Arc<Vec<(buzz_scene::SymbolId, u32)>>,
+        )> = ui.data(|d| d.get_temp(cache_key));
         match cached {
             Some((at, list)) if at == stamp => list,
             _ => {
                 let bounds = scene.cached_bounds_table();
-                let list = std::sync::Arc::new(
-                    scene.library().similar_symbols(instance.symbol, &bounds),
-                );
+                let list =
+                    std::sync::Arc::new(scene.library().similar_symbols(instance.symbol, &bounds));
                 ui.data_mut(|d| d.insert_temp(cache_key, (stamp, list.clone())));
                 list
             }
@@ -1418,12 +1450,8 @@ fn instance_properties(
     // what the Set dropdown has to name.
     let shown_symbol = instance.symbol;
     let library = scene.library();
-    let symbol_name_of = |sid: buzz_scene::SymbolId| {
-        library
-            .get(sid)
-            .map(|s| s.name.clone())
-            .unwrap_or_default()
-    };
+    let symbol_name_of =
+        |sid: buzz_scene::SymbolId| library.get(sid).map(|s| s.name.clone()).unwrap_or_default();
     // Owner first, then the members; empty when the symbol is in no set.
     let set: Vec<(buzz_scene::SymbolId, String)> = library
         .symbol_set(shown_symbol)
@@ -1453,9 +1481,7 @@ fn instance_properties(
 
     // Same frame / From frame 1, remembered between selections and sessions.
     let start_key = egui::Id::new("symbol-set-start");
-    let mut from_start: bool = ui
-        .data_mut(|d| d.get_persisted(start_key))
-        .unwrap_or(false);
+    let mut from_start: bool = ui.data_mut(|d| d.get_persisted(start_key)).unwrap_or(false);
     let mut picked: Option<buzz_scene::SymbolId> = None;
     let mut include: Option<buzz_scene::SymbolId> = None;
     let mut remove: Option<buzz_scene::SymbolId> = None;
@@ -1592,7 +1618,11 @@ fn instance_properties(
                 Some("Which frame of the picked symbol it starts on"),
                 |ui| {
                     let label = |from_start: bool| {
-                        if from_start { "From frame 1" } else { "Same frame" }
+                        if from_start {
+                            "From frame 1"
+                        } else {
+                            "Same frame"
+                        }
                     };
                     egui::ComboBox::from_id_salt("instance-set-start")
                         .selected_text(label(from_start))
@@ -1659,7 +1689,10 @@ fn instance_properties(
                  rather than from where it was placed. Turn off for manual timing.",
             ),
             |ui| {
-                if ui.checkbox(&mut new_sync_to_root, "Match the stage frame").changed() {
+                if ui
+                    .checkbox(&mut new_sync_to_root, "Match the stage frame")
+                    .changed()
+                {
                     edited = true;
                 }
             },
@@ -1866,7 +1899,9 @@ fn bone_properties(ui: &mut Ui, rig: &mut crate::workspace::RigOptions) {
         }
         if ui
             .selectable_label(rig.mode == BoneMode::Move, BoneMode::Move.label())
-            .on_hover_text("Drag any part of a bone, including its end, to move the limb (Shift+M toggles)")
+            .on_hover_text(
+                "Drag any part of a bone, including its end, to move the limb (Shift+M toggles)",
+            )
             .clicked()
         {
             rig.mode = BoneMode::Move;
@@ -1888,11 +1923,14 @@ fn bone_properties(ui: &mut Ui, rig: &mut crate::workspace::RigOptions) {
     );
 
     ui.add_space(4.0);
-    ui.checkbox(&mut rig.show_bones, "Show bones while the Bone tool is active")
-        .on_hover_text(
-            "Draw the skeleton over the artwork. Hidden, it is also out of the \
+    ui.checkbox(
+        &mut rig.show_bones,
+        "Show bones while the Bone tool is active",
+    )
+    .on_hover_text(
+        "Draw the skeleton over the artwork. Hidden, it is also out of the \
              pointer's way. With any other tool the bones are never drawn.",
-        );
+    );
 }
 
 /// How far the stage moves for a given drag of the Hand tool, a Space-drag or
@@ -4075,8 +4113,7 @@ pub fn highlight_menu_body(
 ) {
     for (name, color) in HIGHLIGHT_SWATCHES {
         ui.horizontal(|ui| {
-            let (chip, _) =
-                ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            let (chip, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
             ui.painter().rect_filled(chip, 2.0, to_egui(color));
             if ui.selectable_label(current == Some(color), name).clicked() {
                 on_pick(Some(color));
@@ -4218,8 +4255,13 @@ fn light_list_row(
     let slot = scene.light_slot(id);
     let mut dropped = None;
     ui.horizontal(|ui| {
-        let (mark, _) = ui.allocate_exact_size(egui::vec2(14.0, Tokens::ROW_H), egui::Sense::hover());
-        let ink = if on { Palette::warning() } else { Palette::text_dim() };
+        let (mark, _) =
+            ui.allocate_exact_size(egui::vec2(14.0, Tokens::ROW_H), egui::Sense::hover());
+        let ink = if on {
+            Palette::warning()
+        } else {
+            Palette::text_dim()
+        };
         let c = mark.center();
         ui.painter().circle_filled(c, 2.5, ink);
         for k in 0..8 {
@@ -4309,8 +4351,8 @@ pub fn layers_panel_filtered(
                     crate::icon_sheet::SheetIcon::DeleteLayer,
                     "Delete the selected layer",
                 )
-                    .on_disabled_hover_text("A document must keep at least one layer")
-                    .clicked()
+                .on_disabled_hover_text("A document must keep at least one layer")
+                .clicked()
                 {
                     command = Some(Command::DeleteLayer);
                 }
@@ -4318,7 +4360,13 @@ pub fn layers_panel_filtered(
             if ui.small_button("Fld").on_hover_text("New folder").clicked() {
                 command = Some(Command::NewLayerFolder);
             }
-            if crate::widgets::sheet_icon_button(ui, crate::icon_sheet::SheetIcon::NewLayer, "New layer").clicked() {
+            if crate::widgets::sheet_icon_button(
+                ui,
+                crate::icon_sheet::SheetIcon::NewLayer,
+                "New layer",
+            )
+            .clicked()
+            {
                 command = Some(Command::NewLayer);
             }
         });
@@ -4462,210 +4510,221 @@ pub fn layers_panel_filtered(
         // H2: captured so the highlight bar and wash below can be painted
         // over the row exactly as drawn, switches and chip included — the
         // same two marks the timeline gives a highlighted layer.
-        let row = ui.horizontal(|ui| {
-            ui.add_space(depth as f32 * 12.0);
+        let row = ui
+            .horizontal(|ui| {
+                ui.add_space(depth as f32 * 12.0);
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // **Drawn, not lettered.** These three columns were an
-                // `O`, a padlock and a second `O` — the same glyph for
-                // "visible" and for "outlines", which is no way to tell
-                // two switches apart. Animate draws an eye, a padlock and
-                // a hollow square, and so does this: see `layer_toggle`.
-                //
-                // Laid out right to left, so this reads back to front: the
-                // outline box is the rightmost of the three.
-                if layer_toggle(ui, LayerIcon::Outline, set_outline, color)
-                    .on_hover_text(LayerIcon::Outline.hint(set_outline))
-                    .clicked()
-                {
-                    set_outline = !set_outline;
-                }
-                if layer_toggle(ui, LayerIcon::Lock, set_locked, color)
-                    .on_hover_text(LayerIcon::Lock.hint(set_locked))
-                    .clicked()
-                {
-                    set_locked = !set_locked;
-                }
-                if layer_toggle(ui, LayerIcon::Eye, set_visible, color)
-                    .on_hover_text(LayerIcon::Eye.hint(set_visible))
-                    .clicked()
-                {
-                    set_visible = !set_visible;
-                }
-
-                // The layer's colour chip, used for outline view.
-                let (chip, _) =
-                    ui.allocate_exact_size(egui::vec2(CHIP_WIDTH, 12.0), egui::Sense::hover());
-                ui.painter().rect_filled(chip, 1.0, to_egui(color));
-
-                // Whatever the switches left over belongs to the name.
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    // I2: the disclosure triangle, one column reserved on
-                    // every row (blank unless this is a Folder) so a
-                    // folder's name and a plain layer's name still line up
-                    // with the timeline's own rows.
-                    let is_folder = kind == LayerKind::Folder;
-                    let (triangle_rect, triangle_resp) = ui.allocate_exact_size(
-                        egui::vec2(12.0, Tokens::ROW_H),
-                        if is_folder {
-                            egui::Sense::click()
-                        } else {
-                            egui::Sense::hover()
-                        },
-                    );
-                    if is_folder {
-                        let ink = if triangle_resp.hovered() {
-                            Palette::text()
-                        } else {
-                            Palette::text_dim()
-                        };
-                        let c = triangle_rect.center();
-                        let pts = if collapsed {
-                            // Pointing right: there is more here than the row shows.
-                            vec![
-                                egui::pos2(c.x - 3.0, c.y - 4.0),
-                                egui::pos2(c.x - 3.0, c.y + 4.0),
-                                egui::pos2(c.x + 4.0, c.y),
-                            ]
-                        } else {
-                            // Pointing down: everything under this folder is already shown.
-                            vec![
-                                egui::pos2(c.x - 4.0, c.y - 3.0),
-                                egui::pos2(c.x + 4.0, c.y - 3.0),
-                                egui::pos2(c.x, c.y + 4.0),
-                            ]
-                        };
-                        ui.painter()
-                            .add(egui::Shape::convex_polygon(pts, ink, egui::Stroke::NONE));
-                        if triangle_resp.clicked() {
-                            toggle_collapsed = Some(id);
-                        }
-                    }
-
-                    let mark = match kind {
-                        LayerKind::Folder => "F ",
-                        LayerKind::Mask => "M ",
-                        // The mask that hides rather than reveals. Marked with
-                        // a letter rather than a struck-through M: a combining
-                        // stroke is one of the glyphs the interface font does
-                        // not have, and would draw as a box.
-                        LayerKind::InverseMask => "iM ",
-                        LayerKind::Masked => ". ",
-                        LayerKind::Guide => "G ",
-                        LayerKind::Guided => ". ",
-                        LayerKind::Normal => "",
-                    };
-                    let width = ui.available_width().max(1.0);
-                    // **A layer row is a drag source, for the Rigging panel.**
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // **Drawn, not lettered.** These three columns were an
+                    // `O`, a padlock and a second `O` — the same glyph for
+                    // "visible" and for "outlines", which is no way to tell
+                    // two switches apart. Animate draws an eye, a padlock and
+                    // a hollow square, and so does this: see `layer_toggle`.
                     //
-                    // Sorting a character's parts into a skeleton is done by
-                    // name, by clicking, or by dragging — and the drawings are
-                    // already listed here, one to a layer, which is where an
-                    // animator who has just imported a character is looking.
-                    // Dropping anywhere else does nothing at all: only a rig
-                    // slot accepts this payload. See `rig_panel::DraggedPart`.
-                    let drag_id = ui.id().with(("layer-drag", id.0));
-                    let response = ui
-                        .dnd_drag_source(drag_id, crate::rig_panel::DraggedPart::Layer(id), |ui| {
-                            // Stage 5, item 2: rows at `Tokens::ROW_H` (20 px),
-                            // not the taller general control height.
-                            ui.add_sized(
-                                egui::vec2(width, Tokens::ROW_H),
-                                egui::Button::selectable(
-                                    active == Some(id) || selection.is_layer_selected(id),
-                                    format!("{mark}{name}"),
-                                )
-                                .truncate(),
-                            )
-                        })
-                        .inner;
-                    if on_stage
-                        && let Some(drop) = crate::timeline_panel::light_drop_target(
-                            ui,
-                            ui.painter(),
-                            response.rect,
-                            scene,
-                            crate::timeline_panel::DropRow::Layer(id),
-                        )
+                    // Laid out right to left, so this reads back to front: the
+                    // outline box is the rightmost of the three.
+                    if layer_toggle(ui, LayerIcon::Outline, set_outline, color)
+                        .on_hover_text(LayerIcon::Outline.hint(set_outline))
+                        .clicked()
                     {
-                        place_light = Some(drop);
+                        set_outline = !set_outline;
                     }
-                    if response.clicked() {
-                        let shift = ui.input(|i| i.modifiers.shift);
-                        let toggle = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
-                        if shift {
-                            // I1: sweep from the anchor (or the active layer,
-                            // if there is no anchor yet) to the layer just
-                            // clicked, in stack order — pulling in a
-                            // collapsed folder's hidden children when the
-                            // folder itself falls inside the range. The
-                            // anchor itself does not move.
-                            let anchor = selection.range_anchor().or(active).unwrap_or(id);
-                            let order = row_filter.visible_row_order(scene.layers());
-                            let range = crate::selection::layer_range(&order, anchor, id);
-                            let expanded = crate::selection::expand_collapsed_folders(scene, &range);
-                            selection.select_layers(scene, &expanded, frame);
-                        } else if toggle {
-                            let mut current = selection.selected_layers().to_vec();
-                            if !current.contains(&id) {
-                                current.push(id);
-                            } else {
-                                current.retain(|&lid| lid != id);
-                            }
-                            selection.select_layers(scene, &current, frame);
-                            // Ctrl/Cmd+click moves the anchor, so a
-                            // Shift+click right after sweeps from the layer
-                            // just toggled.
-                            selection.set_range_anchor(Some(id));
-                        } else {
-                            select_this = true;
-                        }
+                    if layer_toggle(ui, LayerIcon::Lock, set_locked, color)
+                        .on_hover_text(LayerIcon::Lock.hint(set_locked))
+                        .clicked()
+                    {
+                        set_locked = !set_locked;
+                    }
+                    if layer_toggle(ui, LayerIcon::Eye, set_visible, color)
+                        .on_hover_text(LayerIcon::Eye.hint(set_visible))
+                        .clicked()
+                    {
+                        set_visible = !set_visible;
                     }
 
-                    if let Some(dragged) =
-                        egui::DragAndDrop::payload::<crate::rig_panel::DraggedPart>(ui.ctx())
-                    {
-                        if let crate::rig_panel::DraggedPart::Layer(dragged_layer_id) = *dragged {
-                            if let Some(hover_pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
-                                if response.rect.contains(hover_pos) {
-                                    let above = hover_pos.y < response.rect.center().y;
-                                    if let Some(from) = scene.layer_index(dragged_layer_id) {
-                                        let target_slot = if above {
-                                            if from < row_idx {
-                                                row_idx.saturating_sub(1)
+                    // The layer's colour chip, used for outline view.
+                    let (chip, _) =
+                        ui.allocate_exact_size(egui::vec2(CHIP_WIDTH, 12.0), egui::Sense::hover());
+                    ui.painter().rect_filled(chip, 1.0, to_egui(color));
+
+                    // Whatever the switches left over belongs to the name.
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        // I2: the disclosure triangle, one column reserved on
+                        // every row (blank unless this is a Folder) so a
+                        // folder's name and a plain layer's name still line up
+                        // with the timeline's own rows.
+                        let is_folder = kind == LayerKind::Folder;
+                        let (triangle_rect, triangle_resp) = ui.allocate_exact_size(
+                            egui::vec2(12.0, Tokens::ROW_H),
+                            if is_folder {
+                                egui::Sense::click()
+                            } else {
+                                egui::Sense::hover()
+                            },
+                        );
+                        if is_folder {
+                            let ink = if triangle_resp.hovered() {
+                                Palette::text()
+                            } else {
+                                Palette::text_dim()
+                            };
+                            let c = triangle_rect.center();
+                            let pts = if collapsed {
+                                // Pointing right: there is more here than the row shows.
+                                vec![
+                                    egui::pos2(c.x - 3.0, c.y - 4.0),
+                                    egui::pos2(c.x - 3.0, c.y + 4.0),
+                                    egui::pos2(c.x + 4.0, c.y),
+                                ]
+                            } else {
+                                // Pointing down: everything under this folder is already shown.
+                                vec![
+                                    egui::pos2(c.x - 4.0, c.y - 3.0),
+                                    egui::pos2(c.x + 4.0, c.y - 3.0),
+                                    egui::pos2(c.x, c.y + 4.0),
+                                ]
+                            };
+                            ui.painter().add(egui::Shape::convex_polygon(
+                                pts,
+                                ink,
+                                egui::Stroke::NONE,
+                            ));
+                            if triangle_resp.clicked() {
+                                toggle_collapsed = Some(id);
+                            }
+                        }
+
+                        let mark = match kind {
+                            LayerKind::Folder => "F ",
+                            LayerKind::Mask => "M ",
+                            // The mask that hides rather than reveals. Marked with
+                            // a letter rather than a struck-through M: a combining
+                            // stroke is one of the glyphs the interface font does
+                            // not have, and would draw as a box.
+                            LayerKind::InverseMask => "iM ",
+                            LayerKind::Masked => ". ",
+                            LayerKind::Guide => "G ",
+                            LayerKind::Guided => ". ",
+                            LayerKind::Normal => "",
+                        };
+                        let width = ui.available_width().max(1.0);
+                        // **A layer row is a drag source, for the Rigging panel.**
+                        //
+                        // Sorting a character's parts into a skeleton is done by
+                        // name, by clicking, or by dragging — and the drawings are
+                        // already listed here, one to a layer, which is where an
+                        // animator who has just imported a character is looking.
+                        // Dropping anywhere else does nothing at all: only a rig
+                        // slot accepts this payload. See `rig_panel::DraggedPart`.
+                        let drag_id = ui.id().with(("layer-drag", id.0));
+                        let response = ui
+                            .dnd_drag_source(
+                                drag_id,
+                                crate::rig_panel::DraggedPart::Layer(id),
+                                |ui| {
+                                    // Stage 5, item 2: rows at `Tokens::ROW_H` (20 px),
+                                    // not the taller general control height.
+                                    ui.add_sized(
+                                        egui::vec2(width, Tokens::ROW_H),
+                                        egui::Button::selectable(
+                                            active == Some(id) || selection.is_layer_selected(id),
+                                            format!("{mark}{name}"),
+                                        )
+                                        .truncate(),
+                                    )
+                                },
+                            )
+                            .inner;
+                        if on_stage
+                            && let Some(drop) = crate::timeline_panel::light_drop_target(
+                                ui,
+                                ui.painter(),
+                                response.rect,
+                                scene,
+                                crate::timeline_panel::DropRow::Layer(id),
+                            )
+                        {
+                            place_light = Some(drop);
+                        }
+                        if response.clicked() {
+                            let shift = ui.input(|i| i.modifiers.shift);
+                            let toggle = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+                            if shift {
+                                // I1: sweep from the anchor (or the active layer,
+                                // if there is no anchor yet) to the layer just
+                                // clicked, in stack order — pulling in a
+                                // collapsed folder's hidden children when the
+                                // folder itself falls inside the range. The
+                                // anchor itself does not move.
+                                let anchor = selection.range_anchor().or(active).unwrap_or(id);
+                                let order = row_filter.visible_row_order(scene.layers());
+                                let range = crate::selection::layer_range(&order, anchor, id);
+                                let expanded =
+                                    crate::selection::expand_collapsed_folders(scene, &range);
+                                selection.select_layers(scene, &expanded, frame);
+                            } else if toggle {
+                                let mut current = selection.selected_layers().to_vec();
+                                if !current.contains(&id) {
+                                    current.push(id);
+                                } else {
+                                    current.retain(|&lid| lid != id);
+                                }
+                                selection.select_layers(scene, &current, frame);
+                                // Ctrl/Cmd+click moves the anchor, so a
+                                // Shift+click right after sweeps from the layer
+                                // just toggled.
+                                selection.set_range_anchor(Some(id));
+                            } else {
+                                select_this = true;
+                            }
+                        }
+
+                        if let Some(dragged) =
+                            egui::DragAndDrop::payload::<crate::rig_panel::DraggedPart>(ui.ctx())
+                        {
+                            if let crate::rig_panel::DraggedPart::Layer(dragged_layer_id) = *dragged
+                            {
+                                if let Some(hover_pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+                                    if response.rect.contains(hover_pos) {
+                                        let above = hover_pos.y < response.rect.center().y;
+                                        if let Some(from) = scene.layer_index(dragged_layer_id) {
+                                            let target_slot = if above {
+                                                if from < row_idx {
+                                                    row_idx.saturating_sub(1)
+                                                } else {
+                                                    row_idx
+                                                }
                                             } else {
-                                                row_idx
-                                            }
-                                        } else {
-                                            if from < row_idx { row_idx } else { row_idx + 1 }
-                                        };
-                                        if from != target_slot {
-                                            let line_y = if above {
-                                                response.rect.top()
-                                            } else {
-                                                response.rect.bottom()
+                                                if from < row_idx { row_idx } else { row_idx + 1 }
                                             };
-                                            ui.painter().line_segment(
-                                                [
-                                                    egui::pos2(response.rect.min.x, line_y),
-                                                    egui::pos2(response.rect.max.x, line_y),
-                                                ],
-                                                egui::Stroke::new(2.0, Palette::active()),
-                                            );
-                                            if ui.input(|i| i.pointer.any_released()) {
-                                                if let Some(dropped) =
-                                                    egui::DragAndDrop::take_payload::<
-                                                        crate::rig_panel::DraggedPart,
-                                                    >(
-                                                        ui.ctx()
-                                                    )
-                                                {
-                                                    if let crate::rig_panel::DraggedPart::Layer(
+                                            if from != target_slot {
+                                                let line_y = if above {
+                                                    response.rect.top()
+                                                } else {
+                                                    response.rect.bottom()
+                                                };
+                                                ui.painter().line_segment(
+                                                    [
+                                                        egui::pos2(response.rect.min.x, line_y),
+                                                        egui::pos2(response.rect.max.x, line_y),
+                                                    ],
+                                                    egui::Stroke::new(2.0, Palette::active()),
+                                                );
+                                                if ui.input(|i| i.pointer.any_released()) {
+                                                    if let Some(dropped) =
+                                                        egui::DragAndDrop::take_payload::<
+                                                            crate::rig_panel::DraggedPart,
+                                                        >(
+                                                            ui.ctx()
+                                                        )
+                                                    {
+                                                        if let crate::rig_panel::DraggedPart::Layer(
                                                         dropped_id,
                                                     ) = *dropped
                                                     {
                                                         reorder_to =
                                                             Some((dropped_id, target_slot));
+                                                    }
                                                     }
                                                 }
                                             }
@@ -4674,110 +4733,110 @@ pub fn layers_panel_filtered(
                                 }
                             }
                         }
-                    }
 
-                    // **The same switches again, by name, on the right button.**
-                    //
-                    // The painted icons are the fast way once you know them, and
-                    // nothing on a 15-point square says which one hides a layer.
-                    // A menu that spells it out is how somebody finds these the
-                    // first time, and it is where Delete belongs anyway: a
-                    // destructive action does not want to be a 15-point square
-                    // beside three toggles.
-                    response.context_menu(|ui| {
-                        ui.label(RichText::new(&name).small().weak());
-                        ui.separator();
-                        if ui
-                            .button(if visible { "Hide Layer" } else { "Show Layer" })
-                            .clicked()
-                        {
-                            set_visible = !visible;
-                            ui.close();
-                        }
-                        if ui
-                            .button(if locked { "Unlock Layer" } else { "Lock Layer" })
-                            .clicked()
-                        {
-                            set_locked = !locked;
-                            ui.close();
-                        }
-                        if ui
-                            .button(if outline {
-                                "Show Layer Filled"
-                            } else {
-                                "Show Layer as Outlines"
-                            })
-                            .clicked()
-                        {
-                            set_outline = !outline;
-                            ui.close();
-                        }
-                        ui.separator();
-                        // H2: Animate's Highlight Layer — a colour to pick this
-                        // layer out in the timeline and here, independent of
-                        // its automatic colour chip.
-                        ui.menu_button("Highlight", |ui| {
-                            highlight_menu_body(ui, highlight, |picked| {
-                                set_highlight = Some((vec![id], picked));
-                            });
-                        });
-                        let selected_layers = selection.selected_layers().to_vec();
-                        if selected_layers.len() > 1 {
-                            ui.menu_button("Highlight Selected Layers", |ui| {
-                                highlight_menu_body(ui, None, |picked| {
-                                    set_highlight = Some((selected_layers.clone(), picked));
+                        // **The same switches again, by name, on the right button.**
+                        //
+                        // The painted icons are the fast way once you know them, and
+                        // nothing on a 15-point square says which one hides a layer.
+                        // A menu that spells it out is how somebody finds these the
+                        // first time, and it is where Delete belongs anyway: a
+                        // destructive action does not want to be a 15-point square
+                        // beside three toggles.
+                        response.context_menu(|ui| {
+                            ui.label(RichText::new(&name).small().weak());
+                            ui.separator();
+                            if ui
+                                .button(if visible { "Hide Layer" } else { "Show Layer" })
+                                .clicked()
+                            {
+                                set_visible = !visible;
+                                ui.close();
+                            }
+                            if ui
+                                .button(if locked { "Unlock Layer" } else { "Lock Layer" })
+                                .clicked()
+                            {
+                                set_locked = !locked;
+                                ui.close();
+                            }
+                            if ui
+                                .button(if outline {
+                                    "Show Layer Filled"
+                                } else {
+                                    "Show Layer as Outlines"
+                                })
+                                .clicked()
+                            {
+                                set_outline = !outline;
+                                ui.close();
+                            }
+                            ui.separator();
+                            // H2: Animate's Highlight Layer — a colour to pick this
+                            // layer out in the timeline and here, independent of
+                            // its automatic colour chip.
+                            let selected_layers = selection.selected_layers().to_vec();
+                            ui.menu_button("Highlight", |ui| {
+                                highlight_menu_body(ui, highlight, |picked| {
+                                    set_highlight = Some((vec![id], picked));
                                 });
                             });
-                        }
-                        ui.separator();
-                        if ui.button(Command::NewLayer.label()).clicked() {
-                            command = Some(Command::NewLayer);
-                            ui.close();
-                        }
-                        if ui.button(Command::NewLayerFolder.label()).clicked() {
-                            command = Some(Command::NewLayerFolder);
-                            ui.close();
-                        }
-                        if ui.button(Command::MoveLayerUp.label()).clicked() {
-                            select_this = true;
-                            command = Some(Command::MoveLayerUp);
-                            ui.close();
-                        }
-                        if ui.button(Command::MoveLayerDown.label()).clicked() {
-                            select_this = true;
-                            command = Some(Command::MoveLayerDown);
-                            ui.close();
-                        }
-                        if ui.button("Select All Layers").clicked() {
-                            let all_layers: Vec<_> = scene.layers().iter().map(|l| l.id).collect();
-                            selection.select_layers(scene, &all_layers, frame);
-                            ui.close();
-                        }
-                        ui.separator();
-                        // Delete acts on the *active* layer, so the row being
-                        // right-clicked has to become the active one first.
-                        // Selecting happens below, before the command is
-                        // dispatched, which is what makes that safe.
-                        if ui
-                            .add_enabled(
-                                can_delete,
-                                egui::Button::new(Command::DeleteLayer.label()),
-                            )
-                            .on_disabled_hover_text("A document must keep at least one layer")
-                            .clicked()
-                        {
-                            select_this = true;
-                            command = Some(Command::DeleteLayer);
-                            ui.close();
-                        }
+                            if selected_layers.len() > 1 {
+                                ui.menu_button("Highlight Selected Layers", |ui| {
+                                    highlight_menu_body(ui, None, |picked| {
+                                        set_highlight = Some((selected_layers.clone(), picked));
+                                    });
+                                });
+                            }
+                            ui.separator();
+                            if ui.button(Command::NewLayer.label()).clicked() {
+                                command = Some(Command::NewLayer);
+                                ui.close();
+                            }
+                            if ui.button(Command::NewLayerFolder.label()).clicked() {
+                                command = Some(Command::NewLayerFolder);
+                                ui.close();
+                            }
+                            if ui.button(Command::MoveLayerUp.label()).clicked() {
+                                select_this = true;
+                                command = Some(Command::MoveLayerUp);
+                                ui.close();
+                            }
+                            if ui.button(Command::MoveLayerDown.label()).clicked() {
+                                select_this = true;
+                                command = Some(Command::MoveLayerDown);
+                                ui.close();
+                            }
+                            if ui.button("Select All Layers").clicked() {
+                                let all_layers: Vec<_> =
+                                    scene.layers().iter().map(|l| l.id).collect();
+                                selection.select_layers(scene, &all_layers, frame);
+                                ui.close();
+                            }
+                            ui.separator();
+                            // Delete acts on the *active* layer, so the row being
+                            // right-clicked has to become the active one first.
+                            // Selecting happens below, before the command is
+                            // dispatched, which is what makes that safe.
+                            if ui
+                                .add_enabled(
+                                    can_delete,
+                                    egui::Button::new(Command::DeleteLayer.label()),
+                                )
+                                .on_disabled_hover_text("A document must keep at least one layer")
+                                .clicked()
+                            {
+                                select_this = true;
+                                command = Some(Command::DeleteLayer);
+                                ui.close();
+                            }
+                        });
                     });
                 });
-            });
-        })
-        .response;
+            })
+            .response;
 
-        // H2: the highlight bar and wash — a solid 4 px bar at the row's left
-        // edge plus a ~22% wash over it, so a highlighted layer is easy to
+        // H2: the highlight bar and wash — a solid bar at the row's left
+        // edge plus a strong wash over it, so a highlighted layer is easy to
         // find scrolling down the list. The wash is skipped on the active
         // row: the selection's own blue already owns that row, and the bar
         // is what stays visible on top of it.
@@ -4788,14 +4847,15 @@ pub fn layers_panel_filtered(
                 ui.painter().rect_filled(
                     row.rect,
                     0.0,
-                    egui::Color32::from_rgba_unmultiplied(r, g, b, 56),
+                    egui::Color32::from_rgba_unmultiplied(r, g, b, crate::timeline_panel::HIGHLIGHT_WASH_ALPHA),
                 );
             }
             let bar = egui::Rect::from_min_max(
                 row.rect.min,
-                egui::pos2(row.rect.min.x + 4.0, row.rect.max.y),
+                egui::pos2(row.rect.min.x + crate::timeline_panel::HIGHLIGHT_BAR_WIDTH, row.rect.max.y),
             );
-            ui.painter().rect_filled(bar, 0.0, egui::Color32::from_rgb(r, g, b));
+            ui.painter()
+                .rect_filled(bar, 0.0, egui::Color32::from_rgb(r, g, b));
         }
 
         if select_this {
@@ -5130,50 +5190,50 @@ fn spatial_properties(
         }
 
         changed |= angle(
-                ui,
-                "Rotate X",
-                &mut spatial.rotation_x,
-                "Tip the object away from the viewer, about the horizontal",
-            );
-            changed |= angle(
-                ui,
-                "Rotate Y",
-                &mut spatial.rotation_y,
-                "Turn the object about the vertical — the one that makes a card read \
+            ui,
+            "Rotate X",
+            &mut spatial.rotation_x,
+            "Tip the object away from the viewer, about the horizontal",
+        );
+        changed |= angle(
+            ui,
+            "Rotate Y",
+            &mut spatial.rotation_y,
+            "Turn the object about the vertical — the one that makes a card read \
                  as a wall when the camera passes it",
-            );
-            changed |= angle(
-                ui,
-                "Rotate Z",
-                &mut spatial.rotation_z,
-                "Spin it in its own plane",
-            );
+        );
+        changed |= angle(
+            ui,
+            "Rotate Z",
+            &mut spatial.rotation_z,
+            "Spin it in its own plane",
+        );
 
-            property_row(
-                ui,
-                "Z",
-                Some(
-                    "How far in front of or behind its layer the object sits. \
+        property_row(
+            ui,
+            "Z",
+            Some(
+                "How far in front of or behind its layer the object sits. \
                      Negative is towards the camera.",
-                ),
-                |ui| {
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut spatial.z, -800.0..=800.0)
-                                .suffix(" px")
-                                .fixed_decimals(0),
-                        )
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                },
-            );
+            ),
+            |ui| {
+                if ui
+                    .add(
+                        egui::Slider::new(&mut spatial.z, -800.0..=800.0)
+                            .suffix(" px")
+                            .fixed_decimals(0),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+            },
+        );
 
-            if turned && ui.small_button("Flatten").clicked() {
-                spatial = buzz_scene::Spatial::default();
-                changed = true;
-            }
+        if turned && ui.small_button("Flatten").clicked() {
+            spatial = buzz_scene::Spatial::default();
+            changed = true;
+        }
     });
 
     if changed && spatial != before {
@@ -5309,8 +5369,11 @@ mod tests {
     /// What can be clicked in `opened` that was not there in `closed` — the
     /// items of the menu that just opened, top to bottom.
     fn new_items(closed: &egui::FullOutput, opened: &egui::FullOutput) -> Vec<egui::Pos2> {
-        let before: std::collections::HashSet<_> =
-            widget_tree(closed).nodes.iter().map(|(id, _)| *id).collect();
+        let before: std::collections::HashSet<_> = widget_tree(closed)
+            .nodes
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
         let mut found: Vec<_> = widget_tree(opened)
             .nodes
             .iter()
@@ -5497,7 +5560,11 @@ mod tests {
             }
         }
 
-        assert!(failures.is_empty(), "picks that crashed:\n{}", failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "picks that crashed:\n{}",
+            failures.join("\n")
+        );
         assert!(
             pairs > 100,
             "only {pairs} pairs were picked, so the walk never reached the menus"
@@ -5715,7 +5782,10 @@ mod tests {
         // does — it draws, and wide enough to hold a button for every member
         // `family_of` names: one flyout button per tool, laid out in a row,
         // so its width is the test that every member actually got one.
-        ctx.memory_mut(|m| m.data.insert_temp(flyout_id(ToolId::Selection, "open"), true));
+        ctx.memory_mut(|m| {
+            m.data
+                .insert_temp(flyout_id(ToolId::Selection, "open"), true)
+        });
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             let _ = tool_bar(ui, ToolId::Selection, &mut style);
         });
@@ -5732,7 +5802,6 @@ mod tests {
             family.len()
         );
     }
-
 }
 
 #[cfg(test)]

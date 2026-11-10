@@ -85,6 +85,11 @@ pub enum PanelId {
     /// redrawn and exported as sheets. Hidden until asked for (Window >
     /// Storyboard); its home is the bottom, beside the Timeline.
     Storyboard,
+    /// **Character voices** (`docs/VOICES_AND_ACTING_PLAN.md`): record a
+    /// line, make a voice from it with sliders, give each character a voice,
+    /// and put a character's line on the timeline with only that character's
+    /// mouth lip-synced over it. A column of its own on the far right.
+    Voices,
 }
 
 impl PanelId {
@@ -113,6 +118,7 @@ impl PanelId {
             Self::Tasks => "Tasks",
             Self::Ai => "AI",
             Self::Storyboard => "Storyboard",
+            Self::Voices => "Voices",
         }
     }
 
@@ -143,7 +149,7 @@ impl PanelId {
         !matches!(self, Self::Tools | Self::Timeline | Self::Sequence | Self::Ai)
     }
 
-    pub const ALL: [PanelId; 22] = [
+    pub const ALL: [PanelId; 23] = [
         PanelId::Tools,
         PanelId::ToolOptions,
         PanelId::Layers,
@@ -166,6 +172,7 @@ impl PanelId {
         PanelId::Tasks,
         PanelId::Ai,
         PanelId::Storyboard,
+        PanelId::Voices,
     ];
 }
 
@@ -506,6 +513,12 @@ pub struct Workspace {
     /// Ctrl+wheel zoom. A person's own preference, not part of any one film.
     #[serde(default = "default_pan_speed")]
     pub pan_speed: f32,
+    /// **File ▸ Auto-Save**: a document that has a file of its own is
+    /// written back to it a moment after each change, so it never needs
+    /// saving by hand. On unless switched off; a person's preference, like the
+    /// rest of this struct, not a property of any one film.
+    #[serde(default = "default_auto_save")]
+    pub auto_save: bool,
     /// **Exports at once** — how many exports the queue runs side by side
     /// (step P of `docs/PRODUCTION_SPEED_PLAN.md`), set in the Tasks panel.
     /// The queue still holds it under what the GPU's free memory allows. A
@@ -949,6 +962,10 @@ fn default_pan_speed() -> f32 {
     1.0
 }
 
+fn default_auto_save() -> bool {
+    true
+}
+
 /// 4 — the knee of P0's measurements: four scenes in about a third of the
 /// serial time, without filling the card.
 fn default_exports_at_once() -> u8 {
@@ -1178,6 +1195,30 @@ impl Workspace {
                     false,
                     false,
                 ),
+                // **Color and Swatches tab in with the inspector**, beside Tool
+                // Options: what you are holding, what you have selected, and
+                // the colour you are about to give it are one stack, one click
+                // apart, rather than a second section pushing the rest of the
+                // column down. Swatches stays next to Color, where a palette
+                // is reached for.
+                tab(
+                    PanelId::Color,
+                    Dock::Right,
+                    4,
+                    Dock::Right,
+                    GROUP_INSPECTOR,
+                    false,
+                    false,
+                ),
+                tab(
+                    PanelId::Swatches,
+                    Dock::Right,
+                    5,
+                    Dock::Right,
+                    GROUP_INSPECTOR,
+                    false,
+                    false,
+                ),
                 // **One tab stack.** Library, Assets and Cast join Properties,
                 // Effects and Tool Options rather than keep a second column of
                 // their own — a character is an asset with a face, and the
@@ -1189,7 +1230,7 @@ impl Workspace {
                 tab(
                     PanelId::Library,
                     Dock::Right,
-                    4,
+                    6,
                     Dock::Right,
                     GROUP_INSPECTOR,
                     false,
@@ -1198,7 +1239,7 @@ impl Workspace {
                 tab(
                     PanelId::Assets,
                     Dock::Right,
-                    5,
+                    7,
                     Dock::Right,
                     GROUP_INSPECTOR,
                     false,
@@ -1207,30 +1248,9 @@ impl Workspace {
                 tab(
                     PanelId::Cast,
                     Dock::Right,
-                    6,
-                    Dock::Right,
-                    GROUP_INSPECTOR,
-                    false,
-                    false,
-                ),
-                tab(
-                    PanelId::Color,
-                    Dock::Right,
-                    7,
-                    Dock::Right,
-                    GROUP_PALETTE,
-                    true,
-                    false,
-                ),
-                // Beside the colour controls, which is where a palette is
-                // reached for. Animate docks Swatches with Color for the same
-                // reason.
-                tab(
-                    PanelId::Swatches,
-                    Dock::Right,
                     8,
                     Dock::Right,
-                    GROUP_PALETTE,
+                    GROUP_INSPECTOR,
                     false,
                     false,
                 ),
@@ -1303,6 +1323,11 @@ impl Workspace {
                 // Closed until asked for (Window > Storyboard); a row of
                 // pictures wants the width under the stage.
                 slot(PanelId::Storyboard, Dock::Hidden, 5, Dock::Bottom),
+                // **Voices has a column of its own**, the far right one the
+                // inspector stack leaves empty: designing a voice is a long
+                // list of sliders, and the lines go to whichever character is
+                // selected on the stage beside it.
+                slot(PanelId::Voices, Dock::RightOuter, 0, Dock::RightOuter),
             ],
             locked: false,
             theme: crate::theme::Theme::default(),
@@ -1325,6 +1350,7 @@ impl Workspace {
             depth_view: false,
             rig: RigOptions::default(),
             pan_speed: default_pan_speed(),
+            auto_save: default_auto_save(),
             exports_at_once: default_exports_at_once(),
             brush_tips: crate::brush::BrushTips::default(),
             drawing_modes: crate::style::ToolDrawingModes::default(),
@@ -2303,6 +2329,11 @@ impl Workspace {
                 selected: false,
             });
         }
+        // **Color and Swatches fold into the inspector's tab stack**, once.
+        // See `VERSION_PALETTE_IN_INSPECTOR`.
+        if self.version < VERSION_PALETTE_IN_INSPECTOR {
+            self.fold_palette_into_inspector();
+        }
         self.version = LAYOUT_VERSION;
 
         for id in PanelId::ALL {
@@ -2402,6 +2433,66 @@ impl Workspace {
         self.right_width = clamp_to(self.right_width, COLUMN_WIDTH_RANGE);
         self.right_outer_width = clamp_to(self.right_outer_width, COLUMN_WIDTH_RANGE);
         self.bottom_height = clamp_to(self.bottom_height, BOTTOM_HEIGHT_RANGE);
+    }
+
+    /// Tab Color and Swatches in with Properties, straight after its Tool
+    /// Options tab — but only while they are still the pair the last default
+    /// left them: the two of them alone in one section on Properties' side.
+    /// Moved, split up or tabbed with anything else, they are where the user
+    /// put them and stay there.
+    fn fold_palette_into_inspector(&mut self) {
+        let (Some(props), Some(color), Some(swatches)) = (
+            self.slot(PanelId::Properties).copied(),
+            self.slot(PanelId::Color).copied(),
+            self.slot(PanelId::Swatches).copied(),
+        ) else {
+            return;
+        };
+        let dock = props.dock;
+        let untouched = dock.is_docked()
+            && color.dock == dock
+            && swatches.dock == dock
+            && color.group == swatches.group
+            && color.group != props.group
+            && self
+                .slots
+                .iter()
+                .filter(|s| s.dock == dock && s.group == color.group)
+                .count()
+                == 2;
+        if !untouched {
+            return;
+        }
+        // Tabs follow `order`, so the column is renumbered with the pair
+        // straight after the inspector's Tool Options tab, or after its last
+        // tab where Tool Options has gone elsewhere. Everything else keeps its
+        // place relative to everything else.
+        let in_inspector =
+            |workspace: &Self, id: PanelId| workspace.slot(id).is_some_and(|s| s.group == props.group);
+        let mut column: Vec<PanelId> = self
+            .on(dock)
+            .into_iter()
+            .filter(|id| !matches!(id, PanelId::Color | PanelId::Swatches))
+            .collect();
+        let after = column
+            .iter()
+            .position(|id| *id == PanelId::ToolOptions && in_inspector(self, *id))
+            .or_else(|| column.iter().rposition(|id| in_inspector(self, *id)))
+            .map_or(column.len(), |at| at + 1);
+        column.splice(after..after, [PanelId::Color, PanelId::Swatches]);
+        for (order, id) in column.into_iter().enumerate() {
+            if let Some(slot) = self.slot_mut(id) {
+                slot.order = order as u32;
+            }
+        }
+        for id in [PanelId::Color, PanelId::Swatches] {
+            if let Some(slot) = self.slot_mut(id) {
+                slot.group = props.group;
+                slot.home = props.home;
+                slot.selected = false;
+                slot.collapsed = props.collapsed;
+            }
+        }
     }
 
     /// Whether a saved layout still has the old untouched default geometry.
@@ -2536,7 +2627,7 @@ impl Workspace {
 
 /// Bumped when the *default arrangement* changes in a way a saved layout
 /// should adopt. See [`Workspace::version`].
-pub const LAYOUT_VERSION: u32 = VERSION_SEQUENCE_PANEL;
+pub const LAYOUT_VERSION: u32 = VERSION_PALETTE_IN_INSPECTOR;
 
 /// Panels gained the roll-up, and five of them started rolled.
 const VERSION_ROLL_UPS: u32 = 1;
@@ -2566,6 +2657,11 @@ const VERSION_PROPERTIES_STACK: u32 = 6;
 /// beside the Timeline it did not choose. See `docs/SEQUENCE_SETUPS_PLAN.md`
 /// S5.
 const VERSION_SEQUENCE_PANEL: u32 = 7;
+/// **Color and Swatches join the inspector.** They tab in beside Properties,
+/// Effects and Tool Options instead of keeping a section of their own below
+/// it — for a saved layout only while the pair is still where the last
+/// default put them. See [`Workspace::fold_palette_into_inspector`].
+const VERSION_PALETTE_IN_INSPECTOR: u32 = 8;
 
 /// The home a slot takes when a saved layout predates the field.
 fn default_home() -> Dock {
@@ -2907,10 +3003,9 @@ mod tests {
     fn a_boundary_stops_where_its_neighbours_run_out() {
         let workspace = Workspace::animate();
         let cap = workspace.column_cap(Dock::Left, 1200.0);
-        // `Dock::RightOuter` is empty by default now that the inspector's
-        // one tab stack holds everything Right used to share the side with
-        // — so Left's only occupied neighbour is Right.
-        let neighbours = *COLUMN_WIDTH_RANGE.start();
+        // Left's occupied neighbours are Right (the inspector stack) and
+        // RightOuter (the Voices panel), each squeezed to its floor.
+        let neighbours = 2.0 * *COLUMN_WIDTH_RANGE.start();
         assert!((cap - (1200.0 - MIN_STAGE_WIDTH - neighbours)).abs() < 0.5);
 
         // And a drag to the cap leaves a layout that fits.
@@ -3804,10 +3899,10 @@ mod migration_tests {
         );
     }
 
-    /// **One tab stack.** Properties, Effects, Tool Options, Library, Assets
-    /// and Cast all share the one section `Dock::Right` docks by default —
-    /// Properties in front, the rest one click behind it — and none of the
-    /// six is hidden. `Dock::RightOuter` is left empty.
+    /// **One tab stack.** Properties, Effects, Tool Options, Color, Swatches,
+    /// Library, Assets and Cast all share the one section `Dock::Right` docks
+    /// by default — Properties in front, the rest one click behind it — and
+    /// none of the eight is hidden. `Dock::RightOuter` is left empty.
     #[test]
     fn the_default_right_section_holds_all_six_inspector_tabs() {
         let workspace = Workspace::animate();
@@ -3820,6 +3915,8 @@ mod migration_tests {
                 PanelId::Properties,
                 PanelId::Filters,
                 PanelId::ToolOptions,
+                PanelId::Color,
+                PanelId::Swatches,
                 PanelId::Library,
                 PanelId::Assets,
                 PanelId::Cast,
@@ -3833,9 +3930,10 @@ mod migration_tests {
             );
             assert_ne!(workspace.dock_of(id), Dock::Hidden);
         }
-        assert!(
-            workspace.on(Dock::RightOuter).is_empty(),
-            "RightOuter should be empty now the tab stack holds everything it used to"
+        assert_eq!(
+            workspace.on(Dock::RightOuter),
+            vec![PanelId::Voices],
+            "RightOuter holds only the Voices panel now the tab stack holds everything it used to"
         );
     }
 
@@ -3866,7 +3964,10 @@ mod migration_tests {
 
         assert_eq!(saved.version, LAYOUT_VERSION);
         assert!(
-            saved.on(Dock::RightOuter).is_empty(),
+            saved
+                .on(Dock::RightOuter)
+                .iter()
+                .all(|id| !matches!(id, PanelId::Library | PanelId::Assets | PanelId::Cast)),
             "Library, Assets and Cast should have moved out of the outer column"
         );
         let section = saved
@@ -3879,6 +3980,8 @@ mod migration_tests {
                 PanelId::Properties,
                 PanelId::Filters,
                 PanelId::ToolOptions,
+                PanelId::Color,
+                PanelId::Swatches,
                 PanelId::Library,
                 PanelId::Assets,
                 PanelId::Cast,
@@ -4154,15 +4257,15 @@ mod group_tests {
             "a tabbed section that starts rolled up shows nothing at all"
         );
 
-        // Five panels, one section. The right column holds ten panels — Layers,
-        // Tool Options, Properties, Color, Swatches and these five — and the
-        // grouping makes that six sections rather than ten.
+        // Five panels, one section. The right column holds Layers, the
+        // inspector's eight tabs and these five, and the grouping makes that
+        // three sections rather than fourteen.
         let inspector = workspace
             .section_of(PanelId::Properties)
             .expect("the inspector is on screen");
         assert!(inspector.panels.contains(&PanelId::Filters));
         assert_eq!(inspector.front, PanelId::Properties);
-        assert_eq!(workspace.sections(Dock::Right).len(), 4);
+        assert_eq!(workspace.sections(Dock::Right).len(), 3);
     }
 
     /// **Every section has exactly one front tab, always.**
@@ -4400,8 +4503,8 @@ mod group_tests {
     }
 
     /// **Floating the inspector floats the whole section**, not just its
-    /// front tab — all six of Properties, Filters, Tool Options, Library,
-    /// Assets and Cast arrive in one window.
+    /// front tab — all eight of Properties, Filters, Tool Options, Color,
+    /// Swatches, Library, Assets and Cast arrive in one window.
     #[test]
     fn the_inspector_floats_as_one_window() {
         let mut workspace = Workspace::animate();
@@ -4411,7 +4514,7 @@ mod group_tests {
         assert_eq!(floating.len(), 1, "one window, not several");
         assert_eq!(
             floating[0].panels.len(),
-            6,
+            8,
             "the whole inspector should have floated: {:?}",
             floating[0].panels
         );
@@ -4430,7 +4533,7 @@ mod group_tests {
         }
     }
 
-    /// **Tabbing the inspector in with the Library groups all six panels**,
+    /// **Tabbing the inspector in with the Library groups all eight panels**,
     /// with Properties still in front. The default already docks the two
     /// together (Impl W's one tab stack), so this also covers the operation
     /// being a no-op on an already-merged pair rather than duplicating tabs
@@ -4452,6 +4555,8 @@ mod group_tests {
             PanelId::Properties,
             PanelId::Filters,
             PanelId::ToolOptions,
+            PanelId::Color,
+            PanelId::Swatches,
         ] {
             assert!(
                 section.panels.contains(&id),
@@ -4459,7 +4564,7 @@ mod group_tests {
                 section.panels
             );
         }
-        assert_eq!(section.panels.len(), 6);
+        assert_eq!(section.panels.len(), 8);
     }
 
     /// **A floated inspector docks back as one section**, in the same tab
@@ -4476,11 +4581,13 @@ mod group_tests {
             .section_of(PanelId::Properties)
             .expect("docked");
         assert_eq!(section.front, PanelId::Properties);
-        assert_eq!(section.panels.len(), 6);
+        assert_eq!(section.panels.len(), 8);
         for id in [
             PanelId::Properties,
             PanelId::Filters,
             PanelId::ToolOptions,
+            PanelId::Color,
+            PanelId::Swatches,
             PanelId::Library,
             PanelId::Assets,
             PanelId::Cast,
@@ -4523,6 +4630,90 @@ mod group_tests {
             .section_of(PanelId::Properties)
             .expect("still on screen");
         assert_eq!(section.front, PanelId::Properties);
-        assert_eq!(section.panels.len(), 6);
+        assert_eq!(section.panels.len(), 8);
+    }
+
+    /// The layout the last build shipped: Color and Swatches tabbed together
+    /// in a section of their own, below the inspector.
+    fn palette_apart() -> Workspace {
+        let mut workspace = Workspace::animate();
+        let order = |workspace: &Workspace| {
+            workspace
+                .slots
+                .iter()
+                .map(|s| s.order)
+                .max()
+                .unwrap_or(0)
+        };
+        // Push the pair to the end of the column, under the inspector, in a
+        // group nothing else shares — which is what version 7 shipped.
+        let base = order(&workspace) + 1;
+        for (i, id) in [PanelId::Color, PanelId::Swatches].into_iter().enumerate() {
+            let slot = workspace.slot_mut(id).expect("in the default layout");
+            slot.group = GROUP_PALETTE;
+            slot.selected = i == 0;
+            slot.order = base + i as u32;
+        }
+        workspace.version = VERSION_SEQUENCE_PANEL;
+        workspace
+    }
+
+    /// **Color and Swatches fold into the inspector**, beside Tool Options,
+    /// for a saved layout that still has them where the last default put them.
+    #[test]
+    fn the_palette_folds_into_the_inspector_once() {
+        let mut workspace = palette_apart();
+        assert_ne!(
+            workspace.section_of(PanelId::Color).map(|s| s.group),
+            workspace.section_of(PanelId::Properties).map(|s| s.group),
+            "the fixture must start with the palette apart"
+        );
+
+        workspace.fill_gaps();
+
+        let section = workspace
+            .section_of(PanelId::Properties)
+            .expect("on screen");
+        assert_eq!(section.front, PanelId::Properties, "Properties stays in front");
+        let tool = section
+            .panels
+            .iter()
+            .position(|id| *id == PanelId::ToolOptions)
+            .expect("Tool Options is in the inspector");
+        assert_eq!(
+            section.panels[tool + 1..tool + 3],
+            [PanelId::Color, PanelId::Swatches],
+            "Color and Swatches tab in straight after Tool Options: {:?}",
+            section.panels
+        );
+        assert_eq!(workspace.version, LAYOUT_VERSION);
+    }
+
+    /// …and a palette the user has moved is theirs: left where it is.
+    #[test]
+    fn a_moved_palette_is_left_where_the_user_put_it() {
+        let mut workspace = palette_apart();
+        workspace.move_section(PanelId::Color, Dock::Left);
+        let before = workspace.section_of(PanelId::Color).expect("on screen");
+
+        workspace.fill_gaps();
+
+        assert_eq!(workspace.dock_of(PanelId::Color), Dock::Left);
+        assert_eq!(
+            workspace.section_of(PanelId::Color).expect("on screen").panels,
+            before.panels
+        );
+    }
+
+    /// The default arrangement already has them in the inspector.
+    #[test]
+    fn the_default_inspector_holds_the_palette() {
+        let workspace = Workspace::animate();
+        let section = workspace
+            .section_of(PanelId::Properties)
+            .expect("on screen");
+        assert!(section.panels.contains(&PanelId::Color));
+        assert!(section.panels.contains(&PanelId::Swatches));
+        assert_eq!(section.front, PanelId::Properties);
     }
 }

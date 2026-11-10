@@ -267,7 +267,7 @@ pub fn encode_plain(
     builder.fill_shape(&scene.stage().stage_rect(), scene.stage().background);
 
     let frame = inputs.frame;
-    let camera = scene.camera_transform(frame);
+    let camera = scene.edit_camera(frame);
     let live = FrameOptions {
         masks: MaskDisplay::WhenLocked,
         lit: true,
@@ -367,7 +367,9 @@ fn encode(
     let frame = editor.current_frame;
     // The camera is part of the document, so it transforms artwork but not the
     // stage rectangle the artwork sits on.
-    let camera = scene.camera_transform(frame);
+    // Inside a symbol opened in place, the shot it was opened through — see
+    // `Scene::edit_camera` — so opening it never moves it.
+    let camera = scene.edit_camera(frame);
 
     // **Edit in place.** Inside a symbol, the scene it was opened from is drawn
     // first and then veiled: the artwork being edited has to be judged against
@@ -390,7 +392,10 @@ fn encode(
             stamp_view,
             ..FrameOptions::default()
         };
-        draw_stage_context(&mut builder, scene, frame, camera, &context, cache);
+        // The stage as it stood when the symbol was opened: the document's
+        // frame and camera, not the symbol's own playhead.
+        let around = scene.context_frame(frame);
+        draw_stage_context(&mut builder, scene, around, scene.camera_transform(around), &context, cache);
 
         // The veil, over everything visible rather than over the stage
         // rectangle: the context runs off the edges of the stage as freely as
@@ -407,6 +412,8 @@ fn encode(
     // frame. Ghosting them would be onion skinning, and the difference between
     // the two modes is exactly that these drawings are the thing being edited
     // rather than a reference to work against.
+    // No colour effect: an open symbol shows its own colours, as in Animate —
+    // the brightness or tint on the instance outside belongs to the instance.
     let place = scene.edit_place();
     for other in editor.multi_frames() {
         let options = FrameOptions {
@@ -433,6 +440,7 @@ fn encode(
             ghost_outlines: editor.onion.outlines,
             masks: MaskDisplay::WhenLocked,
             place,
+            effect: Default::default(),
             // Ghosts are reference, not picture: shading and cast shadows on a
             // faded copy of another frame read as dirt on the stage.
             lit: false,
@@ -586,7 +594,7 @@ pub fn draw_chrome(ui: &mut Ui, editor: &Editor, area: egui::Rect) -> ChromeResp
     // is not there at all is not.
     let shot = editor
         .scene()
-        .camera_projection_at_depth(editor.current_frame, 0.0)
+        .edit_projection(editor.current_frame)
         .unwrap_or(buzz_geom::Projection::IDENTITY);
     // And through the place, so that inside a symbol opened *in place* the
     // handles, bones and the transformation point land on the artwork rather

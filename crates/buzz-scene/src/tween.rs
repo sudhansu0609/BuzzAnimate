@@ -85,9 +85,53 @@ pub enum Easing {
     Strength(f64),
     /// A custom curve, as CSS and Animate's editor express it.
     CubicBezier { x1: f64, y1: f64, x2: f64, y2: f64 },
+    /// A springy settle: the value overshoots the target and rings around it
+    /// with decaying oscillations. One cubic cannot do this (it has at most
+    /// one overshoot), hence its own variant.
+    Elastic { form: EaseForm, oscillations: f64 },
+    /// A ball dropped onto the target: it arrives, rebounds to a fraction of
+    /// the height, and settles after `bounces` rebounds. Stays inside `0..=1`.
+    Bounce { form: EaseForm, bounces: u32 },
 }
 
+/// Which end of the span an [`Easing::Elastic`] / [`Easing::Bounce`] curve
+/// does its wobbling at. `Out` is the familiar "arrives and settles"; `In`
+/// is its mirror (winds up before leaving); `InOut` does both halves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EaseForm {
+    In,
+    #[default]
+    Out,
+    InOut,
+}
+
+/// Default ring count for [`Easing::Elastic`] (full oscillations over the span).
+pub const DEFAULT_ELASTIC_OSCILLATIONS: f64 = 3.0;
+/// Default rebound count for [`Easing::Bounce`] after the first landing.
+pub const DEFAULT_BOUNCES: u32 = 3;
+
 impl Easing {
+    /// "Back In" (anticipation): dips below the start before launching.
+    pub const BACK_IN: Easing = Easing::CubicBezier { x1: 0.36, y1: 0.0, x2: 0.66, y2: -0.56 };
+    /// "Back Out" (overshoot): runs past the target, then eases back.
+    pub const BACK_OUT: Easing = Easing::CubicBezier { x1: 0.34, y1: 1.56, x2: 0.64, y2: 1.0 };
+    /// "Back In-Out": anticipation at the start and overshoot at the end.
+    pub const BACK_IN_OUT: Easing = Easing::CubicBezier { x1: 0.68, y1: -0.6, x2: 0.32, y2: 1.6 };
+
+    pub fn elastic(form: EaseForm) -> Self {
+        Self::Elastic { form, oscillations: DEFAULT_ELASTIC_OSCILLATIONS }
+    }
+
+    pub fn bounce(form: EaseForm) -> Self {
+        Self::Bounce { form, bounces: DEFAULT_BOUNCES }
+    }
+
+    /// True for the curves a pair of Bézier handles can describe, i.e. the
+    /// ones the Motion Editor lets you drag.
+    pub fn is_bezier_like(self) -> bool {
+        !matches!(self, Self::Elastic { .. } | Self::Bounce { .. })
+    }
+
     /// Map linear progress `t` in `0..=1` to eased progress.
     pub fn apply(self, t: f64) -> f64 {
         let t = t.clamp(0.0, 1.0);
@@ -110,6 +154,10 @@ impl Easing {
                 }
             }
             Self::CubicBezier { x1, y1, x2, y2 } => cubic_bezier_ease(t, x1, y1, x2, y2),
+            Self::Elastic { form, oscillations } => {
+                form.shape(t, |u| elastic_out(u, oscillations))
+            }
+            Self::Bounce { form, bounces } => form.shape(t, |u| bounce_out(u, bounces)),
         }
     }
 
@@ -120,8 +168,89 @@ impl Easing {
             Self::Strength(a) if a < 0.0 => format!("Ease In {:.0}", -a),
             Self::Strength(_) => "Linear".to_string(),
             Self::CubicBezier { .. } => "Custom".to_string(),
+            Self::Elastic { form, .. } => format!("Elastic {}", form.label()),
+            Self::Bounce { form, .. } => format!("Bounce {}", form.label()),
         }
     }
+}
+
+impl EaseForm {
+    fn label(self) -> &'static str {
+        match self {
+            Self::In => "In",
+            Self::Out => "Out",
+            Self::InOut => "In-Out",
+        }
+    }
+
+    /// Derive the In / In-Out forms from an Out curve by mirroring, so a
+    /// single formula defines each family and the three always agree.
+    fn shape(self, t: f64, out: impl Fn(f64) -> f64) -> f64 {
+        match self {
+            Self::Out => out(t),
+            Self::In => 1.0 - out(1.0 - t),
+            Self::InOut => {
+                if t < 0.5 {
+                    0.5 * (1.0 - out(1.0 - 2.0 * t))
+                } else {
+                    0.5 + 0.5 * out(2.0 * t - 1.0)
+                }
+            }
+        }
+    }
+}
+
+/// Springy settle: `1 - envelope * cos(2*pi*n*t)`. The envelope decays
+/// exponentially and is also forced to reach 0 at `t = 1` (the `1 - t`
+/// factor), so the curve lands exactly on 1 instead of snapping the last
+/// fraction of a percent. At `t = 0` the cosine is 1 and the envelope is 1,
+/// giving exactly 0.
+fn elastic_out(t: f64, oscillations: f64) -> f64 {
+    let n = if oscillations.is_finite() { oscillations.clamp(0.5, 12.0) } else { DEFAULT_ELASTIC_OSCILLATIONS };
+    if t <= 0.0 {
+        return 0.0;
+    }
+    if t >= 1.0 {
+        return 1.0;
+    }
+    let envelope = (1.0 - t) * (-8.0 * t).exp2();
+    1.0 - envelope * (std::f64::consts::TAU * n * t).cos()
+}
+
+/// A ball dropped from height 1 (value 0 is "on the floor" mirrored: the
+/// eased value is `1 - height`). Each rebound reaches half the previous
+/// height and, being a parabola, lasts proportionally to its square root, so
+/// the timing is physically plausible rather than evenly spaced.
+fn bounce_out(t: f64, bounces: u32) -> f64 {
+    const RESTITUTION: f64 = 0.5;
+    let bounces = bounces.min(10);
+    if t <= 0.0 {
+        return 0.0;
+    }
+    if t >= 1.0 {
+        return 1.0;
+    }
+    // Segment 0 is the initial fall (duration 1, impact at its end); segment
+    // k >= 1 is a rebound of peak height `RESTITUTION^k` and duration
+    // `2 * sqrt(height)`.
+    let total: f64 = 1.0 + (1..=bounces).map(|k| 2.0 * RESTITUTION.powi(k as i32).sqrt()).sum::<f64>();
+    let time = t * total;
+    if time <= 1.0 {
+        // Falling: height = (1 - time)^2.
+        let x = 1.0 - time;
+        return 1.0 - x * x;
+    }
+    let mut start = 1.0;
+    for k in 1..=bounces {
+        let height = RESTITUTION.powi(k as i32);
+        let half = height.sqrt();
+        if time <= start + 2.0 * half {
+            let x = (time - start - half) / half;
+            return (1.0 - height * (1.0 - x * x)).clamp(0.0, 1.0);
+        }
+        start += 2.0 * half;
+    }
+    1.0
 }
 
 /// Solve a CSS-style cubic-Bézier easing for `y` at a given `x`.
@@ -2007,6 +2136,102 @@ mod tests {
             "ease in should be behind early"
         );
         assert!((Easing::Strength(0.0).apply(0.3) - 0.3).abs() < 1e-9);
+    }
+
+    fn new_easings() -> Vec<Easing> {
+        let mut all = vec![Easing::BACK_IN, Easing::BACK_OUT, Easing::BACK_IN_OUT];
+        for form in [EaseForm::In, EaseForm::Out, EaseForm::InOut] {
+            all.push(Easing::elastic(form));
+            all.push(Easing::bounce(form));
+        }
+        all.push(Easing::Elastic { form: EaseForm::Out, oscillations: 6.0 });
+        all.push(Easing::Bounce { form: EaseForm::Out, bounces: 5 });
+        all
+    }
+
+    #[test]
+    fn the_new_easings_hit_both_endpoints_exactly() {
+        for easing in new_easings() {
+            assert!((easing.apply(0.0)).abs() < 1e-6, "{easing:?} at 0");
+            assert!((easing.apply(1.0) - 1.0).abs() < 1e-6, "{easing:?} at 1");
+        }
+        // The non-Bézier curves promise it exactly, not just within tolerance.
+        for form in [EaseForm::In, EaseForm::Out, EaseForm::InOut] {
+            assert_eq!(Easing::elastic(form).apply(0.0), 0.0);
+            assert_eq!(Easing::elastic(form).apply(1.0), 1.0);
+            assert_eq!(Easing::bounce(form).apply(0.0), 0.0);
+            assert_eq!(Easing::bounce(form).apply(1.0), 1.0);
+        }
+    }
+
+    #[test]
+    fn back_out_and_elastic_out_overshoot_while_back_in_anticipates() {
+        let peak = |e: Easing| (0..=200).map(|i| e.apply(i as f64 / 200.0)).fold(f64::MIN, f64::max);
+        let trough = |e: Easing| (0..=200).map(|i| e.apply(i as f64 / 200.0)).fold(f64::MAX, f64::min);
+        assert!(peak(Easing::BACK_OUT) > 1.05, "back out overshoots");
+        assert!(peak(Easing::elastic(EaseForm::Out)) > 1.1, "elastic out overshoots");
+        assert!(trough(Easing::BACK_IN) < -0.05, "back in dips below zero first");
+        assert!(trough(Easing::elastic(EaseForm::In)) < -0.1, "elastic in anticipates");
+        // Elastic rings: it crosses the target more than once.
+        let e = Easing::elastic(EaseForm::Out);
+        let crossings = (1..=400)
+            .filter(|i| (e.apply(*i as f64 / 400.0) - 1.0) * (e.apply((*i - 1) as f64 / 400.0) - 1.0) < 0.0)
+            .count();
+        assert!(crossings >= 3, "only {crossings} crossings");
+    }
+
+    #[test]
+    fn bounce_stays_within_zero_and_one_and_touches_the_target_repeatedly() {
+        for form in [EaseForm::In, EaseForm::Out, EaseForm::InOut] {
+            let e = Easing::bounce(form);
+            for i in 0..=500 {
+                let v = e.apply(i as f64 / 500.0);
+                assert!((0.0..=1.0).contains(&v), "{e:?} produced {v}");
+            }
+        }
+        // Bounce out lands (reaches 1), then rebounds back down below it.
+        let e = Easing::bounce(EaseForm::Out);
+        let dipped_after_landing = (0..=500).map(|i| i as f64 / 500.0).any(|t| t > 0.4 && e.apply(t) < 0.97);
+        assert!(dipped_after_landing);
+    }
+
+    #[test]
+    fn the_new_easings_are_deterministic_and_finite_for_odd_parameters() {
+        for easing in [
+            Easing::Elastic { form: EaseForm::Out, oscillations: f64::NAN },
+            Easing::Elastic { form: EaseForm::InOut, oscillations: -3.0 },
+            Easing::Bounce { form: EaseForm::Out, bounces: 0 },
+            Easing::Bounce { form: EaseForm::In, bounces: 1000 },
+        ] {
+            for i in 0..=50 {
+                let t = i as f64 / 50.0;
+                let v = easing.apply(t);
+                assert!(v.is_finite(), "{easing:?} at {t}");
+                assert_eq!(v, easing.apply(t));
+            }
+            assert_eq!(easing.apply(0.0), 0.0);
+            assert_eq!(easing.apply(1.0), 1.0);
+        }
+    }
+
+    #[test]
+    fn the_new_easings_survive_a_serde_round_trip() {
+        for easing in new_easings() {
+            let json = serde_json::to_string(&easing).unwrap();
+            let back: Easing = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, easing, "{json}");
+        }
+    }
+
+    #[test]
+    fn old_format_easings_still_deserialize() {
+        // Shapes written before the Elastic / Bounce variants existed.
+        assert_eq!(serde_json::from_str::<Easing>("\"Linear\"").unwrap(), Easing::Linear);
+        assert_eq!(serde_json::from_str::<Easing>("{\"Strength\":-40.0}").unwrap(), Easing::Strength(-40.0));
+        assert_eq!(
+            serde_json::from_str::<Easing>("{\"CubicBezier\":{\"x1\":0.4,\"y1\":0.0,\"x2\":0.6,\"y2\":1.0}}").unwrap(),
+            Easing::CubicBezier { x1: 0.4, y1: 0.0, x2: 0.6, y2: 1.0 }
+        );
     }
 
     /// A near-vertical curve must not hang the solver.

@@ -124,7 +124,7 @@ pub use tasks_panel::{FinishedRow, TaskAction, TaskRow, TasksView, tasks_panel};
 pub use theme::{Metrics, Palette};
 pub use timeline_panel::{
     FrameAction, LayerFilter, LayerRowCache, MoveFrames, RowFilter, TimelineResponse,
-    TimelineState, TweenRequest, Waveform, frame_move_targets, frame_move_targets_filtered,
+    TimelineState, TweenRequest, WAVE_PEAKS_PER_FRAME, Waveform, frame_move_targets, frame_move_targets_filtered,
     row_filter_hidden, timeline_panel,
     timeline_panel_with_tools_slot,
 };

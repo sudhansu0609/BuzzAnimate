@@ -259,7 +259,7 @@ pub fn library_panel(
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(
-                        "The library is empty.\n\n\
+                        "No symbols yet.\n\n\
                          Select artwork and press F8 to convert it to a symbol, \
                          or use File > Import to Library to bring in an Animate document.",
                     )
@@ -323,10 +323,105 @@ pub fn library_panel(
             });
     }
 
+    images_section(ui, scene);
+
     ui.separator();
     draw_footer(ui, scene, state, usage, &mut command);
 
     command
+}
+
+/// A picture dragged out of the Library's Images folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraggedImage(pub buzz_scene::ImageId);
+
+/// Library names Generate Image gives its pictures (`gen_<words>_<seed>`).
+fn is_generated(name: &str) -> bool {
+    name.starts_with("gen_")
+}
+
+/// **The Library's Images folder**: every picture in the document — imported
+/// ones, and an "AI Generated" folder for Generate Image's — each with a
+/// thumbnail, to drag onto the stage as Animate's bitmaps are. A picture sent
+/// to the Library used to be stored in the file but listed nowhere.
+fn images_section(ui: &mut Ui, scene: &Scene) {
+    let images: Vec<std::sync::Arc<buzz_scene::ImageAsset>> = scene.images().iter().cloned().collect();
+    if images.is_empty() {
+        return;
+    }
+    ui.separator();
+    let (generated, imported): (Vec<_>, Vec<_>) = images.into_iter().partition(|i| is_generated(&i.name));
+    egui::CollapsingHeader::new(RichText::new(format!("Images ({})", generated.len() + imported.len())).strong())
+        .id_salt("library-images")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("library-images-list")
+                .auto_shrink([false, true])
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    if !generated.is_empty() {
+                        egui::CollapsingHeader::new(format!("AI Generated ({})", generated.len()))
+                            .id_salt("library-images-generated")
+                            .default_open(true)
+                            .show(ui, |ui| generated.iter().for_each(|i| image_row(ui, i)));
+                    }
+                    for image in &imported {
+                        image_row(ui, image);
+                    }
+                });
+        });
+}
+
+/// One picture: thumbnail and name, dragged onto the stage to place it.
+fn image_row(ui: &mut Ui, image: &buzz_scene::ImageAsset) {
+    let texture = image_thumbnail(ui.ctx(), image);
+    let id = egui::Id::new(("library-image", image.id.0));
+    ui.dnd_drag_source(id, DraggedImage(image.id), |ui| {
+        ui.horizontal(|ui| {
+            match &texture {
+                Some(t) => {
+                    let size = t.size_vec2();
+                    let scale = (THUMBNAIL / size.x.max(size.y)).min(1.0);
+                    ui.add(egui::Image::new(t).fit_to_exact_size(size * scale));
+                }
+                None => {
+                    ui.add_space(THUMBNAIL);
+                }
+            }
+            ui.label(&image.name);
+        });
+    })
+    .response
+    .on_hover_text(format!("{} \u{d7} {} \u{2014} drag onto the stage to place it", image.width, image.height));
+}
+
+/// A small texture of `image`, made once and kept in egui's memory by id.
+fn image_thumbnail(ctx: &egui::Context, image: &buzz_scene::ImageAsset) -> Option<egui::TextureHandle> {
+    let key = egui::Id::new(("library-image-thumb", image.id.0, image.width, image.height));
+    if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+        return Some(t);
+    }
+    let (w, h) = (image.width as usize, image.height as usize);
+    if w == 0 || h == 0 || image.pixels.len() < w * h * 4 {
+        return None;
+    }
+    let side = 48usize;
+    let scale = (side as f32 / w.max(h) as f32).min(1.0);
+    let (tw, th) = (((w as f32 * scale).round() as usize).max(1), ((h as f32 * scale).round() as usize).max(1));
+    let mut rgba = Vec::with_capacity(tw * th * 4);
+    for y in 0..th {
+        for x in 0..tw {
+            let sx = (x * w / tw).min(w - 1);
+            let sy = (y * h / th).min(h - 1);
+            let at = (sy * w + sx) * 4;
+            rgba.extend_from_slice(&image.pixels[at..at + 4]);
+        }
+    }
+    let colour = egui::ColorImage::from_rgba_unmultiplied([tw, th], &rgba);
+    let texture = ctx.load_texture(format!("library-image-{}", image.id.0), colour, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(key, texture.clone()));
+    Some(texture)
 }
 
 /// One level of the tree: the folders directly inside `parent`, then the

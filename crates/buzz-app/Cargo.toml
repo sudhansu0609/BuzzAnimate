@@ -31,6 +31,7 @@ buzz-script.workspace = true
 buzz-export.workspace = true
 buzz-rig.workspace = true
 buzz-audio.workspace = true
+buzz-voice.workspace = true
 buzz-ai.workspace = true
 
 vello.workspace = true

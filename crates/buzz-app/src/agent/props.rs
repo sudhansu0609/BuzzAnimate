@@ -13,7 +13,7 @@
 use super::{AgentResult, hex_of, parse_hex};
 use crate::app::App;
 use buzz_scene::{
-    Blend, CameraKey, ColorEffect, ColorTransform, EdgeMode, Easing, EditAt, LayerId, LayerKind,
+    Blend, CameraKey, ColorEffect, ColorTransform, EaseForm, EdgeMode, Easing, EditAt, LayerId, LayerKind,
     LightId, LightKind, LoopMode, ObjectId, ObjectKind, Scene, ShadeModel, ShadowFall, SoundRef,
     SoundSync, TextAlign, TweenKind,
 };
@@ -1065,14 +1065,75 @@ fn easing_json(e: Easing) -> Value {
         Easing::Linear => json!("linear"),
         Easing::Strength(a) => json!(round6(a)),
         Easing::CubicBezier { x1, y1, x2, y2 } => json!([round6(x1), round6(y1), round6(x2), round6(y2)]),
+        Easing::Elastic { form, oscillations } => {
+            json!({"type": "elastic", "form": form_name(form), "oscillations": round6(oscillations)})
+        }
+        Easing::Bounce { form, bounces } => json!({"type": "bounce", "form": form_name(form), "bounces": bounces}),
+    }
+}
+
+fn form_name(form: EaseForm) -> &'static str {
+    match form {
+        EaseForm::In => "in",
+        EaseForm::Out => "out",
+        EaseForm::InOut => "in-out",
+    }
+}
+
+fn parse_form(v: Option<&Value>) -> Option<EaseForm> {
+    match v.and_then(Value::as_str).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("out") => Some(EaseForm::Out),
+        Some("in") => Some(EaseForm::In),
+        Some("in-out") | Some("inout") => Some(EaseForm::InOut),
+        _ => None,
+    }
+}
+
+/// The named presets: `"back-out"`, `"elastic-in-out"`, `"bounce"` (= out)...
+fn named_easing(name: &str) -> Option<Easing> {
+    let name = name.to_ascii_lowercase();
+    let (family, form) = match name.split_once('-') {
+        Some((family, rest)) => (family, parse_form(Some(&json!(rest)))?),
+        None => (name.as_str(), EaseForm::Out),
+    };
+    match (family, form) {
+        ("back", EaseForm::In) => Some(Easing::BACK_IN),
+        ("back", EaseForm::Out) => Some(Easing::BACK_OUT),
+        ("back", EaseForm::InOut) => Some(Easing::BACK_IN_OUT),
+        ("elastic", form) => Some(Easing::elastic(form)),
+        ("bounce", form) => Some(Easing::bounce(form)),
+        _ => None,
     }
 }
 
 fn parse_easing(v: &Value) -> Result<Easing, String> {
-    let usage = "'ease' needs \"linear\", a strength -100..100, or [x1, y1, x2, y2] with x in 0..1";
+    let usage = "'ease' needs \"linear\", a strength -100..100, [x1, y1, x2, y2] with x in 0..1, a preset (\"back-in\", \"back-out\", \"back-in-out\", \"elastic-[in|out|in-out]\", \"bounce-[in|out|in-out]\"), or {\"type\":\"elastic\"|\"bounce\",\"form\":..,\"oscillations\"|\"bounces\":n}";
+    if let Some(obj) = v.as_object() {
+        let form = parse_form(obj.get("form")).ok_or_else(|| usage.to_string())?;
+        return match obj.get("type").and_then(Value::as_str) {
+            Some("elastic") => {
+                let oscillations = obj
+                    .get("oscillations")
+                    .and_then(as_number)
+                    .unwrap_or(buzz_scene::tween::DEFAULT_ELASTIC_OSCILLATIONS);
+                Ok(Easing::Elastic { form, oscillations: oscillations.clamp(0.5, 12.0) })
+            }
+            Some("bounce") => {
+                let bounces = obj
+                    .get("bounces")
+                    .and_then(as_number)
+                    .unwrap_or(buzz_scene::tween::DEFAULT_BOUNCES as f64);
+                Ok(Easing::Bounce { form, bounces: bounces.clamp(0.0, 10.0) as u32 })
+            }
+            _ => Err(usage.to_string()),
+        };
+    }
     if let Some(s) = v.as_str() {
         if s.eq_ignore_ascii_case("linear") {
             return Ok(Easing::Linear);
+        }
+        if let Some(named) = named_easing(s) {
+            return Ok(named);
         }
         return as_number(v)
             .filter(|n| (-100.0..=100.0).contains(n))

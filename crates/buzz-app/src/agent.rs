@@ -59,6 +59,9 @@ pub const AGENT_EXCLUDED: &[(&str, &str)] = &[
     ("snapshots", "UI-only list dialog; use save_snapshot to keep one"),
     ("about", "UI-only dialog, no document effect"),
     ("ai_models", "UI-only dialog for installing models"),
+    ("ai_generate_image", "UI-only window; needs a running ComfyUI and minutes per picture"),
+    ("next_document", "UI-only: switches which open document the window shows"),
+    ("previous_document", "UI-only: switches which open document the window shows"),
     ("voice_push_to_talk", "opens the user's microphone: only the person at the keyboard may do that"),
     ("voice_mute", "controls the user's microphone privacy switch: not the agent's to flip"),
     ("pasteboard_colour", "UI-only colour dialog, no document effect"),
@@ -121,14 +124,14 @@ pub fn route(command: Command) -> Route {
 
         // Open a dialog or panel that needs parameters: run from args.
         New | LipSync | TraceBitmapOptions | SetScene | DirectScene | SceneryFor | Perform
-        | AddFollowThrough | AddWiggle | AddTitleCard | AiIdentifyAssets | AiRigVectorCharacter | AiRigLayers
+        | AddFollowThrough | AddWiggle | AddPendulum | AddHairMotion | AddTitleCard | AiIdentifyAssets | AiRigVectorCharacter | AiRigLayers
         | AiDirectStory | AiCharacterFromImage | AiMouthChart | ClearAllKeyframes | CleanUpLayers
         | ArrangeLayers | RepairLayerRigs | RigHead | EvenLines | RemoveBackgroundSpecks | PasteMotion | PasteMotionSpecial | PastePose | CopyPerformance
         | PastePerformance | PastePerformanceSpecial | StoryboardMake | StoryboardEdit
         | StoryboardExport => Route::Args,
 
         // Needs the user, or has no document effect.
-        Quit | Close | ShortcutEditor | Snapshots | About | AiModels | PasteboardColour
+        Quit | Close | ShortcutEditor | Snapshots | About | AiModels | AiGenerateImage | NextDocument | PreviousDocument | PasteboardColour
         | TestMovie | RunScript | VoicePushToTalk | VoiceMute => Route::Excluded,
         // Dialogs over BuzzEdit and Buzzcaf Studio; their tools take args.
         SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => Route::Excluded,
@@ -142,7 +145,7 @@ pub fn route(command: Command) -> Route {
         SaveSnapshot | AttachSound | RemoveSound | NewMouthSymbol | DetectBeats | FitToNarration
         | LipSyncFromCaptions | Undo | Redo | Cut | Copy | Paste | Delete | SelectAll | Deselect
         | DuplicateSelection | ZoomIn | ZoomOut | ZoomActual | ZoomFitInWindow | ZoomShowFrame
-        | ZoomShowAll | ToggleRulers | ToggleGrid | ToggleGuides | ToggleSnapping
+        | ZoomShowAll | ToggleRulers | ToggleAutoSave | ToggleGrid | ToggleGuides | ToggleSnapping
         | TogglePasteboard | ToggleNeighbours | GroupSelection | UngroupSelection | BreakApart | BringToFront
         | BringForward | SendBackward | SendToBack | RetargetPerformance | SwapSymbol
         | PaintThrough | ExposeOnTwos | ExposeOnThrees | SelectSameColour | ThickenStroke
@@ -875,7 +878,7 @@ pub const AGENT_TOOLS: &[(&str, &str)] = &[
     ("script", "{code: JSFL JavaScript, one undo step; returns fl.trace output and errors}"),
     ("snapshot", "{frame?: 0-based frame} -> {png_base64, width, height}, longest side <= 768"),
     ("set_property", "{target: element:<id>|layer:<index|name> (index = inspect timeline \"index\", not \"id\")|frame:<layer>:<frame>|light:<id>|light:rig|camera|document|scene, field, value}; inspect {what:\"properties\", target} lists the fields, values and hints. {target:\"document\", field:\"playhead\", value:<0-based frame>} moves the playhead (frame 24 = 23)"),
-    ("edit_list", "{target: element:<id>|layer:<index|name> (index = inspect timeline \"index\", not \"id\")|document, list: filters|modifiers|swatches|swatch_folders|poses|bones|rig, op: get|add|remove|move|set (rig list: set_rest_pose|mirror_pose|reset_pose), index?, to?, item?}; one undo step per op, returns the list. filters (element|layer): item {kind: blur|drop_shadow|glow|bevel|adjust|gradient_map, enabled?, <kind parameters>}, move uses to. modifiers (element): item {kind: wiggle|spring|look_at|squash_stretch|breathe|blink|turn|sway|drift, <parameters>}. swatches (document): add {name, color, folder?}; set index {name?, color? (repaints linked fills), folder?|null}; remove; move index to folder. swatch_folders (document): add {name}; remove {name}|index. poses (armature element): add {name} saves the pose; set index applies (item {key:true} also keys it); remove index. bones (armature element): remove index deletes a bone; move index to parent bone|null reparents"),
+    ("edit_list", "{target: element:<id>|layer:<index|name> (index = inspect timeline \"index\", not \"id\")|document, list: filters|modifiers|swatches|swatch_folders|poses|bones|rig, op: get|add|remove|move|set (rig list: set_rest_pose|mirror_pose|reset_pose), index?, to?, item?}; one undo step per op, returns the list. filters (element|layer): item {kind: blur|drop_shadow|glow|bevel|adjust|gradient_map, enabled?, <kind parameters>}, move uses to. modifiers (element): item {kind: wiggle|spring|look_at|squash_stretch|breathe|blink|turn|sway|drift|pendulum|hair (side 0 top|1 left|2 right|3 bottom, segments, stiffness, damping, wind, wind_rate, lag), <parameters>}. swatches (document): add {name, color, folder?}; set index {name?, color? (repaints linked fills), folder?|null}; remove; move index to folder. swatch_folders (document): add {name}; remove {name}|index. poses (armature element): add {name} saves the pose; set index applies (item {key:true} also keys it); remove index. bones (armature element): remove index deletes a bone; move index to parent bone|null reparents"),
     ("wait_for_jobs", "{timeout_s?: 1..300 (default 120)} -> {jobs:[{id, kind, status: running|done|failed, result?, error?}], running, timed_out}; waits for every AI job started in this run (ai_rig_vector_character, ai_rig_layers, ai_direct_story, ai_character_from_image, ai_scene_from_image, transcribe) and returns as soon as none is running, or at the timeout with the ones still running; the BuzzEdit and Studio tools' jobs are waited for the same way. A finished job's result is given once"),
     ("transcribe", "{sound?: name of a sound in the library, path?: audio file} (exactly one) -> {started:true, job}; Whisper runs in the background (the multilingual model when installed, else base.en); call wait_for_jobs for {text, language, model, timing, speakers:\"not identified\", segments:[{start_s, end_s, text}]}. There is no speaker separation: infer who speaks from the content"),
     ("send_to_buzzedit", "{scope?: document|scene (default document: the whole film; scene: the scene being edited), project?: BuzzEdit project id from buzzedit_projects (default: a new BuzzEdit project), path?: .mp4 to write (must not exist; default beside the document), start?: bool (launch BuzzEdit if it is not running)} -> {started:true, job}; exports an MP4 on the export queue, then imports it into BuzzEdit; wait_for_jobs gives {project_id, project_name, new_project, video}. Needs ffmpeg"),

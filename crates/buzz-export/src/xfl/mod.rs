@@ -843,6 +843,9 @@ fn tween_attrs(
             None
         }
         Easing::CubicBezier { .. } => Some(easing_points(tween.easing)),
+        // Animate has no elastic / bounce method; its custom-ease curve is
+        // the faithful carrier, fitted from samples like the slider is.
+        Easing::Elastic { .. } | Easing::Bounce { .. } => Some(easing_points(tween.easing)),
     };
     let drawn = curve.filter(|c| !c.is_empty());
     let all: Option<Vec<buzz_geom::Point>> = drawn

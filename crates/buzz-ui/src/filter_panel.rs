@@ -270,13 +270,36 @@ pub fn filter_panel(
                     });
                     ui.close();
                 }
+                if ui
+                    .button("Pendulum")
+                    .on_hover_text(
+                        "Swings from a pivot at the top of the drawing like a lamp or a \
+                         sign, shaken by the object's own keyframed motion.",
+                    )
+                    .clicked()
+                {
+                    out.add_modifier = Some(Modifier::pendulum());
+                    ui.close();
+                }
+                if ui
+                    .button("Hair / Cloth")
+                    .on_hover_text(
+                        "Bends the drawing from a pinned edge like a scarf, ponytail or \
+                         flag, trailing the object's own motion. Stays live when baked.",
+                    )
+                    .clicked()
+                {
+                    out.add_modifier = Some(Modifier::hair());
+                    ui.close();
+                }
             });
         });
         if modifiers.is_empty() {
             ui.label(
                 RichText::new(
-                    "Springs and wiggles are added from the Scene menu; look-at, \
-                     squash & stretch, breathing, blinking, turning and sway, here.",
+                    "Springs, wiggles, pendulums and hair / cloth are added from the Scene menu; \
+                     look-at, squash & stretch, breathing, blinking, turning and \
+                     sway, here.",
                 )
                 .small()
                 .weak(),
@@ -285,7 +308,9 @@ pub fn filter_panel(
         for (i, modifier) in modifiers.iter().enumerate() {
             let mut edited = *modifier;
             let mut changed = false;
-            ui.horizontal(|ui| {
+            // Wrapped: a pendulum has eight numbers, more than a narrow panel
+            // holds on one line.
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .small_button("\u{2715}")
                     .on_hover_text("Remove")
@@ -419,6 +444,149 @@ pub fn filter_panel(
                                  different values and they scatter instead of crossing in \
                                  formation.",
                             )
+                            .changed();
+                    }
+                    Modifier::Pendulum {
+                        period,
+                        damping,
+                        reaction,
+                        initial_angle,
+                        sway,
+                        max_angle,
+                        pivot_dx,
+                        pivot_dy,
+                    } => {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(period)
+                                    .prefix("T ")
+                                    .suffix(" s")
+                                    .speed(0.02)
+                                    .range(0.1..=30.0),
+                            )
+                            .on_hover_text("Seconds for one small swing")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(damping)
+                                    .prefix("damp ")
+                                    .speed(0.01)
+                                    .range(0.0..=2.0),
+                            )
+                            .on_hover_text("Damping ratio: 0 never settles, 1 does not overshoot")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(reaction)
+                                    .prefix("react ")
+                                    .speed(0.01)
+                                    .range(0.0..=4.0),
+                            )
+                            .on_hover_text("How much the object's own motion shakes the swing")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(initial_angle)
+                                    .prefix("start ")
+                                    .suffix("\u{b0}")
+                                    .range(-180.0..=180.0),
+                            )
+                            .on_hover_text("Starting angle, in degrees")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(sway)
+                                    .prefix("sway ")
+                                    .suffix("\u{b0}")
+                                    .speed(0.05)
+                                    .range(0.0..=45.0),
+                            )
+                            .on_hover_text("Idle sway, in degrees (0 for none)")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(max_angle)
+                                    .prefix("max ")
+                                    .suffix("\u{b0}")
+                                    .range(1.0..=170.0),
+                            )
+                            .on_hover_text("Hard stop either side, in degrees")
+                            .changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(pivot_dx).prefix("pivot x "))
+                            .on_hover_text("Pivot offset from the drawing's top-centre")
+                            .changed();
+                        changed |= ui
+                            .add(egui::DragValue::new(pivot_dy).prefix("y "))
+                            .changed();
+                    }
+                    Modifier::Hair {
+                        side,
+                        segments,
+                        stiffness,
+                        damping,
+                        wind,
+                        wind_rate,
+                        lag,
+                    } => {
+                        egui::ComboBox::from_id_salt(("hair-side", i))
+                            .selected_text(side.label())
+                            .width(60.0)
+                            .show_ui(ui, |ui| {
+                                for choice in buzz_scene::PinSide::ALL {
+                                    changed |= ui.selectable_value(side, choice, choice.label()).changed();
+                                }
+                            })
+                            .response
+                            .on_hover_text("Pinned edge");
+                        changed |= ui
+                            .add(egui::DragValue::new(segments).prefix("links ").range(2..=12))
+                            .on_hover_text("How many links the drawing bends at")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(stiffness)
+                                    .prefix("k ")
+                                    .speed(1.0)
+                                    .range(1.0..=1500.0),
+                            )
+                            .on_hover_text("Link stiffness")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(damping)
+                                    .prefix("d ")
+                                    .speed(0.2)
+                                    .range(0.0..=120.0),
+                            )
+                            .on_hover_text("Link damping")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(lag)
+                                    .prefix("lag ")
+                                    .speed(0.01)
+                                    .range(0.0..=4.0),
+                            )
+                            .on_hover_text("How far the tip is left behind a move")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(wind)
+                                    .prefix("wind ")
+                                    .speed(0.01)
+                                    .range(0.0..=5.0),
+                            )
+                            .on_hover_text("Wind strength (0 for none)")
+                            .changed();
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(wind_rate)
+                                    .prefix("Hz ")
+                                    .speed(0.01)
+                                    .range(0.05..=10.0),
+                            )
+                            .on_hover_text("Gusts per second")
                             .changed();
                     }
                     Modifier::Sway { amount, rate } => {

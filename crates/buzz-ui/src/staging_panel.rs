@@ -143,6 +143,10 @@ pub enum StagingDialog {
     Physics,
     /// Add a procedural wiggle to the selected object.
     Wiggle,
+    /// Hang the selected object from a pivot so it swings like a pendulum.
+    Pendulum,
+    /// Bend the selected drawing like hair or cloth from a pinned edge.
+    Hair,
 }
 
 /// Everything the two dialogs remember.
@@ -213,6 +217,37 @@ pub struct StagingState {
     /// Stay live rather than bake keyframes.
     pub wiggle_live: bool,
 
+    // -- the pendulum --
+    /// Seconds for one small swing.
+    pub pendulum_period: f64,
+    /// Damping ratio: 0 never settles, about 0.1 swings a few times, 1 does
+    /// not overshoot.
+    pub pendulum_damping: f64,
+    /// How much of the object's own keyed motion shakes the pivot.
+    pub pendulum_reaction: f64,
+    /// Where the swing starts, in degrees.
+    pub pendulum_initial_angle: f64,
+    /// Idle sway, in degrees (0 for none).
+    pub pendulum_sway: f64,
+    /// Hard stop either side, in degrees.
+    pub pendulum_max_angle: f64,
+    /// The pivot, as an offset from the top-centre of the drawing.
+    pub pendulum_pivot_dx: f64,
+    pub pendulum_pivot_dy: f64,
+
+    // -- the hair / cloth --
+    /// Which edge of the drawing is pinned.
+    pub hair_side: buzz_scene::PinSide,
+    /// How many links the drawing is divided into.
+    pub hair_segments: usize,
+    pub hair_stiffness: f64,
+    pub hair_damping: f64,
+    /// Wind strength (0 for none) and gusts per second.
+    pub hair_wind: f64,
+    pub hair_wind_rate: f64,
+    /// How far the tip is left behind a move.
+    pub hair_lag: f64,
+
     // -- the story --
     /// The prose the director reads. Kept between openings: a story is
     /// something the user iterates on, and a box that forgot it would cost
@@ -255,6 +290,21 @@ impl Default for StagingState {
             wiggle_amplitude: 12.0,
             wiggle_frequency: 1.5,
             wiggle_live: true,
+            pendulum_period: 1.6,
+            pendulum_damping: 0.12,
+            pendulum_reaction: 0.5,
+            pendulum_initial_angle: 0.0,
+            pendulum_sway: 0.0,
+            pendulum_max_angle: 80.0,
+            pendulum_pivot_dx: 0.0,
+            pendulum_pivot_dy: 0.0,
+            hair_side: buzz_scene::PinSide::Top,
+            hair_segments: 6,
+            hair_stiffness: 120.0,
+            hair_damping: 10.0,
+            hair_wind: 0.0,
+            hair_wind_rate: 0.6,
+            hair_lag: 1.0,
             story: String::new(),
             problem: None,
         }
@@ -316,6 +366,18 @@ impl StagingState {
         self.problem = None;
     }
 
+    /// Open the pendulum dialog.
+    pub fn open_pendulum(&mut self) {
+        self.open = Some(StagingDialog::Pendulum);
+        self.problem = None;
+    }
+
+    /// Open the hair / cloth dialog.
+    pub fn open_hair(&mut self) {
+        self.open = Some(StagingDialog::Hair);
+        self.problem = None;
+    }
+
     pub fn close(&mut self) {
         self.open = None;
         self.problem = None;
@@ -347,6 +409,10 @@ pub struct StagingResponse {
     pub add_physics: bool,
     /// Bake a wiggle onto the selected object.
     pub add_wiggle: bool,
+    /// Attach a pendulum to the selected object.
+    pub add_pendulum: bool,
+    /// Attach hair / cloth motion to the selected drawing.
+    pub add_hair: bool,
     pub cancelled: bool,
 }
 
@@ -373,6 +439,8 @@ pub fn staging_dialog(
         StagingDialog::MotionPath => "Send Along Path",
         StagingDialog::Physics => "Add Follow-Through",
         StagingDialog::Wiggle => "Add Wiggle",
+        StagingDialog::Pendulum => "Add Pendulum",
+        StagingDialog::Hair => "Add Hair/Cloth Motion",
     };
 
     let mut still_open = true;
@@ -388,6 +456,8 @@ pub fn staging_dialog(
             StagingDialog::MotionPath => motion_view(ui, state, &mut response),
             StagingDialog::Physics => physics_view(ui, state, &mut response),
             StagingDialog::Wiggle => wiggle_view(ui, state, &mut response),
+            StagingDialog::Pendulum => pendulum_view(ui, state, &mut response),
+            StagingDialog::Hair => hair_view(ui, state, &mut response),
         });
 
     if !still_open {
@@ -905,6 +975,184 @@ fn wiggle_view(ui: &mut Ui, state: &mut StagingState, response: &mut StagingResp
     ui.horizontal(|ui| {
         if ui.button("Add").clicked() {
             response.add_wiggle = true;
+        }
+        if ui.button("Cancel").clicked() {
+            response.cancelled = true;
+        }
+    });
+}
+
+fn pendulum_view(ui: &mut Ui, state: &mut StagingState, response: &mut StagingResponse) {
+    ui.label(
+        RichText::new(
+            "Hangs the selected object from a pivot so it swings like a lamp, an earring or a \
+             sign. Live: the object's own keyframed motion shakes it \u{2014} slide it left and \
+             it swings right, then settles. Bake Modifiers turns it into keyframes.",
+        )
+        .small()
+        .weak(),
+    );
+    ui.add_space(6.0);
+
+    egui::Grid::new("pendulum-grid")
+        .num_columns(2)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Swing period");
+            ui.add(
+                egui::Slider::new(&mut state.pendulum_period, 0.3..=6.0)
+                    .suffix(" s")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text("Seconds for one swing. Longer is a longer, heavier hang.");
+            ui.end_row();
+
+            ui.label("Damping");
+            ui.add(egui::Slider::new(&mut state.pendulum_damping, 0.0..=1.0).fixed_decimals(2))
+                .on_hover_text("0 never settles; around 0.1 swings a few times; 1 does not overshoot.");
+            ui.end_row();
+
+            ui.label("Reacts to motion");
+            ui.add(egui::Slider::new(&mut state.pendulum_reaction, 0.0..=2.0).fixed_decimals(2))
+                .on_hover_text("How much the object's own movement shakes it. 0 hangs from a still ceiling.");
+            ui.end_row();
+
+            ui.label("Start angle");
+            ui.add(
+                egui::Slider::new(&mut state.pendulum_initial_angle, -90.0..=90.0)
+                    .suffix("\u{b0}")
+                    .fixed_decimals(0),
+            )
+            .on_hover_text("Where the swing begins; it settles back towards hanging straight.");
+            ui.end_row();
+
+            ui.label("Idle sway");
+            ui.add(
+                egui::Slider::new(&mut state.pendulum_sway, 0.0..=20.0)
+                    .suffix("\u{b0}")
+                    .fixed_decimals(1),
+            )
+            .on_hover_text("A gentle breeze that keeps it moving when nothing else does.");
+            ui.end_row();
+
+            ui.label("Max angle");
+            ui.add(
+                egui::Slider::new(&mut state.pendulum_max_angle, 5.0..=170.0)
+                    .suffix("\u{b0}")
+                    .fixed_decimals(0),
+            )
+            .on_hover_text("A hard stop either side.");
+            ui.end_row();
+
+            ui.label("Pivot offset");
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut state.pendulum_pivot_dx).prefix("x "));
+                ui.add(egui::DragValue::new(&mut state.pendulum_pivot_dy).prefix("y "));
+            })
+            .response
+            .on_hover_text("The pivot is the top-centre of the drawing, moved by this many units.");
+            ui.end_row();
+        });
+
+    if let Some(problem) = &state.problem {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(problem)
+                .small()
+                .color(egui::Color32::from_rgb(0xE0, 0x8C, 0x3C)),
+        );
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui.button("Add").clicked() {
+            response.add_pendulum = true;
+        }
+        if ui.button("Cancel").clicked() {
+            response.cancelled = true;
+        }
+    });
+}
+
+fn hair_view(ui: &mut Ui, state: &mut StagingState, response: &mut StagingResponse) {
+    ui.label(
+        RichText::new(
+            "Bends the selected drawing like hair or cloth \u{2014} a scarf, a ponytail, a flag, \
+             a cape, a tail. One edge is pinned; the rest trails behind the object's own \
+             keyframed motion and settles. Live, and it works on shapes, groups and symbols. \
+             It deforms the drawing, so Bake Modifiers leaves it live.",
+        )
+        .small()
+        .weak(),
+    );
+    ui.add_space(6.0);
+
+    egui::Grid::new("hair-grid")
+        .num_columns(2)
+        .spacing([8.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Pinned side");
+            egui::ComboBox::from_id_salt("hair-side")
+                .selected_text(state.hair_side.label())
+                .show_ui(ui, |ui| {
+                    for side in buzz_scene::PinSide::ALL {
+                        ui.selectable_value(&mut state.hair_side, side, side.label());
+                    }
+                })
+                .response
+                .on_hover_text("The edge that stays put. The drawing trails away from it.");
+            ui.end_row();
+
+            ui.label("Segments");
+            ui.add(egui::Slider::new(&mut state.hair_segments, 2..=12))
+                .on_hover_text("How many links the drawing bends at. More is smoother and ripples more.");
+            ui.end_row();
+
+            ui.label("Stiffness");
+            ui.add(egui::Slider::new(&mut state.hair_stiffness, 10.0..=600.0).fixed_decimals(0))
+                .on_hover_text("How hard each link is pulled back into line. Higher is quicker to settle.");
+            ui.end_row();
+
+            ui.label("Damping");
+            ui.add(egui::Slider::new(&mut state.hair_damping, 0.0..=60.0).fixed_decimals(1))
+                .on_hover_text("How quickly the swing dies. Lower is silkier and bouncier.");
+            ui.end_row();
+
+            ui.label("Tip lag");
+            ui.add(egui::Slider::new(&mut state.hair_lag, 0.0..=3.0).fixed_decimals(2))
+                .on_hover_text("How far the free end is left behind a move. 1 is natural.");
+            ui.end_row();
+
+            ui.label("Wind");
+            ui.add(egui::Slider::new(&mut state.hair_wind, 0.0..=2.0).fixed_decimals(2))
+                .on_hover_text("A gusting push that keeps it rippling when nothing else moves.");
+            ui.end_row();
+
+            ui.label("Gusts");
+            ui.add(
+                egui::Slider::new(&mut state.hair_wind_rate, 0.1..=4.0)
+                    .suffix(" Hz")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text("How often the wind gusts.");
+            ui.end_row();
+        });
+
+    if let Some(problem) = &state.problem {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(problem)
+                .small()
+                .color(egui::Color32::from_rgb(0xE0, 0x8C, 0x3C)),
+        );
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui.button("Add").clicked() {
+            response.add_hair = true;
         }
         if ui.button("Cancel").clicked() {
             response.cancelled = true;

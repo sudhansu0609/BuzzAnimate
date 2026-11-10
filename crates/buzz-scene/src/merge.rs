@@ -222,6 +222,78 @@ impl Remapper<'_> {
 }
 
 impl Scene {
+    /// `id` and every symbol its artwork reaches — nested instances, groups
+    /// and rig parts, to any depth. What has to come along when a symbol is
+    /// copied into another document, or it would draw nothing there.
+    pub fn symbol_closure(&self, id: SymbolId) -> std::collections::BTreeSet<SymbolId> {
+        fn walk(object: &Object, out: &mut Vec<SymbolId>) {
+            match &object.kind {
+                ObjectKind::Instance(i) => out.push(i.symbol),
+                ObjectKind::Group(children) => children.iter().for_each(|c| walk(c, out)),
+                ObjectKind::Armature(rig) => rig.parts.iter().for_each(|p| walk(&p.artwork, out)),
+                ObjectKind::Shape(_) | ObjectKind::Warp(_) => {}
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo = vec![id];
+        while let Some(next) = todo.pop() {
+            if !seen.insert(next) {
+                continue;
+            }
+            let Some(symbol) = self.library.get(next) else {
+                continue;
+            };
+            let mut found = Vec::new();
+            for layer in symbol.layers.iter() {
+                for object in layer.all_objects() {
+                    walk(object, &mut found);
+                }
+            }
+            todo.extend(found.into_iter().filter(|s| !seen.contains(s)));
+        }
+        seen
+    }
+
+    /// **Use a symbol from another open document** — Animate's Library
+    /// dropdown. `id` is copied into this library from `other`, with every
+    /// symbol it uses and the sounds its keyframes play, and nothing else of
+    /// `other`'s. Names already taken here are renamed, as an import renames
+    /// them. Returns the copy's id here; `None` if `other` has no such symbol.
+    pub fn import_symbol(&mut self, other: &Scene, id: SymbolId) -> Option<(SymbolId, MergeReport)> {
+        let wanted = other.library.get(id)?.name.clone();
+        let keep = other.symbol_closure(id);
+        let mut source = other.clone();
+        let unused: Vec<SymbolId> = source.library.iter().map(|s| s.id).filter(|s| !keep.contains(s)).collect();
+        for s in unused {
+            source.library.remove(s);
+        }
+        let played: std::collections::HashSet<crate::sound::SoundId> = keep
+            .iter()
+            .filter_map(|s| other.library.get(*s))
+            .flat_map(|s| s.layers.iter())
+            .flat_map(|l| l.frames.keyframes().iter().filter_map(|k| k.sound.as_ref().map(|r| r.sound)))
+            .collect();
+        let silent: Vec<crate::sound::SoundId> =
+            source.sounds.iter().map(|s| s.id).filter(|s| !played.contains(s)).collect();
+        for s in silent {
+            source.sounds.remove(s);
+        }
+        let before: std::collections::HashSet<SymbolId> = self.library.iter().map(|s| s.id).collect();
+        let report = self.merge(&source, ImportTarget::Library);
+        let name = report
+            .renamed
+            .iter()
+            .find(|(asked, _)| *asked == wanted)
+            .map(|(_, given)| given.clone())
+            .unwrap_or(wanted);
+        let copy = self
+            .library
+            .iter()
+            .find(|s| !before.contains(&s.id) && s.name == name)
+            .map(|s| s.id)?;
+        Some((copy, report))
+    }
+
     /// Merge another document into this one.
     ///
     /// The other scene is left untouched, so an importer can hand over a
@@ -418,6 +490,35 @@ mod tests {
 
         scene.add_instance_at(layer, 0, outer, Affine::IDENTITY);
         scene
+    }
+
+    /// **A symbol from another open document** comes across with what it
+    /// uses — the symbol nested inside it — and nothing it does not: an
+    /// unrelated symbol of the other document stays where it is.
+    #[test]
+    fn importing_a_symbol_brings_what_it_uses_and_nothing_else() {
+        let mut other = document("Other", 5.0);
+        other.add_symbol("Unrelated", SymbolKind::Graphic, None);
+        let outer = other.library().iter().find(|s| s.name == "Other Outer").unwrap().id;
+        assert_eq!(other.symbol_closure(outer).len(), 2, "outer and the inner it holds");
+
+        let mut here = Scene::default();
+        let (copy, _) = here.import_symbol(&other, outer).expect("imported");
+        let names: Vec<String> = here.library().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(here.library().len(), 2, "{names:?}");
+        assert!(!names.iter().any(|n| n == "Unrelated"), "{names:?}");
+        assert_eq!(here.library().get(copy).unwrap().name, "Other Outer");
+        // The copy's nested instance points at the copied inner symbol here.
+        let nested = here.library().get(copy).unwrap().layers.iter().next().unwrap().objects_at(0)[0].clone();
+        let inner = nested.instance().unwrap().symbol;
+        assert_eq!(here.library().get(inner).map(|s| s.name.as_str()), Some("Other Inner"));
+
+        // Again: names already taken here are renamed, and the id returned is
+        // the new copy's.
+        let (again, report) = here.import_symbol(&other, outer).expect("imported twice");
+        assert_ne!(again, copy);
+        assert!(!report.renamed.is_empty());
+        assert_eq!(here.library().len(), 4);
     }
 
     /// **Layer Parenting survives a merge**, renumbered along with the layers.

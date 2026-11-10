@@ -11,7 +11,7 @@
 //! each frame, so what is on screen is always what is on the keyframe, and a
 //! drag is a read-modify-write like every other panel here.
 
-use buzz_scene::{Easing, TweenKind};
+use buzz_scene::{EaseForm, Easing, TweenKind};
 use egui::{Color32, Id, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 
 /// The four control values of an easing, as a cubic-bezier `(x1, y1, x2, y2)`
@@ -27,6 +27,11 @@ pub fn control_points(easing: Easing) -> [f64; 4] {
         Easing::Strength(a) if a > 0.0 => [0.0, 0.0, 0.58, 1.0], // ease out
         Easing::Strength(a) if a < 0.0 => [0.42, 0.0, 1.0, 1.0], // ease in
         Easing::Strength(_) => [1.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0],
+        // Not a Bézier at all; the panel hides the handles for these, and a
+        // straight seed is what "start editing handles" would begin from.
+        Easing::Elastic { .. } | Easing::Bounce { .. } => {
+            [1.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0]
+        }
     }
 }
 
@@ -42,36 +47,47 @@ pub struct MotionEditorResponse {
     pub set_easing: Option<Easing>,
 }
 
-const PRESETS: &[(&str, Easing)] = &[
-    ("Linear", Easing::Linear),
-    (
-        "Ease In",
-        Easing::CubicBezier {
-            x1: 0.42,
-            y1: 0.0,
-            x2: 1.0,
-            y2: 1.0,
-        },
-    ),
-    (
-        "Ease Out",
-        Easing::CubicBezier {
-            x1: 0.0,
-            y1: 0.0,
-            x2: 0.58,
-            y2: 1.0,
-        },
-    ),
-    (
-        "Ease In-Out",
-        Easing::CubicBezier {
-            x1: 0.42,
-            y1: 0.0,
-            x2: 0.58,
-            y2: 1.0,
-        },
-    ),
-];
+/// Presets as `(group, [(name, easing)])`, in the order the panel shows them.
+/// The "Back" trio are plain Béziers (draggable afterwards); Elastic and
+/// Bounce are their own curves a single cubic cannot express.
+fn preset_groups() -> Vec<(&'static str, Vec<(&'static str, Easing)>)> {
+    let bez = |x1, y1, x2, y2| Easing::CubicBezier { x1, y1, x2, y2 };
+    vec![
+        (
+            "Basic",
+            vec![
+                ("Linear", Easing::Linear),
+                ("Ease In", bez(0.42, 0.0, 1.0, 1.0)),
+                ("Ease Out", bez(0.0, 0.0, 0.58, 1.0)),
+                ("Ease In-Out", bez(0.42, 0.0, 0.58, 1.0)),
+            ],
+        ),
+        (
+            "Anticipation / overshoot",
+            vec![
+                ("Back In", Easing::BACK_IN),
+                ("Back Out", Easing::BACK_OUT),
+                ("Back In-Out", Easing::BACK_IN_OUT),
+            ],
+        ),
+        (
+            "Elastic",
+            vec![
+                ("Elastic In", Easing::elastic(EaseForm::In)),
+                ("Elastic Out", Easing::elastic(EaseForm::Out)),
+                ("Elastic In-Out", Easing::elastic(EaseForm::InOut)),
+            ],
+        ),
+        (
+            "Bounce",
+            vec![
+                ("Bounce In", Easing::bounce(EaseForm::In)),
+                ("Bounce Out", Easing::bounce(EaseForm::Out)),
+                ("Bounce In-Out", Easing::bounce(EaseForm::InOut)),
+            ],
+        ),
+    ]
+}
 
 /// Draw the panel.
 ///
@@ -167,25 +183,41 @@ pub fn motion_editor_panel(
         Stroke::new(1.5, Color32::from_gray(120)),
     ));
 
+    let bezier = easing.is_bezier_like();
+    let accent = Color32::from_rgb(0x6C, 0x8E, 0xBF);
+    if !bezier {
+        // Elastic / Bounce: no handles to drag, so the sampled curve itself
+        // is the accent line.
+        let samples: Vec<Pos2> = (0..=96)
+            .map(|i| {
+                let t = i as f64 / 96.0;
+                to_screen(t, easing.apply(t))
+            })
+            .collect();
+        painter.add(egui::Shape::line(samples, Stroke::new(2.0, accent)));
+    }
+
     // The editable bezier, and its handle guide-lines.
     let p0 = to_screen(0.0, 0.0);
     let h1 = to_screen(cp[0], cp[1]);
     let h2 = to_screen(cp[2], cp[3]);
     let p3 = to_screen(1.0, 1.0);
-    let accent = Color32::from_rgb(0x6C, 0x8E, 0xBF);
-    painter.add(egui::Shape::CubicBezier(
-        egui::epaint::CubicBezierShape::from_points_stroke(
-            [p0, h1, h2, p3],
-            false,
-            Color32::TRANSPARENT,
-            Stroke::new(2.0, accent),
-        ),
-    ));
-    painter.line_segment([p0, h1], Stroke::new(1.0, accent.gamma_multiply(0.5)));
-    painter.line_segment([p3, h2], Stroke::new(1.0, accent.gamma_multiply(0.5)));
+    if bezier {
+        painter.add(egui::Shape::CubicBezier(
+            egui::epaint::CubicBezierShape::from_points_stroke(
+                [p0, h1, h2, p3],
+                false,
+                Color32::TRANSPARENT,
+                Stroke::new(2.0, accent),
+            ),
+        ));
+        painter.line_segment([p0, h1], Stroke::new(1.0, accent.gamma_multiply(0.5)));
+        painter.line_segment([p3, h2], Stroke::new(1.0, accent.gamma_multiply(0.5)));
+    }
 
     // -- the two draggable handles ------------------------------------------
-    for (i, centre) in [h1, h2].into_iter().enumerate() {
+    let handles = if bezier { vec![h1, h2] } else { Vec::new() };
+    for (i, centre) in handles.into_iter().enumerate() {
         let handle_rect = Rect::from_center_size(centre, vec2(16.0, 16.0));
         let resp = ui.interact(
             handle_rect,
@@ -214,23 +246,57 @@ pub fn motion_editor_panel(
         painter.circle_stroke(centre, 5.0, Stroke::new(1.0, Color32::WHITE));
     }
 
+    // -- the one parameter of the non-Bézier curves --------------------------
+    match easing {
+        Easing::Elastic { form, oscillations } => {
+            let mut n = oscillations;
+            ui.horizontal(|ui| {
+                ui.label("Oscillations");
+                if ui
+                    .add(egui::DragValue::new(&mut n).range(0.5..=12.0).speed(0.05))
+                    .changed()
+                {
+                    out.set_easing = Some(Easing::Elastic {
+                        form,
+                        oscillations: n,
+                    });
+                }
+            });
+        }
+        Easing::Bounce { form, bounces } => {
+            let mut n = bounces;
+            ui.horizontal(|ui| {
+                ui.label("Bounces");
+                if ui.add(egui::DragValue::new(&mut n).range(0..=10)).changed() {
+                    out.set_easing = Some(Easing::Bounce { form, bounces: n });
+                }
+            });
+        }
+        _ => {}
+    }
+
     // -- presets ------------------------------------------------------------
     ui.add_space(6.0);
-    ui.horizontal_wrapped(|ui| {
-        for (name, preset) in PRESETS {
-            if ui.button(*name).clicked() {
-                out.set_easing = Some(*preset);
+    for (group, presets) in preset_groups() {
+        ui.label(RichText::new(group).small().weak());
+        ui.horizontal_wrapped(|ui| {
+            for (name, preset) in presets {
+                if ui.button(name).clicked() {
+                    out.set_easing = Some(preset);
+                }
             }
-        }
-    });
-    ui.label(
-        RichText::new(format!(
-            "({:.2}, {:.2}) ({:.2}, {:.2})",
-            cp[0], cp[1], cp[2], cp[3]
-        ))
-        .small()
-        .weak(),
-    );
+        });
+    }
+    if bezier {
+        ui.label(
+            RichText::new(format!(
+                "({:.2}, {:.2}) ({:.2}, {:.2})",
+                cp[0], cp[1], cp[2], cp[3]
+            ))
+            .small()
+            .weak(),
+        );
+    }
 
     out
 }
@@ -273,9 +339,37 @@ mod tests {
         // A preset must map onto a real curve the renderer can apply — and its
         // endpoints must hold (apply(0)=0, apply(1)=1), which is the contract of
         // an easing.
-        for (_, preset) in PRESETS {
-            assert!(preset.apply(0.0).abs() < 1e-6);
-            assert!((preset.apply(1.0) - 1.0).abs() < 1e-6);
+        for (_, presets) in preset_groups() {
+            for (_, preset) in presets {
+                assert!(preset.apply(0.0).abs() < 1e-6);
+                assert!((preset.apply(1.0) - 1.0).abs() < 1e-6);
+            }
         }
+    }
+
+    #[test]
+    fn the_back_elastic_and_bounce_presets_are_offered() {
+        let names: Vec<&str> = preset_groups()
+            .into_iter()
+            .flat_map(|(_, p)| p)
+            .map(|(n, _)| n)
+            .collect();
+        for want in [
+            "Back In",
+            "Back Out",
+            "Back In-Out",
+            "Elastic Out",
+            "Bounce Out",
+            "Bounce In-Out",
+        ] {
+            assert!(names.contains(&want), "{want} missing");
+        }
+    }
+
+    #[test]
+    fn only_bezier_curves_get_handles() {
+        assert!(Easing::BACK_OUT.is_bezier_like());
+        assert!(!Easing::elastic(EaseForm::Out).is_bezier_like());
+        assert!(!Easing::bounce(EaseForm::In).is_bezier_like());
     }
 }

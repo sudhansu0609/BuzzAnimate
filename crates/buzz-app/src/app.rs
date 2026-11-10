@@ -367,6 +367,25 @@ const WHEEL_ZOOM_STEP: f64 = 1.18;
 /// feeds writes after a pause in drawing, which a five-second poll would blunt
 /// into "up to ten seconds".
 const AUTOSAVE_POLL: Duration = Duration::from_secs(1);
+/// How long a document is left unchanged before File ▸ Auto-Save writes it:
+/// long enough that a burst of edits is one write, short enough that work is
+/// on disk before anyone thinks to reach for Cmd+S.
+const AUTO_SAVE_QUIET: Duration = Duration::from_millis(1500);
+
+/// File ▸ Auto-Save's state between frames.
+struct AutoSaveState {
+    /// The document revision last seen, and when it last changed.
+    revision: Option<u64>,
+    changed_at: Instant,
+    /// The write on the background pool, if one is running.
+    in_flight: Option<std::sync::mpsc::Receiver<(buzz_doc::SavePlan, Result<(), String>)>>,
+}
+
+impl Default for AutoSaveState {
+    fn default() -> Self {
+        Self { revision: None, changed_at: Instant::now(), in_flight: None }
+    }
+}
 
 struct TargetTexture {
     #[allow(dead_code, reason = "kept alive so the view stays valid")]
@@ -452,6 +471,10 @@ pub enum Pick {
     ExportCaptions,
     /// A reference image for AI ▸ Scene from Image.
     AiSceneImage,
+    /// The ComfyUI workflow for AI ▸ Generate Image.
+    GenerateWorkflow,
+    /// A recording to use as the Voices panel's take.
+    VoiceTake,
 }
 
 /// A compact UTC timestamp, `YYYY-MM-DD HHhMM`, for naming a snapshot. Built
@@ -1124,6 +1147,8 @@ pub struct App {
     /// View > Pasteboard Colour…'s open state. The colour itself lives in
     /// `Workspace::pasteboard` — this is only whether the dialog is showing.
     show_pasteboard_dialog: bool,
+    /// AI ▸ Generate Image…: prompts to ComfyUI, the picture into the document.
+    generate_image: crate::generate_image::GenerateImage,
     /// The keyboard-shortcut editor's open/capture state.
     shortcut_editor: buzz_ui::ShortcutEditorState,
     /// The camera panel's between-frames state (the angle name being typed).
@@ -1132,6 +1157,8 @@ pub struct App {
     commands: buzz_doc::CommandLibrary,
     /// The revision the crash snapshot was last taken at.
     last_crash_revision: Option<u64>,
+    /// File ▸ Auto-Save's bookkeeping. See [`App::poll_auto_save`].
+    auto_save: AutoSaveState,
     /// A scene being renamed from the edit bar: its index and the text so far.
     scene_rename: Option<(usize, String)>,
     /// An Animate asset import running on its own thread.
@@ -1149,6 +1176,10 @@ pub struct App {
     /// Top-left of the stage this frame, so the right-click menu can turn a
     /// pointer position into a document point the way the tools do.
     stage_area_min: egui::Pos2,
+    /// While Space is held: whether a mouse button went down during it. A
+    /// press and release with no button between is a tap — Play/Pause; with
+    /// one it was the hold-to-pan gesture and plays nothing.
+    space_held: Option<bool>,
     thumbnails: crate::thumbnails::Thumbnails,
     /// Pictures for the Assets panel. Separate from [`Self::thumbnails`]
     /// because an asset is a file on disk rather than a symbol in the open
@@ -1179,6 +1210,9 @@ pub struct App {
     /// **Window ▸ Storyboard** (STORYBOARD_PLAN S3): the board, its pictures
     /// and the worker that makes and draws them.
     storyboard: crate::storyboard_panel::StoryboardPanel,
+    /// Window ▸ Voices: the take, the voice being designed, who speaks with
+    /// what. See [`crate::voices_panel`].
+    voices: crate::voices_panel::VoicesPanel,
     arrange_rx: Option<crossbeam_channel::Receiver<ArrangeMsg>>,
     /// The open character's loaded document, and the wardrobe and poses derived
     /// from it. Held here rather than re-read from disk every frame: a
@@ -1329,6 +1363,14 @@ pub struct App {
     /// Every section on screen this frame, for a dragged panel to be dropped
     /// on. Filled as the sections are drawn, like `dock_rects`.
     drop_zones: Vec<DropZone>,
+    /// Strips along the edges of the stage for the sides with nothing docked
+    /// on them, so a dragged panel can still be docked there. Filled with the
+    /// columns, like `drop_zones`.
+    edge_zones: Vec<(buzz_ui::Dock, egui::Rect)>,
+    /// The floating section whose window was being moved by its title bar
+    /// last frame — kept so the frame the button comes up on still knows
+    /// what was being carried.
+    window_carry: Option<Vec<buzz_ui::PanelId>>,
     /// The panel being lit up and how brightly, resolved once per frame from
     /// `Workspace::highlight` and the clock.
     highlight_frame: Option<(buzz_ui::PanelId, f32)>,
@@ -1373,6 +1415,15 @@ pub struct App {
     /// Ctrl+W on a dirty tab, or by Quit with any tab dirty. `None` when
     /// nothing is being asked.
     close_prompt: Option<ClosePrompt>,
+    /// Whose Library the Library panel is showing: `None` for the document
+    /// in front, else another open tab's — Animate's Library dropdown.
+    library_source: Option<usize>,
+    /// The panel's own state while it shows another document's Library, kept
+    /// apart so browsing there never moves this document's selection.
+    foreign_library: buzz_ui::LibraryState,
+    /// A symbol is being dragged out of another document's Library, from
+    /// this tab: dropping it on the stage copies it in first.
+    foreign_drag: Option<usize>,
     /// Sequence ▸ Master Audio Mode was chosen once and its confirm is on
     /// the status line; choosing it again turns the mode on. Disarmed by any
     /// other command (`Self::dispatch`).
@@ -1395,6 +1446,14 @@ struct ClosePrompt {
     /// Index into `App::documents` of the tab being asked about.
     index: usize,
     then: CloseThen,
+}
+
+/// What the document tab strip asked for this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabAction {
+    Switch(usize),
+    Close(usize),
+    New,
 }
 
 /// **D2.** Why a document is being asked about before it goes away.
@@ -1467,14 +1526,17 @@ impl App {
             snapshots: buzz_doc::SnapshotLibrary::user(),
             show_snapshots: false,
             show_pasteboard_dialog: false,
+            generate_image: crate::generate_image::GenerateImage::default(),
             shortcut_editor: buzz_ui::ShortcutEditorState::default(),
             camera_panel_state: buzz_ui::CameraPanelState::default(),
             commands: buzz_doc::CommandLibrary::user(),
             last_crash_revision: None,
+            auto_save: AutoSaveState::default(),
             scene_rename: None,
             animate_import: None,
             merging: false,
             stage_area_min: egui::Pos2::ZERO,
+            space_held: None,
             thumbnails: crate::thumbnails::Thumbnails::default(),
             asset_thumbnails: crate::thumbnails::AssetThumbnails::default(),
             arrange: buzz_ui::ArrangeDialogState::default(),
@@ -1491,6 +1553,7 @@ impl App {
             episode_task: None,
             episode_parts_rx: None,
             storyboard: crate::storyboard_panel::StoryboardPanel::default(),
+            voices: crate::voices_panel::VoicesPanel::default(),
             arrange_rx: None,
             cast_sheet: None,
             preview: crate::preview::Preview::default(),
@@ -1530,6 +1593,8 @@ impl App {
             tasks: crate::tasks::TaskRegistry::default(),
             dock_rects: Vec::new(),
             drop_zones: Vec::new(),
+            edge_zones: Vec::new(),
+            window_carry: None,
             highlight_frame: None,
             timeline_tools_slot: None,
             highlight_since: None,
@@ -1543,6 +1608,9 @@ impl App {
             active_document: 0,
             open_queue: std::collections::VecDeque::new(),
             close_prompt: None,
+            library_source: None,
+            foreign_library: buzz_ui::LibraryState::default(),
+            foreign_drag: None,
             master_audio_confirm: false,
         };
         app.recovery = app.find_recoveries();
@@ -2814,6 +2882,9 @@ const KEYBOARD_COMMANDS: &[Command] = &[
     Command::ClearKeyframe,
     Command::CreateClassicTween,
     Command::PlayPause,
+    // D2: the document tabs, Ctrl+Tab / Ctrl+Shift+Tab as in Animate.
+    Command::NextDocument,
+    Command::PreviousDocument,
     Command::NextFrame,
     Command::PreviousFrame,
     Command::FirstFrame,
@@ -3422,6 +3493,11 @@ impl App {
     /// draws, the same way the headless `dock_drag_tests::Drive` harness below
     /// already does from within this module.
     pub(crate) fn build_ui(&mut self, ui: &mut egui::Ui) -> egui::Rect {
+        // A drag from another document's Library that ended anywhere but the
+        // stage leaves nothing behind to mislabel the next drag.
+        if !egui::DragAndDrop::has_payload_of_type::<buzz_ui::library_panel::DraggedSymbol>(ui.ctx()) {
+            self.foreign_drag = None;
+        }
         let mut commands: Vec<Command> = Vec::new();
         self.editor.forget_bone_if_deselected();
         // L3: Focus selection, when the active layer has changed.
@@ -3512,6 +3588,7 @@ impl App {
             let locked = workspace.locked;
             self.dock_rects.clear();
             self.drop_zones.clear();
+            self.edge_zones.clear();
 
             // Every visible section's front panel, on every dock — built once
             // and handed to every `section_header` call, so "Group With" can
@@ -3692,11 +3769,53 @@ impl App {
                     .push((dock, response.response.rect.intersect(window_rect)));
             }
 
+            // **Somewhere to dock on an empty side.** A side with nothing on it
+            // draws no column, and with no column there was nothing to drop a
+            // panel onto — the Far Right column is empty by default, so it
+            // could never be docked to by hand. A strip along that edge of the
+            // stage stands in for it while a panel is carried.
+            {
+                const EDGE: f32 = 24.0;
+                let stage = ui.available_rect_before_wrap();
+                let empty = |dock| workspace.sections(dock).is_empty();
+                let left = egui::Rect::from_min_max(
+                    stage.left_top(),
+                    egui::pos2(stage.left() + EDGE, stage.bottom()),
+                );
+                let right = egui::Rect::from_min_max(
+                    egui::pos2(stage.right() - EDGE, stage.top()),
+                    stage.right_bottom(),
+                );
+                // The far-right column is drawn outside the inner one, so its
+                // strip is the window's own right edge, over the inner column.
+                let far_right = egui::Rect::from_min_max(
+                    egui::pos2(window_rect.right() - EDGE, stage.top()),
+                    egui::pos2(window_rect.right(), stage.bottom()),
+                );
+                let bottom = egui::Rect::from_min_max(
+                    egui::pos2(stage.left(), stage.bottom() - EDGE),
+                    stage.right_bottom(),
+                );
+                if empty(buzz_ui::Dock::Left) {
+                    self.edge_zones.push((buzz_ui::Dock::Left, left));
+                }
+                if empty(buzz_ui::Dock::Right) {
+                    self.edge_zones.push((buzz_ui::Dock::Right, right));
+                } else if empty(buzz_ui::Dock::RightOuter) {
+                    self.edge_zones.push((buzz_ui::Dock::RightOuter, far_right));
+                }
+                if empty(buzz_ui::Dock::Bottom) {
+                    self.edge_zones.push((buzz_ui::Dock::Bottom, bottom));
+                }
+            }
+
             // Floating sections are windows over the stage, movable and
             // resizable unless the layout is locked. A grouped section floats
             // as **one** window with its tabs, which is what "undock these two
             // together" has to mean if grouping is to survive being undocked.
             let floating = workspace.sections(buzz_ui::Dock::Float);
+            // The floating section being moved by its window's title bar.
+            let mut carrying_window: Option<Vec<buzz_ui::PanelId>> = None;
             for section in floating {
                 let slot = workspace.slot(section.front).copied();
                 let mut open = true;
@@ -3754,6 +3873,18 @@ impl App {
                                 .show(ui, |ui| self.draw_panel(ui, section.front, &mut commands));
                         });
                 });
+                // **Moved by its own title bar, a floating window can dock.**
+                // That bar is the handle everyone reaches for, and egui only
+                // ever moved the window with it: carried over a column or a
+                // section it never lit up, and let go there it stayed afloat.
+                // `__title_click` is the id egui gives a window's title bar.
+                if !locked
+                    && ui.ctx().is_being_dragged(
+                        egui::Id::new(("float", section.group)).with("__title_click"),
+                    )
+                {
+                    carrying_window = Some(section.panels.clone());
+                }
                 if let Some(response) = response {
                     let rect = response.response.rect;
                     // Written to every tab in the section, so the window keeps
@@ -3790,7 +3921,16 @@ impl App {
             // section of its own; anywhere else, it floats at that point.
             // The target is outlined while the drag is in progress, so the
             // drop is never a guess.
-            self.drag_docking(ui.ctx(), &mut requests);
+            //
+            // A floating window moved by its title bar is carried the same
+            // way. Its drag has already ended by the frame the button comes
+            // up on, so last frame's carry is what lands.
+            let released = ui.input(|i| i.pointer.any_released());
+            let window_carry = carrying_window
+                .clone()
+                .or_else(|| released.then(|| self.window_carry.take()).flatten());
+            self.window_carry = carrying_window;
+            self.drag_docking(ui.ctx(), window_carry.as_deref(), &mut requests);
 
             let floated: Vec<(buzz_ui::PanelId, (f32, f32))> = requests.floats.clone();
             requests.apply(&mut self.editor.workspace);
@@ -3815,14 +3955,31 @@ impl App {
             // Not collapsible: egui's collapsible panel binds a `&mut bool`
             // the user can also flip, which would let them hide their only way
             // out of a symbol.
+            //
+            // **The document tabs** (D2) lead the same strip: one per open
+            // file, as Animate's tabs sit above its stage. Click to switch, ×
+            // or a middle-click to close, + for a new document. On this row
+            // rather than one of their own, so opening files costs the stage
+            // no height.
             {
+                let mut tab_action = None;
                 egui::Panel::top("breadcrumb")
                     .frame(egui::Frame::new().fill(Palette::bg()).inner_margin(3))
                     .show(ui, |ui| {
-                        if let Some(command) = self.breadcrumb(ui) {
-                            commands.push(command);
-                        }
+                        ui.horizontal(|ui| {
+                            tab_action = self.document_tabs(ui);
+                            ui.separator();
+                            if let Some(command) = self.breadcrumb(ui) {
+                                commands.push(command);
+                            }
+                        });
                     });
+                match tab_action {
+                    Some(TabAction::Switch(i)) => self.switch_to_tab(i),
+                    Some(TabAction::Close(i)) => self.request_close_tab(i),
+                    Some(TabAction::New) => commands.push(Command::New),
+                    None => {}
+                }
             }
 
             // Whatever is left is the stage.
@@ -3927,6 +4084,7 @@ impl App {
         // everything, and gates pointer input to the document beneath it.
         self.script_overlay(&ctx);
         self.quit_prompt_dialog(&ctx);
+        self.close_prompt_dialog(&ctx);
         self.export_dialog(&ctx);
         self.lip_sync_dialog(&ctx);
         self.staging_dialog(&ctx);
@@ -3943,6 +4101,12 @@ impl App {
         self.snapshots_dialog(&ctx);
         self.estate_dialog(&ctx);
         self.pasteboard_colour_dialog(&ctx);
+        if let Some(crate::generate_image::Action::BrowseWorkflow) = self.generate_image.show(&ctx, &mut self.editor) {
+            self.ask_for_path(
+                crate::dialogs::Request::open_file().filter("ComfyUI workflow", &["json"]),
+                Pick::GenerateWorkflow,
+            );
+        }
         // The shortcut editor writes straight into the workspace keymap; save it
         // when it reports a change, the way every other preference is saved.
         if buzz_ui::shortcut_editor(&ctx, &mut self.shortcut_editor, &mut self.editor.workspace) {
@@ -3994,7 +4158,17 @@ impl App {
         // File ▸ New asks before it acts, and the answer is remembered.
         let new_document = buzz_ui::new_document_dialog(&ctx, &mut self.editor.new_document);
         if let Some(setup) = new_document.create {
-            self.editor.create_document(setup);
+            // **A new tab** (D2): File ▸ New opens beside what is already
+            // open — replacing the document in front threw its work away.
+            let setup = setup.sane();
+            self.open_document_in_new_tab(crate::editor::Editor::build_new_document(&setup));
+            self.editor.zoom_fit();
+            self.editor.workspace.new_document = setup;
+            self.editor.workspace.save();
+            self.editor.status = Some(format!(
+                "New document \u{2014} {:.0} \u{00D7} {:.0} at {:.0} fps",
+                setup.width, setup.height, setup.frame_rate
+            ));
         }
         // Insert > Title Card: one undo step, at the playhead.
         let title_card = buzz_ui::title_card_dialog(&ctx, &mut self.editor.title_card);
@@ -4148,6 +4322,7 @@ impl App {
         }
 
         commands.extend(keyboard_commands(&ctx, &mut self.editor));
+        commands.extend(self.space_tap(&ctx));
         // While a script owns the document — or an import is being merged —
         // nothing else may touch it, keyboard shortcuts included, which the
         // modal backdrop does not catch. The one thing still live is the
@@ -4867,6 +5042,42 @@ impl App {
         }
     }
 
+    /// **A tap of Space plays and pauses**, as in most editors an animator
+    /// comes from; holding Space and dragging still pans the stage. Decided
+    /// on release: a mouse button pressed while Space was down makes it a pan.
+    /// Skipped while a widget has keyboard focus (a space is being typed, or
+    /// egui is about to press the focused button) and when the user has bound
+    /// Play/Pause to Space themselves, which the keymap already handles.
+    fn space_tap(&mut self, ctx: &egui::Context) -> Option<Command> {
+        let bound_to_space = self
+            .editor
+            .workspace
+            .shortcut_for(Command::PlayPause)
+            .is_some_and(|s| s.logical_key == egui::Key::Space);
+        if ctx.memory(|m| m.focused().is_some()) || bound_to_space {
+            self.space_held = None;
+            return None;
+        }
+        let (down, pointer, plain) =
+            ctx.input(|i| (i.key_down(egui::Key::Space), i.pointer.any_down(), i.modifiers.is_none()));
+        match (&mut self.space_held, down) {
+            (None, true) => {
+                self.space_held = Some(pointer || !plain);
+                None
+            }
+            (Some(used), true) => {
+                *used |= pointer || !plain;
+                None
+            }
+            (Some(used), false) => {
+                let tap = !*used;
+                self.space_held = None;
+                tap.then_some(Command::PlayPause)
+            }
+            (None, false) => None,
+        }
+    }
+
     /// Commands a person may still raise while the Assistant runs: view,
     /// layout and playback only. Everything else would edit the document.
     pub(crate) fn user_command_allowed(&self, command: Command) -> bool {
@@ -4884,6 +5095,7 @@ impl App {
                 | ZoomShowFrame
                 | ZoomShowAll
                 | ToggleRulers
+                | ToggleAutoSave
                 | ToggleGrid
                 | ToggleGuides
                 | ToggleSnapping
@@ -4902,6 +5114,7 @@ impl App {
                 | SaveWorkspace
                 | ShortcutEditor
                 | AiModels
+                | AiGenerateImage
                 | VoicePushToTalk
                 | VoiceMute
                 | PlayPause
@@ -5522,6 +5735,40 @@ impl App {
                     self.usage_cache.spawned(revision, receive);
                 }
 
+                // **Animate's Library dropdown**: with more than one document
+                // open, any of their Libraries can be shown here, and its
+                // symbols dragged onto this stage or copied in.
+                if self.library_source.is_some_and(|i| i >= self.documents.len() || i == self.active_document) {
+                    self.library_source = None;
+                }
+                if self.documents.len() > 1 {
+                    let current = self.library_source;
+                    let name_of = |app: &App, i: Option<usize>| match i {
+                        None => format!("{} (this document)", app.tab_label(app.active_document).trim_end_matches('*')),
+                        Some(i) => app.tab_label(i).trim_end_matches('*').to_string(),
+                    };
+                    let mut chosen = current;
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Library of").small().weak());
+                        egui::ComboBox::from_id_salt("library-source")
+                            .selected_text(name_of(self, current))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut chosen, None, name_of(self, None));
+                                for i in (0..self.documents.len()).filter(|&i| i != self.active_document) {
+                                    ui.selectable_value(&mut chosen, Some(i), name_of(self, Some(i)));
+                                }
+                            });
+                    });
+                    if chosen != current {
+                        self.library_source = chosen;
+                        self.foreign_library = buzz_ui::LibraryState::default();
+                    }
+                }
+                if let Some(source) = self.library_source {
+                    self.foreign_library_panel(ui, source);
+                    return;
+                }
+
                 let editor = &mut self.editor;
                 let library = &mut editor.library;
                 let thumbnails = &mut self.thumbnails;
@@ -5615,6 +5862,7 @@ impl App {
             }
             MotionEditor => self.motion_editor_panel(ui),
             Sequence => self.sequence_panel(ui),
+            Voices => self.voices_panel(ui),
         }
     }
 
@@ -6037,6 +6285,69 @@ impl App {
         }
         if response.lip_sync {
             self.dispatch(Command::LipSync);
+        }
+    }
+
+    /// **Window ▸ Voices.** The panel draws itself and asks for two things:
+    /// a file for the take, and putting the take on the timeline as one
+    /// character's line — re-voiced, on that character's `Voice:` layer at
+    /// the playhead, and only that character's mouth lip-synced over it, as
+    /// one undo step.
+    fn voices_panel(&mut self, ui: &mut egui::Ui) {
+        let root = self.editor.assets.root().map(std::path::Path::to_path_buf);
+        let frame = self.editor.current_frame;
+        let (cast, selected) = {
+            let scene = self.editor.doc.scene();
+            let cast = crate::voices::stage_characters(scene, frame);
+            let selected = self
+                .editor
+                .selection
+                .ids()
+                .into_iter()
+                .find_map(|id| crate::voices::character_of(scene, id));
+            (cast, selected)
+        };
+        let action = self.voices.ui(ui, root.as_deref(), &cast, selected.as_ref(), frame);
+        match action {
+            Some(crate::voices_panel::VoicesAction::ImportTake) => {
+                self.ask_for_path(
+                    crate::dialogs::Request::open_file()
+                        .title("Take for the Voices panel")
+                        .filter("Sound", &["wav", "mp3", "ogg", "flac", "m4a", "aac", "aiff", "aif"]),
+                    Pick::VoiceTake,
+                );
+            }
+            Some(crate::voices_panel::VoicesAction::PlaceLine { character, voice, emotion, intensity }) => {
+                let (Some(who), Some(take)) = (cast.iter().find(|c| c.name == character).cloned(), self.voices.take.clone())
+                else {
+                    return;
+                };
+                let mut outcome = None;
+                self.editor.doc.edit("Voice Line", |scene| {
+                    outcome = Some(crate::voices::place_line(scene, &who, &take, voice.as_ref(), emotion, intensity, frame));
+                });
+                self.editor.doc.end_gesture();
+                let scene = self.editor.doc.scene().clone();
+                self.editor.sound.refresh(&scene);
+                self.voices.status = match outcome {
+                    Some(Ok(placed)) => {
+                        let mouth = match placed.mouth_keys {
+                            Some(n) => format!("{n} mouth keys on {}", who.name),
+                            None => format!("{} has no mouth to sync", who.name),
+                        };
+                        format!(
+                            "{}'s line at frames {}\u{2013}{}{}; {mouth}",
+                            who.name,
+                            placed.frames.start + 1,
+                            placed.frames.end,
+                            if placed.voiced { "" } else { " (as recorded)" }
+                        )
+                    }
+                    Some(Err(e)) => format!("Could not put the line on: {e}"),
+                    None => String::new(),
+                };
+            }
+            None => {}
         }
     }
 
@@ -7046,6 +7357,20 @@ impl App {
                         LayerIcon::Eye => l.visible = target,
                         LayerIcon::Lock => l.locked = target,
                         LayerIcon::Outline => l.outline = target,
+                    });
+                }
+            });
+        }
+        if let Some(kinds) = response.set_kinds {
+            // The timeline's Mask / Layer Type: one undo step for the pair.
+            let label = if kinds.iter().any(|(_, k, _)| *k == buzz_scene::LayerKind::Mask) { "Mask" } else { "Layer Type" };
+            self.editor.doc.edit(label, |scene| {
+                for (id, kind, lock) in kinds {
+                    scene.update_layer(id, |l| {
+                        l.kind = kind;
+                        if lock {
+                            l.locked = true;
+                        }
                     });
                 }
             });
@@ -8066,24 +8391,30 @@ impl App {
             let ctx = response.ctx.clone();
             ctx.data_mut(|d| d.insert_temp(egui::Id::new("stage-context-probe"), true));
         }
-        response.context_menu(|ui| {
-            // A right-click on artwork that is not selected selects it first,
-            // which is what every editor does: the menu is about the thing you
-            // pointed at, not about whatever was chosen before.
-            if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
-                let local = buzz_geom::Point::new(
-                    (pos.x - self.stage_area_min.x) as f64,
-                    (pos.y - self.stage_area_min.y) as f64,
-                );
-                let point = self.editor.screen_to_edit(local);
-                if let Some(id) = self.editor.object_at(point, self.editor.pick_tolerance())
-                    && !self.editor.selection.contains(id)
-                {
-                    self.editor.selection.select_one(id);
-                }
+        // A right-click on artwork that is not selected selects it first,
+        // which is what every editor does: the menu is about the thing you
+        // pointed at, not about whatever was chosen before.
+        //
+        // **Once, where the click was** — not inside the menu, which runs
+        // every frame it is open. There the pointer is wherever it has got to
+        // on its way to an entry, so artwork lying under "Delete" was selected
+        // in place of what was right-clicked, and the command went to it.
+        if response.secondary_clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let local = buzz_geom::Point::new(
+                (pos.x - self.stage_area_min.x) as f64,
+                (pos.y - self.stage_area_min.y) as f64,
+            );
+            let point = self.editor.screen_to_edit(local);
+            if let Some(id) = self.editor.object_at(point, self.editor.pick_tolerance())
+                && !self.editor.selection.contains(id)
+            {
+                self.editor.selection.select_one(id);
             }
-            let has_selection = has_selection || !self.editor.selection.is_empty();
-
+        }
+        let has_selection = has_selection || !self.editor.selection.is_empty();
+        response.context_menu(|ui| {
             let mut item = |ui: &mut egui::Ui, command: Command, enabled: bool| {
                 if ui
                     .add_enabled(enabled, egui::Button::new(command.label()))
@@ -8211,7 +8542,33 @@ impl App {
                     egui::DragAndDrop::take_payload::<buzz_ui::library_panel::DraggedSymbol>(&ctx)
                     && let Some(p) = ctx.input(|i| i.pointer.interact_pos())
                 {
-                    self.editor.place_symbol_at(dropped.0, local(p));
+                    // From another document's Library: copied in first, then
+                    // placed — the dropped id is that document's, not this one's.
+                    let symbol = match self.foreign_drag.take() {
+                        Some(source) => self.use_foreign_symbol(source, dropped.0),
+                        None => Some(dropped.0),
+                    };
+                    if let Some(symbol) = symbol {
+                        self.editor.place_symbol_at(symbol, local(p));
+                    }
+                }
+                self.foreign_drag = None;
+                return;
+            }
+        }
+
+        // **A picture dragged out of the Library's Images folder**, placed
+        // where it is let go — the same as a symbol above.
+        if egui::DragAndDrop::has_payload_of_type::<buzz_ui::library_panel::DraggedImage>(&ctx) {
+            let over = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|p| area.contains(p));
+            if over {
+                ctx.set_cursor_icon(egui::CursorIcon::Copy);
+            }
+            if over && ctx.input(|i| i.pointer.any_released()) {
+                if let Some(dropped) = egui::DragAndDrop::take_payload::<buzz_ui::library_panel::DraggedImage>(&ctx)
+                    && let Some(p) = ctx.input(|i| i.pointer.interact_pos())
+                {
+                    self.editor.place_library_image_at(dropped.0, local(p));
                 }
                 return;
             }
@@ -8585,7 +8942,13 @@ impl App {
             Command::Open => self.open_dialog(),
             Command::Save => self.save(false),
             Command::SaveAs => self.save(true),
-            Command::Close => self.request_quit(),
+            // Cmd+W closes the document in front, not the program (D2).
+            Command::Close => self.request_close_tab(self.active_document),
+            // Through the same door as the window's close button, so unsaved
+            // documents and running exports are asked about first.
+            Command::Quit => self.request_quit(),
+            Command::NextDocument => self.cycle_tab(1),
+            Command::PreviousDocument => self.cycle_tab(-1),
             Command::ImportToStage => self.import_dialog(buzz_scene::ImportTarget::Stage),
             Command::ImportToLibrary => self.import_dialog(buzz_scene::ImportTarget::Library),
             // A script drives the whole document and can run for seconds, so it
@@ -8602,6 +8965,7 @@ impl App {
             }
             Command::ShortcutEditor => self.shortcut_editor.open(),
             Command::PasteboardColour => self.show_pasteboard_dialog = true,
+            Command::AiGenerateImage => self.generate_image.open = true,
             Command::TestMovie => self.toggle_test_movie(),
             // The VLM call and the LLM call are both seconds of network I/O —
             // too slow for the UI thread, and a file dialog besides for the
@@ -9327,6 +9691,7 @@ impl App {
             Pick::VideoReference => self.video_reference_from(path),
             Pick::SequenceFolder => self.sequence_folder_from(path),
             Pick::ImportSound => self.import_sound_from(path),
+            Pick::VoiceTake => self.voices.load_take(&path),
             Pick::SetMasterAudio => self.set_master_audio_from(path),
             Pick::SetMasterAudioForMode => {
                 self.set_master_audio_from(path);
@@ -9348,6 +9713,7 @@ impl App {
             Pick::Export(kind) => self.start_export(kind, path),
             Pick::ExportFla => self.export_fla_to(path),
             Pick::AiSceneImage => self.ai_scene_from_image_from(path),
+            Pick::GenerateWorkflow => self.generate_image.set_workflow(path),
         }
     }
 
@@ -12180,6 +12546,12 @@ impl App {
         if response.add_wiggle {
             self.editor.add_wiggle(&mut state);
         }
+        if response.add_pendulum {
+            self.editor.add_pendulum(&mut state);
+        }
+        if response.add_hair {
+            self.editor.add_hair_motion(&mut state);
+        }
         self.editor.staging = state;
     }
 
@@ -12766,6 +13138,21 @@ impl App {
     /// flight — minutes of GPU time and a file half-written to disk — the quit
     /// waits behind a prompt rather than throwing it away.
     fn request_quit(&mut self) {
+        // **Unsaved documents first** (D2): each dirty tab is asked about in
+        // turn — `close_prompt_dialog` comes back here after every answer —
+        // and only once none is left does quitting go on. With Auto-Save on,
+        // a document that has a file is simply written now.
+        if self.close_prompt.is_some() {
+            return;
+        }
+        if let Some(index) = self.next_unsaved_tab() {
+            self.switch_to_tab(index);
+            self.close_prompt = Some(ClosePrompt { index: self.active_document, then: CloseThen::Quit });
+            if let Some(active) = &self.active {
+                active.window.request_redraw();
+            }
+            return;
+        }
         // The Assistant must not keep editing a document that is going away.
         self.agent_abort("The app is closing, so the Assistant stopped.");
         if self.tasks.quit_blockers().is_empty() {
@@ -13396,6 +13783,281 @@ impl App {
         self.active_document = index;
     }
 
+    /// The label a tab shows: the file's name, `*` when unsaved, and the
+    /// untitled ones numbered as Animate numbers them (Untitled-1, -2…).
+    fn tab_label(&self, i: usize) -> String {
+        let doc = self.tab_document(i);
+        let dirty = if doc.is_dirty() { "*" } else { "" };
+        if doc.path().is_some() || doc.origin().is_some() {
+            return format!("{}{dirty}", doc.title());
+        }
+        let n = (0..=i).filter(|&j| {
+            let d = self.tab_document(j);
+            d.path().is_none() && d.origin().is_none()
+        }).count();
+        format!("Untitled-{n}{dirty}")
+    }
+
+    /// Draw the tab strip; what it asked for, if anything.
+    fn document_tabs(&mut self, ui: &mut egui::Ui) -> Option<TabAction> {
+        let mut action = None;
+        {
+            {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for i in 0..self.documents.len() {
+                        let active = i == self.active_document;
+                        let label = self.tab_label(i);
+                        let tip = self
+                            .tab_document(i)
+                            .path()
+                            .or(self.tab_document(i).origin())
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "Not saved yet".into());
+                        let fill = if active { Palette::panel() } else { Palette::bg() };
+                        egui::Frame::new()
+                            .fill(fill)
+                            .stroke(egui::Stroke::new(1.0, if active { Palette::active() } else { Palette::hairline() }))
+                            .corner_radius(egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 })
+                            .inner_margin(egui::Margin { left: 6, right: 0, top: 0, bottom: 0 })
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    let text = egui::RichText::new(&label).small();
+                                    let text = if active { text.strong() } else { text };
+                                    let tab = ui
+                                        .add(egui::Label::new(text).sense(egui::Sense::click()).selectable(false))
+                                        .on_hover_text(&tip);
+                                    if tab.clicked() {
+                                        action = Some(TabAction::Switch(i));
+                                    }
+                                    if tab.middle_clicked() {
+                                        action = Some(TabAction::Close(i));
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Button::new(egui::RichText::new("\u{d7}").small())
+                                                .frame(false)
+                                                .min_size(egui::vec2(24.0, 24.0)),
+                                        )
+                                        .on_hover_text("Close (Cmd+W)")
+                                        .clicked()
+                                    {
+                                        action = Some(TabAction::Close(i));
+                                    }
+                                });
+                            });
+                    }
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("+").small()).frame(false).min_size(egui::vec2(24.0, 24.0)))
+                        .on_hover_text("New document")
+                        .clicked()
+                    {
+                        action = Some(TabAction::New);
+                    }
+                });
+            }
+        }
+        action
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab: the next or previous tab, round the end.
+    fn cycle_tab(&mut self, step: isize) {
+        let n = self.documents.len() as isize;
+        if n > 1 {
+            let next = (self.active_document as isize + step).rem_euclid(n) as usize;
+            self.switch_to_tab(next);
+        }
+    }
+
+    /// The first tab, from the one in front, whose unsaved changes would be
+    /// lost by quitting. With Auto-Save on, any of them that has a file is
+    /// written here and so is not one.
+    fn next_unsaved_tab(&mut self) -> Option<usize> {
+        let n = self.documents.len();
+        let order = (0..n).map(|k| (self.active_document + k) % n);
+        let mut found = None;
+        for i in order {
+            let auto = self.editor.workspace.auto_save;
+            let doc = if i == self.active_document { &mut self.editor.doc } else { &mut self.documents[i].doc };
+            if !doc.is_dirty() {
+                continue;
+            }
+            if auto && doc.path().is_some() && doc.save().is_ok() {
+                continue;
+            }
+            found = Some(i);
+            break;
+        }
+        found
+    }
+
+    /// Another open document's Library, read-only: browse it, drag a symbol
+    /// onto this stage, or copy the selected one in. What the panel would
+    /// change there is thrown away — that document is edited in its own tab.
+    fn foreign_library_panel(&mut self, ui: &mut egui::Ui, source: usize) {
+        let mut scene = self.tab_document(source).scene().clone();
+        let usage = scene.symbol_usage();
+        // Its own thumbnails are not this document's: ids collide.
+        let _ = buzz_ui::library_panel(ui, &mut scene, &mut self.foreign_library, &usage, &mut |_| None);
+        if egui::DragAndDrop::has_payload_of_type::<buzz_ui::library_panel::DraggedSymbol>(ui.ctx()) {
+            self.foreign_drag = Some(source);
+        }
+        ui.separator();
+        ui.label(
+            egui::RichText::new("From another document: drag a symbol onto the stage, or copy it into this one.")
+                .small()
+                .weak(),
+        );
+        let selected = self.foreign_library.selected;
+        if ui
+            .add_enabled(selected.is_some(), egui::Button::new("Use in This Document"))
+            .on_hover_text("Copy the selected symbol, and every symbol it uses, into this document's Library")
+            .clicked()
+            && let Some(id) = selected
+        {
+            self.use_foreign_symbol(source, id);
+        }
+    }
+
+    /// Copy symbol `id` of tab `source` into the document in front, with
+    /// everything it uses; its id here.
+    fn use_foreign_symbol(&mut self, source: usize, id: buzz_scene::SymbolId) -> Option<buzz_scene::SymbolId> {
+        let other = self.tab_document(source).scene().clone();
+        let from = self.tab_label(source).trim_end_matches('*').to_string();
+        let mut copied = None;
+        self.editor.doc.edit("Use Symbol", |scene| copied = scene.import_symbol(&other, id));
+        self.editor.doc.end_gesture();
+        match &copied {
+            Some((new, report)) => {
+                let name = self.editor.doc.scene().library().get(*new).map(|s| s.name.clone()).unwrap_or_default();
+                let more = report.symbols.saturating_sub(1);
+                let extra = if more > 0 { format!(" and {more} symbol(s) it uses") } else { String::new() };
+                self.editor.status = Some(format!("Copied \u{201c}{name}\u{201d}{extra} from {from}"));
+                self.editor.library.selected = Some(*new);
+            }
+            None => self.editor.status = Some(format!("{from} no longer has that symbol")),
+        }
+        copied.map(|(new, _)| new)
+    }
+
+    /// Cmd+W / a tab's ×: close tab `index`, asking first if it has unsaved
+    /// changes — unless Auto-Save can simply write them.
+    fn request_close_tab(&mut self, index: usize) {
+        if index >= self.documents.len() || self.close_prompt.is_some() {
+            return;
+        }
+        let auto = self.editor.workspace.auto_save;
+        let doc = if index == self.active_document { &mut self.editor.doc } else { &mut self.documents[index].doc };
+        let saved_now = auto && doc.is_dirty() && doc.path().is_some() && doc.save().is_ok();
+        if doc.is_dirty() && !saved_now {
+            self.switch_to_tab(index);
+            self.close_prompt = Some(ClosePrompt { index: self.active_document, then: CloseThen::CloseTab });
+            return;
+        }
+        self.close_tab(index);
+    }
+
+    /// Close tab `index` now, unsaved changes and all. The last one closing
+    /// leaves a fresh untitled document, so there is always one to work in.
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.documents.len() {
+            return;
+        }
+        if index != self.active_document {
+            let mut gone = self.documents.remove(index);
+            gone.doc.discard_recovery();
+            if index < self.active_document {
+                self.active_document -= 1;
+            }
+            return;
+        }
+        let (incoming, view) = if self.documents.len() == 1 {
+            let doc = crate::editor::Editor::build_new_document(&self.editor.workspace.new_document.sane());
+            let view = crate::editor::DocView::fresh(&doc);
+            (doc, view)
+        } else {
+            // The tab to the right takes its place, else the one to the left.
+            let next = if index + 1 < self.documents.len() { index + 1 } else { index - 1 };
+            (std::mem::take(&mut self.documents[next].doc), std::mem::take(&mut self.documents[next].view))
+        };
+        let (mut gone, _) = self.activate_document_keeping(incoming, view, false);
+        gone.discard_recovery();
+        buzz_doc::autosave::forget_crash_snapshot();
+        if self.documents.len() == 1 {
+            self.editor.zoom_fit();
+            return;
+        }
+        let next = if index + 1 < self.documents.len() { index + 1 } else { index - 1 };
+        self.documents.remove(index);
+        self.active_document = if next > index { next - 1 } else { next };
+    }
+
+    /// "Save changes to … ?" for the tab `close_prompt` names: Save, Don't
+    /// Save, or Cancel — then on to closing that tab, or to the next unsaved
+    /// one when quitting.
+    fn close_prompt_dialog(&mut self, ctx: &egui::Context) {
+        let Some(ClosePrompt { index, then }) = self.close_prompt else {
+            return;
+        };
+        if index != self.active_document {
+            self.switch_to_tab(index);
+        }
+        let name = self.tab_label(self.active_document).trim_end_matches('*').to_string();
+        let mut choice = None;
+        egui::Modal::new(egui::Id::new("close-prompt")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading(format!("Save changes to \u{201c}{name}\u{201d}?"));
+            ui.label(match then {
+                CloseThen::CloseTab => "Your changes will be lost if you close it without saving.",
+                CloseThen::Quit => "Your changes will be lost if you quit without saving.",
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    choice = Some(0);
+                }
+                if ui.button("Don't Save").clicked() {
+                    choice = Some(1);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(2);
+                }
+            });
+        });
+        let Some(choice) = choice else {
+            return;
+        };
+        self.close_prompt = None;
+        match choice {
+            0 if self.editor.doc.path().is_none() => {
+                // Nowhere to save it yet: Save As, and the close waits for the
+                // user to try again once it has a file.
+                self.save(true);
+                return;
+            }
+            0 => {
+                if let Err(e) = self.editor.doc.save() {
+                    self.editor.status = Some(format!("Could not save: {e}"));
+                    return;
+                }
+            }
+            1 => {}
+            _ => return,
+        }
+        match then {
+            CloseThen::CloseTab => self.close_tab(self.active_document),
+            CloseThen::Quit => {
+                if choice == 1 {
+                    // Not asked about again on the way out.
+                    self.editor.doc.discard_recovery();
+                    self.editor.doc.mark_clean();
+                }
+                self.request_quit();
+            }
+        }
+    }
+
     /// Swap `doc`/`view` into the editor, flush the outgoing document's
     /// autosave and crash snapshot if it is dirty (see the note below), and
     /// reset the per-document caches that must not leak between tabs.
@@ -13405,6 +14067,18 @@ impl App {
         doc: Document,
         view: crate::editor::DocView,
     ) -> (Document, crate::editor::DocView) {
+        self.activate_document_keeping(doc, view, true)
+    }
+
+    /// [`Self::activate_document`]; `keep` false when the outgoing document
+    /// is being thrown away (Close ▸ Don't Save), so it is neither auto-saved
+    /// nor snapshotted for recovery on its way out.
+    fn activate_document_keeping(
+        &mut self,
+        doc: Document,
+        view: crate::editor::DocView,
+        keep: bool,
+    ) -> (Document, crate::editor::DocView) {
         let (mut outgoing_doc, outgoing_view) = self.editor.swap_document(doc, view);
 
         // **A background tab cannot change** — every edit runs through
@@ -13413,7 +14087,18 @@ impl App {
         // bringing up to date is right here, as it stops being active. A
         // periodic per-tab tick would do the same thing far more often for
         // no benefit, since nothing can touch it again until it is focused.
-        if outgoing_doc.is_dirty() {
+        // File ▸ Auto-Save: a tab left with unsaved changes is written to its
+        // own file now, while it is still to hand — nothing reaches a
+        // background tab to save it later.
+        if keep
+            && self.editor.workspace.auto_save
+            && outgoing_doc.is_dirty()
+            && outgoing_doc.path().is_some()
+            && let Err(e) = outgoing_doc.save()
+        {
+            self.editor.status = Some(format!("Auto-Save could not write {}: {e}", outgoing_doc.title()));
+        }
+        if keep && outgoing_doc.is_dirty() {
             outgoing_doc.remember_for_crash();
             if let Some(plan) = outgoing_doc.autosave_plan() {
                 self.jobs.spawn(Pool::Background, move || {
@@ -13767,6 +14452,57 @@ impl App {
                 }
             });
         }
+    }
+
+    /// **File ▸ Auto-Save.** A document with a file of its own is written back
+    /// to it once the changes settle: [`AUTO_SAVE_QUIET`] after the last edit,
+    /// never while a mouse button is down (a stroke half-drawn is not a thing
+    /// to save), one write at a time, on the background pool. The write is a
+    /// snapshot, so editing carries on meanwhile; what changed during it is
+    /// picked up by the next one. Untitled work has nowhere to go and keeps
+    /// to the recovery autosave until it is saved once.
+    fn poll_auto_save(&mut self) {
+        // A finished write first, whether or not the switch is still on.
+        if let Some(rx) = &self.auto_save.in_flight
+            && let Ok((plan, result)) = rx.try_recv()
+        {
+            self.auto_save.in_flight = None;
+            match result {
+                Ok(()) => {
+                    if self.editor.doc.mark_saved(&plan) {
+                        buzz_doc::autosave::forget_crash_snapshot();
+                    }
+                }
+                Err(e) => self.editor.status = Some(format!("Auto-Save could not write {}: {e}", plan.path().display())),
+            }
+        }
+        if !self.editor.workspace.auto_save || self.auto_save.in_flight.is_some() {
+            return;
+        }
+        let revision = self.editor.doc.combined_revision();
+        if self.auto_save.revision != Some(revision) {
+            self.auto_save.revision = Some(revision);
+            self.auto_save.changed_at = Instant::now();
+        }
+        if self.auto_save.changed_at.elapsed() < AUTO_SAVE_QUIET {
+            return;
+        }
+        let pointer_down = self
+            .active
+            .as_ref()
+            .is_some_and(|a| a.egui_ctx.input(|i| i.pointer.any_down()));
+        if pointer_down {
+            return;
+        }
+        let Some(plan) = self.editor.doc.save_plan() else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.auto_save.in_flight = Some(rx);
+        self.jobs.spawn(Pool::Background, move || {
+            let result = plan.write().map_err(|e| e.to_string());
+            let _ = tx.send((plan, result));
+        });
     }
 
     /// An [`Ahead`] over this app's own fields (for callers that do not hold
@@ -14938,6 +15674,7 @@ impl App {
 
         self.keep_crash_snapshot();
         self.poll_autosave();
+        self.poll_auto_save();
 
         // Close the frame: store its section times and warn if one blew the
         // budget. This is the watchdog that catches an O(document) cost creeping
@@ -15360,6 +16097,32 @@ impl App {
     fn drop_target(&self, pointer: egui::Pos2, dragged: &[buzz_ui::PanelId]) -> Option<DropTarget> {
         const PROXIMITY_MARGIN: f32 = 28.0;
 
+        // 0. An empty side's edge strip. First, because the far-right strip
+        // lies over the inner column and must win there.
+        if let Some((dock, strip)) = self.edge_zones.iter().find(|(_, r)| r.contains(pointer)) {
+            // The bar sits on the edge the new column will grow from.
+            let bar = match dock {
+                buzz_ui::Dock::Left => egui::Rect::from_min_max(
+                    strip.left_top(),
+                    egui::pos2(strip.left() + 4.0, strip.bottom()),
+                ),
+                buzz_ui::Dock::Bottom => egui::Rect::from_min_max(
+                    egui::pos2(strip.left(), strip.bottom() - 4.0),
+                    strip.right_bottom(),
+                ),
+                _ => egui::Rect::from_min_max(
+                    egui::pos2(strip.right() - 4.0, strip.top()),
+                    strip.right_bottom(),
+                ),
+            };
+            return Some(DropTarget::Column {
+                dock: *dock,
+                before: None,
+                line: bar,
+                highlight_rect: Some(*strip),
+            });
+        }
+
         // Candidate drop zones that do not already contain the panel being carried.
         let candidates: Vec<&DropZone> = self
             .drop_zones
@@ -15469,9 +16232,21 @@ impl App {
     }
 
     /// Carry a dragged panel, show where it would land, and land it.
-    fn drag_docking(&self, ctx: &egui::Context, requests: &mut DockRequests) {
-        let Some(dragged) = egui::DragAndDrop::payload::<DraggedPanels>(ctx) else {
-            return;
+    ///
+    /// `window` is a floating section being moved by its own title bar. egui
+    /// is already moving that window, so it is only ever *docked* from here:
+    /// let go anywhere but over a dock and it simply stays where it was put.
+    fn drag_docking(
+        &self,
+        ctx: &egui::Context,
+        window: Option<&[buzz_ui::PanelId]>,
+        requests: &mut DockRequests,
+    ) {
+        let payload = egui::DragAndDrop::payload::<DraggedPanels>(ctx);
+        let (dragged, by_window) = match (&payload, window) {
+            (Some(carried), _) => (carried.0.clone(), false),
+            (None, Some(panels)) => (panels.to_vec(), true),
+            (None, None) => return,
         };
         let accent = DROP_ACCENT;
         let painter = ctx.layer_painter(egui::LayerId::new(
@@ -15481,10 +16256,9 @@ impl App {
         let pointer = ctx.pointer_latest_pos();
 
         // The name travels with the pointer, so what is being carried is
-        // never in doubt.
-        if let Some(p) = pointer {
+        // never in doubt. A window being moved is its own label.
+        if let Some(p) = pointer.filter(|_| !by_window) {
             let names = dragged
-                .0
                 .iter()
                 .map(|id| id.tab_title())
                 .collect::<Vec<_>>()
@@ -15500,7 +16274,9 @@ impl App {
                 });
         }
 
-        let target = pointer.and_then(|p| self.drop_target(p, &dragged.0));
+        let target = pointer
+            .and_then(|p| self.drop_target(p, &dragged))
+            .filter(|t| !(by_window && matches!(t, DropTarget::Float(_))));
         match &target {
             Some(DropTarget::Section { rect, .. }) => {
                 // Tabbing in: a filled green wash under a glowing clear green border,
@@ -15556,20 +16332,20 @@ impl App {
 
         if ctx.input(|i| i.pointer.any_released()) {
             egui::DragAndDrop::clear_payload(ctx);
-            // A grip carries a whole section — every panel in `dragged.0` — and
+            // A grip carries a whole section — every panel in `dragged` — and
             // it must land as one: one section-level request for the first
             // panel, rather than one per-panel request that would split the
             // section back apart on the way down. A single tab dragged out
             // still goes through the old per-panel requests.
-            let whole_section = dragged.0.len() > 1;
+            let whole_section = dragged.len() > 1;
             match target {
                 Some(DropTarget::Section { front, .. }) => {
                     if whole_section {
-                        if dragged.0[0] != front {
-                            requests.section_groups.push((dragged.0[0], front));
+                        if dragged[0] != front {
+                            requests.section_groups.push((dragged[0], front));
                         }
                     } else {
-                        for id in &dragged.0 {
+                        for id in &dragged {
                             if *id != front {
                                 requests.groups.push((*id, front));
                             }
@@ -15578,9 +16354,9 @@ impl App {
                 }
                 Some(DropTarget::Column { dock, before, .. }) => {
                     if whole_section {
-                        requests.section_docks.push((dragged.0[0], dock, before));
+                        requests.section_docks.push((dragged[0], dock, before));
                     } else {
-                        for id in &dragged.0 {
+                        for id in &dragged {
                             requests.docks.push((*id, dock, before));
                         }
                     }
@@ -15589,9 +16365,9 @@ impl App {
                     if whole_section {
                         requests
                             .section_floats
-                            .push((dragged.0[0], (pos.x, pos.y)));
+                            .push((dragged[0], (pos.x, pos.y)));
                     } else {
-                        for id in &dragged.0 {
+                        for id in &dragged {
                             requests.floats.push((*id, (pos.x, pos.y)));
                         }
                     }
@@ -17397,6 +18173,897 @@ mod idle_tests {
         assert!(opened, "right-clicking the stage should raise its menu");
     }
 
+    /// Survey: every right-click entry, on every kind of thing it can be
+    /// opened over, through the same `dispatch` the menus use. Prints what each
+    /// did; fails only on a panic. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn survey_right_click_entries() {
+        use buzz_scene::ShapeData;
+        let square = |x: f64| {
+            ShapeData::filled(
+                buzz_geom::Shape::to_path(&buzz_geom::Rect::new(x, 100.0, x + 80.0, 180.0), 1e-9),
+                peniko::Color::from_rgb8(200, 40, 40),
+            )
+        };
+        let png = {
+            let img = image::RgbaImage::from_pixel(32, 32, image::Rgba([10, 120, 200, 255]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        // Each fixture: a fresh app with one thing selected on frame 0 of a
+        // two-keyframe layer.
+        let fixture = |kind: &str| -> App {
+            let mut app = App::new(GpuPreference::Automatic);
+            app.recovery.found.clear();
+            let layer = app.editor.doc.scene().layers().iter().next().unwrap().id;
+            let mut ids = Vec::new();
+            app.editor.doc.edit("fixture", |s| {
+                ids.push(s.add_shape(layer, square(100.0)).unwrap());
+                ids.push(s.add_shape(layer, square(300.0)).unwrap());
+                s.update_layer(layer, |l| {
+                    l.frames.insert_keyframe(10);
+                });
+            });
+            app.editor.doc.end_gesture();
+            app.editor.selection.set([ids[0]]);
+            match kind {
+                "shape" => {}
+                "group" => {
+                    app.editor.selection.set([ids[0], ids[1]]);
+                    app.dispatch(Command::GroupSelection);
+                }
+                "instance" => app.dispatch(Command::ConvertToSymbol),
+                "bitmap" => {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("pic.png");
+                    std::fs::write(&path, &png).unwrap();
+                    app.editor.import_image(&path).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            app.editor.doc.end_gesture();
+            app
+        };
+        let stage_menu = [
+            Command::Cut, Command::Copy, Command::Paste, Command::Delete,
+            Command::RotateClockwise, Command::RotateAnticlockwise, Command::FlipHorizontal, Command::FlipVertical,
+            Command::BringToFront, Command::BringForward, Command::SendBackward, Command::SendToBack,
+            Command::GroupSelection, Command::UngroupSelection, Command::BreakApart, Command::ConvertToSymbol,
+            Command::ClearAllKeyframes, Command::RigHead, Command::EvenLines, Command::RemoveBackgroundSpecks,
+            Command::CopyMotion, Command::CopyPose, Command::CopyPerformance, Command::SelectAll,
+        ];
+        for kind in ["shape", "group", "instance", "bitmap"] {
+            for &c in &stage_menu {
+                let mut app = fixture(kind);
+                let sel_before = app.editor.selection.len();
+                let rev = app.editor.doc.scene().revision();
+                app.editor.status = None;
+                app.dispatch(c);
+                let changed = app.editor.doc.scene().revision() != rev;
+                println!(
+                    "STAGE {kind:9} {:28} changed={changed:5} sel {sel_before}->{} status={:?}",
+                    c.label(), app.editor.selection.len(), app.editor.status
+                );
+            }
+        }
+        for kind in ["shape", "group", "instance", "bitmap"] {
+            let mut app = fixture(kind);
+            let count = |app: &App| app.editor.doc.scene().layers().iter().next().unwrap().frames.objects_at(0).len();
+            let before = count(&app);
+            app.dispatch(Command::Copy);
+            app.dispatch(Command::Paste);
+            println!("PASTE {kind:9} objects {before} -> {} library={} status={:?}", count(&app), app.editor.doc.scene().library().len(), app.editor.status);
+            let mut app = fixture(kind);
+            app.dispatch(Command::GroupSelection);
+            println!("GROUP1 {kind:9} sel={} status={:?}", app.editor.selection.len(), app.editor.status);
+        }
+        // The frame menu, on a keyframe, inside its span, on the next
+        // keyframe, and past the layer's end.
+        let frame_menu = [
+            Command::InsertFrame, Command::RemoveFrame, Command::InsertKeyframe, Command::InsertBlankKeyframe,
+            Command::ClearKeyframe, Command::CreateMotionTween, Command::CreateShapeTween, Command::CreateClassicTween,
+            Command::RemoveTween,
+        ];
+        for frame in [0u32, 5, 10, 25] {
+            for &c in &frame_menu {
+                for kind in ["shape", "instance"] {
+                    let mut app = fixture(kind);
+                    let layer = app.editor.doc.scene().layers().iter().next().unwrap().id;
+                    app.editor.set_frame(frame);
+                    app.editor.selection.set_timeline(buzz_ui::TimelineSelection::cell(layer, frame));
+                    let rev = app.editor.doc.scene().revision();
+                    app.editor.status = None;
+                    app.dispatch(c);
+                    let changed = app.editor.doc.scene().revision() != rev;
+                    println!(
+                        "FRAME f{frame:<3} {kind:9} {:24} changed={changed:5} status={:?}",
+                        c.label(), app.editor.status
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Copy and Paste of an instance is another of the same symbol**, not a
+    /// new one: the Library keeps one entry and both instances follow it.
+    #[test]
+    fn pasting_an_instance_reuses_its_symbol() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let layer = app.editor.doc.scene().layers().iter().next().unwrap().id;
+        let mut id = None;
+        app.editor.doc.edit("fixture", |s| {
+            id = s.add_shape(
+                layer,
+                buzz_scene::ShapeData::filled(
+                    buzz_geom::Shape::to_path(&buzz_geom::Rect::new(0.0, 0.0, 50.0, 50.0), 1e-9),
+                    peniko::Color::BLACK,
+                ),
+            );
+        });
+        app.editor.selection.set([id.unwrap()]);
+        app.dispatch(Command::ConvertToSymbol);
+        assert_eq!(app.editor.doc.scene().library().len(), 1);
+        app.dispatch(Command::Copy);
+        app.dispatch(Command::Paste);
+        let scene = app.editor.doc.scene();
+        assert_eq!(scene.library().len(), 1, "no second copy of the symbol");
+        let symbols: Vec<_> = scene.layers().get(layer).unwrap().objects_at(0).iter().filter_map(|o| o.instance().map(|i| i.symbol)).collect();
+        assert_eq!(symbols.len(), 2, "two instances");
+        assert_eq!(symbols[0], symbols[1], "of the one symbol");
+    }
+
+    /// **The stage menu acts on what was right-clicked**, not on whatever the
+    /// pointer crosses on its way to an entry. The selection used to be made
+    /// inside the menu, every frame it was open, from the pointer's current
+    /// position — so artwork lying under "Delete" was selected in place of
+    /// the right-clicked object, and deleted.
+    #[test]
+    fn the_stage_menu_keeps_the_right_clicked_object() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0));
+        let mods = egui::Modifiers::default();
+        let drive = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput { events, screen_rect: Some(screen), ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            });
+        };
+        drive(&mut app, vec![]);
+
+        // Two squares, one where the click lands and one where the pointer
+        // goes next, both on the stage.
+        let a = egui::pos2(700.0, 430.0);
+        let b = egui::pos2(760.0, 470.0);
+        let doc = |app: &App, p: egui::Pos2| {
+            app.editor.screen_to_edit(buzz_geom::Point::new(
+                (p.x - app.stage_area_min.x) as f64,
+                (p.y - app.stage_area_min.y) as f64,
+            ))
+        };
+        let layer = app.editor.doc.scene().layers().iter().next().expect("a layer").id;
+        let mut ids = Vec::new();
+        for p in [a, b] {
+            let c = doc(&app, p);
+            let r = 4.0 / app.editor.camera.zoom.max(1e-6);
+            let shape = buzz_scene::ShapeData::filled(
+                buzz_geom::Shape::to_path(&buzz_geom::Rect::new(c.x - r, c.y - r, c.x + r, c.y + r), 1e-9),
+                peniko::Color::BLACK,
+            );
+            let mut id = None;
+            app.editor.doc.edit("Test Shape", |s| id = s.add_shape(layer, shape));
+            ids.push(id.expect("placed"));
+        }
+        app.editor.selection.clear();
+
+        drive(&mut app, vec![egui::Event::PointerMoved(a)]);
+        for pressed in [true, false] {
+            drive(
+                &mut app,
+                vec![egui::Event::PointerButton { pos: a, button: egui::PointerButton::Secondary, pressed, modifiers: mods }],
+            );
+        }
+        drive(&mut app, vec![]);
+        assert!(app.editor.selection.contains(ids[0]), "the right-clicked square is selected");
+
+        // On towards the menu, across the other square.
+        assert_eq!(app.editor.object_at(doc(&app, b), app.editor.pick_tolerance()), Some(ids[1]), "b is over the second square");
+        let probe = egui::Id::new("stage-context-probe");
+        assert!(ctx.data(|d| d.get_temp::<bool>(probe)).unwrap_or(false), "the menu is open");
+        drive(&mut app, vec![egui::Event::PointerMoved(b)]);
+        drive(&mut app, vec![]);
+        assert!(app.editor.selection.contains(ids[0]), "the right-clicked square stays selected");
+        assert!(!app.editor.selection.contains(ids[1]), "the square the pointer crossed is not selected");
+    }
+
+    /// Play/Pause from the keyboard: Enter (Animate's key), a tap of Space
+    /// (a held Space still pans), and whatever key the user bound in the
+    /// shortcut editor.
+    #[test]
+    fn play_and_pause_from_the_keyboard() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0));
+        let drive = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput { events, screen_rect: Some(screen), ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            });
+        };
+        let key = |key: egui::Key, pressed: bool, modifiers: egui::Modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let none = egui::Modifiers::default();
+        let tap = |app: &mut App, k: egui::Key, m: egui::Modifiers| {
+            drive(app, vec![key(k, true, m)]);
+            drive(app, vec![key(k, false, m)]);
+            drive(app, vec![]);
+        };
+        drive(&mut app, vec![]);
+        assert!(!app.editor.playback.playing);
+
+        tap(&mut app, egui::Key::Enter, none);
+        assert!(app.editor.playback.playing, "Enter plays");
+        tap(&mut app, egui::Key::Enter, none);
+        assert!(!app.editor.playback.playing, "Enter pauses");
+
+        tap(&mut app, egui::Key::Space, none);
+        assert!(app.editor.playback.playing, "a Space tap plays");
+        tap(&mut app, egui::Key::Space, none);
+        assert!(!app.editor.playback.playing, "a Space tap pauses");
+
+        // A held Space that pans is not a tap.
+        let mid = egui::pos2(700.0, 430.0);
+        drive(&mut app, vec![egui::Event::PointerMoved(mid)]);
+        drive(&mut app, vec![key(egui::Key::Space, true, none)]);
+        drive(&mut app, vec![egui::Event::PointerButton { pos: mid, button: egui::PointerButton::Primary, pressed: true, modifiers: none }]);
+        for dx in [4.0, 10.0, 30.0, 60.0] {
+            drive(&mut app, vec![egui::Event::PointerMoved(egui::pos2(mid.x + dx, mid.y))]);
+        }
+        drive(&mut app, vec![egui::Event::PointerButton { pos: egui::pos2(mid.x + 60.0, mid.y), button: egui::PointerButton::Primary, pressed: false, modifiers: none }]);
+        drive(&mut app, vec![key(egui::Key::Space, false, none)]);
+        drive(&mut app, vec![]);
+        assert!(!app.editor.playback.playing, "panning with Space held does not start playback");
+
+        // The user's own key.
+        app.editor.workspace.rebind(
+            buzz_ui::Command::PlayPause,
+            buzz_ui::workspace::KeyChord::from_shortcut(egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::P)),
+        );
+        tap(&mut app, egui::Key::P, egui::Modifiers::COMMAND);
+        assert!(app.editor.playback.playing, "the user's own key plays");
+
+        tap(&mut app, egui::Key::Space, none);
+        assert!(!app.editor.playback.playing, "and a Space tap still pauses");
+    }
+
+    /// Drive the timeline's layer-name menu the way a user does: right-click
+    /// the name, hover a submenu, click an entry. Finds entries by their
+    /// painted text, so it tests what is on screen rather than the code path.
+    struct MenuDrive {
+        app: App,
+        ctx: egui::Context,
+        texts: Vec<(String, egui::Rect)>,
+        /// Keys held, as egui reads them each frame.
+        mods: egui::Modifiers,
+        /// A steady clock, a 60th of a second a frame: egui tells a click from
+        /// a long press by time, and a loaded test machine's own clock let a
+        /// press-and-release run long enough to stop being a click.
+        time: f64,
+    }
+
+    impl MenuDrive {
+        fn new() -> Self {
+            let mut app = App::new(GpuPreference::Automatic);
+            app.recovery.found.clear();
+            // A fresh workspace: the dock-drag tests rearrange the panels in
+            // this process's shared scratch layout file, and a timeline floated
+            // somewhere else is not where these tests look for it.
+            app.editor.workspace = buzz_ui::Workspace::default();
+            let ctx = egui::Context::default();
+            buzz_ui::theme::apply(&ctx);
+            let mut d = Self { app, ctx, texts: Vec::new(), mods: egui::Modifiers::default(), time: 0.0 };
+            d.frame(vec![]);
+            d
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1400.0));
+            self.time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(screen),
+                modifiers: self.mods,
+                time: Some(self.time),
+                predicted_dt: 1.0 / 60.0,
+                ..Default::default()
+            };
+            let app = &mut self.app;
+            let out = self.ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            });
+            self.texts = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) => {
+                        Some((t.galley.text().to_string(), t.visual_bounding_rect()))
+                    }
+                    _ => None,
+                })
+                .collect();
+        }
+
+        fn click(&mut self, at: egui::Pos2, button: egui::PointerButton) {
+            let m = egui::Modifiers::default();
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            self.frame(vec![egui::Event::PointerButton { pos: at, button, pressed: true, modifiers: m }]);
+            self.frame(vec![egui::Event::PointerButton { pos: at, button, pressed: false, modifiers: m }]);
+            self.frame(vec![]);
+        }
+
+        /// The last-painted text exactly `label` (menus paint on top).
+        fn find(&self, label: &str) -> Option<egui::Pos2> {
+            self.texts.iter().rev().find(|(t, _)| t == label).map(|(_, r)| r.center())
+        }
+
+        fn hover(&mut self, label: &str) {
+            let at = self.find(label).unwrap_or_else(|| panic!("no {label:?} on screen"));
+            for _ in 0..4 {
+                self.frame(vec![egui::Event::PointerMoved(at)]);
+            }
+        }
+
+        fn press(&mut self, label: &str) {
+            let at = self.find(label).unwrap_or_else(|| panic!("no {label:?} on screen"));
+            self.click(at, egui::PointerButton::Primary);
+        }
+
+        /// The middle of `frame`'s cell on `layer`'s row.
+        fn cell(&self, layer: buzz_scene::LayerId, frame: u32) -> egui::Pos2 {
+            let (row, grid_left, w): (egui::Rect, f32, f32) = self
+                .ctx
+                .data(|m| m.get_temp(egui::Id::new((buzz_ui::timeline_panel::ROW_GEOMETRY, layer))))
+                .expect("row drawn");
+            egui::pos2(grid_left + (frame as f32 + 0.5) * w, row.center().y)
+        }
+
+        /// Press at `from`, move through `path`, release at `to`.
+        fn drag(&mut self, from: egui::Pos2, path: &[egui::Pos2], to: egui::Pos2) {
+            let m = egui::Modifiers::default();
+            self.frame(vec![egui::Event::PointerMoved(from)]);
+            self.frame(vec![egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: m }]);
+            for p in path {
+                self.frame(vec![egui::Event::PointerMoved(*p)]);
+            }
+            self.frame(vec![egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: m }]);
+            self.frame(vec![]);
+        }
+
+        /// Right-click the layer's name in the timeline.
+        fn layer_menu(&mut self, layer: buzz_scene::LayerId) {
+            let name = self.app.editor.doc.scene().layers().get(layer).expect("layer").name.clone();
+            let at = self
+                .texts
+                .iter()
+                // A mask's row carries its kind before the name ("M ").
+                .find(|(t, r)| (*t == name || t.ends_with(&format!(" {name}"))) && r.min.y > 500.0)
+                .map(|(_, r)| r.center())
+                .unwrap_or_else(|| panic!("the timeline shows no row named {name:?}"));
+            self.click(at, egui::PointerButton::Secondary);
+        }
+    }
+
+    /// Animate's right-click **Mask**: the layer masks the one below and both
+    /// lock, so the mask shows at once; ticking it again undoes the pair.
+    #[test]
+    fn masking_a_layer_from_the_timeline_menu() {
+        use buzz_scene::LayerKind as K;
+        let mut d = MenuDrive::new();
+        let below = d.app.editor.doc.scene().layers().iter().next().expect("a layer").id;
+        let mut top = below;
+        d.app.editor.doc.edit("Add", |s| top = s.add_layer("Mask Me", K::Normal));
+        // Above the starter layer, as a new layer goes.
+        let rows: Vec<_> = d.app.editor.doc.scene().layers().iter().map(|l| l.id).collect();
+        let (mask, masked) = if rows[0] == top { (top, below) } else { (rows[0], rows[1]) };
+        d.frame(vec![]);
+        d.layer_menu(mask);
+        d.press("Mask");
+        let scene = d.app.editor.doc.scene();
+        let (m, n) = (scene.layers().get(mask).unwrap(), scene.layers().get(masked).unwrap());
+        assert_eq!((m.kind, n.kind), (K::Mask, K::Masked));
+        assert!(m.locked && n.locked, "both locked so the mask shows");
+
+        d.layer_menu(mask);
+        d.press("Mask");
+        let scene = d.app.editor.doc.scene();
+        assert_eq!(scene.layers().get(mask).unwrap().kind, K::Normal);
+        assert_eq!(scene.layers().get(masked).unwrap().kind, K::Normal);
+    }
+
+    /// Dragging across the frame grid from one layer down to another selects
+    /// the block of frames on every layer between — Animate's vertical
+    /// frame selection.
+    #[test]
+    fn dragging_down_the_frame_grid_selects_frames_on_several_layers() {
+        let mut d = MenuDrive::new();
+        d.app.editor.doc.edit("Layers", |s| {
+            s.set_frame_count(30);
+            s.add_layer("Two", buzz_scene::LayerKind::Normal);
+            s.add_layer("Three", buzz_scene::LayerKind::Normal);
+        });
+        d.frame(vec![]);
+        d.frame(vec![]);
+        let rows: Vec<buzz_scene::LayerId> = d.app.editor.doc.scene().layers().iter().map(|l| l.id).collect();
+        let cell = |d: &MenuDrive, layer: buzz_scene::LayerId, frame: u32| {
+            let (row, grid_left, w): (egui::Rect, f32, f32) = d
+                .ctx
+                .data(|m| m.get_temp(egui::Id::new((buzz_ui::timeline_panel::ROW_GEOMETRY, layer))))
+                .expect("row drawn");
+            egui::pos2(grid_left + (frame as f32 + 0.5) * w, row.center().y)
+        };
+        let from = cell(&d, rows[0], 2);
+        let to = cell(&d, rows[2], 5);
+        let m = egui::Modifiers::default();
+        d.frame(vec![egui::Event::PointerMoved(from)]);
+        d.frame(vec![egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: m }]);
+        for i in 1..=8 {
+            let t = i as f32 / 8.0;
+            d.frame(vec![egui::Event::PointerMoved(from + (to - from) * t)]);
+        }
+        d.frame(vec![egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: m }]);
+        d.frame(vec![]);
+        let sel = d.app.editor.selection.timeline().cloned().expect("frames selected");
+        assert_eq!((sel.first_frame, sel.last_frame), (2, 5), "{sel:?}");
+        for l in &rows[..3] {
+            assert!(sel.layers.contains(l), "every layer dragged across is in the selection: {sel:?}");
+        }
+    }
+
+    /// Outline view from the timeline: the square in the layer's third
+    /// column, and the layer menu's "Show Layer as Outlines".
+    #[test]
+    fn outline_view_switches_on_from_the_timeline() {
+        let mut d = MenuDrive::new();
+        let layer = d.app.editor.doc.scene().layers().iter().next().expect("a layer").id;
+        let outlined = |d: &MenuDrive| d.app.editor.doc.scene().layers().get(layer).unwrap().outline;
+
+        d.layer_menu(layer);
+        d.press("Show Layer as Outlines");
+        assert!(outlined(&d), "the menu turns outlines on");
+        d.layer_menu(layer);
+        d.press("Show Layer Filled");
+        assert!(!outlined(&d), "and off");
+
+        // The third switch: a LAYER_COLUMN-wide name row, switches at its right.
+        let (row, grid_left, _): (egui::Rect, f32, f32) = d
+            .ctx
+            .data(|m| m.get_temp(egui::Id::new((buzz_ui::timeline_panel::ROW_GEOMETRY, layer))))
+            .expect("row drawn");
+        let side = buzz_ui::panels::LAYER_SWITCH;
+        let at = egui::pos2(grid_left - 5.0 - side * 0.5, row.center().y);
+        d.click(at, egui::PointerButton::Primary);
+        assert!(outlined(&d), "the outline square turns outlines on");
+    }
+
+    /// With several layers selected, right-clicking one of them keeps the
+    /// selection, and Highlight Selected Layers colours them all.
+    #[test]
+    fn highlighting_several_selected_layers_at_once() {
+        let mut d = MenuDrive::new();
+        d.app.editor.doc.edit("Layers", |s| {
+            s.add_layer("Two", buzz_scene::LayerKind::Normal);
+            s.add_layer("Three", buzz_scene::LayerKind::Normal);
+        });
+        let rows: Vec<buzz_scene::LayerId> = d.app.editor.doc.scene().layers().iter().map(|l| l.id).collect();
+        d.app.editor.selection.set_selected_layers(&rows[..2]);
+        d.frame(vec![]);
+        d.layer_menu(rows[1]);
+        d.hover("Highlight Selected Layers");
+        d.press("Red");
+        let red = Some(buzz_ui::panels::HIGHLIGHT_SWATCHES[2].1);
+        let scene = d.app.editor.doc.scene();
+        assert_eq!(scene.layers().get(rows[0]).unwrap().highlight, red);
+        assert_eq!(scene.layers().get(rows[1]).unwrap().highlight, red);
+        assert_eq!(scene.layers().get(rows[2]).unwrap().highlight, None, "an unselected layer is left alone");
+    }
+
+    /// A quick flick: the pointer is already a row down by the time egui
+    /// calls it a drag. The row pressed on is still in the selection.
+    #[test]
+    fn a_fast_frame_drag_keeps_the_row_it_started_on() {
+        let mut d = MenuDrive::new();
+        d.app.editor.doc.edit("Layers", |s| {
+            s.set_frame_count(30);
+            s.add_layer("Two", buzz_scene::LayerKind::Normal);
+            s.add_layer("Three", buzz_scene::LayerKind::Normal);
+        });
+        d.frame(vec![]);
+        d.frame(vec![]);
+        let rows: Vec<buzz_scene::LayerId> = d.app.editor.doc.scene().layers().iter().map(|l| l.id).collect();
+        let from = d.cell(rows[0], 2);
+        let to = d.cell(rows[2], 4);
+        d.drag(from, &[to], to);
+        let sel = d.app.editor.selection.timeline().cloned().expect("frames selected");
+        assert!(sel.layers.contains(&rows[0]), "the row the drag began on: {sel:?}");
+        assert_eq!(sel.layers.len(), 3, "{sel:?}");
+        assert_eq!((sel.first_frame, sel.last_frame), (2, 4), "{sel:?}");
+    }
+
+    /// Dragging past the bottom of the timeline reaches the rows scrolled out
+    /// of view below it.
+    #[test]
+    fn a_frame_drag_past_the_bottom_reaches_rows_out_of_view() {
+        let mut d = MenuDrive::new();
+        d.app.editor.doc.edit("Layers", |s| {
+            s.set_frame_count(30);
+            for i in 0..30 {
+                s.add_layer(format!("L{i}"), buzz_scene::LayerKind::Normal);
+            }
+        });
+        d.frame(vec![]);
+        d.frame(vec![]);
+        let rows: Vec<buzz_scene::LayerId> = d.app.editor.doc.scene().layers().iter().map(|l| l.id).collect();
+        let from = d.cell(rows[0], 1);
+        let bottom = egui::pos2(from.x, 1395.0);
+        // Held at the bottom edge for a while: the timeline scrolls.
+        let mut path = vec![egui::pos2(from.x, from.y + 30.0), bottom];
+        path.extend(std::iter::repeat(bottom).take(30));
+        d.drag(from, &path, bottom);
+        let sel = d.app.editor.selection.timeline().cloned().expect("frames selected");
+        assert!(sel.layers.contains(&rows[0]), "{sel:?}");
+        assert_eq!(sel.layers.len(), rows.len(), "every row down to the last, seen or not: {sel:?}");
+    }
+
+    /// The Column button, and Option-click on a frame: that frame on every
+    /// layer, in one click.
+    #[test]
+    fn one_click_selects_a_frame_on_every_layer() {
+        let mut d = MenuDrive::new();
+        d.app.editor.doc.edit("Layers", |s| {
+            s.set_frame_count(30);
+            s.add_layer("Two", buzz_scene::LayerKind::Normal);
+            s.add_layer("Three", buzz_scene::LayerKind::Normal);
+        });
+        d.app.editor.set_frame(6);
+        d.frame(vec![]);
+        d.press("Column");
+        let sel = d.app.editor.selection.timeline().cloned().expect("a column");
+        assert_eq!(sel.layers.len(), 3, "{sel:?}");
+        assert_eq!((sel.first_frame, sel.last_frame), (6, 6));
+
+        let rows: Vec<buzz_scene::LayerId> = d.app.editor.doc.scene().layers().iter().map(|l| l.id).collect();
+        let at = d.cell(rows[1], 9);
+        let alt = egui::Modifiers { alt: true, ..Default::default() };
+        d.mods = alt;
+        d.frame(vec![egui::Event::PointerMoved(at)]);
+        d.frame(vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: alt }]);
+        d.frame(vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: alt }]);
+        d.frame(vec![]);
+        let sel = d.app.editor.selection.timeline().cloned().expect("a column");
+        assert_eq!(sel.layers.len(), 3, "{sel:?}");
+        assert_eq!((sel.first_frame, sel.last_frame), (9, 9));
+    }
+
+    /// Highlight one layer, then another, then a third: each keeps its own.
+    #[test]
+    fn highlighting_layers_one_after_another_keeps_every_highlight() {
+        let mut d = MenuDrive::new();
+        d.app.editor.doc.edit("Layers", |s| {
+            s.add_layer("Two", buzz_scene::LayerKind::Normal);
+            s.add_layer("Three", buzz_scene::LayerKind::Normal);
+        });
+        d.frame(vec![]);
+        let rows: Vec<buzz_scene::LayerId> = d.app.editor.doc.scene().layers().iter().map(|l| l.id).collect();
+        // A block of layers selected first, as a frame drag leaves them.
+        d.app.editor.selection.set_selected_layers(&rows);
+        d.frame(vec![]);
+        for (row, colour) in rows.iter().zip(["Green", "Red", "Blue"]) {
+            d.layer_menu(*row);
+            d.hover("Highlight");
+            d.press(colour);
+        }
+        let swatch = |name: &str| buzz_ui::panels::HIGHLIGHT_SWATCHES.iter().find(|(n, _)| *n == name).map(|(_, c)| *c);
+        let scene = d.app.editor.doc.scene();
+        for (row, colour) in rows.iter().zip(["Green", "Red", "Blue"]) {
+            assert_eq!(scene.layers().get(*row).unwrap().highlight, swatch(colour), "{colour}");
+        }
+    }
+
+    /// Draw one square on the active document's first layer.
+    fn scribble(app: &mut App) {
+        let layer = app.editor.doc.scene().layers().iter().next().expect("a layer").id;
+        let shape = buzz_scene::ShapeData::filled(
+            buzz_geom::Shape::to_path(&buzz_geom::Rect::new(0.0, 0.0, 10.0, 10.0), 1e-9),
+            peniko::Color::BLACK,
+        );
+        app.editor.doc.edit("Draw", |s| {
+            s.add_shape(layer, shape);
+        });
+    }
+
+    /// **D2: several documents, as tabs.** File ▸ New opens a second tab
+    /// beside the first instead of replacing it; clicking a tab switches; an
+    /// edit in one leaves the other alone; Ctrl+Tab cycles.
+    #[test]
+    fn new_documents_open_as_tabs_that_switch() {
+        let mut d = MenuDrive::new();
+        d.app.editor.workspace.auto_save = false;
+        scribble(&mut d.app);
+        d.app.open_document_in_new_tab(crate::editor::Editor::build_new_document(&buzz_ui::DocumentSetup::default()));
+        d.frame(vec![]);
+        assert_eq!(d.app.documents.len(), 2);
+        assert_eq!(d.app.active_document, 1);
+        assert!(d.find("Untitled-1*").is_some(), "the first tab, unsaved: {:?}", d.texts.iter().map(|t| &t.0).take(30).collect::<Vec<_>>());
+        assert!(d.find("Untitled-2").is_some());
+        assert!(!d.app.editor.doc.is_dirty(), "the new tab is its own, clean document");
+
+        d.press("Untitled-1*");
+        assert_eq!(d.app.active_document, 0, "clicking a tab switches to it");
+        assert!(d.app.editor.doc.is_dirty(), "and its own edit is still there");
+
+        d.mods = egui::Modifiers::CTRL;
+        d.frame(vec![egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL }]);
+        d.frame(vec![]);
+        d.mods = egui::Modifiers::default();
+        assert_eq!(d.app.active_document, 1, "Ctrl+Tab goes to the next tab");
+    }
+
+    /// Closing: a clean tab goes at once; an unsaved one asks first — Cancel
+    /// keeps it, Don't Save closes it. The last tab closing leaves a fresh
+    /// untitled document, not none.
+    #[test]
+    fn closing_a_tab_asks_about_unsaved_changes() {
+        let mut d = MenuDrive::new();
+        d.app.editor.workspace.auto_save = false;
+        d.app.open_document_in_new_tab(crate::editor::Editor::build_new_document(&buzz_ui::DocumentSetup::default()));
+        d.frame(vec![]);
+        d.app.request_close_tab(1);
+        d.frame(vec![]);
+        assert_eq!(d.app.documents.len(), 1, "a clean tab closes at once");
+
+        scribble(&mut d.app);
+        d.app.dispatch(Command::Close);
+        d.frame(vec![]);
+        d.frame(vec![]);
+        assert!(d.find("Don't Save").is_some(), "an unsaved tab asks first");
+        d.press("Cancel");
+        assert_eq!(d.app.documents.len(), 1);
+        assert!(d.app.editor.doc.is_dirty(), "Cancel keeps the work");
+
+        d.app.dispatch(Command::Close);
+        d.frame(vec![]);
+        d.frame(vec![]);
+        d.press("Don't Save");
+        assert_eq!(d.app.documents.len(), 1, "the last tab leaves a fresh one");
+        assert!(!d.app.editor.doc.is_dirty());
+        assert_eq!(
+            d.app.editor.doc.scene().layers().iter().map(|l| l.objects_at(0).len()).sum::<usize>(),
+            0,
+            "and it is empty"
+        );
+    }
+
+    /// Quitting with unsaved work asks about it, and only quits once
+    /// answered; a saved file with Auto-Save on is simply written.
+    #[test]
+    fn quitting_asks_about_unsaved_documents() {
+        let mut d = MenuDrive::new();
+        d.app.editor.workspace.auto_save = false;
+        scribble(&mut d.app);
+        d.app.request_quit();
+        // A modal shows on its second frame, once egui has measured it.
+        d.frame(vec![]);
+        d.frame(vec![]);
+        assert!(!d.app.editor.should_quit, "not before the unsaved document is answered for");
+        assert!(d.find("Don't Save").is_some());
+        d.press("Don't Save");
+        assert!(d.app.editor.should_quit, "then it quits");
+
+        let dir = std::env::temp_dir().join(format!("buzz-quit-tabs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kept.buzz");
+        let mut d = MenuDrive::new();
+        d.app.editor.workspace.auto_save = true;
+        d.app.editor.doc.save_as(&path).unwrap();
+        scribble(&mut d.app);
+        d.app.request_quit();
+        assert!(d.app.editor.should_quit, "Auto-Save writes it, nothing to ask");
+        assert!(!d.app.editor.doc.is_dirty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Animate's Library dropdown**: with two documents open, the Library
+    /// shows the other one's symbols, and one of them is copied into this
+    /// document — chosen in the panel, then "Use in This Document".
+    #[test]
+    fn a_symbol_from_another_open_document_is_used_here() {
+        let mut d = MenuDrive::new();
+        d.app.editor.workspace.auto_save = false;
+        // The other document, with a symbol of its own.
+        let mut other = crate::editor::Editor::build_new_document(&buzz_ui::DocumentSetup::default());
+        other.edit("Make", |s| {
+            let lamp = s.add_symbol("Lamp", buzz_scene::SymbolKind::Graphic, None);
+            let layer = s.library().get(lamp).unwrap().layers.iter().next().unwrap().id;
+            let art = buzz_scene::Object::shape(
+                s.next_object_id(),
+                buzz_scene::ShapeData::filled(
+                    buzz_geom::Shape::to_path(&buzz_geom::Rect::new(0.0, 0.0, 10.0, 10.0), 1e-9),
+                    peniko::Color::BLACK,
+                ),
+            );
+            s.library_mut().update(lamp, |sym| {
+                sym.layers.update(layer, |l| {
+                    l.frames.set_objects(0, vec![std::sync::Arc::new(art)]);
+                });
+            });
+        });
+        d.app.open_document_in_new_tab(other);
+        d.app.switch_to_tab(0);
+        d.frame(vec![]);
+        d.press("Library");
+        assert!(d.find("Library of").is_some(), "the dropdown shows with two documents open");
+        d.press("Untitled-1 (this document)");
+        d.frame(vec![]);
+        d.press("Untitled-2");
+        d.frame(vec![]);
+        assert_eq!(d.app.library_source, Some(1));
+        d.press("Lamp");
+        d.press("Use in This Document");
+        let here: Vec<String> = d.app.editor.doc.scene().library().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(here, vec!["Lamp".to_string()], "copied into this document");
+        assert_eq!(d.app.tab_document(1).scene().library().len(), 1, "the other keeps its own");
+    }
+
+    /// The Library's Images folder lists every picture, Generate Image's in
+    /// "AI Generated", and one dragged out lands on the stage.
+    #[test]
+    fn library_images_are_listed_and_placed() {
+        let mut d = MenuDrive::new();
+        let png = |r: u8| {
+            let img = image::RgbaImage::from_pixel(8, 6, image::Rgba([r, 0, 0, 255]));
+            let mut out = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+            out.into_inner()
+        };
+        let mut generated = None;
+        d.app.editor.doc.edit("Images", |s| {
+            s.add_image("photo", &png(200)).unwrap();
+            generated = Some(s.add_image("gen_a_lamp_42", &png(90)).unwrap().id);
+        });
+        d.frame(vec![]);
+        d.press("Library");
+        d.frame(vec![]);
+        assert!(d.find("Images (2)").is_some(), "{:?}", d.texts.iter().map(|t| &t.0).filter(|t| t.contains("mage")).collect::<Vec<_>>());
+        assert!(d.find("AI Generated (1)").is_some());
+        assert!(d.find("gen_a_lamp_42").is_some());
+        assert!(d.find("photo").is_some());
+
+        let before = d.app.editor.doc.scene().layers().iter().map(|l| l.objects_at(0).len()).sum::<usize>();
+        d.app.editor.place_library_image_at(generated.unwrap(), buzz_geom::Point::new(300.0, 200.0));
+        let after = d.app.editor.doc.scene().layers().iter().map(|l| l.objects_at(0).len()).sum::<usize>();
+        assert_eq!(after, before + 1, "placed on the stage");
+    }
+
+    /// Reset Layout never draws over the Help menu: in a narrow window with
+    /// a long status line there is no room for it, and it is left out.
+    #[test]
+    fn reset_layout_never_covers_help() {
+        for width in [900.0f32, 1100.0, 1300.0, 1600.0] {
+            let mut app = App::new(GpuPreference::Automatic);
+            app.recovery.found.clear();
+            app.editor.workspace = buzz_ui::Workspace::default();
+            app.editor.status = Some("Copied \u{201c}a long symbol name\u{201d} and 4 symbols it uses from Untitled-2".into());
+            let ctx = egui::Context::default();
+            buzz_ui::theme::apply(&ctx);
+            let mut texts = Vec::new();
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 900.0))),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(input, |ui| {
+                    app.build_ui(ui);
+                });
+                texts = out
+                    .shapes
+                    .iter()
+                    .filter_map(|s| match &s.shape {
+                        egui::epaint::Shape::Text(t) => Some((t.galley.text().to_string(), t.visual_bounding_rect())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+            }
+            let help = texts.iter().find(|(t, r)| t == "Help" && r.min.y < 40.0).map(|(_, r)| *r).expect("Help is drawn");
+            if let Some((_, reset)) = texts.iter().find(|(t, r)| t == "Reset Layout" && r.min.y < 40.0) {
+                assert!(reset.min.x >= help.max.x, "{width}px: Reset Layout {reset:?} over Help {help:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn highlighting_a_layer_from_the_timeline_menu() {
+        let mut d = MenuDrive::new();
+        let layer = d.app.editor.doc.scene().layers().iter().next().expect("a layer").id;
+        d.layer_menu(layer);
+        d.hover("Highlight");
+        d.press("Green");
+        let got = d.app.editor.doc.scene().layers().get(layer).and_then(|l| l.highlight);
+        assert_eq!(got, Some(buzz_ui::panels::HIGHLIGHT_SWATCHES[3].1), "the layer is highlighted green");
+    }
+
+    /// File ▸ Auto-Save: an edit to a saved document reaches its file once
+    /// the changes settle, without Save — and with the switch off, it does not.
+    #[test]
+    fn auto_save_writes_a_saved_document_after_changes_settle() {
+        let dir = std::env::temp_dir().join(format!("buzz-auto-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("film.buzz");
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.editor.doc.save_as(&path).unwrap();
+        let layer = app.editor.doc.scene().layers().iter().next().expect("a layer").id;
+        let draw = |app: &mut App| {
+            let shape = buzz_scene::ShapeData::filled(
+                buzz_geom::Shape::to_path(&buzz_geom::Rect::new(0.0, 0.0, 10.0, 10.0), 1e-9),
+                peniko::Color::BLACK,
+            );
+            app.editor.doc.edit("Draw", |s| {
+                s.add_shape(layer, shape);
+            });
+        };
+        let on_disk = || {
+            buzz_doc::Document::open(&path)
+                .unwrap()
+                .scene()
+                .layers()
+                .iter()
+                .map(|l| l.objects_at(0).len())
+                .sum::<usize>()
+        };
+        // Poll as frames would, with the quiet period already over.
+        let settle = |app: &mut App| {
+            app.poll_auto_save();
+            app.auto_save.changed_at = Instant::now() - AUTO_SAVE_QUIET * 2;
+            for _ in 0..200 {
+                app.poll_auto_save();
+                if app.auto_save.in_flight.is_none() && !app.editor.doc.is_dirty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        app.editor.workspace.auto_save = false;
+        draw(&mut app);
+        settle(&mut app);
+        assert!(app.editor.doc.is_dirty(), "off: nothing is saved");
+        assert_eq!(on_disk(), 0);
+
+        app.editor.workspace.auto_save = true;
+        settle(&mut app);
+        assert!(!app.editor.doc.is_dirty(), "on: the change is saved");
+        assert_eq!(on_disk(), 1);
+
+        draw(&mut app);
+        app.poll_auto_save();
+        assert!(app.editor.doc.is_dirty(), "not before the changes settle");
+        settle(&mut app);
+        assert_eq!(on_disk(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ai_models_dialog_opens_and_renders_through_ui() {
         let mut app = App::new(GpuPreference::Automatic);
@@ -18333,43 +20000,49 @@ mod idle_tests {
         #[test]
         fn dropping_a_section_between_two_others_docks_it_there() {
             let mut d = Drive::new();
-            // The Color section — still its own section, tabbed with
-            // Swatches, since the inspector's one big stack absorbed Library
-            // — carried within the same column: just above the Properties
-            // section, in the gap between it and what is above.
-            let from = d.grip(buzz_ui::PanelId::Color);
+            // The Story stack — the one tabbed section below the inspector,
+            // now that Color and Swatches tab in with Properties — carried
+            // within the same column: just above the Properties section, in
+            // the gap between it and what is above.
+            let from = d.grip(buzz_ui::PanelId::Story);
             let target = d.zone(buzz_ui::PanelId::Properties);
             let to = egui::pos2(target.center().x, target.top() - 1.0);
+            let carried = d
+                .app
+                .editor
+                .workspace
+                .section_of(buzz_ui::PanelId::Story)
+                .expect("on screen")
+                .panels;
 
             d.drag(from, to);
 
             let workspace = &d.app.editor.workspace;
             assert_eq!(
-                workspace.dock_of(buzz_ui::PanelId::Color),
+                workspace.dock_of(buzz_ui::PanelId::Story),
                 buzz_ui::Dock::Right
             );
             let side = workspace.on(buzz_ui::Dock::Right);
-            let color = side
+            let story = side
                 .iter()
-                .position(|p| *p == buzz_ui::PanelId::Color)
+                .position(|p| *p == buzz_ui::PanelId::Story)
                 .expect("in the right column");
             let properties = side
                 .iter()
                 .position(|p| *p == buzz_ui::PanelId::Properties)
                 .expect("Properties is still there");
             assert!(
-                color < properties && properties - color <= 3,
+                story < properties && side[story..properties] == carried[..],
                 "not just above Properties: {side:?}"
             );
             let section = workspace
-                .section_of(buzz_ui::PanelId::Color)
+                .section_of(buzz_ui::PanelId::Story)
                 .expect("still on screen");
             assert_eq!(
-                section.panels,
-                vec![buzz_ui::PanelId::Color, buzz_ui::PanelId::Swatches,],
-                "the grip carries the whole section, not just Color"
+                section.panels, carried,
+                "the grip carries the whole section, not just Story"
             );
-            assert_eq!(section.front, buzz_ui::PanelId::Color);
+            assert_eq!(section.front, buzz_ui::PanelId::Story);
         }
 
         /// **The whole title bar re-docks, not only the `::` grip.** Dragging a
@@ -18401,9 +20074,9 @@ mod idle_tests {
         #[test]
         fn dropping_on_a_sections_lower_edge_docks_a_row_below_it() {
             let mut d = Drive::new();
-            // Color — still its own section — since Library now tabs with
-            // Properties rather than sitting apart from it.
-            let from = d.grip(buzz_ui::PanelId::Color);
+            // Layers starts *above* Properties, so ending up below it is the
+            // drop's doing and not where it already was.
+            let from = d.grip(buzz_ui::PanelId::Layers);
             let target = d.zone(buzz_ui::PanelId::Properties);
             // Just inside the bottom edge, where the green insertion line shows.
             let to = egui::pos2(target.center().x, target.bottom() - 2.0);
@@ -18412,31 +20085,31 @@ mod idle_tests {
 
             let workspace = &d.app.editor.workspace;
             let section = workspace
-                .section_of(buzz_ui::PanelId::Color)
+                .section_of(buzz_ui::PanelId::Layers)
                 .expect("still on screen");
             assert!(
                 !section.panels.contains(&buzz_ui::PanelId::Properties),
-                "Color tabbed into Properties instead of docking below it: {:?}",
+                "Layers tabbed into Properties instead of docking below it: {:?}",
                 section.panels
             );
             let dock = workspace.dock_of(buzz_ui::PanelId::Properties);
             assert_eq!(
-                workspace.dock_of(buzz_ui::PanelId::Color),
+                workspace.dock_of(buzz_ui::PanelId::Layers),
                 dock,
-                "Color landed in the same column as Properties"
+                "Layers landed in the same column as Properties"
             );
             let side = workspace.on(dock);
-            let color = side
+            let layers = side
                 .iter()
-                .position(|p| *p == buzz_ui::PanelId::Color)
+                .position(|p| *p == buzz_ui::PanelId::Layers)
                 .expect("in the column");
             let properties = side
                 .iter()
                 .position(|p| *p == buzz_ui::PanelId::Properties)
                 .expect("in the column");
             assert!(
-                color > properties,
-                "Color must sit below Properties: {side:?}"
+                layers > properties,
+                "Layers must sit below Properties: {side:?}"
             );
         }
 
@@ -18567,9 +20240,9 @@ mod idle_tests {
         fn proximity_border_highlight_when_close_to_section() {
             let mut d = Drive::new();
             // Need a drag in progress for drop_target to be meaningful.
-            // Color, not Library: Library now tabs inside the same section
-            // as Properties, so it has no grip of its own to start from.
-            let from = d.grip(buzz_ui::PanelId::Color);
+            // Story, not Library or Color: both tab inside the same section
+            // as Properties, so neither has a grip of its own to start from.
+            let from = d.grip(buzz_ui::PanelId::Story);
             let target_rect = d.zone(buzz_ui::PanelId::Properties);
 
             // A point 10 px to the left of the Properties section — outside
@@ -18591,7 +20264,7 @@ mod idle_tests {
             }
 
             // Ask drop_target where this pointer would land.
-            let dragged = vec![buzz_ui::PanelId::Color];
+            let dragged = vec![buzz_ui::PanelId::Story];
             let target = d.app.drop_target(near, &dragged);
             assert!(
                 target.is_some(),
@@ -18617,17 +20290,16 @@ mod idle_tests {
             }
         }
 
-        /// **Grip-dragging the inspector onto Color tabs the whole section
-        /// in.** All eight panels end up sharing one section, on Color's own
-        /// dock, with Properties still in front. Library used to sit apart
-        /// from the inspector and stood in for "another section" here; now
-        /// it tabs alongside Properties already, so Color — still its own
-        /// section — is the one left to drag onto.
+        /// **Grip-dragging the inspector onto the Story stack tabs the whole
+        /// section in.** All thirteen panels end up sharing one section, with
+        /// Properties still in front. Library and then Color used to stand in
+        /// for "another section" here; both tab alongside Properties now, so
+        /// the Story stack is the one left to drag onto.
         #[test]
         fn grip_dragging_the_inspector_onto_the_library_tabs_it_there() {
             let mut d = Drive::new();
             let from = d.grip(buzz_ui::PanelId::Properties);
-            let to = d.zone(buzz_ui::PanelId::Color).center();
+            let to = d.zone(buzz_ui::PanelId::Story).center();
 
             d.drag(from, to);
 
@@ -18649,6 +20321,11 @@ mod idle_tests {
                 buzz_ui::PanelId::ToolOptions,
                 buzz_ui::PanelId::Color,
                 buzz_ui::PanelId::Swatches,
+                buzz_ui::PanelId::Story,
+                buzz_ui::PanelId::Depth,
+                buzz_ui::PanelId::Rig,
+                buzz_ui::PanelId::Lighting,
+                buzz_ui::PanelId::Sound,
             ] {
                 assert!(
                     section.panels.contains(&id),
@@ -18656,14 +20333,14 @@ mod idle_tests {
                     section.panels
                 );
             }
-            assert_eq!(section.panels.len(), 8);
+            assert_eq!(section.panels.len(), 13);
         }
 
         /// **Grip-dragging the inspector onto the stage floats one window**,
-        /// not six — the whole section, not just the panel that was gripped.
-        /// Six, not three: the inspector's one tab stack now holds
-        /// Properties, Filters and Tool Options alongside Library, Assets
-        /// and Cast.
+        /// not eight — the whole section, not just the panel that was gripped.
+        /// Eight: the inspector's one tab stack holds Properties, Effects,
+        /// Tool Options, Color and Swatches alongside Library, Assets and
+        /// Cast.
         #[test]
         fn grip_dragging_the_inspector_onto_the_stage_floats_one_window() {
             let mut d = Drive::new();
@@ -18682,7 +20359,7 @@ mod idle_tests {
                 .expect("still on screen");
             assert_eq!(
                 section.panels.len(),
-                6,
+                8,
                 "the whole inspector should have floated together: {:?}",
                 section.panels
             );
@@ -18691,6 +20368,8 @@ mod idle_tests {
                 buzz_ui::PanelId::Properties,
                 buzz_ui::PanelId::Filters,
                 buzz_ui::PanelId::ToolOptions,
+                buzz_ui::PanelId::Color,
+                buzz_ui::PanelId::Swatches,
                 buzz_ui::PanelId::Library,
                 buzz_ui::PanelId::Assets,
                 buzz_ui::PanelId::Cast,
@@ -18732,6 +20411,119 @@ mod idle_tests {
             assert_eq!(
                 dock_paren_label(workspace.dock_of(buzz_ui::PanelId::Tools)),
                 "Left"
+            );
+        }
+
+        /// Float `id` and let its window settle; returns a point on the
+        /// window's own title bar.
+        fn float_and_find_title(d: &mut Drive, id: buzz_ui::PanelId) -> egui::Pos2 {
+            d.app.editor.workspace.float_at(id, (500.0, 300.0));
+            for _ in 0..4 {
+                d.frame(vec![]);
+            }
+            let window = d.zone(id);
+            // Clear of the close button at the right end of the bar.
+            egui::pos2(window.left() + 30.0, window.top() + 8.0)
+        }
+
+        /// Press at `from`, carry to `to`, let go — with no expectation about
+        /// what egui does with it, unlike [`Drive::drag`].
+        fn press_carry_release(d: &mut Drive, from: egui::Pos2, to: egui::Pos2) {
+            let mods = egui::Modifiers::default();
+            d.frame(vec![egui::Event::PointerMoved(from)]);
+            d.frame(vec![egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: mods,
+            }]);
+            for step in 1..=8 {
+                let t = step as f32 / 8.0;
+                d.frame(vec![egui::Event::PointerMoved(from + (to - from) * t)]);
+            }
+            d.frame(vec![egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: mods,
+            }]);
+            d.frame(vec![]);
+        }
+
+        /// **A floating window dragged by its own title bar docks.** The bar
+        /// is the handle a hand reaches for, and it used to only ever move
+        /// the window — over a section it never lit up, and let go there it
+        /// stayed afloat.
+        #[test]
+        fn a_floating_window_dragged_by_its_title_bar_docks_into_a_section() {
+            let mut d = Drive::new();
+            let from = float_and_find_title(&mut d, buzz_ui::PanelId::Layers);
+            let to = d.zone(buzz_ui::PanelId::Properties).center();
+
+            press_carry_release(&mut d, from, to);
+
+            let workspace = &d.app.editor.workspace;
+            assert_ne!(
+                workspace.dock_of(buzz_ui::PanelId::Layers),
+                buzz_ui::Dock::Float,
+                "the window was let go over Properties and should have docked"
+            );
+            let section = workspace
+                .section_of(buzz_ui::PanelId::Layers)
+                .expect("still on screen");
+            assert!(
+                section.panels.contains(&buzz_ui::PanelId::Properties),
+                "Layers did not tab in with Properties: {:?}",
+                section.panels
+            );
+        }
+
+        /// …and moved over the stage it is only *moved*: a floating window is
+        /// repositioned by its title bar all the time, and that must not dock
+        /// it or do anything else to the layout.
+        #[test]
+        fn a_floating_window_moved_over_the_stage_stays_floating() {
+            let mut d = Drive::new();
+            let from = float_and_find_title(&mut d, buzz_ui::PanelId::Layers);
+            let to = from + egui::vec2(60.0, 40.0);
+
+            press_carry_release(&mut d, from, to);
+
+            assert_eq!(
+                d.app.editor.workspace.dock_of(buzz_ui::PanelId::Layers),
+                buzz_ui::Dock::Float
+            );
+        }
+
+        /// **An empty side can be docked to.** An empty column draws
+        /// nothing, so there was nothing to drop on; the window's edge stands
+        /// in for it.
+        #[test]
+        fn a_panel_dropped_on_an_empty_sides_edge_docks_there() {
+            let mut d = Drive::new();
+            // The Voices panel lives in the Far Right column by default; close
+            // it so that side is empty.
+            d.app.editor.workspace.move_to(buzz_ui::PanelId::Voices, buzz_ui::Dock::Hidden);
+            d.frame(vec![]);
+            d.frame(vec![]);
+            assert!(
+                d.app.editor.workspace.on(buzz_ui::Dock::RightOuter).is_empty(),
+                "this test needs the Far Right column empty"
+            );
+            let strip = d
+                .app
+                .edge_zones
+                .iter()
+                .find(|(dock, _)| *dock == buzz_ui::Dock::RightOuter)
+                .map(|(_, r)| *r)
+                .expect("the empty Far Right side has a drop strip");
+            let from = d.grip(buzz_ui::PanelId::Layers);
+
+            d.drag(from, strip.center());
+
+            assert_eq!(
+                d.app.editor.workspace.dock_of(buzz_ui::PanelId::Layers),
+                buzz_ui::Dock::RightOuter
             );
         }
     }

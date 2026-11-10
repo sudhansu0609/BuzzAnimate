@@ -401,7 +401,7 @@ fn filters_apply(app: &mut App, target: &Target, req: &Req) -> Result<Value, Str
 // -- modifiers --------------------------------------------------------------------------
 
 const MODIFIER_KINDS: &[&str] =
-    &["wiggle", "spring", "look_at", "squash_stretch", "breathe", "blink", "turn", "sway", "drift"];
+    &["wiggle", "spring", "look_at", "squash_stretch", "breathe", "blink", "turn", "sway", "drift", "pendulum", "hair"];
 
 fn modifier_fields(m: &Modifier) -> (&'static str, Vec<(&'static str, f64)>) {
     match *m {
@@ -421,6 +421,31 @@ fn modifier_fields(m: &Modifier) -> (&'static str, Vec<(&'static str, f64)>) {
         Modifier::Drift { dx, dy, span, phase } => {
             ("drift", vec![("dx", dx), ("dy", dy), ("span", span), ("phase", phase)])
         }
+        Modifier::Pendulum { period, damping, reaction, initial_angle, sway, max_angle, pivot_dx, pivot_dy } => (
+            "pendulum",
+            vec![
+                ("period", period),
+                ("damping", damping),
+                ("reaction", reaction),
+                ("initial_angle", initial_angle),
+                ("sway", sway),
+                ("max_angle", max_angle),
+                ("pivot_dx", pivot_dx),
+                ("pivot_dy", pivot_dy),
+            ],
+        ),
+        Modifier::Hair { side, segments, stiffness, damping, wind, wind_rate, lag } => (
+            "hair",
+            vec![
+                ("side", side.index() as f64),
+                ("segments", segments as f64),
+                ("stiffness", stiffness),
+                ("damping", damping),
+                ("wind", wind),
+                ("wind_rate", wind_rate),
+                ("lag", lag),
+            ],
+        ),
     }
 }
 
@@ -437,6 +462,8 @@ fn modifier_default(kind: &str) -> Option<Modifier> {
         "turn" => Modifier::Turn { round: 1.0 },
         "sway" => Modifier::Sway { amount: 0.12, rate: 0.2 },
         "drift" => Modifier::Drift { dx: 12.0, dy: 0.0, span: 0.0, phase: 0.0 },
+        "pendulum" => Modifier::pendulum(),
+        "hair" | "cloth" | "haircloth" => Modifier::hair(),
         _ => return None,
     })
 }
@@ -519,6 +546,35 @@ fn build_modifier(item: &Map<String, Value>, base: Option<&Modifier>) -> Result<
         "blink" => Modifier::Blink { rate: f("rate"), duration: f("duration") },
         "turn" => Modifier::Turn { round: f("round") },
         "sway" => Modifier::Sway { amount: f("amount"), rate: f("rate") },
+        "pendulum" => Modifier::Pendulum {
+            period: f("period").clamp(0.1, 30.0),
+            damping: f("damping").clamp(0.0, 2.0),
+            reaction: f("reaction").clamp(0.0, 4.0),
+            initial_angle: f("initial_angle").clamp(-180.0, 180.0),
+            sway: f("sway").clamp(0.0, 45.0),
+            max_angle: f("max_angle").clamp(1.0, 170.0),
+            pivot_dx: f("pivot_dx"),
+            pivot_dy: f("pivot_dy"),
+        },
+        "hair" => {
+            let side = f("side");
+            if !(0.0..=3.0).contains(&side) || side.fract() != 0.0 {
+                return Err("'side' needs 0 (top), 1 (left), 2 (right) or 3 (bottom)".into());
+            }
+            let segments = f("segments");
+            if !(2.0..=12.0).contains(&segments) || segments.fract() != 0.0 {
+                return Err("'segments' needs a whole number 2..12".into());
+            }
+            Modifier::Hair {
+                side: buzz_scene::PinSide::from_index(side as usize),
+                segments: segments as usize,
+                stiffness: f("stiffness").clamp(1.0, 1500.0),
+                damping: f("damping").clamp(0.0, 120.0),
+                wind: f("wind").clamp(0.0, 5.0),
+                wind_rate: f("wind_rate").clamp(0.05, 10.0),
+                lag: f("lag").clamp(0.0, 4.0),
+            }
+        }
         _ => Modifier::Drift { dx: f("dx"), dy: f("dy"), span: f("span"), phase: f("phase") },
     })
 }

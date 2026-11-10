@@ -91,6 +91,10 @@ pub struct TimelineResponse {
     /// One entry for a single layer's own "Highlight" submenu; every
     /// selected layer for "Highlight Selected Layers". H2.
     pub set_highlight: Option<(Vec<LayerId>, Option<peniko::Color>)>,
+    /// Layers whose kind changes, and whether to lock them — Animate's
+    /// right-click **Mask**: the layer becomes a mask, the one under it is
+    /// masked by it, and both are locked so the mask shows at once.
+    pub set_kinds: Option<Vec<(LayerId, buzz_scene::LayerKind, bool)>>,
     /// A frame operation was requested.
     pub action: Option<FrameAction>,
     /// A tween was created or removed from the frame menu.
@@ -277,7 +281,11 @@ pub enum LayerFilter {
 }
 
 impl LayerFilter {
-    pub const EVERY: [LayerFilter; 3] = [LayerFilter::All, LayerFilter::HideEmpty, LayerFilter::HereOnly];
+    pub const EVERY: [LayerFilter; 3] = [
+        LayerFilter::All,
+        LayerFilter::HideEmpty,
+        LayerFilter::HereOnly,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -350,7 +358,12 @@ pub struct RowFilterCtx<'a> {
 /// A row shows when it is pinned, when it passes the filter and the search on
 /// its own, or when any row filed under it shows (so ancestors of a shown row
 /// show, and a folder whose children are all hidden hides).
-pub fn row_filter_hidden(scene: &Scene, id: LayerId, filter: LayerFilter, ctx: &RowFilterCtx) -> bool {
+pub fn row_filter_hidden(
+    scene: &Scene,
+    id: LayerId,
+    filter: LayerFilter,
+    ctx: &RowFilterCtx,
+) -> bool {
     if filter == LayerFilter::All && ctx.search.is_empty() {
         return false;
     }
@@ -394,9 +407,10 @@ fn row_shown(
     if depth > stack.len() {
         return false;
     }
-    ctx.children
-        .get(&id)
-        .is_some_and(|kids| kids.iter().any(|&k| row_shown(stack, k, filter, ctx, depth + 1)))
+    ctx.children.get(&id).is_some_and(|kids| {
+        kids.iter()
+            .any(|&k| row_shown(stack, k, filter, ctx, depth + 1))
+    })
 }
 
 /// The layer filter's answer for one frame of drawing: which rows it hides.
@@ -527,7 +541,8 @@ impl LayerRowCache {
         if self.objects_key.as_ref() != Some(&objects_key) {
             self.object_layers.clear();
             if !selected_objects.is_empty() {
-                let wanted: std::collections::HashSet<_> = selected_objects.iter().copied().collect();
+                let wanted: std::collections::HashSet<_> =
+                    selected_objects.iter().copied().collect();
                 for layer in scene.layers().iter() {
                     if layer.all_objects().any(|o| wanted.contains(&o.id)) {
                         self.object_layers.push(layer.id);
@@ -564,7 +579,10 @@ impl LayerRowCache {
             .map(|l| l.id)
             .filter(|&id| row_filter_hidden(scene, id, filter, &ctx))
             .collect();
-        let hidden_count = hidden.iter().filter(|&&id| !stack.is_row_hidden(id)).count();
+        let hidden_count = hidden
+            .iter()
+            .filter(|&&id| !stack.is_row_hidden(id))
+            .count();
         self.view = RowFilter {
             hidden: Some(std::sync::Arc::new(hidden)),
             hidden_count,
@@ -626,7 +644,10 @@ pub fn frame_move_targets_filtered(
             return Err("there is no layer row there".into());
         };
         if !layer.kind.holds_artwork() {
-            return Err(format!("\u{201C}{}\u{201D} is a folder, which holds no frames", layer.name));
+            return Err(format!(
+                "\u{201C}{}\u{201D} is a folder, which holds no frames",
+                layer.name
+            ));
         }
         if stack.is_effectively_locked(target) {
             return Err(format!("\u{201C}{}\u{201D} is locked", layer.name));
@@ -837,7 +858,14 @@ pub struct Waveform {
     /// One past the last level to draw — the out-point in clip-frames, or the
     /// clip's end when `None`.
     pub level_end: Option<usize>,
+    /// The signal's minimum and maximum in [`WAVE_PEAKS_PER_FRAME`] slices of
+    /// every clip-frame, for drawing the wave itself rather than one block of
+    /// loudness per frame. Empty draws the loudness envelope instead.
+    pub peaks: std::sync::Arc<Vec<(f32, f32)>>,
 }
+
+/// How many min/max readings of the sound each frame cell draws.
+pub const WAVE_PEAKS_PER_FRAME: usize = 8;
 
 /// Width reserved for the layer-name column.
 ///
@@ -847,7 +875,7 @@ const LAYER_COLUMN: f32 = 210.0;
 
 /// H2: the width of a highlighted layer's left-edge bar, in both the
 /// timeline's name column and the Layers panel's rows.
-const HIGHLIGHT_BAR_WIDTH: f32 = 4.0;
+pub(crate) const HIGHLIGHT_BAR_WIDTH: f32 = 8.0;
 
 /// I2: width reserved for the folder disclosure triangle, left of every
 /// row's name. Reserved on every row, not only folders', so a folder's name
@@ -860,7 +888,13 @@ const DISCLOSURE_WIDTH: f32 = 12.0;
 /// frame; drawn on folder rows only, but `rect` is reserved on every row (see
 /// [`DISCLOSURE_WIDTH`]) so the call site can skip drawing without leaving a
 /// gap where the name shifts.
-fn disclosure_triangle(ui: &Ui, painter: &egui::Painter, rect: egui::Rect, id: egui::Id, collapsed: bool) -> bool {
+fn disclosure_triangle(
+    ui: &Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    id: egui::Id,
+    collapsed: bool,
+) -> bool {
     let response = ui.interact(rect, id, Sense::click());
     let color = if response.hovered() {
         Palette::text()
@@ -887,9 +921,10 @@ fn disclosure_triangle(ui: &Ui, painter: &egui::Painter, rect: egui::Rect, id: e
     response.clicked()
 }
 
-/// H2: the alpha of a highlighted layer's colour wash — roughly 22% of
-/// `0xFF`, muted enough to mark a row without drowning what is drawn on it.
-const HIGHLIGHT_WASH_ALPHA: u8 = 56;
+/// H2: the alpha of a highlighted layer's colour wash — a little under half,
+/// so a highlighted row is plain at a glance down a long timeline, as in
+/// Animate. At 22% it was easy to miss entirely on the light frame cells.
+pub(crate) const HIGHLIGHT_WASH_ALPHA: u8 = 120;
 /// The alpha of the selected layer's wash across its frames — fainter than a
 /// highlight colour's, so a highlighted *and* selected row still shows both.
 const ACTIVE_ROW_WASH_ALPHA: u8 = 34;
@@ -1342,6 +1377,9 @@ pub fn timeline_panel_with_tools_slot(
                 layer_row(ui, scene, layer, columns, state, &mut response);
             }
 
+            // The rows a frame drag covers, now that every row has been laid out.
+            frame_drag_select(ui, scene, columns, state, &mut response);
+
             // **The playhead runs down through every row.** Animate's playhead
             // is one line from the ruler to the bottom of the timeline, so the
             // current frame can be read on any layer; the per-cell wash alone
@@ -1349,7 +1387,13 @@ pub fn timeline_panel_with_tools_slot(
             // over the rows, clipped to the frame grid so it never crosses the
             // pinned layer names, and down to the bottom of the view even when
             // the layers end above it.
-            draw_playhead_line(ui, rows_left, rows_top, state.current_frame, state.frame_width);
+            draw_playhead_line(
+                ui,
+                rows_left,
+                rows_top,
+                state.current_frame,
+                state.frame_width,
+            );
 
             // **Connectors last**, over every row, because a link crosses the
             // rows between its two ends and would otherwise be painted over by
@@ -1404,6 +1448,23 @@ pub fn timeline_panel_with_tools_slot(
 
     ui.spacing_mut().scroll = theme_scroll;
     if ui.input(|i| i.pointer.any_released()) {
+        // A frame drag ends here, with every row it crossed collected.
+        let drag = ui
+            .ctx()
+            .data(|d| d.get_temp::<FrameVerticalDrag>(egui::Id::new("timeline_frame_vertical_drag")));
+        if let Some(drag) = drag
+            && let Some(layers) = response.select_layers.clone()
+            && let Some(&first) = layers.first()
+        {
+            let anchor = drag.anchor_layer.filter(|a| layers.contains(a)).unwrap_or(first);
+            response.select_cells = Some(crate::TimelineSelection::new(
+                layers,
+                drag.start_frame,
+                drag.current_frame,
+                anchor,
+                drag.start_frame,
+            ));
+        }
         ui.ctx().data_mut(|d| {
             d.remove_temp::<FrameVerticalDrag>(egui::Id::new("timeline_frame_vertical_drag"));
             d.remove::<FrameMoveDrag>(egui::Id::new(FRAME_MOVE_DRAG));
@@ -1514,9 +1575,7 @@ fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Time
         // the far side of the window cannot answer it next to the layer it is
         // about.
         if ui
-            .add(
-                egui::Button::new("Depth").selected(state.depth_view),
-            )
+            .add(egui::Button::new("Depth").selected(state.depth_view))
             .on_hover_text(
                 "Depth view: the layer column shows how far each layer sits \
                  from the camera. Drag a number to move that layer in space.",
@@ -1524,6 +1583,25 @@ fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Time
             .clicked()
         {
             out.toggle_depth = true;
+        }
+
+        // **One click for a whole column**: the playhead frame on every shown
+        // layer, scrolled out of view or not — the same selection as a drag
+        // from the top row to the bottom, or Option-clicking a frame.
+        if ui
+            .button("Column")
+            .on_hover_text(
+                "Select this frame on every layer (Option-click a frame does the same)",
+            )
+            .clicked()
+            && let Some(&anchor) = display_rows(scene, &state.row_filter).first()
+        {
+            out.select_cells = Some(column_selection(
+                scene,
+                &state.row_filter,
+                state.current_frame,
+                state.active_layer.unwrap_or(anchor),
+            ));
         }
 
         // How many, on the same line: the count is the one thing about the
@@ -1616,7 +1694,10 @@ fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Time
             egui::ComboBox::from_id_salt("protect_scope")
                 .selected_text(name(scope))
                 .show_ui(ui, |ui| {
-                    for s in [buzz_scene::ProtectScope::ThisKeyframe, buzz_scene::ProtectScope::FromHere] {
+                    for s in [
+                        buzz_scene::ProtectScope::ThisKeyframe,
+                        buzz_scene::ProtectScope::FromHere,
+                    ] {
                         ui.selectable_value(&mut picked, s, name(s));
                     }
                 });
@@ -1773,8 +1854,11 @@ fn icon_button(ui: &mut Ui, active: bool, tip: &str, glyph: Glyph) -> bool {
     if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 3.0, bg);
     }
+    // On the active fill, the role made to be read against it — the fill is
+    // the accent itself, so accent-coloured ink drew Pause blue on blue and
+    // the button looked empty while playing. Same fix as the tool buttons'.
     let ink = if active {
-        Palette::accent()
+        Palette::accent_text()
     } else {
         crate::icon_sheet::ink()
     };
@@ -2231,9 +2315,7 @@ fn ruler(
             || ui
                 .ctx()
                 .data(|d| {
-                    d.get_temp::<FrameVerticalDrag>(egui::Id::new(
-                        "timeline_frame_vertical_drag",
-                    ))
+                    d.get_temp::<FrameVerticalDrag>(egui::Id::new("timeline_frame_vertical_drag"))
                 })
                 .is_some();
         if let Some(target_x) = playhead_follow_target(
@@ -2483,13 +2565,21 @@ fn draw_playhead(
 fn draw_playhead_line(ui: &Ui, left: f32, top: f32, frame: u32, cell_width: f32) {
     let clip = ui.clip_rect();
     let x = left + LAYER_COLUMN + (frame as f32 + 0.5) * cell_width;
-    let grid_area = egui::Rect::from_min_max(egui::pos2(clip.min.x + LAYER_COLUMN, top.max(clip.min.y)), clip.max);
+    let grid_area = egui::Rect::from_min_max(
+        egui::pos2(clip.min.x + LAYER_COLUMN, top.max(clip.min.y)),
+        clip.max,
+    );
     if x < grid_area.min.x || x > grid_area.max.x || grid_area.height() <= 0.0 {
         return;
     }
-    let line = egui::Rect::from_min_max(egui::pos2(x - 0.5, grid_area.min.y), egui::pos2(x + 0.5, grid_area.max.y));
-    ui.painter_at(grid_area).rect_filled(line, 0.0, Palette::accent());
-    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(PLAYHEAD_LINE), line));
+    let line = egui::Rect::from_min_max(
+        egui::pos2(x - 0.5, grid_area.min.y),
+        egui::pos2(x + 0.5, grid_area.max.y),
+    );
+    ui.painter_at(grid_area)
+        .rect_filled(line, 0.0, Palette::accent());
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(egui::Id::new(PLAYHEAD_LINE), line));
 }
 
 /// Where [`draw_playhead_line`] drew the playhead through the rows, for tests.
@@ -2547,14 +2637,20 @@ fn shows_camera_row(scene: &Scene) -> bool {
 }
 
 /// The camera row's interpolated-run tint: a blue distinct from the accent,
-/// so a camera move reads apart from an ordinary tween. Lightened in a light
-/// theme rather than left at the dark-theme value regardless of which theme is
-/// current — the same "canvas follows the theme" rule the frame cells follow.
+/// so a camera move reads apart from an ordinary tween.
 fn camera_tween_tint() -> Color32 {
+    // Mid-toned in every theme, like a layer's own tween colours — a softer,
+    // greyer blue than a motion tween's so the two still read apart.
+    Color32::from_rgb(0x9C, 0xB4, 0xD6)
+}
+
+/// The camera row's occupied cells: the layers' own paper colour with a
+/// slight blue cast, so the row looks like a layer's but reads as the camera.
+fn camera_fill() -> Color32 {
     if crate::theme::theme().is_dark() {
-        Color32::from_rgb(0x3A, 0x4A, 0x60)
+        Color32::from_rgb(0xC6, 0xD4, 0xE8)
     } else {
-        Color32::from_rgb(0xC9, 0xD8, 0xEE)
+        Color32::from_rgb(0xD6, 0xE2, 0xF3)
     }
 }
 
@@ -2638,6 +2734,8 @@ fn camera_row(
             false,
             frame == state.current_frame,
             None,
+            Some(camera_fill()),
+            !camera.is_empty() && frame == last,
         );
     }
 
@@ -2652,6 +2750,12 @@ fn camera_row(
             names_bg()
         },
     );
+    // The camera's row reads as a layer's, tinted blue so it is told apart
+    // at a glance — lighter than a highlighted layer's wash.
+    if !state.camera_selected {
+        let [r, g, b, _] = camera_fill().to_array();
+        names.rect_filled(name_row, 0.0, Color32::from_rgba_unmultiplied(r, g, b, 56));
+    }
     // **C1**: dimmed while the camera is switched off — the same treatment a
     // hidden layer's own name gets — so a row shown only because it still
     // carries keys reads at a glance as "off".
@@ -2841,6 +2945,8 @@ fn light_row(
             false,
             frame == state.current_frame,
             None,
+            None,
+            !is_empty && frame == last,
         );
     }
 
@@ -3034,6 +3140,8 @@ fn layer_row(
                     && (state.active_layer == Some(layer.id)
                         || state.selected_layers.contains(&layer.id))),
             highlight_wash,
+            None,
+            matches!(layer.frame_kind(frame + 1), FrameKind::Empty),
         );
     }
     // A sound layer draws its waveform across the frames the sound covers, over
@@ -3061,7 +3169,11 @@ fn layer_row(
     if active {
         let [r, g, b, _] = Palette::active().to_array();
         let row = egui::Rect::from_min_max(egui::pos2(grid_left, rect.min.y), rect.max);
-        grid.rect_filled(row, 0.0, Color32::from_rgba_unmultiplied(r, g, b, ACTIVE_ROW_WASH_ALPHA));
+        grid.rect_filled(
+            row,
+            0.0,
+            Color32::from_rgba_unmultiplied(r, g, b, ACTIVE_ROW_WASH_ALPHA),
+        );
         let [r, g, b, _] = layer.color.to_rgba8().to_u8_array();
         grid.rect_filled(
             egui::Rect::from_min_max(egui::pos2(grid_left, rect.max.y - 2.0), rect.max),
@@ -3072,7 +3184,12 @@ fn layer_row(
 
     // -- name column, pinned and drawn over the grid ----------------------
     let painter = ui.painter_at(name_row.intersect(ui.clip_rect()));
-    if active {
+    // Only the layer being worked on takes the solid blue. The others in a
+    // multi-layer selection — a vertical frame drag selects a dozen — get a
+    // light wash instead, so their names stay readable and their own
+    // highlights still show: a column of solid blue hid every name in it.
+    let current = state.active_layer == Some(layer.id);
+    if current {
         // Animate marks the selected layer with a blue name panel and its own
         // outline colour as a line along the bottom of the row — the theme's
         // own "active/selected" role, not a fixed blue.
@@ -3090,8 +3207,7 @@ fn layer_row(
         // Opaque, so the scrolling grid never shows through the pinned names.
         painter.rect_filled(name_row, 0.0, names_bg());
         // H2: the highlight wash. Painted only when the row is not the
-        // active one — the selected-layer blue above already owns the name
-        // cell, and this must not tint it.
+        // current one — the solid blue above already owns that name cell.
         if let Some(h) = layer.highlight {
             let [r, g, b, _] = h.to_rgba8().to_u8_array();
             painter.rect_filled(
@@ -3101,7 +3217,11 @@ fn layer_row(
             );
         }
     }
-    // H2: the highlight's own 4 px bar at the row's left edge, painted last
+    if active && !current {
+        let [r, g, b, _] = Palette::active().to_array();
+        painter.rect_filled(name_row, 0.0, Color32::from_rgba_unmultiplied(r, g, b, 0x50));
+    }
+    // H2: the highlight's own bar at the row's left edge, painted last
     // so it stays visible even on the active row, whose blue would otherwise
     // cover it.
     if let Some(h) = layer.highlight {
@@ -3168,11 +3288,13 @@ fn layer_row(
                 // pulling in a collapsed folder's hidden children when the
                 // folder itself falls inside the range. The anchor itself
                 // does not move.
-                let anchor = state.range_anchor.or(state.active_layer).unwrap_or(layer.id);
+                let anchor = state
+                    .range_anchor
+                    .or(state.active_layer)
+                    .unwrap_or(layer.id);
                 let order = state.row_filter.visible_row_order(scene.layers());
                 let range = crate::selection::layer_range(&order, anchor, layer.id);
-                out.select_layers =
-                    Some(crate::selection::expand_collapsed_folders(scene, &range));
+                out.select_layers = Some(crate::selection::expand_collapsed_folders(scene, &range));
             } else if toggle {
                 let mut current = state.selected_layers.clone();
                 if !current.contains(&layer.id) {
@@ -3189,7 +3311,13 @@ fn layer_row(
             }
         }
         name_resp.context_menu(|ui| {
-            out.select_layer = Some(layer.id);
+            // Right-clicking one of several selected layers keeps them all
+            // selected — the menu then offers "Highlight Selected Layers"
+            // and acts on the lot. Re-selecting here, every frame the menu
+            // was open, collapsed the selection to this one layer.
+            if !state.selected_layers.contains(&layer.id) {
+                out.select_layer = Some(layer.id);
+            }
             layer_context_menu(ui, scene, layer, state, out);
         });
 
@@ -3201,10 +3329,13 @@ fn layer_row(
             Align2::LEFT_CENTER,
             format!("{mark}{}", layer.name),
             FontId::proportional(11.0),
-            if layer.visible {
-                Palette::text()
-            } else {
-                Palette::text_dim()
+            // On the selected row's blue, the ink made to be read against
+            // it; the ordinary text colour vanished into it in Light.
+            match (current, layer.visible) {
+                (true, true) => Palette::accent_text(),
+                (true, false) => Palette::accent_text().gamma_multiply(0.6),
+                (false, true) => Palette::text(),
+                (false, false) => Palette::text_dim(),
             },
         );
     }
@@ -3325,25 +3456,36 @@ fn layer_row(
         let frame = (((press.x - grid_left) / cell_width).floor().max(0.0) as u32)
             .min(columns.saturating_sub(1));
         let selection = state.timeline_selection.as_ref()?;
-        selection.contains(layer.id, frame).then_some(FrameMoveDrag {
-            press_frame: frame,
-            current_frame: frame,
-            press_layer: layer.id,
-            first_frame: selection.first_frame,
-            rows: 0,
-        })
+        selection
+            .contains(layer.id, frame)
+            .then_some(FrameMoveDrag {
+                press_frame: frame,
+                current_frame: frame,
+                press_layer: layer.id,
+                first_frame: selection.first_frame,
+                rows: 0,
+            })
     });
     if let Some(Some(drag)) = move_press {
-        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(FRAME_MOVE_DRAG), drag));
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new(FRAME_MOVE_DRAG), drag));
     }
     frame_move_drag(
         ui, scene, &grid, layer.id, rect, grid_left, cell_width, columns, state, out,
     );
 
-    // Initiating vertical drag across frames on a column
+    // **A frame drag starts on the row and the frame that were pressed** —
+    // read from the press, not from wherever the pointer is once egui calls
+    // it a drag: by then a quick downward flick was already on the next row,
+    // and the row the drag began on was left out. Which rows it reaches is
+    // decided once per frame after every row is laid out
+    // (`frame_drag_select`), by row order, so rows scrolled out of view
+    // are included too.
     if response.drag_started()
         && !matches!(move_press, Some(Some(_)))
-        && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+        && let Some(pos) = ui
+            .ctx()
+            .input(|i| i.pointer.press_origin().or(i.pointer.interact_pos()))
         && pos.x >= grid_edge
     {
         let frame = ((pos.x - grid_left) / cell_width).floor().max(0.0) as u32;
@@ -3360,69 +3502,15 @@ fn layer_row(
         });
     }
 
-    // When vertical drag is active, check whether this layer row falls in the vertical drag range
-    let drag_active = ui.ctx().data(|d| d.get_temp::<FrameVerticalDrag>(drag_id));
-    if let Some(mut drag) = drag_active {
-        let cur_y = ui
-            .ctx()
-            .input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()))
-            .map(|p| p.y)
-            .unwrap_or(drag.start_y);
-        let y_min = drag.start_y.min(cur_y);
-        let y_max = drag.start_y.max(cur_y);
-        if let Some(pos) = ui
-            .ctx()
-            .input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()))
-        {
-            drag.current_frame = (((pos.x - grid_left) / cell_width).floor().max(0.0) as u32)
-                .min(columns.saturating_sub(1));
-            ui.ctx().data_mut(|d| d.insert_temp(drag_id, drag));
-        }
-
-        if rect.min.y <= y_max && rect.max.y >= y_min {
-            out.select_layers
-                .get_or_insert_with(Vec::new)
-                .push(layer.id);
-            out.scrub_to = Some(drag.current_frame);
-
-            // Highlight the dragged frame cell
-            let first = drag.start_frame.min(drag.current_frame);
-            let last = drag.start_frame.max(drag.current_frame);
-            let x = grid_left + first as f32 * cell_width;
-            let cell = egui::Rect::from_min_size(
-                egui::pos2(x, rect.min.y),
-                egui::vec2(cell_width * (last - first + 1) as f32, height),
-            );
-            let [r, g, b, _] = Palette::active().to_array();
-            grid.rect_filled(cell, 0.0, Color32::from_rgba_unmultiplied(r, g, b, 0xA0));
-            grid.rect_stroke(
-                cell,
-                0.0,
-                egui::Stroke::new(1.5, Palette::active()),
-                StrokeKind::Inside,
-            );
-
-            // Highlight the layer name panel
-            painter.rect_filled(name_row, 0.0, Palette::active());
-        }
-
-        if ui.input(|i| i.pointer.any_released())
-            && let Some(layers) = out.select_layers.clone()
-            && let Some(anchor) = drag.anchor_layer.or_else(|| layers.first().copied())
-        {
-            out.select_cells = Some(crate::TimelineSelection::new(
-                layers,
-                drag.start_frame,
-                drag.current_frame,
-                anchor,
-                drag.start_frame,
-            ));
-            ui.ctx()
-                .data_mut(|d| d.remove_temp::<FrameVerticalDrag>(drag_id));
-        }
+    // **Option/Alt-click selects the whole column**: this frame on every
+    // layer, the one-click version of a drag from the top row to the bottom.
+    let column_click = response.clicked() && ui.input(|i| i.modifiers.alt);
+    if column_click && let Some(frame) = clicked_frame(ui) {
+        out.select_cells = Some(column_selection(scene, &state.row_filter, frame, layer.id));
+        out.scrub_to = Some(frame);
     }
 
-    if response.clicked() {
+    if response.clicked() && !column_click {
         // A switch first: clicking the eye hides the layer, it does not also
         // select it and move the playhead to frame one.
         let hit = ui
@@ -3483,11 +3571,15 @@ fn layer_row(
             .ctx()
             .input(|i| i.pointer.interact_pos())
             .is_some_and(|pos| pos.x < grid_edge);
+        // Read the frame before taking the data lock: `clicked_frame` reads
+        // the pointer through `ctx.input`, and egui's context lock is not
+        // re-entrant — calling it inside `data_mut` froze the app.
+        let frame = clicked_frame(ui);
         ui.ctx().data_mut(|d| {
             d.insert_temp(
                 menu_target_id,
                 MenuTarget {
-                    frame: clicked_frame(ui),
+                    frame,
                     in_name_column,
                 },
             )
@@ -3507,7 +3599,8 @@ fn layer_row(
         }) {
             if let Some(frame) = clicked {
                 out.select_cells = Some(crate::TimelineSelection::cell(layer.id, frame));
-            } else {
+            } else if !state.selected_layers.contains(&layer.id) {
+                // A layer already among several selected keeps them all.
                 out.select_layer = Some(layer.id);
             }
         }
@@ -3862,6 +3955,8 @@ fn layer_context_menu(
 
     // H2: Animate's Highlight Layer — a colour to pick this layer out down
     // the track, independent of its automatic colour chip.
+    // This layer only, so layers can be coloured one after another and each
+    // keeps its own; "Highlight Selected Layers" below colours a selection.
     ui.menu_button("Highlight", |ui| {
         crate::panels::highlight_menu_body(ui, layer.highlight, |picked| {
             out.set_highlight = Some((vec![layer.id], picked));
@@ -3873,6 +3968,51 @@ fn layer_context_menu(
             crate::panels::highlight_menu_body(ui, None, |picked| {
                 out.set_highlight = Some((selected.clone(), picked));
             });
+        });
+    }
+
+    // **Mask**, as Animate's layer menu has it: this layer masks the one
+    // below, and both are locked — the stage shows a mask's effect only on
+    // locked layers, so without the lock it looked as if nothing happened.
+    // Ticked on a mask layer, where it turns the pair back into plain layers.
+    if layer.kind != LayerKind::Folder {
+        use buzz_scene::LayerKind as K;
+        let is_mask = matches!(layer.kind, K::Mask | K::InverseMask);
+        let rows: Vec<&std::sync::Arc<buzz_scene::Layer>> = scene.layers().iter().collect();
+        let below = rows
+            .iter()
+            .position(|l| l.id == layer.id)
+            .and_then(|i| rows.get(i + 1))
+            .filter(|l| l.kind != K::Folder)
+            .map(|l| l.id);
+        if ui.checkbox(&mut is_mask.clone(), "Mask").clicked() {
+            out.set_kinds = Some(if is_mask {
+                // Unmask: the mask and every layer it was clipping go back.
+                let mut kinds = vec![(layer.id, K::Normal, false)];
+                let start = rows.iter().position(|l| l.id == layer.id).unwrap_or(0) + 1;
+                kinds.extend(
+                    rows[start.min(rows.len())..]
+                        .iter()
+                        .take_while(|l| l.kind == K::Masked)
+                        .map(|l| (l.id, K::Normal, false)),
+                );
+                kinds
+            } else {
+                let mut kinds = vec![(layer.id, K::Mask, true)];
+                if let Some(below) = below {
+                    kinds.push((below, K::Masked, true));
+                }
+                kinds
+            });
+            ui.close();
+        }
+        ui.menu_button("Layer Type", |ui| {
+            for choice in [K::Normal, K::Mask, K::InverseMask, K::Masked, K::Guide, K::Guided] {
+                if ui.selectable_label(layer.kind == choice, choice.display_name()).clicked() {
+                    out.set_kinds = Some(vec![(layer.id, choice, false)]);
+                    ui.close();
+                }
+            }
         });
     }
 
@@ -4059,46 +4199,153 @@ fn draw_waveform(
 ) {
     let middle = row.center().y;
     let half = (height * 0.5 - 2.0).max(1.0);
-    let colour = Color32::from_rgba_unmultiplied(120, 215, 255, 150);
+    // Deep red, nearly opaque, so the accents an animator times to stand out
+    // on Animate's light paper; a thin centre line keeps silence readable.
+    let colour = Color32::from_rgba_unmultiplied(150, 18, 28, 230);
 
     // Only the trimmed section of the clip is drawn, laid out from the sound's
-    // start frame: timeline frame `start_frame + i` shows clip level
+    // start frame: timeline frame `start_frame + i` shows clip frame
     // `level_start + i`, up to the out-point (`level_end`) or the clip's end.
     let last_level = waveform
         .level_end
         .unwrap_or(waveform.levels.len())
         .min(waveform.levels.len());
-    let mut i = 0u32;
-    loop {
-        let level_idx = waveform.level_start + i as usize;
-        if level_idx >= last_level {
-            break;
+    let first = waveform.start_frame.max(visible.start);
+    let stop = {
+        let clip_end = waveform.start_frame as u64 + last_level.saturating_sub(waveform.level_start) as u64;
+        // The sound also stops at the next keyframe (a blank keyframe cuts
+        // it), so the waveform does too.
+        let mut stop = clip_end.min(visible.end as u64);
+        if let Some(e) = end {
+            stop = stop.min(e as u64);
         }
-        let frame = waveform.start_frame + i;
-        i += 1;
-        // The sound also stops at the next keyframe (a blank keyframe cuts it),
-        // so the waveform does too.
-        if end.is_some_and(|e| frame >= e) {
-            break;
+        stop as u32
+    };
+    if first >= stop {
+        return;
+    }
+    let x0 = grid_left + first as f32 * cell_width;
+    let x1 = grid_left + stop as f32 * cell_width;
+    painter.line_segment(
+        [egui::pos2(x0, middle), egui::pos2(x1, middle)],
+        Stroke::new(1.0, colour.gamma_multiply(0.6)),
+    );
+
+    let per = WAVE_PEAKS_PER_FRAME;
+    let has_peaks = !waveform.peaks.is_empty();
+    // One vertical stroke per screen pixel at most: below that the slices
+    // would overdraw each other for nothing.
+    let slices = if has_peaks { (cell_width.floor() as usize).clamp(1, per) } else { 1 };
+    let slice_w = cell_width / slices as f32;
+    for frame in first..stop {
+        let clip_frame = waveform.level_start + (frame - waveform.start_frame) as usize;
+        let x = grid_left + frame as f32 * cell_width;
+        for k in 0..slices {
+            let (lo, hi) = if has_peaks {
+                // The slices this column covers, merged.
+                let from = clip_frame * per + k * per / slices;
+                let to = (clip_frame * per + (k + 1) * per / slices).max(from + 1);
+                waveform.peaks.get(from..to.min(waveform.peaks.len())).map_or((0.0, 0.0), |s| {
+                    s.iter().fold((0.0f32, 0.0f32), |(lo, hi), &(a, b)| (lo.min(a), hi.max(b)))
+                })
+            } else {
+                let level = waveform.levels.get(clip_frame).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                (-level, level)
+            };
+            let top = middle - hi.clamp(-1.0, 1.0) * half;
+            let bottom = (middle - lo.clamp(-1.0, 1.0) * half).max(top + 1.0);
+            let left = x + k as f32 * slice_w;
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(left + slice_w.max(1.0), bottom)),
+                0.0,
+                colour,
+            );
         }
-        // Only the bars in view — the strip is virtualized with the cells.
-        if frame >= visible.end {
-            break;
-        }
-        if frame < visible.start {
+    }
+}
+
+/// Every shown row at `frame` — the whole column — anchored on `anchor`.
+fn column_selection(scene: &Scene, filter: &RowFilter, frame: u32, anchor: LayerId) -> crate::TimelineSelection {
+    let rows = display_rows(scene, filter);
+    let anchor = if rows.contains(&anchor) { anchor } else { rows.first().copied().unwrap_or(anchor) };
+    crate::TimelineSelection::new(rows, frame, frame, anchor, frame)
+}
+
+/// **The rows a frame drag covers**, decided once all of them are laid out:
+/// every shown row from the one the drag began on to the one under the
+/// pointer, in timeline order — so a row scrolled out of view between the two
+/// is in it as surely as one on screen. Past the last row (or above the
+/// first) the drag reaches the end, and near the edge of the view the
+/// timeline scrolls, so rows below the fold can be reached at all.
+fn frame_drag_select(ui: &mut Ui, scene: &Scene, columns: u32, state: &TimelineState, out: &mut TimelineResponse) {
+    let drag_id = egui::Id::new("timeline_frame_vertical_drag");
+    let Some(mut drag) = ui.ctx().data(|d| d.get_temp::<FrameVerticalDrag>(drag_id)) else {
+        return;
+    };
+    let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())) else {
+        return;
+    };
+    let rows = display_rows(scene, &state.row_filter);
+    let geometry: Vec<(LayerId, egui::Rect, f32, f32)> = rows
+        .iter()
+        .filter_map(|&id| {
+            ui.ctx()
+                .data(|d| d.get_temp::<(egui::Rect, f32, f32)>(egui::Id::new((ROW_GEOMETRY, id))))
+                .map(|(r, g, w)| (id, r, g, w))
+        })
+        .collect();
+    let Some(&(_, _, grid_left, cell_width)) = geometry.first() else {
+        return;
+    };
+    let under = geometry
+        .iter()
+        .find(|(_, r, _, _)| pos.y < r.max.y)
+        .or(geometry.last())
+        .map(|(id, ..)| *id);
+    let from = drag.anchor_layer.and_then(|a| rows.iter().position(|&id| id == a)).unwrap_or(0);
+    let to = under.and_then(|u| rows.iter().position(|&id| id == u)).unwrap_or(from);
+    let picked: Vec<LayerId> = rows[from.min(to)..=from.max(to)].to_vec();
+
+    drag.current_frame = (((pos.x - grid_left) / cell_width).floor().max(0.0) as u32).min(columns.saturating_sub(1));
+    ui.ctx().data_mut(|d| d.insert_temp(drag_id, drag));
+    out.select_layers = Some(picked.clone());
+    out.scrub_to = Some(drag.current_frame);
+
+    // The block being swept, washed over the frames — never over the names,
+    // which stay readable while the drag is on.
+    let clip = ui.clip_rect();
+    let grid = ui.painter_at(egui::Rect::from_min_max(egui::pos2(clip.min.x + LAYER_COLUMN, clip.min.y), clip.max));
+    let first = drag.start_frame.min(drag.current_frame);
+    let last = drag.start_frame.max(drag.current_frame);
+    let [r, g, b, _] = Palette::active().to_array();
+    for (id, row, grid_left, cell_width) in &geometry {
+        if !picked.contains(id) {
             continue;
         }
-        let level = waveform.levels[level_idx];
-        let x = grid_left + frame as f32 * cell_width;
-        let amplitude = (level.clamp(0.0, 1.0) * half).max(0.5);
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(x + 0.5, middle - amplitude),
-                egui::pos2(x + cell_width - 0.5, middle + amplitude),
-            ),
-            0.0,
-            colour,
+        let block = egui::Rect::from_min_max(
+            egui::pos2(grid_left + first as f32 * cell_width, row.min.y),
+            egui::pos2(grid_left + (last + 1) as f32 * cell_width, row.max.y),
         );
+        grid.rect_filled(block, 0.0, Color32::from_rgba_unmultiplied(r, g, b, 0x70));
+        grid.rect_stroke(block, 0.0, Stroke::new(1.5, Palette::active()), StrokeKind::Inside);
+    }
+
+    // Auto-scroll at the edges, faster the further past them the pointer is.
+    const EDGE: f32 = 12.0;
+    let mut delta = egui::Vec2::ZERO;
+    if pos.y > clip.max.y - EDGE {
+        delta.y = -(pos.y - (clip.max.y - EDGE)).min(40.0);
+    } else if pos.y < clip.min.y + EDGE {
+        delta.y = ((clip.min.y + EDGE) - pos.y).min(40.0);
+    }
+    if pos.x > clip.max.x - EDGE {
+        delta.x = -(pos.x - (clip.max.x - EDGE)).min(40.0);
+    } else if pos.x < clip.min.x + LAYER_COLUMN + EDGE && pos.x > clip.min.x + LAYER_COLUMN - EDGE * 4.0 {
+        delta.x = ((clip.min.x + LAYER_COLUMN + EDGE) - pos.x).min(40.0);
+    }
+    if delta != egui::Vec2::ZERO && ui.input(|i| i.pointer.primary_down()) {
+        ui.scroll_with_delta(delta);
+        ui.ctx().request_repaint();
     }
 }
 
@@ -4111,6 +4358,11 @@ fn draw_frame_cell(
     blank: bool,
     playhead: bool,
     highlight_wash: Option<Color32>,
+    // The row's own fill for an occupied cell, in place of the paper colour
+    // — the camera's light blue. `None` for an ordinary layer.
+    occupied_fill: Option<Color32>,
+    // A span closes at this cell's right edge: the next frame is empty.
+    span_ends: bool,
 ) {
     // The frame grid, brightest where there is the most to see: a frame that
     // **holds art** stands out light; a **blank** keyframe and the span it holds
@@ -4127,18 +4379,15 @@ fn draw_frame_cell(
         (FrameKind::Empty, _) => empty,
         (_, Some(t)) => t.tint,
         _ if blank => blank_fill,
-        _ => filled,
+        _ => occupied_fill.unwrap_or(filled),
     };
     painter.rect_filled(cell, 0.0, background);
 
-    // **Ruled, not boxed.** A full rectangle round every cell draws each line
-    // twice — once as one cell's right edge and again as its neighbour's left
-    // — and at twelve pixels a cell that doubled ink was most of what the
-    // timeline showed: rows looked separated by a gap they did not have, and
-    // the frames themselves were hard to count. One hairline down the right
-    // and one along the bottom is Animate's grid, and it is half the ink.
-    // A subtle grid: a darker hairline on the light occupied cells, a lighter
-    // one on the dark empty cells, so the columns read without boxing each frame.
+    // **Rows ruled, frames notched** — Animate's grid. A hairline along the
+    // bottom of every row separates the layers; between frames only a short
+    // notch at the foot of the row counts them, so the grid reads as rows
+    // rather than as a wall of boxes. The one full-height line is where a
+    // span begins or ends — the edge of a keyframe's block, as in Animate.
     let on_empty = matches!(kind, FrameKind::Empty) && tween.is_none();
     let rule = if on_empty {
         Palette::timeline_rule_empty()
@@ -4146,15 +4395,32 @@ fn draw_frame_cell(
         Palette::timeline_rule_filled()
     };
     painter.rect_filled(
-        egui::Rect::from_min_max(egui::pos2(cell.max.x - 1.0, cell.min.y), cell.max),
-        0.0,
-        rule,
-    );
-    painter.rect_filled(
         egui::Rect::from_min_max(egui::pos2(cell.min.x, cell.max.y - 1.0), cell.max),
         0.0,
         rule,
     );
+    let notch = (cell.height() * 0.2).clamp(3.0, 5.0);
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(cell.max.x - 1.0, cell.max.y - notch), cell.max),
+        0.0,
+        rule,
+    );
+    // The same near-black ink as the keyframe dots.
+    let edge = Palette::handle_stroke();
+    if matches!(kind, FrameKind::Keyframe | FrameKind::BlankKeyframe) {
+        painter.rect_filled(
+            egui::Rect::from_min_max(cell.min, egui::pos2(cell.min.x + 1.0, cell.max.y)),
+            0.0,
+            edge,
+        );
+    }
+    if span_ends && !matches!(kind, FrameKind::Empty) {
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(cell.max.x - 1.0, cell.min.y), cell.max),
+            0.0,
+            edge,
+        );
+    }
 
     // H2: the highlight wash — over the background and its ruling, under
     // every mark the frame draws next, exactly like the name cell's own.
@@ -4518,7 +4784,10 @@ mod tests {
         let mut st = state();
         st.current_frame = 4;
         let screen = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0))),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 600.0),
+            )),
             ..Default::default()
         };
         let _ = ctx.run_ui(screen, |ui| {
@@ -4528,14 +4797,75 @@ mod tests {
             .data(|d| d.get_temp(egui::Id::new(PLAYHEAD_LINE)))
             .expect("the playhead line is drawn");
         let row = |id: LayerId| -> (egui::Rect, f32, f32) {
-            ctx.data(|d| d.get_temp(egui::Id::new((ROW_GEOMETRY, id)))).expect("row drawn")
+            ctx.data(|d| d.get_temp(egui::Id::new((ROW_GEOMETRY, id))))
+                .expect("row drawn")
         };
         let (first, grid_left, cell) = row(ids[0]);
         let (last, _, _) = row(*ids.last().unwrap());
-        assert!(line.min.y <= first.min.y + 0.5, "starts at the first row: {line:?} vs {first:?}");
-        assert!(line.max.y >= last.max.y - 0.5, "reaches past the last row: {line:?} vs {last:?}");
+        assert!(
+            line.min.y <= first.min.y + 0.5,
+            "starts at the first row: {line:?} vs {first:?}"
+        );
+        assert!(
+            line.max.y >= last.max.y - 0.5,
+            "reaches past the last row: {line:?} vs {last:?}"
+        );
         let x = grid_left + 4.5 * cell;
-        assert!((line.center().x - x).abs() < 0.6, "at frame 5's centre: {} vs {x}", line.center().x);
+        assert!(
+            (line.center().x - x).abs() < 0.6,
+            "at frame 5's centre: {} vs {x}",
+            line.center().x
+        );
+    }
+
+    /// Right-clicking a frame cell must not freeze the app. Capturing the
+    /// menu's frame used to read the pointer inside `ctx.data_mut`, and
+    /// egui's context lock is not re-entrant, so the UI thread waited on
+    /// itself forever. Run on a thread so a regression fails instead of hangs.
+    #[test]
+    fn right_clicking_a_frame_does_not_freeze() {
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut scene = Scene::empty();
+            let id = scene.add_layer("L1", LayerKind::Normal);
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let st = state();
+            let drive = |events: Vec<egui::Event>| {
+                let input = egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 600.0),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(input, |ui| {
+                    let _ = timeline_panel(ui, &scene, &st);
+                });
+            };
+            drive(vec![]);
+            let (row, grid_left, cell) = ctx
+                .data(|d| d.get_temp::<(egui::Rect, f32, f32)>(egui::Id::new((ROW_GEOMETRY, id))))
+                .expect("row drawn");
+            let at = egui::pos2(grid_left + 3.5 * cell, row.center().y);
+            let click = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            drive(vec![egui::Event::PointerMoved(at)]);
+            drive(vec![click(true)]);
+            drive(vec![click(false)]);
+            drive(vec![]);
+            let _ = done.send(());
+        });
+        assert!(
+            wait.recv_timeout(std::time::Duration::from_secs(20))
+                .is_ok(),
+            "right-clicking a frame deadlocked the timeline"
+        );
     }
 
     /// The selected layer's row is marked across the frames too, with its
@@ -4552,7 +4882,10 @@ mod tests {
         let mut st = state();
         st.active_layer = Some(ids[1]);
         let screen = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0))),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 600.0),
+            )),
             ..Default::default()
         };
         let out = ctx.run_ui(screen, |ui| {
@@ -4561,7 +4894,13 @@ mod tests {
         let (row, grid_left, _) = ctx
             .data(|d| d.get_temp::<(egui::Rect, f32, f32)>(egui::Id::new((ROW_GEOMETRY, ids[1]))))
             .expect("row drawn");
-        let [r, g, b, _] = scene.layers().get(ids[1]).unwrap().color.to_rgba8().to_u8_array();
+        let [r, g, b, _] = scene
+            .layers()
+            .get(ids[1])
+            .unwrap()
+            .color
+            .to_rgba8()
+            .to_u8_array();
         let colour = Color32::from_rgb(r, g, b);
         let underline = out.shapes.iter().any(|c| match &c.shape {
             egui::Shape::Rect(s) => {
@@ -4573,7 +4912,10 @@ mod tests {
             }
             _ => false,
         });
-        assert!(underline, "the layer's colour runs along the bottom of its frames");
+        assert!(
+            underline,
+            "the layer's colour runs along the bottom of its frames"
+        );
     }
 
     #[test]
@@ -4622,40 +4964,41 @@ mod tests {
         assert_eq!(rows.len(), 6, "expected one row per layer");
         let click_pos = |row: egui::Rect| egui::pos2(row.min.x + 60.0, row.center().y);
 
-        let click = |pos: egui::Pos2, modifiers: egui::Modifiers, st: &TimelineState| -> TimelineResponse {
-            let _ = ctx.run_ui(
-                egui::RawInput {
-                    events: vec![egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
+        let click =
+            |pos: egui::Pos2, modifiers: egui::Modifiers, st: &TimelineState| -> TimelineResponse {
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        events: vec![egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers,
+                        }],
                         modifiers,
-                    }],
-                    modifiers,
-                    ..screen()
-                },
-                |ui| {
-                    let _ = timeline_panel(ui, &scene, st);
-                },
-            );
-            let mut response = TimelineResponse::default();
-            let _ = ctx.run_ui(
-                egui::RawInput {
-                    events: vec![egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
+                        ..screen()
+                    },
+                    |ui| {
+                        let _ = timeline_panel(ui, &scene, st);
+                    },
+                );
+                let mut response = TimelineResponse::default();
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        events: vec![egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers,
+                        }],
                         modifiers,
-                    }],
-                    modifiers,
-                    ..screen()
-                },
-                |ui| {
-                    response = timeline_panel(ui, &scene, st);
-                },
-            );
-            response
-        };
+                        ..screen()
+                    },
+                    |ui| {
+                        response = timeline_panel(ui, &scene, st);
+                    },
+                );
+                response
+            };
 
         // A plain click on row 2 becomes the anchor.
         let r = click(click_pos(rows[1]), egui::Modifiers::NONE, &st);
@@ -4744,18 +5087,22 @@ mod tests {
             // clipped to the frame grid's own region — not just anywhere past
             // x=260, which the transport row's separators and slider handles
             // also satisfy — so this can only be a cell's own background fill.
-            let canvas = output.shapes.iter().find_map(|clipped| match &clipped.shape {
-                egui::Shape::Rect(r)
-                    if r.rect.min.x > LAYER_COLUMN + 50.0
-                        && r.rect.width() > 1.0
-                        && clipped.clip_rect.min.x >= LAYER_COLUMN - 1.0 =>
-                {
-                    Some(r.fill)
-                }
-                _ => None,
+            let canvas = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(r)
+                        if r.rect.min.x > LAYER_COLUMN + 50.0
+                            && r.rect.width() > 1.0
+                            && clipped.clip_rect.min.x >= LAYER_COLUMN - 1.0 =>
+                    {
+                        Some(r.fill)
+                    }
+                    _ => None,
+                });
+            let canvas = canvas.unwrap_or_else(|| {
+                panic!("{t:?}: no frame-grid cell painted past the name column")
             });
-            let canvas = canvas
-                .unwrap_or_else(|| panic!("{t:?}: no frame-grid cell painted past the name column"));
             assert_eq!(
                 canvas, panel,
                 "{t:?}: an empty frame cell should read as the panel behind it, \
@@ -4797,7 +5144,10 @@ mod tests {
                 width = row.response.rect.width();
             },
         );
-        assert!(width > 300.0, "the layer tools drew nothing measurable ({width})");
+        assert!(
+            width > 300.0,
+            "the layer tools drew nothing measurable ({width})"
+        );
         assert!(
             width <= LAYER_TOOLS_INLINE_WIDTH,
             "the layer tools are {width:.0} points wide, more than the              {LAYER_TOOLS_INLINE_WIDTH} the header line reserves for them"
@@ -4968,30 +5318,71 @@ mod tests {
         // Off-screen to the right, but the frame did not just change and
         // playback is not running: a manual scroll is left alone.
         assert_eq!(
-            playhead_follow_target(false, false, false, 2000.0, pinned_left, clip_right, cell_width),
+            playhead_follow_target(
+                false,
+                false,
+                false,
+                2000.0,
+                pinned_left,
+                clip_right,
+                cell_width
+            ),
             None
         );
 
         // The frame changed, and the playhead sits well past the right edge:
         // page to it.
         let target = playhead_follow_target(
-            true, false, false, 2000.0, pinned_left, clip_right, cell_width,
+            true,
+            false,
+            false,
+            2000.0,
+            pinned_left,
+            clip_right,
+            cell_width,
         );
         assert_eq!(target, Some(2000.0 - LAYER_COLUMN));
 
         // Playback running has the same effect as a frame change.
-        assert!(playhead_follow_target(false, true, false, 2000.0, pinned_left, clip_right, cell_width).is_some());
+        assert!(
+            playhead_follow_target(
+                false,
+                true,
+                false,
+                2000.0,
+                pinned_left,
+                clip_right,
+                cell_width
+            )
+            .is_some()
+        );
 
         // Already inside the visible band: nothing to do.
         let visible_x = pinned_left + LAYER_COLUMN + 20.0;
         assert_eq!(
-            playhead_follow_target(true, false, false, visible_x, pinned_left, clip_right, cell_width),
+            playhead_follow_target(
+                true,
+                false,
+                false,
+                visible_x,
+                pinned_left,
+                clip_right,
+                cell_width
+            ),
             None
         );
 
         // Dragging the grid or ruler always wins, even off-screen.
         assert_eq!(
-            playhead_follow_target(true, true, true, 2000.0, pinned_left, clip_right, cell_width),
+            playhead_follow_target(
+                true,
+                true,
+                true,
+                2000.0,
+                pinned_left,
+                clip_right,
+                cell_width
+            ),
             None
         );
     }
@@ -5027,7 +5418,14 @@ mod tests {
             };
             let out = ctx.run_ui(input, |ui| {
                 let mut response = TimelineResponse::default();
-                ruler(ui, &scene, columns, LoopRegion::default(), &st, &mut response);
+                ruler(
+                    ui,
+                    &scene,
+                    columns,
+                    LoopRegion::default(),
+                    &st,
+                    &mut response,
+                );
             });
             texts = out
                 .shapes
@@ -5584,13 +5982,25 @@ mod light_drop_tests {
         assert!([a, b].contains(&first), "a new layer goes in front");
 
         // Top half of a layer: directly above it.
-        assert_eq!(light_drop_slot(&scene, DropRow::Layer(first), false), Some(Some(first)));
+        assert_eq!(
+            light_drop_slot(&scene, DropRow::Layer(first), false),
+            Some(Some(first))
+        );
         // Bottom half: above the layer beneath it.
-        assert_eq!(light_drop_slot(&scene, DropRow::Layer(first), true), Some(Some(next)));
+        assert_eq!(
+            light_drop_slot(&scene, DropRow::Layer(first), true),
+            Some(Some(next))
+        );
         // Bottom half of the last layer is not a place — it would light nothing.
         assert_eq!(light_drop_slot(&scene, DropRow::Layer(last), true), None);
         // Onto another light: that light's own slot, top of stack included.
-        assert_eq!(light_drop_slot(&scene, DropRow::Light(None), true), Some(None));
-        assert_eq!(light_drop_slot(&scene, DropRow::Light(Some(last)), false), Some(Some(last)));
+        assert_eq!(
+            light_drop_slot(&scene, DropRow::Light(None), true),
+            Some(None)
+        );
+        assert_eq!(
+            light_drop_slot(&scene, DropRow::Light(Some(last)), false),
+            Some(Some(last))
+        );
     }
 }

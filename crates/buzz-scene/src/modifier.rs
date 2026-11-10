@@ -215,6 +215,121 @@ pub enum Modifier {
         span: f64,
         phase: f64,
     },
+    /// **A pendulum.** The object hangs from a pivot and swings about it like
+    /// a lamp, an earring or a shop sign.
+    ///
+    /// # What drives it
+    ///
+    /// Gravity pulls it back to hanging straight down, and — the part that
+    /// makes it read as *attached to* something — **the object's own keyed
+    /// motion shakes the pivot**. Slide the lamp's keyframes to the left and
+    /// it swings right, overshoots, and settles; stop it dead and it keeps
+    /// going for a few swings. See [`crate::secondary::pendulum_angles`] for
+    /// the equation and [`crate::secondary`] for why the result is the same
+    /// whatever order frames are drawn in.
+    ///
+    /// # The pivot
+    ///
+    /// Top-centre of the drawing's bounds, moved by `(pivot_dx, pivot_dy)`
+    /// stage units (so a sign hung from a corner, or a pendulum pivoted well
+    /// above its drawing, is an offset away). The rotation is composed about
+    /// that point, so the pivot itself never moves.
+    ///
+    /// # The numbers
+    ///
+    /// * `period` — seconds for one small swing; the effective length follows
+    ///   from it (about a metre at two seconds).
+    /// * `damping` — damping ratio: `0` never settles, around `0.1` swings a
+    ///   handful of times, `1` returns without overshooting.
+    /// * `reaction` — how much of the object's own motion shakes it; `0`
+    ///   makes it a lamp on a rock-steady ceiling, `1` is physical.
+    /// * `initial_angle`, `sway`, `max_angle` — in degrees: where it starts,
+    ///   the size of an idle breeze (`0` for none), and the hard stop.
+    Pendulum {
+        period: f64,
+        damping: f64,
+        reaction: f64,
+        initial_angle: f64,
+        sway: f64,
+        max_angle: f64,
+        pivot_dx: f64,
+        pivot_dy: f64,
+    },
+    /// **Hair and cloth.** The drawing bends along a chain of springs hanging
+    /// from one pinned edge — a scarf, a ponytail, a flag, a cape, a tail —
+    /// lagging behind the object's own keyed motion and settling after it.
+    ///
+    /// # How it works
+    ///
+    /// The drawing is divided, along the direction away from the pinned
+    /// `side`, into `segments` links. Each link is a damped spring (the same
+    /// [`buzz_physics::Spring`] the follow-through baker drives bones with)
+    /// chasing its parent link, pushed opposite to the pinned edge's own
+    /// sideways acceleration, so a move to the right leaves the tip behind and
+    /// it swings through and settles. The artwork is then **deformed**, not
+    /// sliced: each point goes to the matching spot on a smooth curve through
+    /// the chain, so there are no seams. The pinned edge never moves.
+    ///
+    /// It reaches the artwork the way a breath does — through the renderer —
+    /// so it works on shapes, groups, rigs and the contents of symbol
+    /// instances alike. See [`crate::secondary::ChainBend`].
+    ///
+    /// # Because it is a deformation
+    ///
+    /// **Bake Modifiers leaves it live**, exactly as it does a breath: a
+    /// keyframe holds a placement, and a bent drawing is not one. Clear
+    /// Modifiers removes it.
+    ///
+    /// # The numbers
+    ///
+    /// * `side` — which edge is pinned.
+    /// * `segments` — how many links (2 to 12). More is smoother and ripples
+    ///   more; fewer is a stiffer, simpler curve.
+    /// * `stiffness`, `damping` — each link's spring. Stiff and damped is a
+    ///   heavy cloth; loose and light is silk.
+    /// * `wind`, `wind_rate` — a gusting push (strength about `0..1`, gusts a
+    ///   second), so a flag keeps rippling after its pole stops. `0` is none.
+    /// * `lag` — how far the tip is left behind by a move; `1` is natural.
+    Hair {
+        side: crate::secondary::PinSide,
+        segments: usize,
+        stiffness: f64,
+        damping: f64,
+        wind: f64,
+        wind_rate: f64,
+        lag: f64,
+    },
+}
+
+impl Modifier {
+    /// Hair / cloth with the dialog's starting values: pinned at the top, six
+    /// links, a soft hair-like spring, a light breeze.
+    pub const fn hair() -> Self {
+        Modifier::Hair {
+            side: crate::secondary::PinSide::Top,
+            segments: 6,
+            stiffness: 120.0,
+            damping: 10.0,
+            wind: 0.0,
+            wind_rate: 0.6,
+            lag: 1.0,
+        }
+    }
+
+    /// A pendulum with the dialog's starting values: a lamp-sized swing that
+    /// settles in a few seconds and reacts to its own motion.
+    pub const fn pendulum() -> Self {
+        Modifier::Pendulum {
+            period: 1.6,
+            damping: 0.12,
+            reaction: 0.5,
+            initial_angle: 0.0,
+            sway: 0.0,
+            max_angle: 80.0,
+            pivot_dx: 0.0,
+            pivot_dy: 0.0,
+        }
+    }
 }
 
 impl Modifier {
@@ -230,6 +345,8 @@ impl Modifier {
             Modifier::Turn { .. } => "Turn",
             Modifier::Sway { .. } => "Sway",
             Modifier::Drift { .. } => "Drift",
+            Modifier::Pendulum { .. } => "Pendulum",
+            Modifier::Hair { .. } => "Hair / Cloth",
         }
     }
 
@@ -663,6 +780,65 @@ impl Breath {
     }
 }
 
+/// **Everything that deforms an object's artwork, rather than placing it.**
+///
+/// A breath and a hair / cloth bend are the same kind of thing to the
+/// renderer: a map from stage-space points to stage-space points, applied where
+/// the artwork is — after its transform, inside symbols — because no single
+/// affine can express them. One type carries both so the renderer threads one
+/// value through its caches and fingerprints.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Deform {
+    pub breath: Option<Breath>,
+    pub bend: Option<crate::secondary::ChainBend>,
+}
+
+impl Deform {
+    /// `None` when there is nothing to deform by.
+    pub fn new(breath: Option<Breath>, bend: Option<crate::secondary::ChainBend>) -> Option<Self> {
+        (breath.is_some() || bend.is_some()).then_some(Self { breath, bend })
+    }
+
+    /// Where a point of the artwork goes: breathed, then bent.
+    pub fn at(&self, p: Point) -> Point {
+        let p = self.breath.map_or(p, |b| b.at(p));
+        self.bend.map_or(p, |b| b.at(p))
+    }
+
+    /// The path, deformed.
+    pub fn path(&self, path: &buzz_geom::BezPath) -> buzz_geom::BezPath {
+        let breathed = match &self.breath {
+            Some(b) => b.path(path),
+            None => path.clone(),
+        };
+        match &self.bend {
+            Some(b) => b.path(&breathed),
+            None => breathed,
+        }
+    }
+
+    /// How far beyond its own bounds the artwork can now reach, for the
+    /// renderer's culling box.
+    pub fn reach(&self) -> f64 {
+        self.bend.map_or(0.0, |b| b.reach())
+    }
+
+    /// Every number that shapes the deformation, as bits, for the renderer's
+    /// cache keys: two evaluations that differ at all must hash differently.
+    pub fn fingerprint(&self) -> Vec<u64> {
+        let mut words = Vec::new();
+        match &self.breath {
+            Some(b) => words.extend([b.hips, b.shoulders, b.centre, b.rise, b.widen].map(f64::to_bits)),
+            None => words.push(0),
+        }
+        match &self.bend {
+            Some(b) => words.extend(b.words()),
+            None => words.push(0),
+        }
+        words
+    }
+}
+
 /// The result of evaluating an object's modifiers at a frame.
 ///
 /// `prepend` is composed onto the object's own transform in stage space (a
@@ -673,10 +849,11 @@ impl Breath {
 pub struct ModifierEval {
     pub prepend: Affine,
     pub object: Option<Object>,
-    /// The breath to deform this object's artwork by, if it breathes. Applied
-    /// by the renderer, because the renderer is what expands a symbol into the
-    /// artwork a breath has to reach. See [`Breath`].
-    pub breath: Option<Breath>,
+    /// What deforms this object's artwork — a breath, a hair / cloth bend —
+    /// if anything does. Applied by the renderer, because the renderer is what
+    /// expands a symbol into the artwork a deformation has to reach. See
+    /// [`Deform`].
+    pub deform: Option<Deform>,
 }
 
 impl Scene {
@@ -705,6 +882,7 @@ impl Scene {
         let mut prepend = Affine::IDENTITY;
         let mut posed: Option<Object> = None;
         let mut breath: Option<Breath> = None;
+        let mut bend: Option<crate::secondary::ChainBend> = None;
 
         for modifier in &object.modifiers {
             match *modifier {
@@ -911,6 +1089,81 @@ impl Scene {
                         prepend = Affine::translate((dx * step, dy * step)) * prepend;
                     }
                 }
+                Modifier::Pendulum {
+                    period,
+                    damping,
+                    reaction,
+                    initial_angle,
+                    sway,
+                    max_angle,
+                    pivot_dx,
+                    pivot_dy,
+                } => {
+                    let settings = crate::secondary::PendulumSettings::new(
+                        period,
+                        damping,
+                        reaction,
+                        initial_angle,
+                        sway,
+                        max_angle,
+                    );
+                    let offset = buzz_geom::Vec2::new(
+                        if pivot_dx.is_finite() { pivot_dx } else { 0.0 },
+                        if pivot_dy.is_finite() { pivot_dy } else { 0.0 },
+                    );
+                    // Continuous in time, like the wiggle: the table holds one
+                    // angle per frame and a motion-blurred sample reads between
+                    // two of them.
+                    if let Some(angle) =
+                        self.pendulum_angle_at(layer, object, settings, offset, time, fps)
+                    {
+                        // The pivot on the drawing as it is placed *now*
+                        // (including whatever earlier modifiers did), so the
+                        // swing is about the point the drawing actually hangs
+                        // from, and that point does not move.
+                        let bounds =
+                            crate::object::transform_rect(prepend, self.resolved_bounds(object));
+                        let pivot = Point::new(bounds.center().x, bounds.y0) + offset;
+                        if pivot.x.is_finite() && pivot.y.is_finite() && angle != 0.0 {
+                            prepend = Affine::translate(pivot.to_vec2())
+                                * Affine::rotate(angle)
+                                * Affine::translate(-pivot.to_vec2())
+                                * prepend;
+                        }
+                    }
+                }
+                Modifier::Hair {
+                    side,
+                    segments,
+                    stiffness,
+                    damping,
+                    wind,
+                    wind_rate,
+                    lag,
+                } => {
+                    // Resolved bounds, as for the breath and the sway: a hanging
+                    // scarf is usually a symbol instance. A drawing with no
+                    // extent has no chain to bend, which is also what keeps a
+                    // zero-size shape from producing a NaN.
+                    let bounds =
+                        crate::object::transform_rect(prepend, self.resolved_bounds(object));
+                    let length = side.extent(bounds);
+                    if bounds.width() > 0.0 && bounds.height() > 0.0 && length.is_finite() {
+                        let settings = crate::secondary::ChainSettings::new(
+                            segments, stiffness, damping, wind, wind_rate, lag,
+                        );
+                        if let Some(angles) =
+                            self.chain_angles_at(layer, object, side, settings, time, fps)
+                        {
+                            bend = crate::secondary::ChainBend::new(
+                                side.pin_point(bounds),
+                                side.axis(),
+                                length,
+                                &angles,
+                            );
+                        }
+                    }
+                }
                 Modifier::Sway { amount, rate } => {
                     // Resolved, for the same reason as the blink above: a tree
                     // placed as a symbol would otherwise lean about a point two
@@ -945,7 +1198,7 @@ impl Scene {
         Some(ModifierEval {
             prepend,
             object: posed,
-            breath,
+            deform: Deform::new(breath, bend),
         })
     }
 
@@ -1231,7 +1484,7 @@ mod tests {
         let sample = |frame: u32, y: f64| {
             let obj = resolved(&scene, layer, id, frame);
             let eval = scene.modified_object_at(layer, &obj, frame).unwrap();
-            let breath = eval.breath.expect("a breath");
+            let breath = eval.deform.and_then(|d| d.breath).expect("a breath");
             breath.at(buzz_geom::Point::new(50.0, y)).y
         };
 
@@ -1287,7 +1540,7 @@ mod tests {
         for frame in 0..60u32 {
             let obj = resolved(&scene, layer, id, frame);
             let eval = scene.modified_object_at(layer, &obj, frame).unwrap();
-            let breath = eval.breath.expect("a breath");
+            let breath = eval.deform.and_then(|d| d.breath).expect("a breath");
             for y in legs {
                 let p = buzz_geom::Point::new(30.0, y);
                 let moved = breath.at(p);
@@ -1324,7 +1577,7 @@ mod tests {
         for frame in [3u32, 9, 17, 26, 38] {
             let obj = resolved(&scene, layer, id, frame);
             let eval = scene.modified_object_at(layer, &obj, frame).unwrap();
-            let breath = eval.breath.expect("a breath");
+            let breath = eval.deform.and_then(|d| d.breath).expect("a breath");
             // The chin and the crown are both above the shoulders, so the
             // distance between them must not change.
             let (chin, crown) = (
@@ -1362,7 +1615,8 @@ mod tests {
         let breath = scene
             .modified_object_at(layer, &obj, 7u32)
             .unwrap()
-            .breath
+            .deform
+            .and_then(|d| d.breath)
             .expect("a breath");
         assert!(
             breath.hips - breath.shoulders > 10.0,

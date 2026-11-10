@@ -383,6 +383,68 @@ pub fn write_rig_mouth(
     track: &VisemeTrack,
     start: u32,
 ) -> Result<LipSyncReport, RigMouthError> {
+    rig_mouth(scene, object, track, start, false)
+}
+
+/// [`write_rig_mouth`] for **one line**: only the frames from `start` to the
+/// end of `track` are touched, and the mouth closes on the frame after. Every
+/// other key the character has — its other lines, synced one at a time — is
+/// left exactly as it was.
+pub fn write_rig_mouth_span(
+    scene: &mut Scene,
+    object: ObjectId,
+    track: &VisemeTrack,
+    start: u32,
+) -> Result<LipSyncReport, RigMouthError> {
+    rig_mouth(scene, object, track, start, true)
+}
+
+/// The keys a mouth writer rewrites: every one of the object's on its layer,
+/// or — for a single line — only those inside the line, plus a closing key
+/// just after it when nothing is keyed there already.
+fn mouth_keys(
+    scene: &mut Scene,
+    layer: buzz_scene::LayerId,
+    object: ObjectId,
+    start: u32,
+    last: u32,
+    span: bool,
+    key: &dyn Fn(&mut Scene, buzz_scene::LayerId, u32),
+) -> Vec<u32> {
+    let keyed = |scene: &Scene| -> Vec<u32> {
+        scene
+            .layers()
+            .get(layer)
+            .map(|l| {
+                l.frames
+                    .keyframes()
+                    .iter()
+                    .filter(|k| k.objects.iter().any(|o| o.id == object))
+                    .map(|k| k.start)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if !span {
+        return keyed(scene);
+    }
+    let close_free = !keyed(scene).contains(&last);
+    if close_free {
+        key(scene, layer, last);
+    }
+    keyed(scene)
+        .into_iter()
+        .filter(|f| *f >= start && (*f < last || (*f == last && close_free)))
+        .collect()
+}
+
+fn rig_mouth(
+    scene: &mut Scene,
+    object: ObjectId,
+    track: &VisemeTrack,
+    start: u32,
+    span: bool,
+) -> Result<LipSyncReport, RigMouthError> {
     let (layer, found) = scene.find_object(object).ok_or(RigMouthError::NoObject)?;
     if !matches!(found.kind, ObjectKind::Armature(_)) {
         return Err(RigMouthError::NotRigged);
@@ -410,18 +472,9 @@ pub fn write_rig_mouth(
     // any of this: in loop mode, running through every shape. Every key on the
     // layer is told what the mouth is doing at its frame, and a key outside the
     // track is a closed mouth.
-    let keys: Vec<u32> = scene
-        .layers()
-        .get(layer)
-        .map(|l| {
-            l.frames
-                .keyframes()
-                .iter()
-                .filter(|k| k.objects.iter().any(|o| o.id == object))
-                .map(|k| k.start)
-                .collect()
-        })
-        .unwrap_or_default();
+    let keys = mouth_keys(scene, layer, object, start, last, span, &|s, l, f| {
+        s.ensure_keyframe(l, f);
+    });
     for frame in keys {
         let shape = match frame.checked_sub(start) {
             Some(offset) => track.at(offset),
@@ -497,6 +550,26 @@ pub fn write_layer_rig_mouth(
     track: &VisemeTrack,
     start: u32,
 ) -> Result<LipSyncReport, RigMouthError> {
+    layer_rig_mouth(scene, object, track, start, false)
+}
+
+/// [`write_layer_rig_mouth`] for one line; see [`write_rig_mouth_span`].
+pub fn write_layer_rig_mouth_span(
+    scene: &mut Scene,
+    object: ObjectId,
+    track: &VisemeTrack,
+    start: u32,
+) -> Result<LipSyncReport, RigMouthError> {
+    layer_rig_mouth(scene, object, track, start, true)
+}
+
+fn layer_rig_mouth(
+    scene: &mut Scene,
+    object: ObjectId,
+    track: &VisemeTrack,
+    start: u32,
+    span: bool,
+) -> Result<LipSyncReport, RigMouthError> {
     let (layer, found) = scene.find_object(object).ok_or(RigMouthError::NoObject)?;
     if !matches!(found.kind, ObjectKind::Instance(_)) {
         return Err(RigMouthError::NoMouth);
@@ -515,18 +588,9 @@ pub fn write_layer_rig_mouth(
         crate::layer_rig::key_at(scene, layer, start + first);
     }
 
-    let keys: Vec<u32> = scene
-        .layers()
-        .get(layer)
-        .map(|l| {
-            l.frames
-                .keyframes()
-                .iter()
-                .filter(|k| k.objects.iter().any(|o| o.id == object))
-                .map(|k| k.start)
-                .collect()
-        })
-        .unwrap_or_default();
+    let keys = mouth_keys(scene, layer, object, start, last, span, &|s, l, f| {
+        crate::layer_rig::key_at(s, l, f);
+    });
     for frame in keys {
         let shape = match frame.checked_sub(start) {
             Some(offset) => track.at(offset),
@@ -821,6 +885,35 @@ mod tests {
             shapes.insert(i.first_frame);
         }
         assert!(shapes.len() >= 3, "{shapes:?}");
+    }
+
+    /// **Two lines, synced one at a time, both keep their mouths.** The whole-
+    /// track writer closes the mouth everywhere outside the track it is given,
+    /// so syncing a character's second line would have shut the first; the
+    /// span writer touches only the line it is given.
+    #[test]
+    fn syncing_one_line_leaves_the_characters_other_lines_alone() {
+        let (mut scene, rig, part) = rig_with_mouth();
+        let layer = scene.find_object(rig).expect("rig").0;
+        let line = |text: &str| line_track(24, 24.0, &[SpokenLine { start: 0, frames: 24, text }]);
+        let first = line("Aa gaya sarkar.");
+        let second = line("Bolo, kya baat hai?");
+        write_rig_mouth_span(&mut scene, rig, &first, 10).expect("first line");
+        write_rig_mouth_span(&mut scene, rig, &second, 60).expect("second line");
+
+        let mouth_at = |scene: &Scene, frame: u32| -> u32 {
+            let l = scene.layers().get(layer).expect("layer");
+            let key = l.frames.keyframes().iter().filter(|k| k.start <= frame).last().expect("a key");
+            let ObjectKind::Armature(a) = &key.objects[0].kind else { panic!("not a rig") };
+            let ObjectKind::Instance(i) = &a.parts[part].artwork.kind else { panic!("not an instance") };
+            i.first_frame
+        };
+        let open = |track: &VisemeTrack| (0..track.len() as u32).find(|f| !track.at(*f).is_closed()).expect("an open shape");
+        let f1 = open(&first);
+        assert_eq!(mouth_at(&scene, 10 + f1), first.at(f1).frame(), "the first line's mouth was lost");
+        let f2 = open(&second);
+        assert_eq!(mouth_at(&scene, 60 + f2), second.at(f2).frame());
+        assert_eq!(mouth_at(&scene, 40), Viseme::Rest.frame(), "closed between the lines");
     }
 
     #[test]

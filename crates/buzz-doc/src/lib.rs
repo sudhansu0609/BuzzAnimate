@@ -1222,6 +1222,58 @@ impl Document {
         Ok(())
     }
 
+    /// **A save to the document's own file, to write off the main thread** —
+    /// what File ▸ Auto-Save does after each change. `None` for a document
+    /// with no file yet (it has nowhere to go but Save As) and for one with
+    /// nothing unsaved. The snapshot is the whole document as it stands, in
+    /// exactly the format [`Self::save_as`] writes, and costs a pointer copy
+    /// per scene; hand it to [`Self::mark_saved`] once it is on disk.
+    pub fn save_plan(&self) -> Option<SavePlan> {
+        let path = self.path.clone()?;
+        // Only ever a document file of our own: never written over anything
+        // else, whatever a path was set to.
+        let ours = path.extension().is_some_and(|e| e.eq_ignore_ascii_case(EXTENSION));
+        if !ours || !self.is_dirty() {
+            return None;
+        }
+        let refs: Vec<(&str, &Scene)> = self
+            .scenes
+            .iter()
+            .map(|s| (s.name.as_str(), &s.scene))
+            .collect();
+        let plan = crate::autosave::crash_plan(&refs, self.active, self.combined_revision(), path.clone())
+            .with_sequence(self.sequence_meta());
+        Some(SavePlan {
+            plan,
+            path,
+            revisions: self.scenes.iter().map(|s| s.scene.revision()).collect(),
+        })
+    }
+
+    /// Record that `saved` reached disk: each scene is clean **as of the
+    /// revision the snapshot was taken at**, so an edit made while it was
+    /// being written stays unsaved and is picked up by the next one. False
+    /// (and nothing marked) if the document moved to another file or gained
+    /// or lost a scene meanwhile.
+    pub fn mark_saved(&mut self, saved: &SavePlan) -> bool {
+        if self.path.as_deref() != Some(saved.path.as_path()) || self.scenes.len() != saved.revisions.len() {
+            return false;
+        }
+        for (slot, revision) in self.scenes.iter_mut().zip(&saved.revisions) {
+            slot.history.mark_saved(*revision);
+        }
+        if !self.is_dirty() {
+            let _ = self.autosave.discard_recovery();
+        }
+        true
+    }
+
+    /// Delete this document's recovery copy: it is being closed without
+    /// saving, on purpose, so there is nothing to offer back next launch.
+    pub fn discard_recovery(&mut self) {
+        let _ = self.autosave.discard_recovery();
+    }
+
     /// Forget where this document came from: it becomes untitled.
     ///
     /// For a recovered autosave. The recovery file is *evidence of a crash*,
@@ -1300,6 +1352,26 @@ impl Document {
     }
 }
 
+/// A whole document on its way to its own file — see
+/// [`Document::save_plan`]. `Send`, so it can be written on a worker.
+pub struct SavePlan {
+    plan: AutosavePlan,
+    path: PathBuf,
+    revisions: Vec<u64>,
+}
+
+impl SavePlan {
+    /// Serialise and write, atomically. Intended for the background pool.
+    pub fn write(&self) -> Result<(), DocError> {
+        self.plan.write()
+    }
+
+    /// The file it writes.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1319,6 +1391,38 @@ mod tests {
             layer,
             ShapeData::filled(Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9), Color::WHITE),
         );
+    }
+
+    /// Auto-Save's round trip: the plan writes the document to its own file
+    /// in the format Save writes, and marking it saved leaves an edit made
+    /// meanwhile still unsaved.
+    #[test]
+    fn a_save_plan_writes_the_file_and_keeps_later_edits_dirty() {
+        let dir = std::env::temp_dir().join(format!("buzz-save-plan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("film.buzz");
+        let mut doc = Document::default();
+        assert!(doc.save_plan().is_none(), "no file yet: nowhere to auto-save");
+        doc.save_as(&path).unwrap();
+        assert!(doc.save_plan().is_none(), "nothing unsaved");
+
+        doc.edit("Draw", add_shape);
+        let plan = doc.save_plan().expect("an edit makes a save due");
+        plan.write().unwrap();
+        doc.edit("Draw again", add_shape); // while it was writing
+        assert!(doc.mark_saved(&plan));
+        assert!(doc.is_dirty(), "the edit made during the write is still unsaved");
+
+        let reopened = Document::open(&path).unwrap();
+        let shapes = |d: &Document| d.scene().layers().iter().map(|l| l.objects_at(0).len()).sum::<usize>();
+        assert_eq!(shapes(&reopened), 1, "the file holds what the plan saw");
+
+        let plan = doc.save_plan().expect("still due");
+        plan.write().unwrap();
+        assert!(doc.mark_saved(&plan));
+        assert!(!doc.is_dirty());
+        assert_eq!(shapes(&Document::open(&path).unwrap()), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

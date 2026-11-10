@@ -408,7 +408,7 @@ type SymbolBounds =
 /// pointer check catches a re-decode of the same id.
 /// A memoised per-clip envelope: the clip's pointer (to catch a re-decode) and
 /// the shared levels.
-type CachedLevels = (usize, std::sync::Arc<Vec<f32>>);
+type CachedLevels = (usize, std::sync::Arc<Vec<f32>>, std::sync::Arc<Vec<(f32, f32)>>);
 
 #[derive(Default)]
 struct WaveformCache {
@@ -2378,7 +2378,7 @@ impl Editor {
         // Identity for a document with the camera off, which is every document
         // that has not asked for one.
         let doc = scene
-            .camera_projection_at_depth(self.current_frame, 0.0)
+            .edit_projection(self.current_frame)
             .and_then(|shot| shot.inverse())
             .and_then(|back| back.map_point(doc))
             // A shot with no inverse cannot be undone; the point as it stands
@@ -2460,7 +2460,7 @@ impl Editor {
     pub fn edit_to_stage(&self) -> buzz_geom::Projection {
         let scene = self.doc.scene();
         let shot = scene
-            .camera_projection_at_depth(self.current_frame, 0.0)
+            .edit_projection(self.current_frame)
             .unwrap_or(buzz_geom::Projection::IDENTITY);
         shot.pre_affine(scene.edit_place())
     }
@@ -4190,7 +4190,7 @@ impl Editor {
         // "did this drag start inside the selection?" test has to ask
         // its question. The place comes off with it, for the same
         // reason it does there.
-        let shot = buzz_geom::Projection::from_affine(scene.camera_transform(frame));
+        let shot = buzz_geom::Projection::from_affine(scene.edit_camera(frame));
         let back = shot.inverse()?;
         let unplace = buzz_scene::invert_affine(scene.edit_place());
 
@@ -5241,7 +5241,7 @@ impl Editor {
                 self.new_document.open = true;
             }
             Save | SaveAs | Open | Close | SaveSnapshot | Snapshots | ShortcutEditor
-            | TestMovie | PasteboardColour => {
+            | TestMovie | PasteboardColour | AiGenerateImage | NextDocument | PreviousDocument => {
                 // File dialogs, the snapshots store, the shortcut editor and
                 // Test Movie are host concerns; the shell handles them.
                 self.status = Some(format!("{} is handled by the shell", command.label()));
@@ -5396,6 +5396,15 @@ impl Editor {
             }
 
             ToggleRulers => self.view.show_rulers = !self.view.show_rulers,
+            ToggleAutoSave => {
+                self.workspace.auto_save = !self.workspace.auto_save;
+                self.workspace.save();
+                self.status = Some(if self.workspace.auto_save {
+                    "Auto-Save on \u{2014} saved documents write themselves back after each change".into()
+                } else {
+                    "Auto-Save off \u{2014} save with Cmd+S".into()
+                });
+            }
             ToggleGrid => self.view.show_grid = !self.view.show_grid,
             ToggleBoneRig => {
                 let on = !self.workspace.rig.show_bones;
@@ -5755,6 +5764,32 @@ impl Editor {
                     self.staging.open_wiggle(from, last);
                 } else {
                     self.status = Some("Select an object to add a wiggle to".into());
+                }
+            }
+            AddPendulum => {
+                let has_object = {
+                    let scene = self.doc.scene();
+                    self.selection
+                        .iter()
+                        .any(|id| scene.find_object(id).is_some())
+                };
+                if has_object {
+                    self.staging.open_pendulum();
+                } else {
+                    self.status = Some("Select an object to hang a pendulum from".into());
+                }
+            }
+            AddHairMotion => {
+                let has_object = {
+                    let scene = self.doc.scene();
+                    self.selection
+                        .iter()
+                        .any(|id| scene.find_object(id).is_some())
+                };
+                if has_object {
+                    self.staging.open_hair();
+                } else {
+                    self.status = Some("Select a drawing to add hair / cloth motion to".into());
                 }
             }
             ClearModifiers => {
@@ -6740,14 +6775,15 @@ impl Editor {
                 let key = (reference.sound, fps_bits);
                 // Reuse the memoised envelope unless the sound was re-decoded
                 // (its clip lives at a new address).
-                let levels = match self.waveform_cache.levels.get(&key) {
-                    Some((ptr, levels)) if *ptr == clip_ptr => levels.clone(),
+                let (levels, peaks) = match self.waveform_cache.levels.get(&key) {
+                    Some((ptr, levels, peaks)) if *ptr == clip_ptr => (levels.clone(), peaks.clone()),
                     _ => {
                         let levels = std::sync::Arc::new(clip.frame_levels(fps));
+                        let peaks = std::sync::Arc::new(clip.frame_peaks(fps, buzz_ui::WAVE_PEAKS_PER_FRAME));
                         self.waveform_cache
                             .levels
-                            .insert(key, (clip_ptr, levels.clone()));
-                        levels
+                            .insert(key, (clip_ptr, levels.clone(), peaks.clone()));
+                        (levels, peaks)
                     }
                 };
                 // The trim in-point and out-point, in clip-frames, so the strip
@@ -6763,6 +6799,7 @@ impl Editor {
                         levels,
                         level_start,
                         level_end,
+                        peaks,
                     },
                 );
             }
@@ -7165,6 +7202,8 @@ impl Editor {
             levels,
             level_start: 0,
             level_end: None,
+            // The Sequence strip draws the loudness envelope.
+            peaks: Default::default(),
         })
     }
 
@@ -8464,15 +8503,21 @@ impl Editor {
                         keyframe_start,
                         object: object.id,
                     });
-                Some((instance.symbol, follows * object.transform, inner, origin))
+                // The depth of the layer it sits on, so the shot it is opened
+                // through is the one it was seen through.
+                let depth = scene.layers().get(layer).map_or(0.0, |l| l.depth);
+                Some((instance.symbol, follows * object.transform, inner, origin, depth))
             });
 
         match opened {
-            Some((id, place, inner, origin)) => {
+            Some((id, place, inner, origin, depth)) => {
                 self.enter_frame = inner;
                 let mut entered = false;
                 self.doc.edit_view(|scene| {
-                    entered = scene.enter_symbol_in_place_from(id, place, origin)
+                    entered = scene.enter_symbol_in_place_from(id, place, origin);
+                    if entered {
+                        scene.set_edit_shot(frame, depth);
+                    }
                 });
                 if !entered {
                     self.enter_frame = None;
@@ -8561,6 +8606,35 @@ impl Editor {
     /// The drop end of dragging a symbol out of the Library. Screen rather than
     /// document coordinates because that is what a pointer has; the camera
     /// converts, so it lands under the cursor at any zoom or pan.
+    /// A picture from the Library's Images folder, placed where it was
+    /// dropped: fitted inside the stage if it is larger, one undo step.
+    pub fn place_library_image_at(&mut self, image: buzz_scene::ImageId, screen: Point) {
+        let Some(asset) = self.doc.scene().images().get(image).cloned() else {
+            return;
+        };
+        let Some(layer) = self.active_layer() else {
+            self.status = Some("No layer to place it on".into());
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+        let at = self.camera.screen_to_doc(screen);
+        let stage = self.doc.scene().stage().size;
+        let (w, h) = (asset.width as f64, asset.height as f64);
+        let fit = (stage.width / w).min(stage.height / h).min(1.0);
+        let (w, h) = (w * fit, h * fit);
+        let rect = buzz_geom::Rect::new(at.x - w / 2.0, at.y - h / 2.0, at.x + w / 2.0, at.y + h / 2.0);
+        let frame = self.current_frame;
+        let name = asset.name.clone();
+        self.doc.edit("Place Image", |scene| {
+            scene.place_image_in(layer, frame, asset, rect);
+        });
+        self.doc.end_gesture();
+        self.status = Some(format!("Placed \u{201c}{name}\u{201d}"));
+    }
+
     pub fn place_symbol_at(&mut self, symbol: buzz_scene::SymbolId, screen: Point) {
         let at = self.camera.screen_to_doc(screen);
         self.place_symbol(symbol, at);
@@ -8942,9 +9016,11 @@ impl Editor {
                 });
             }
         });
-        self.status = Some(format!(
-            "Tween: {changed} span(s) changed, {skipped} skipped"
-        ));
+        self.status = Some(if changed == 0 && skipped > 0 && tween.is_active() {
+            "Tween: nothing to tween to \u{2014} add a keyframe later on this layer (F6), then tween the span before it".to_string()
+        } else {
+            format!("Tween: {changed} span(s) changed, {skipped} skipped")
+        });
     }
 
     /// Replace only the *easing* of the tween on the keyframe governing the
@@ -12257,6 +12333,24 @@ impl Editor {
         let Some((layer, _)) = self.doc.scene().find_object(id) else {
             return;
         };
+        // **A hair / cloth bend has nothing to bake into.** Like a breath it
+        // deforms the artwork, which a placement keyframe cannot hold. An
+        // object whose only modifiers are deformations is left exactly as it
+        // is, rather than gaining a column of keys that change nothing.
+        let only_deformations = self.doc.scene().find_object(id).is_some_and(|(_, o)| {
+            o.modifiers.iter().any(|m| matches!(m, buzz_scene::Modifier::Hair { .. }))
+                && o.modifiers
+                    .iter()
+                    .all(|m| matches!(m, buzz_scene::Modifier::Hair { .. } | buzz_scene::Modifier::Breathe { .. }))
+        });
+        if only_deformations {
+            self.status = Some(
+                "Hair / cloth bends the drawing itself, which keyframes cannot hold, so it stays live \
+                 (Clear Modifiers removes it)"
+                    .into(),
+            );
+            return;
+        }
         let span = self.doc.scene().frame_count().max(1);
         let last = span - 1;
         let step = 2u32;
@@ -12294,7 +12388,7 @@ impl Editor {
             return;
         }
         // Whether anything is being left live, for what the status bar says.
-        let kept_breath = self
+        let kept_deformation = self
             .doc
             .scene()
             .layers()
@@ -12306,7 +12400,12 @@ impl Editor {
                 o.id == id
                     && o.modifiers
                         .iter()
-                        .any(|m| matches!(m, buzz_scene::Modifier::Breathe { .. }))
+                        .any(|m| {
+                            matches!(
+                                m,
+                                buzz_scene::Modifier::Breathe { .. } | buzz_scene::Modifier::Hair { .. }
+                            )
+                        })
             });
 
         // Phase 2: write the keyframes and drop the modifiers, so the baked
@@ -12338,15 +12437,21 @@ impl Editor {
             // the artwork, with the legs still, the ribs swelling and the head
             // riding on them, and there is nothing in a transform keyframe that
             // can say so. Clearing it with the rest would quietly delete the
-            // character's breathing, which is worse than not baking it.
+            // character's breathing, which is worse than not baking it. A
+            // hair / cloth bend is the same: it deforms, so it stays live.
             scene.update_object_across(0, u32::MAX, id, |o| {
-                o.modifiers
-                    .retain(|m| matches!(m, buzz_scene::Modifier::Breathe { .. }));
+                o.modifiers.retain(|m| {
+                    matches!(
+                        m,
+                        buzz_scene::Modifier::Breathe { .. } | buzz_scene::Modifier::Hair { .. }
+                    )
+                });
             });
         });
         self.doc.end_gesture();
-        self.status = Some(if kept_breath {
-            "Baked the live modifiers into keyframes. The breath is a              deformation, not a placement, so it stays live."
+        self.status = Some(if kept_deformation {
+            "Baked the live modifiers into keyframes. A breath or hair / cloth bend is a \
+             deformation, not a placement, so it stays live."
                 .into()
         } else {
             "Baked the live modifiers into keyframes".into()
@@ -12414,13 +12519,28 @@ impl Editor {
             self.status = Some("A document must keep at least one layer".into());
             return;
         }
+        // The rows as the timeline shows them, top to bottom: the layer that
+        // takes over is the next row down, as in Animate — the row above only
+        // when the deleted layer was the bottom one.
+        let rows = self.doc.scene().layers().visible_row_order();
+        let at = rows.iter().position(|&id| id == layer).unwrap_or(rows.len());
+        let neighbours: Vec<LayerId> =
+            rows[(at + 1).min(rows.len())..].iter().chain(rows[..at.min(rows.len())].iter().rev()).copied().collect();
         self.doc.edit("Delete Layer", |scene| {
             scene.remove_layer(layer);
         });
-        self.selection.set_active_layer(None);
-        self.selection.prune(self.doc.scene());
-        self.selection
-            .ensure_active_layer(&self.doc.scene().clone());
+        let scene = self.doc.scene().clone();
+        let usable = |id: LayerId| {
+            scene.layers().get(id).is_some_and(|l| l.is_editable() && scene.layers().is_effectively_visible(id))
+        };
+        let next = neighbours
+            .iter()
+            .copied()
+            .find(|&id| usable(id))
+            .or_else(|| neighbours.iter().copied().find(|&id| scene.layers().get(id).is_some()));
+        self.selection.set_active_layer(next);
+        self.selection.prune(&scene);
+        self.selection.ensure_active_layer(&scene);
     }
 
     /// Move a light to sit directly above `above` in the layer stack (or to
@@ -12651,6 +12771,25 @@ impl Editor {
             .map(|l| l.objects_at(frame).iter().map(|o| o.id).collect())
             .unwrap_or_default();
 
+        // **A symbol this document already holds, unchanged, is not copied
+        // again.** Copy and Paste inside one film is "another of the same
+        // character", as it is in Animate: the pasted instance points at the
+        // symbol it was copied from, so editing the symbol changes both and
+        // the Library does not fill with `walk copy`, `walk copy 2`… A merge
+        // leaves the reference of an instance whose symbol it was not given
+        // as it was. A symbol edited since the copy, or one from another
+        // document, still arrives as its own.
+        let mut lifted = lifted;
+        let shared: Vec<buzz_scene::SymbolId> = lifted
+            .library()
+            .iter()
+            .filter(|s| scene.library().get(s.id).is_some_and(|mine| **mine == ***s))
+            .map(|s| s.id)
+            .collect();
+        for id in shared {
+            lifted.library_mut().remove(id);
+        }
+
         let mut report = None;
         self.doc.edit("Paste", |scene| {
             report = Some(scene.merge(
@@ -12731,7 +12870,11 @@ impl Editor {
     }
 
     fn group_selection(&mut self) {
-        if self.selection.len() < 2 {
+        // One object groups too, as Animate's Ctrl+G does: a lone drawing in
+        // a group stops merging with whatever is drawn over it. Nothing
+        // selected says so rather than doing nothing.
+        if self.selection.is_empty() {
+            self.status = Some("Select something to group".into());
             return;
         }
         let ids = self.selection.ids();
@@ -12762,6 +12905,11 @@ impl Editor {
 
     fn ungroup_selection(&mut self) {
         let ids = self.selection.ids();
+        let scene = self.doc.scene();
+        if !ids.iter().any(|id| scene.find_object(*id).is_some_and(|(_, o)| matches!(o.kind, ObjectKind::Group(_)))) {
+            self.status = Some("Nothing to ungroup \u{2014} select a group".into());
+            return;
+        }
         let mut freed = Vec::new();
         self.doc.edit("Ungroup", |scene| {
             for id in ids {
@@ -17822,6 +17970,27 @@ mod tests {
 
     /// Pasting when the layers are gone says so and leaves no empty step in
     /// the history for the user to undo past.
+    /// Deleting a layer hands the selection to the row below it, as Animate
+    /// does — not back up to the top layer. The bottom row hands it upward.
+    #[test]
+    fn deleting_a_layer_selects_the_one_below() {
+        let mut e = editor();
+        for name in ["A", "B", "C", "D"] {
+            e.doc_add_layer(name, buzz_scene::LayerKind::Normal);
+        }
+        let rows = e.scene().layers().visible_row_order();
+        assert!(rows.len() >= 4);
+        e.selection.set_active_layer(Some(rows[1]));
+        e.run(buzz_ui::Command::DeleteLayer);
+        assert_eq!(e.selection.active_layer(), Some(rows[2]), "the row below takes over");
+
+        let rows = e.scene().layers().visible_row_order();
+        let bottom = *rows.last().unwrap();
+        e.selection.set_active_layer(Some(bottom));
+        e.run(buzz_ui::Command::DeleteLayer);
+        assert_eq!(e.selection.active_layer(), Some(rows[rows.len() - 2]), "the bottom row hands it up");
+    }
+
     #[test]
     fn pasting_frames_whose_layers_are_gone_says_so() {
         let mut e = editor();
@@ -20173,7 +20342,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("[{name}] no bounds"));
             let shot = e
                 .scene()
-                .camera_projection_at_depth(e.current_frame, 0.0)
+                .edit_projection(e.current_frame)
                 .unwrap_or(buzz_geom::Projection::IDENTITY);
             let handles = shot
                 .map_point(e.scene().edit_place() * bounds.center())
@@ -26043,6 +26212,65 @@ mod tests {
             None,
             "a click well away from it should still find nothing"
         );
+    }
+
+    /// **Opening a symbol never moves it**, camera on or off. Inside, the
+    /// playhead moves to the symbol's own frames; an animated camera read at
+    /// those, and a parallax layer read at depth zero, used to draw the opened
+    /// character somewhere else than where it was double-clicked.
+    #[test]
+    fn a_symbol_opens_where_it_stood_with_the_camera_on_or_off() {
+        for camera_on in [false, true] {
+            let mut e = editor();
+            let id = place_nested_character(&mut e);
+            let layer = e.scene().find_object(id).map(|(l, _)| l).expect("placed");
+            e.doc.edit("Shot", |scene| {
+                scene.set_frame_count(40);
+                scene.update_layer(layer, |l| {
+                    l.depth = 150.0;
+                    // Held to frame 20, so the playhead can sit mid-move.
+                    for _ in 0..20 {
+                        l.frames.insert_frame(0);
+                    }
+                });
+                let cam = scene.camera_mut();
+                cam.enabled = camera_on;
+                if camera_on {
+                    let mut a = buzz_scene::CameraKey::new(0, Point::new(200.0, 150.0));
+                    a.zoom = 1.0;
+                    let mut b = buzz_scene::CameraKey::new(30, Point::new(420.0, 260.0));
+                    b.zoom = 1.8;
+                    b.rotation = 0.2;
+                    cam.set_key(a);
+                    cam.set_key(b);
+                }
+            });
+            e.set_frame(12);
+            let frame = e.current_frame;
+
+            // Where the body is drawn on the stage before opening.
+            let shot = e
+                .scene()
+                .camera_projection_at_depth(frame, 150.0)
+                .expect("drawable");
+            let (_, object) = e.scene().find_object(id).expect("placed");
+            let place = e.scene().layers().inherited_transform(layer, frame) * object.transform;
+            let local = [Point::new(0.0, 0.0), Point::new(40.0, 25.0), Point::new(-30.0, 60.0)];
+            let before: Vec<Point> = local.iter().map(|p| shot.map_point(place * *p).expect("seen")).collect();
+
+            let on_the_body = shot.map_point(Point::new(270.0, 240.0)).expect("seen");
+            e.enter_or_leave_at(e.camera.doc_to_screen(on_the_body));
+            assert!(!e.scene().edit_path().is_empty(), "camera {camera_on}: opened");
+
+            let inside = e.edit_to_stage();
+            for (p, want) in local.iter().zip(&before) {
+                let got = inside.map_point(*p).expect("seen");
+                assert!(
+                    (got - *want).hypot() < 1e-6,
+                    "camera {camera_on}: {p:?} drawn at {got:?} inside, {want:?} outside"
+                );
+            }
+        }
     }
 
     /// **The whole complaint, end to end.** Double-click into a character, then

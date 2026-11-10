@@ -689,6 +689,7 @@ dependencies = [
  "buzz-script",
  "buzz-text",
  "buzz-ui",
+ "buzz-voice",
  "crossbeam-channel",
  "egui",
  "egui-wgpu",
@@ -967,6 +968,17 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "buzz-voice"
+version = "0.1.0"
+dependencies = [
+ "buzz-audio",
+ "hound",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

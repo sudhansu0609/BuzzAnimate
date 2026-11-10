@@ -121,6 +121,13 @@ pub enum Command {
     ZoomShowFrame,
     ZoomShowAll,
     ToggleRulers,
+    /// File ▸ Auto-Save: write a saved document back to its file after each
+    /// change. A person's preference, kept in the workspace.
+    ToggleAutoSave,
+    /// D2: the next open document's tab (Ctrl+Tab).
+    NextDocument,
+    /// D2: the previous open document's tab (Ctrl+Shift+Tab).
+    PreviousDocument,
     ToggleGrid,
     ToggleGuides,
     ToggleSnapping,
@@ -286,6 +293,9 @@ pub enum Command {
     ShortcutEditor,
     /// Open the local AI models and LLM backends dialog.
     AiModels,
+    /// A picture from the local ComfyUI: positive and negative prompt, LoRA
+    /// strengths, into the Library or onto the stage.
+    AiGenerateImage,
     /// Voice commands: press to talk (or stop) in "Push to talk" mode. The
     /// transcript goes into the Assistant's request box for review.
     VoicePushToTalk,
@@ -367,6 +377,16 @@ pub enum Command {
     /// **Add wiggle**: bake a deterministic jitter onto the selected object — an
     /// idle sway, a breeze, a handheld shake. See `buzz_act::physics`.
     AddWiggle,
+    /// **Add pendulum**: make the selected object swing from a pivot like a
+    /// hanging lamp, earring or sign, shaken by its own keyed motion. A live
+    /// modifier (`buzz_scene::Modifier::Pendulum`); Bake Modifiers writes it down.
+    AddPendulum,
+    /// **Add hair / cloth motion**: bend the selected drawing along a chain of
+    /// springs hanging from a pinned edge — a scarf, a ponytail, a flag, a cape
+    /// — lagging its keyed motion. A live modifier
+    /// (`buzz_scene::Modifier::Hair`); a deformation, so it stays live when
+    /// modifiers are baked.
+    AddHairMotion,
     /// **Clear modifiers**: remove all live modifiers from the selected object.
     ClearModifiers,
     /// **Bake modifiers**: evaluate the selected object's live modifiers across
@@ -709,6 +729,9 @@ command_table! {
             ZoomShowFrame => "zoom_show_frame",
             ZoomShowAll => "zoom_show_all",
             ToggleRulers => "toggle_rulers",
+            ToggleAutoSave => "toggle_auto_save",
+            NextDocument => "next_document",
+            PreviousDocument => "previous_document",
             ToggleGrid => "toggle_grid",
             ToggleGuides => "toggle_guides",
             ToggleSnapping => "toggle_snapping",
@@ -774,6 +797,7 @@ command_table! {
             Snapshots => "snapshots",
             ShortcutEditor => "shortcut_editor",
             AiModels => "ai_models",
+            AiGenerateImage => "ai_generate_image",
             VoicePushToTalk => "voice_push_to_talk",
             VoiceMute => "voice_mute",
             AiCharacterFromImage => "ai_character_from_image",
@@ -802,6 +826,8 @@ command_table! {
             Perform => "perform",
             AddFollowThrough => "add_follow_through",
             AddWiggle => "add_wiggle",
+            AddPendulum => "add_pendulum",
+            AddHairMotion => "add_hair_motion",
             ClearModifiers => "clear_modifiers",
             BakeModifiers => "bake_modifiers",
             SetReverse => "set_reverse",
@@ -895,8 +921,27 @@ command_table! {
 const ALL_PANELS: [super::workspace::PanelId; 22] = {
     use super::workspace::PanelId::*;
     [
-        Tools, ToolOptions, Layers, Properties, Color, Swatches, Depth, Rig, Filters, Lighting,
-        Sound, Library, Assets, Cast, Timeline, Sequence, Actions, Story, MotionEditor, Tasks, Ai,
+        Tools,
+        ToolOptions,
+        Layers,
+        Properties,
+        Color,
+        Swatches,
+        Depth,
+        Rig,
+        Filters,
+        Lighting,
+        Sound,
+        Library,
+        Assets,
+        Cast,
+        Timeline,
+        Sequence,
+        Actions,
+        Story,
+        MotionEditor,
+        Tasks,
+        Ai,
         Storyboard,
     ]
 };
@@ -948,11 +993,19 @@ impl Command {
             return Ok(unit);
         }
         Ok(match id {
-            "toggle_panel" => TogglePanel(pick_named(&ALL_PANELS, arg_str(args, "panel")?, "panel")?),
-            "set_theme" => SetTheme(pick_named(&super::theme::Theme::ALL, arg_str(args, "theme")?, "theme")?),
+            "toggle_panel" => {
+                TogglePanel(pick_named(&ALL_PANELS, arg_str(args, "panel")?, "panel")?)
+            }
+            "set_theme" => SetTheme(pick_named(
+                &super::theme::Theme::ALL,
+                arg_str(args, "theme")?,
+                "theme",
+            )?),
             "set_ui_scale" => {
                 let n = arg_i64(args, "scale")?;
-                SetUiScale(u32::try_from(n).map_err(|_| "scale must be a positive percent".to_string())?)
+                SetUiScale(
+                    u32::try_from(n).map_err(|_| "scale must be a positive percent".to_string())?,
+                )
             }
             "set_workspace_preset" => SetWorkspacePreset(pick_named(
                 &super::workspace::WorkspacePreset::ALL,
@@ -971,16 +1024,29 @@ impl Command {
             "add_missing_setup_layers" => AddMissingSetupLayers(arg_key(args, "shot")?),
             "edit_setup" => EditSetup(arg_key(args, "setup")?),
             "cut_on_dialogue" => CutOnDialogue(arg_key(args, "setup")?),
-            "continue_from_shot" => ContinueFromShot(arg_key(args, "shot")?, arg_key(args, "source")?),
+            "continue_from_shot" => {
+                ContinueFromShot(arg_key(args, "shot")?, arg_key(args, "source")?)
+            }
             "add_camera_move" => {
                 use buzz_scene::CameraMove as M;
                 AddCameraMove(pick_named(
-                    &[M::PushIn, M::PullOut, M::PanLeft, M::PanRight, M::Reveal, M::Drift],
+                    &[
+                        M::PushIn,
+                        M::PullOut,
+                        M::PanLeft,
+                        M::PanRight,
+                        M::Reveal,
+                        M::Drift,
+                    ],
                     arg_str(args, "move")?,
                     "camera move",
                 )?)
             }
-            "select_tool" => SelectTool(pick_named(&super::tools::all_tools(), arg_str(args, "tool")?, "tool")?),
+            "select_tool" => SelectTool(pick_named(
+                &super::tools::all_tools(),
+                arg_str(args, "tool")?,
+                "tool",
+            )?),
             "new_from_template" => {
                 let n = arg_i64(args, "index")?;
                 NewFromTemplate(usize::try_from(n).map_err(|_| "index must be >= 0".to_string())?)
@@ -989,28 +1055,49 @@ impl Command {
                 use super::align::Align as A;
                 Align {
                     op: pick_named(
-                        &[A::LeftEdges, A::HorizontalCentres, A::RightEdges, A::TopEdges, A::VerticalCentres, A::BottomEdges],
+                        &[
+                            A::LeftEdges,
+                            A::HorizontalCentres,
+                            A::RightEdges,
+                            A::TopEdges,
+                            A::VerticalCentres,
+                            A::BottomEdges,
+                        ],
                         arg_str(args, "edge")?,
                         "alignment edge",
                     )?,
-                    to_stage: args.get("to_stage").and_then(|v| v.as_bool()).unwrap_or(false),
+                    to_stage: args
+                        .get("to_stage")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                 }
             }
             "distribute" => {
                 use super::align::Distribute as D;
                 Distribute(pick_named(
-                    &[D::HorizontalCentres, D::VerticalCentres, D::HorizontalSpacing, D::VerticalSpacing],
+                    &[
+                        D::HorizontalCentres,
+                        D::VerticalCentres,
+                        D::HorizontalSpacing,
+                        D::VerticalSpacing,
+                    ],
                     arg_str(args, "mode")?,
                     "distribute mode",
                 )?)
             }
             "match_size" => {
                 use super::align::MatchSize as S;
-                MatchSize(pick_named(&[S::Width, S::Height, S::Both], arg_str(args, "mode")?, "match-size mode")?)
+                MatchSize(pick_named(
+                    &[S::Width, S::Height, S::Both],
+                    arg_str(args, "mode")?,
+                    "match-size mode",
+                )?)
             }
             "nudge" => {
-                let x = i32::try_from(arg_i64(args, "dx")?).map_err(|_| "dx out of range".to_string())?;
-                let y = i32::try_from(arg_i64(args, "dy")?).map_err(|_| "dy out of range".to_string())?;
+                let x = i32::try_from(arg_i64(args, "dx")?)
+                    .map_err(|_| "dx out of range".to_string())?;
+                let y = i32::try_from(arg_i64(args, "dy")?)
+                    .map_err(|_| "dy out of range".to_string())?;
                 Nudge { x, y }
             }
             "move_frames" => {
@@ -1090,6 +1177,9 @@ impl Command {
             ZoomShowFrame => "Show Frame",
             ZoomShowAll => "Show All",
             ToggleRulers => "Rulers",
+            ToggleAutoSave => "Auto-Save",
+            NextDocument => "Next Document",
+            PreviousDocument => "Previous Document",
             ToggleGrid => "Grid",
             ToggleGuides => "Guides",
             ToggleSnapping => "Snap to Objects",
@@ -1164,6 +1254,7 @@ impl Command {
             Snapshots => "Snapshots\u{2026}",
             ShortcutEditor => "Keyboard Shortcuts\u{2026}",
             AiModels => "AI Models\u{2026}",
+            AiGenerateImage => "Generate Image\u{2026}",
             VoicePushToTalk => "Voice: Push to Talk",
             VoiceMute => "Voice: Mute Microphone",
             AiCharacterFromImage => "Character from Image\u{2026}",
@@ -1194,6 +1285,8 @@ impl Command {
             Perform => "Animate Selection\u{2026}",
             AddFollowThrough => "Add Follow-Through\u{2026}",
             AddWiggle => "Add Wiggle\u{2026}",
+            AddPendulum => "Add Pendulum\u{2026}",
+            AddHairMotion => "Add Hair/Cloth Motion\u{2026}",
             ClearModifiers => "Clear Modifiers",
             BakeModifiers => "Bake Modifiers",
             SetReverse => "Set Reverse Drawing",
@@ -1339,6 +1432,9 @@ impl Command {
             // Animate puts rulers on Ctrl+Alt+Shift+R, not Ctrl+Shift+R —
             // the latter is Import to Library.
             ToggleRulers => sc(ctrl_shift.plus(Modifiers::ALT), Key::R),
+            ToggleAutoSave => None,
+            NextDocument => sc(Modifiers::CTRL, Key::Tab),
+            PreviousDocument => sc(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab),
             ToggleGrid => sc(ctrl, Key::Quote),
             ToggleGuides => sc(ctrl_semicolon(), Key::Semicolon),
             ToggleSnapping => sc(ctrl_shift, Key::U),
@@ -1421,18 +1517,27 @@ impl Command {
             // No Animate binding to follow, and these open dialogs rather than
             // acting straight away, so a key would only save the menu.
             SetScene | DirectScene | SceneryFor | AddScene | DuplicateScene | AddPerson
-            | AddTitleCard | Perform | AddFollowThrough | AddWiggle | ClearModifiers | BakeModifiers
-            | SetReverse | ClearReverse | AddProfileRight | AddProfileLeft
+            | AddTitleCard | Perform | AddFollowThrough | AddWiggle | AddPendulum | AddHairMotion | ClearModifiers
+            | BakeModifiers | SetReverse | ClearReverse | AddProfileRight | AddProfileLeft
             | AddThreeQuarterRight | AddThreeQuarterLeft => None,
             // `SplitAtPlayhead`'s `S` is scoped to the Sequence strip having
             // the pointer's attention (`sequence_panel` itself reads the key),
             // not a document-wide binding — so it carries none here, and
             // never collides with a tool's own shortcut.
-            SetMasterAudio | SetMasterAudioFromLayer(_) | ToggleMasterAudioMode
-            | ReapplyMasterAudio | MakeSetupFromScene
-            | NewShotFromSetup(_) | SplitAtPlayhead | TryAnotherSetup(..)
-            | DuplicateShot(_) | AddMissingSetupLayers(_) | EditSetup(_)
-            | FlattenToMasterScene | CutOnDialogue(_) | ContinueFromShot(..) => None,
+            SetMasterAudio
+            | SetMasterAudioFromLayer(_)
+            | ToggleMasterAudioMode
+            | ReapplyMasterAudio
+            | MakeSetupFromScene
+            | NewShotFromSetup(_)
+            | SplitAtPlayhead
+            | TryAnotherSetup(..)
+            | DuplicateShot(_)
+            | AddMissingSetupLayers(_)
+            | EditSetup(_)
+            | FlattenToMasterScene
+            | CutOnDialogue(_)
+            | ContinueFromShot(..) => None,
             ToggleLightGizmos => sc(ctrl_shift, Key::L),
             // Ctrl+Shift+B, beside the light handles it sits next to in the
             // View menu. Animate has no equivalent; there was nothing to clash.
@@ -1478,8 +1583,14 @@ impl Command {
             CutFrames => sc(ctrl_alt, Key::X),
             CopyFrames => sc(ctrl_alt, Key::C),
             PasteFrames => sc(ctrl_alt, Key::V),
-            CopyMotion | PasteMotion | PasteMotionSpecial | CopyPose | PastePose | CopyPerformance
-            | PastePerformance | PastePerformanceSpecial => None,
+            CopyMotion
+            | PasteMotion
+            | PasteMotionSpecial
+            | CopyPose
+            | PastePose
+            | CopyPerformance
+            | PastePerformance
+            | PastePerformanceSpecial => None,
             ClearFrames => sc(Modifiers::ALT, Key::Backspace),
             ReverseFrames => None,
             CleanUpLayers => None,
@@ -1525,7 +1636,9 @@ impl Command {
             ProducerPanel => None,
             // The Storyboard panel's buttons.
             StoryboardMake | StoryboardEdit | StoryboardExport => None,
-            AiModels | AiCharacterFromImage | AiIdentifyAssets | AiRigVectorCharacter | AiRigLayers | AiSceneFromImage | AiDirectStory | AiMouthChart => None,
+            AiModels | AiGenerateImage | AiCharacterFromImage | AiIdentifyAssets
+            | AiRigVectorCharacter | AiRigLayers | AiSceneFromImage | AiDirectStory
+            | AiMouthChart => None,
         }
     }
 
@@ -1611,6 +1724,9 @@ pub fn palette_commands() -> Vec<Command> {
         ZoomShowFrame,
         ZoomShowAll,
         ToggleRulers,
+        ToggleAutoSave,
+        NextDocument,
+        PreviousDocument,
         ToggleGrid,
         ToggleGuides,
         ToggleSnapping,
@@ -1723,6 +1839,8 @@ pub fn palette_commands() -> Vec<Command> {
         Perform,
         AddFollowThrough,
         AddWiggle,
+        AddPendulum,
+        AddHairMotion,
         ClearModifiers,
         BakeModifiers,
         SetReverse,
@@ -1772,6 +1890,7 @@ pub fn palette_commands() -> Vec<Command> {
         LipSyncFromCaptions,
         TranscribeWithBuzzEdit,
         AiModels,
+        AiGenerateImage,
         VoicePushToTalk,
         VoiceMute,
         AiCharacterFromImage,
@@ -1851,6 +1970,9 @@ mod tests {
             ZoomShowFrame,
             ZoomShowAll,
             ToggleRulers,
+            ToggleAutoSave,
+            NextDocument,
+            PreviousDocument,
             ToggleGrid,
             ToggleGuides,
             ToggleSnapping,
@@ -1958,6 +2080,8 @@ mod tests {
             Perform,
             AddFollowThrough,
             AddWiggle,
+            AddPendulum,
+            AddHairMotion,
             ClearModifiers,
             BakeModifiers,
             SetReverse,
@@ -2091,24 +2215,59 @@ mod tests {
             assert!(seen.insert(c.id()), "duplicate id {}", c.id());
             assert_eq!(Command::from_id(c.id(), &serde_json::Value::Null), Ok(c));
         }
-        assert_eq!(Command::unit_commands().len() + Command::data_command_hints().len(), 229);
+        assert_eq!(
+            Command::unit_commands().len() + Command::data_command_hints().len(),
+            235
+        );
     }
 
     #[test]
     fn data_commands_round_trip_and_bad_args_are_errors() {
         use serde_json::json;
         let cases = [
-            ("select_tool", json!({"tool": "paint_bucket"}), Command::SelectTool(crate::tools::ToolId::PaintBucket)),
-            ("set_ui_scale", json!({"scale": 150}), Command::SetUiScale(150)),
-            ("nudge", json!({"dx": 2, "dy": -3}), Command::Nudge { x: 2, y: -3 }),
+            (
+                "select_tool",
+                json!({"tool": "paint_bucket"}),
+                Command::SelectTool(crate::tools::ToolId::PaintBucket),
+            ),
+            (
+                "set_ui_scale",
+                json!({"scale": 150}),
+                Command::SetUiScale(150),
+            ),
+            (
+                "nudge",
+                json!({"dx": 2, "dy": -3}),
+                Command::Nudge { x: 2, y: -3 },
+            ),
             (
                 "move_frames",
                 json!({"to": 5, "rows": -1, "copy": true}),
-                Command::MoveFrames { to: 5, rows: -1, copy: true },
+                Command::MoveFrames {
+                    to: 5,
+                    rows: -1,
+                    copy: true,
+                },
             ),
-            ("move_frames", json!({"to": 5}), Command::MoveFrames { to: 5, rows: 0, copy: false }),
-            ("new_from_template", json!({"index": 1}), Command::NewFromTemplate(1)),
-            ("new_shot_from_setup", json!({"setup": 4}), Command::NewShotFromSetup(SceneKey(4))),
+            (
+                "move_frames",
+                json!({"to": 5}),
+                Command::MoveFrames {
+                    to: 5,
+                    rows: 0,
+                    copy: false,
+                },
+            ),
+            (
+                "new_from_template",
+                json!({"index": 1}),
+                Command::NewFromTemplate(1),
+            ),
+            (
+                "new_shot_from_setup",
+                json!({"setup": 4}),
+                Command::NewShotFromSetup(SceneKey(4)),
+            ),
         ];
         for (id, args, want) in cases {
             let got = Command::from_id(id, &args).unwrap();

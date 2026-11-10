@@ -1183,6 +1183,31 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
         crate::copilot::apply_to_plan(out, &mut p);
         p
     });
+    // V4 (docs/VOICES_AND_ACTING_PLAN.md): every line in its own speaker's
+    // voice, and only that line. The plan moves onto the re-voiced copy, so
+    // the build cuts, captions and lip-syncs each character against the voice
+    // it now speaks with, on its own segments and nobody else's.
+    let plan = match plan {
+        Some(p) => {
+            let mut notes = Vec::new();
+            let voices = crate::voices::resolve(&assets_root, &series, &mut notes);
+            report.warnings.extend(notes.into_iter().map(|n| format!("voices: {n}")));
+            if voices.is_empty() {
+                Some(p)
+            } else {
+                let (moved, voiced) =
+                    crate::voices::revoice_plan(&p, &chosen, &voices, out.as_path(), &mut |m| progress(Step::Audio, m))?;
+                for (speaker, n) in &voiced.per_speaker {
+                    progress(Step::Audio, &format!("{speaker}: {n} line(s) in their own voice"));
+                }
+                if voiced.as_recorded > 0 {
+                    progress(Step::Audio, &format!("{} line(s) kept as recorded (no voice set)", voiced.as_recorded));
+                }
+                Some(moved)
+            }
+        }
+        None => None,
+    };
     // B3: `--part N` builds only the scenes that part's audio covers, into its own files.
     let build_numbers: Vec<u32> = match (req.part, &parts_plan) {
         (Some(n), Some(pp)) => {

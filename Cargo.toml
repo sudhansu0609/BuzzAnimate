@@ -105,6 +105,7 @@ buzz-act = { path = "crates/buzz-act" }
 buzz-physics = { path = "crates/buzz-physics" }
 buzz-text = { path = "crates/buzz-text" }
 buzz-ai = { path = "crates/buzz-ai" }
+buzz-voice = { path = "crates/buzz-voice" }
 
 [patch.crates-io]
 # Verbatim copy of vello_encoding 0.9.0 with one change: BufferSizes::new

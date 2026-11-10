@@ -47,6 +47,7 @@ pub mod rig;
 pub mod sound;
 pub mod stamp;
 pub mod swatch;
+pub mod secondary;
 pub mod symbol;
 pub mod texture;
 pub mod time;
@@ -92,7 +93,8 @@ pub use index::{IndexEntry, SpatialIndex};
 pub use layer::{Layer, LayerHeight, LayerId, LayerKind, LayerStack, MaskGroup};
 pub use looping::{LoopRegion, MAX_REPEATS};
 pub use merge::{ImportTarget, MergeReport};
-pub use modifier::{Breath, Modifier};
+pub use modifier::{Breath, Deform, Modifier};
+pub use secondary::{ChainBend, PinSide};
 pub use object::{
     FillSpec, Object, ObjectId, ObjectKind, Paint, PaintBlend, ShapeData, Spatial, StrokeSpec,
     TextData, TextRun, Turnaround, TurnaroundView, restyle_runs, shift_runs_for_edit,
@@ -119,7 +121,7 @@ pub use symbol::{
 pub use timeline::{FrameKind, FrameSegment, Keyframe, LayerTimeline, ResolvedFrame, TweenSpan};
 pub use trace::{LineStyle, TraceMode, TraceOptions, TraceReport, quantise, trace};
 pub use trace_tuning::{ColourTuning, InkTuning, TraceTuning};
-pub use tween::{Easing, EasingSet, Tween, TweenKind, eval_bezier_ease};
+pub use tween::{EaseForm, Easing, EasingSet, Tween, TweenKind, eval_bezier_ease};
 pub use wand::{WandOptions, region_at as wand_region};
 pub use wave::{WaveKind, WaveSettings, WaveStroke, wave_artwork, wave_bounds, wave_loop};
 
@@ -306,6 +308,12 @@ pub struct Scene {
     /// symbol edits ([`Scene::fork_edit_path`]) repoint exactly these. View
     /// state exactly as `editing` is.
     edit_origins: Vec<Option<EditOrigin>>,
+    /// The document frame and layer depth the outermost symbol was opened
+    /// in place at — the shot it was seen through. Inside, the playhead moves
+    /// to the symbol's own frames, and reading an animated camera there put
+    /// the artwork somewhere else the moment it was opened. View state
+    /// exactly as `editing` is.
+    edit_shot: Option<(u32, f64)>,
     /// Memoised resolved-bounds table, tagged with the revision it was built
     /// for. Rebuilding it is linear in the library, but resolving bounds is a
     /// per-object, per-frame operation on every selection, so even a linear
@@ -339,6 +347,7 @@ impl Clone for Scene {
             editing: self.editing.clone(),
             edit_places: self.edit_places.clone(),
             edit_origins: self.edit_origins.clone(),
+            edit_shot: self.edit_shot,
             // A fresh, empty cache: a snapshot rebuilds its own on first use,
             // so a clone shares no mutable state with the scene it came from.
             bounds_cache: std::sync::RwLock::new(None),
@@ -506,6 +515,7 @@ impl Default for Scene {
             editing: Vec::new(),
             edit_places: Vec::new(),
             edit_origins: Vec::new(),
+            edit_shot: None,
             bounds_cache: std::sync::RwLock::new(None),
             modifier_cache: std::sync::RwLock::new(None),
         };
@@ -555,6 +565,7 @@ impl Scene {
             editing: Vec::new(),
             edit_places: Vec::new(),
             edit_origins: Vec::new(),
+            edit_shot: None,
             bounds_cache: std::sync::RwLock::new(None),
             modifier_cache: std::sync::RwLock::new(None),
         }
@@ -668,11 +679,63 @@ impl Scene {
             .fold(Affine::IDENTITY, |acc, place| acc * *place)
     }
 
+    /// Record the shot a symbol opened in place from the main timeline was
+    /// seen through: the document `frame` it was clicked on and the `depth`
+    /// of the layer it sat on. Ignored deeper in, where the outermost shot
+    /// still frames everything.
+    pub fn set_edit_shot(&mut self, frame: u32, depth: f64) {
+        if self.editing.len() == 1 {
+            self.edit_shot = Some((frame, depth));
+        }
+    }
+
+    /// The document frame the stage around an open symbol shows: the one it
+    /// was opened on, not the symbol's own playhead. `frame` on the main
+    /// timeline, and for a symbol opened from the Library.
+    pub fn context_frame(&self, frame: u32) -> u32 {
+        match self.edit_shot {
+            Some((at, _)) if !self.editing.is_empty() => at,
+            _ => frame,
+        }
+    }
+
+    /// **The camera the open symbol is drawn through**, so opening a symbol
+    /// leaves it exactly where it stood on the stage — camera on or off.
+    ///
+    /// On the main timeline this is [`Self::camera_transform`]. Inside a
+    /// symbol opened in place it is the camera at the document frame and
+    /// layer depth it was opened from ([`Self::set_edit_shot`]): the symbol's
+    /// own frames are not the document's, and an animated camera read at
+    /// them, or a parallax layer read at depth zero, moved the artwork.
+    pub fn edit_camera(&self, frame: u32) -> Affine {
+        match self.edit_shot {
+            Some((at, depth)) if !self.editing.is_empty() => self
+                .camera_transform_at_depth(at, depth)
+                .unwrap_or_else(|| self.camera_transform(at)),
+            _ => self.camera_transform(frame),
+        }
+    }
+
+    /// [`Self::edit_camera`] as the editor's pointer mapping takes it: the
+    /// depth-zero shot on the main timeline (tilt included), the shot the
+    /// open symbol was entered through inside one. `None` when the shot
+    /// cannot be drawn at all.
+    pub fn edit_projection(&self, frame: u32) -> Option<buzz_geom::Projection> {
+        match self.edit_shot {
+            Some(_) if !self.editing.is_empty() => Some(buzz_geom::Projection::from_affine(self.edit_camera(frame))),
+            _ => self.camera_projection_at_depth(frame, 0.0),
+        }
+    }
+
     /// Step out one level, towards the main timeline.
     pub fn exit_symbol(&mut self) -> bool {
         self.edit_places.pop();
         self.edit_origins.pop();
-        self.editing.pop().is_some()
+        let left = self.editing.pop().is_some();
+        if self.editing.is_empty() {
+            self.edit_shot = None;
+        }
+        left
     }
 
     /// Return all the way to the main timeline.
@@ -680,6 +743,7 @@ impl Scene {
         self.editing.clear();
         self.edit_places.clear();
         self.edit_origins.clear();
+        self.edit_shot = None;
     }
 
     /// **Copy-on-write for a symbol edited in place** (*Protect Other

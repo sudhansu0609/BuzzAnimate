@@ -86,19 +86,23 @@ struct Entry {
     used: u64,
 }
 
+/// One picture: a symbol at one of its frames. The Library shows frame 0;
+/// the Frame Picker asks for every frame it has on screen.
+type Key = (SymbolId, u32);
+
 /// Pictures of symbols, drawn once and kept until the symbol changes.
 #[derive(Default)]
 pub struct Thumbnails {
-    entries: HashMap<SymbolId, Entry>,
+    entries: HashMap<Key, Entry>,
     /// What the panels asked for while the frame was being built, in the order
     /// they asked. The front [`PER_FRAME`] are drawn each frame; the rest stay
     /// queued rather than being thrown away and re-asked, which on a large
     /// library was pure churn proportional to its size.
-    wanted: Vec<SymbolId>,
+    wanted: Vec<Key>,
     /// The set of everything in `wanted`, so [`Self::get`] can dedupe a request
     /// in O(1) rather than scanning the queue — the difference between O(n) and
     /// O(n²) per frame across a library's worth of rows.
-    requested: HashSet<SymbolId>,
+    requested: HashSet<Key>,
     /// egui texture ids of dropped pictures, freed in [`Self::fulfil`] where the
     /// renderer is reachable.
     retired: Vec<egui::TextureId>,
@@ -116,7 +120,7 @@ impl Thumbnails {
     /// compile.
     pub fn invalidate_stale(&mut self, scene: &Scene) {
         let retired = &mut self.retired;
-        self.entries.retain(|id, entry| {
+        self.entries.retain(|(id, _), entry| {
             let fresh = scene
                 .library()
                 .get(*id)
@@ -135,15 +139,23 @@ impl Thumbnails {
     ///
     /// Called from panel code, which has no GPU: asking is all it can do.
     pub fn get(&mut self, symbol: SymbolId) -> Option<egui::TextureId> {
+        self.get_frame(symbol, 0)
+    }
+
+    /// The picture of one frame of a symbol — what the Frame Picker shows.
+    /// Every frame is framed on the symbol's whole extent, so a row of them
+    /// lines up and only what moves changes from one to the next.
+    pub fn get_frame(&mut self, symbol: SymbolId, frame: u32) -> Option<egui::TextureId> {
+        let key = (symbol, frame);
         let tick = self.tick;
-        if let Some(entry) = self.entries.get_mut(&symbol) {
+        if let Some(entry) = self.entries.get_mut(&key) {
             entry.used = tick;
             return Some(entry.id);
         }
         // `insert` returns false when already queued, so a symbol asked for by a
         // dozen rows this frame is enqueued once — O(1), not a queue scan.
-        if self.requested.insert(symbol) {
-            self.wanted.push(symbol);
+        if self.requested.insert(key) {
+            self.wanted.push(key);
         }
         None
     }
@@ -177,21 +189,22 @@ impl Thumbnails {
         // Take the front of the queue only; the rest stay queued for the next
         // frame rather than being dropped and re-asked.
         let count = PER_FRAME.min(self.wanted.len());
-        let batch: Vec<SymbolId> = self.wanted.drain(..count).collect();
-        for symbol in &batch {
-            self.requested.remove(symbol);
+        let batch: Vec<Key> = self.wanted.drain(..count).collect();
+        for key in &batch {
+            self.requested.remove(key);
         }
-        for symbol in batch {
+        for key in batch {
+            let (symbol, frame) = key;
             // Gone since it was asked for — a symbol deleted while the panel
             // was being drawn is not an error, it is just nothing to draw.
             let Some(arc) = scene.library().get(symbol).cloned() else {
-                if let Some(entry) = self.entries.remove(&symbol) {
+                if let Some(entry) = self.entries.remove(&key) {
                     egui_renderer.free_texture(&entry.id);
                 }
                 continue;
             };
-            if let Some(entry) = self.draw(gpu, egui_renderer, vello, scene, symbol, arc, cache) {
-                self.entries.insert(symbol, entry);
+            if let Some(entry) = self.draw(gpu, egui_renderer, vello, scene, symbol, frame, arc, cache) {
+                self.entries.insert(key, entry);
             }
         }
 
@@ -206,7 +219,7 @@ impl Thumbnails {
         if self.entries.len() <= MAX_ENTRIES {
             return;
         }
-        let mut by_use: Vec<(SymbolId, u64)> =
+        let mut by_use: Vec<(Key, u64)> =
             self.entries.iter().map(|(id, e)| (*id, e.used)).collect();
         // Oldest first.
         by_use.sort_by_key(|(_, used)| *used);
@@ -243,6 +256,7 @@ impl Thumbnails {
         vello: &mut vello::Scene,
         scene: &Scene,
         symbol: SymbolId,
+        frame: u32,
         arc: std::sync::Arc<buzz_scene::Symbol>,
         cache: &mut buzz_render::document::DrawCache,
     ) -> Option<Entry> {
@@ -260,7 +274,7 @@ impl Thumbnails {
             &mut builder,
             scene,
             symbol,
-            0,
+            frame,
             buzz_geom::Affine::IDENTITY,
             &buzz_render::document::FrameOptions::default(),
             cache,
@@ -573,11 +587,22 @@ mod tests {
         assert!(thumbs.get(SymbolId(1)).is_none());
         assert!(thumbs.get(SymbolId(1)).is_none());
         assert!(thumbs.get(SymbolId(1)).is_none());
-        assert_eq!(thumbs.wanted, vec![SymbolId(1)], "queued once, not thrice");
+        assert_eq!(thumbs.wanted, vec![(SymbolId(1), 0)], "queued once, not thrice");
 
         assert!(thumbs.get(SymbolId(2)).is_none());
-        assert_eq!(thumbs.wanted, vec![SymbolId(1), SymbolId(2)]);
+        assert_eq!(thumbs.wanted, vec![(SymbolId(1), 0), (SymbolId(2), 0)]);
         assert!(thumbs.pending());
+    }
+
+    /// The Frame Picker's pictures are one per frame: frame 3 is its own
+    /// request, and frame 0 is the Library's picture, asked for once.
+    #[test]
+    fn each_frame_of_a_symbol_is_its_own_picture() {
+        let mut thumbs = Thumbnails::default();
+        assert!(thumbs.get(SymbolId(1)).is_none());
+        assert!(thumbs.get_frame(SymbolId(1), 0).is_none());
+        assert!(thumbs.get_frame(SymbolId(1), 3).is_none());
+        assert_eq!(thumbs.wanted, vec![(SymbolId(1), 0), (SymbolId(1), 3)]);
     }
 
     /// Clearing queues every live picture's texture to be freed, and empties the

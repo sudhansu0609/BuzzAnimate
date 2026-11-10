@@ -1373,13 +1373,284 @@ fn single_selected_instance(scene: &Scene, selection: &Selection) -> Option<buzz
 /// Everything here is a property of the *placement*, not of the symbol: two
 /// instances of one symbol can start on different frames, loop differently and
 /// carry different colour effects, which is what makes symbols worth using.
+/// **Color Effect** — Animate's Style menu (None, Brightness, Tint, Alpha)
+/// and the controls for the one chosen, over `current`. Shared by an
+/// instance's properties and a keyframe's, so both work alike. Returns the new
+/// transform when something was changed.
+///
+/// **The style picked is remembered** for `key` (the instance, or the
+/// keyframe). Alpha starts at 100 % and Brightness at 0, both of which are no
+/// effect at all — so read back from the transform alone the choice vanished
+/// on the next frame, the slider never appeared, and picking Alpha "did
+/// nothing".
+fn color_effect_controls(
+    ui: &mut Ui,
+    salt: &str,
+    key: egui::Id,
+    current: &buzz_scene::ColorTransform,
+) -> Option<buzz_scene::ColorTransform> {
+    use buzz_scene::ColorEffect;
+    let memory = egui::Id::new(("color-effect-style", salt)).with(key);
+    let remembered: Option<u8> = ui.data(|d| d.get_temp(memory));
+    let effect = match (ColorEffect::from_transform(current), remembered) {
+        (ColorEffect::None, Some(1)) => ColorEffect::Brightness(0.0),
+        (ColorEffect::None, Some(3)) => ColorEffect::Alpha(1.0),
+        (derived, _) => derived,
+    };
+    let mut picked = None;
+
+    property_row(ui, "Style", None, |ui| {
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text(effect.label())
+            .show_ui(ui, |ui| {
+                // Switching style starts that effect at a visible amount,
+                // rather than at zero where it would look broken.
+                let options = [
+                    ColorEffect::None,
+                    ColorEffect::Brightness(0.0),
+                    ColorEffect::Tint {
+                        color: Color::from_rgba8(0xFF, 0x00, 0x00, 0xFF),
+                        amount: 0.5,
+                    },
+                    ColorEffect::Alpha(1.0),
+                ];
+                for option in options {
+                    let selected =
+                        std::mem::discriminant(&option) == std::mem::discriminant(&effect);
+                    if ui.selectable_label(selected, option.label()).clicked() && !selected {
+                        let code: u8 = match option {
+                            ColorEffect::Brightness(_) => 1,
+                            ColorEffect::Tint { .. } => 2,
+                            ColorEffect::Alpha(_) => 3,
+                            _ => 0,
+                        };
+                        ui.data_mut(|d| d.insert_temp(memory, code));
+                        picked = Some(option.to_transform().unwrap_or_default());
+                    }
+                }
+            });
+    });
+
+    match effect {
+        ColorEffect::Brightness(amount) => {
+            property_row(ui, "Brightness", None, |ui| {
+                let mut percent = amount * 100.0;
+                if ui
+                    .add(egui::Slider::new(&mut percent, -100.0..=100.0).suffix("%"))
+                    .changed()
+                {
+                    picked = Some(buzz_scene::ColorTransform::brightness(percent / 100.0));
+                }
+            });
+        }
+        ColorEffect::Alpha(amount) => {
+            property_row(ui, "Alpha", None, |ui| {
+                let mut percent = amount * 100.0;
+                if ui
+                    .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
+                    .changed()
+                {
+                    picked = Some(buzz_scene::ColorTransform::alpha(percent / 100.0));
+                }
+            });
+        }
+        ColorEffect::Tint { color, amount } => {
+            let mut tint = to_egui(color);
+            let mut percent = amount * 100.0;
+
+            property_row(ui, "Tint", None, |ui| {
+                if ui.color_edit_button_srgba(&mut tint).changed() {
+                    picked = Some(buzz_scene::ColorTransform::tint(from_egui(tint), percent / 100.0));
+                }
+            });
+
+            property_row(ui, "Amount", None, |ui| {
+                if ui
+                    .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
+                    .changed()
+                {
+                    picked = Some(buzz_scene::ColorTransform::tint(from_egui(tint), percent / 100.0));
+                }
+            });
+        }
+        ColorEffect::Advanced => {
+            property_row(ui, "Advanced", None, |ui| {
+                ui.label(RichText::new("Set by a tween or an import").small().weak())
+                    .on_hover_text(
+                        "This colour effect is not one of Animate's four named ones. \
+                     Choosing a style above replaces it.",
+                    );
+            });
+        }
+        ColorEffect::None => {}
+    }
+    picked
+}
+
+/// **Frame** — the selected frames' own Color Effect (alpha, brightness,
+/// tint) over everything on the keyframe, in the film as well as on the stage.
+/// A frame that is not a keyframe becomes one first while Auto Keyframe is
+/// on, so the frames before it keep theirs; with a tween to the next keyframe
+/// the effect blends across the span. Applied on every selected, unlocked
+/// layer.
+fn frame_properties(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    frames: &crate::selection::TimelineSelection,
+    at: EditAt,
+) -> bool {
+    let shown = frames
+        .layers
+        .iter()
+        .find_map(|id| scene.layers().get(*id))
+        .map_or_else(buzz_scene::ColorTransform::default, |l| {
+            l.frames.color_at(frames.first_frame)
+        });
+    let mut changed = false;
+    let title = if frames.first_frame == frames.last_frame {
+        format!("Frame {}", frames.first_frame + 1)
+    } else {
+        format!("Frames {}\u{2013}{}", frames.first_frame + 1, frames.last_frame + 1)
+    };
+    property_section(ui, "frame-section", &title, true, |ui| {
+        ui.label(
+            RichText::new("Color Effect \u{2014} this keyframe only")
+                .small()
+                .weak(),
+        )
+        .on_hover_text(
+            "Alpha, brightness or tint for everything on this keyframe, in the film too. \
+             Earlier keyframes keep theirs; tween to the next keyframe to blend across the frames.",
+        );
+        let key = egui::Id::new((frames.layers.iter().next().copied(), frames.first_frame));
+        if let Some(color) = color_effect_controls(ui, "frame-effect", key, &shown) {
+            for layer in frames.layers.iter().copied().collect::<Vec<_>>() {
+                changed |= scene.set_keyframe_color(
+                    layer,
+                    frames.first_frame,
+                    frames.last_frame,
+                    color,
+                    at.auto_key,
+                );
+            }
+        }
+    });
+    changed
+}
+
+/// The Frame Picker: a grid of the symbol's frames as pictures, the one the
+/// instance starts on outlined. Clicking a picture makes it the first frame;
+/// with **Hold** on, a graphic also switches to Single Frame so it stays on
+/// the picked drawing instead of playing on from it. Only the pictures on
+/// screen are asked for, so a symbol a thousand frames long costs what its
+/// visible rows cost.
+#[allow(clippy::too_many_arguments, reason = "one caller, the instance section")]
+fn frame_picker(
+    ui: &mut Ui,
+    symbol: buzz_scene::SymbolId,
+    length: u32,
+    key_frames: &[u32],
+    is_graphic: bool,
+    first_frame: &mut u32,
+    loop_mode: &mut buzz_scene::LoopMode,
+    edited: &mut bool,
+    thumbnail: FrameThumbnails<'_>,
+) {
+    const TILE: f32 = 56.0;
+    const LABEL: f32 = 14.0;
+    let keys_id = egui::Id::new("frame-picker-keys-only");
+    let hold_id = egui::Id::new("frame-picker-hold");
+    let mut keys_only: bool = ui.data_mut(|d| d.get_persisted(keys_id)).unwrap_or(false);
+    let mut hold: bool = ui.data_mut(|d| d.get_persisted(hold_id)).unwrap_or(true);
+
+    egui::CollapsingHeader::new(format!("Frame Picker \u{2014} {length} frames"))
+        .id_salt("frame-picker")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut keys_only, "Keyframes only")
+                    .on_hover_text("Show only the frames where the symbol's drawing changes")
+                    .changed()
+                {
+                    ui.data_mut(|d| d.insert_persisted(keys_id, keys_only));
+                }
+                if is_graphic
+                    && ui
+                        .checkbox(&mut hold, "Hold")
+                        .on_hover_text(
+                            "Picking a frame also sets Looping to Single Frame, so the instance \
+                             stays on it. Off: it plays on from the picked frame.",
+                        )
+                        .changed()
+                {
+                    ui.data_mut(|d| d.insert_persisted(hold_id, hold));
+                }
+            });
+            let frames: Vec<u32> = if keys_only { key_frames.to_vec() } else { (0..length).collect() };
+            egui::ScrollArea::vertical()
+                .id_salt("frame-picker-scroll")
+                .max_height(3.0 * (TILE + LABEL + 4.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        for frame in frames {
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(TILE, TILE + LABEL),
+                                egui::Sense::click(),
+                            );
+                            if ui.is_rect_visible(rect) {
+                                let picture = egui::Rect::from_min_size(rect.min, egui::vec2(TILE, TILE));
+                                let visuals = ui.visuals();
+                                let painter = ui.painter();
+                                painter.rect_filled(picture, 3.0, visuals.extreme_bg_color);
+                                if let Some(texture) = thumbnail(symbol, frame) {
+                                    painter.image(
+                                        texture,
+                                        picture.shrink(2.0),
+                                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                }
+                                let picked = frame == *first_frame;
+                                let stroke = if picked {
+                                    egui::Stroke::new(2.0, visuals.selection.stroke.color)
+                                } else if response.hovered() {
+                                    visuals.widgets.hovered.bg_stroke
+                                } else {
+                                    visuals.widgets.noninteractive.bg_stroke
+                                };
+                                painter.rect_stroke(picture, 3.0, stroke, egui::StrokeKind::Inside);
+                                painter.text(
+                                    egui::pos2(picture.center().x, picture.bottom() + LABEL / 2.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{}", frame + 1),
+                                    egui::FontId::proportional(10.0),
+                                    if picked { visuals.strong_text_color() } else { visuals.weak_text_color() },
+                                );
+                            }
+                            if response.on_hover_text(format!("Frame {}", frame + 1)).clicked() {
+                                *first_frame = frame;
+                                if is_graphic && hold {
+                                    *loop_mode = buzz_scene::LoopMode::SingleFrame;
+                                }
+                                *edited = true;
+                            }
+                        }
+                    });
+                });
+        });
+}
+
 fn instance_properties(
     ui: &mut Ui,
     scene: &mut Scene,
     id: buzz_scene::ObjectId,
     at: EditAt,
+    thumbnail: FrameThumbnails<'_>,
 ) -> bool {
-    use buzz_scene::{ColorEffect, LoopMode};
+    use buzz_scene::LoopMode;
 
     let Some((layer, earliest)) = scene.find_object(id) else {
         return false;
@@ -1411,6 +1682,19 @@ fn instance_properties(
     };
     let (symbol_name, symbol_kind, symbol_length) =
         (symbol.name.clone(), symbol.kind, symbol.length());
+    // Where something changes inside the symbol, for the Frame Picker's
+    // "Keyframes only": a mouth chart is a handful of drawings held for
+    // dozens of frames each, and those few are the frames worth picking.
+    let key_frames: Vec<u32> = {
+        let mut starts: std::collections::BTreeSet<u32> = symbol
+            .layers
+            .iter()
+            .flat_map(|l| l.frames.keyframes().iter().map(|k| k.start))
+            .filter(|f| *f < symbol_length)
+            .collect();
+        starts.insert(0);
+        starts.into_iter().collect()
+    };
 
     // Collected first, applied after the widgets, so the scene is not borrowed
     // while the panel is drawn.
@@ -1419,6 +1703,7 @@ fn instance_properties(
     let mut new_color = instance.color;
     let mut new_symbol = instance.symbol;
     let mut new_sync_to_root = instance.sync_to_root;
+    let mut new_kind = symbol_kind;
     let mut edited = false;
 
     // What Swap… offers first: the symbols similar to this one, ranked
@@ -1640,6 +1925,32 @@ fn instance_properties(
             );
         }
 
+        // **The symbol's type, changeable here** — Animate's Symbol
+        // Properties ▸ Type. It belongs to the symbol, so every instance
+        // changes with it; a graphic plays on the timeline it sits in and gets
+        // the Looping control below, a movie clip shows its first frame.
+        property_row(
+            ui,
+            "Type",
+            Some(
+                "Graphic: plays on the timeline it is placed in (Loop, Play Once, Single Frame). \
+                 Movie Clip: shows its first frame. Changes every instance of this symbol.",
+            ),
+            |ui| {
+                egui::ComboBox::from_id_salt("instance-symbol-kind")
+                    .selected_text(new_kind.label())
+                    .show_ui(ui, |ui| {
+                        for kind in [
+                            buzz_scene::SymbolKind::Graphic,
+                            buzz_scene::SymbolKind::MovieClip,
+                            buzz_scene::SymbolKind::Button,
+                        ] {
+                            ui.selectable_value(&mut new_kind, kind, kind.label());
+                        }
+                    });
+            },
+        );
+
         property_row(ui, "Frames", None, |ui| {
             ui.label(RichText::new(format!("{symbol_length}")).weak());
         });
@@ -1656,6 +1967,21 @@ fn instance_properties(
                 edited = true;
             }
         });
+
+        // **Frame Picker** — Animate's: every frame of the symbol as a
+        // picture, and a click shows that one. What a lip sync or a set of
+        // hand poses is picked from by eye instead of by number.
+        frame_picker(
+            ui,
+            instance.symbol,
+            symbol_length,
+            &key_frames,
+            symbol_kind.follows_parent_timeline(),
+            &mut new_first_frame,
+            &mut new_loop,
+            &mut edited,
+            thumbnail,
+        );
 
         // Only a graphic follows the parent playhead, so only a graphic has
         // anything to loop. Showing the control for a movie clip would
@@ -1699,98 +2025,11 @@ fn instance_properties(
         );
 
         // -- colour effect ---------------------------------------------------
-        let effect = ColorEffect::from_transform(&instance.color);
-
         ui.add_space(Tokens::SPACE_1);
         ui.label(RichText::new("Color Effect").small().weak());
-
-        property_row(ui, "Style", None, |ui| {
-            egui::ComboBox::from_id_salt("instance-effect")
-                .selected_text(effect.label())
-                .show_ui(ui, |ui| {
-                    // Switching style starts that effect at a visible amount,
-                    // rather than at zero where it would look broken.
-                    let options = [
-                        ColorEffect::None,
-                        ColorEffect::Brightness(0.0),
-                        ColorEffect::Tint {
-                            color: Color::from_rgba8(0xFF, 0x00, 0x00, 0xFF),
-                            amount: 0.5,
-                        },
-                        ColorEffect::Alpha(1.0),
-                    ];
-                    for option in options {
-                        let selected =
-                            std::mem::discriminant(&option) == std::mem::discriminant(&effect);
-                        if ui.selectable_label(selected, option.label()).clicked()
-                            && !selected
-                            && let Some(t) = option.to_transform()
-                        {
-                            new_color = t;
-                            edited = true;
-                        }
-                    }
-                });
-        });
-
-        match effect {
-            ColorEffect::Brightness(amount) => {
-                property_row(ui, "Brightness", None, |ui| {
-                    let mut percent = amount * 100.0;
-                    if ui
-                        .add(egui::Slider::new(&mut percent, -100.0..=100.0).suffix("%"))
-                        .changed()
-                    {
-                        new_color = buzz_scene::ColorTransform::brightness(percent / 100.0);
-                        edited = true;
-                    }
-                });
-            }
-            ColorEffect::Alpha(amount) => {
-                property_row(ui, "Alpha", None, |ui| {
-                    let mut percent = amount * 100.0;
-                    if ui
-                        .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
-                        .changed()
-                    {
-                        new_color = buzz_scene::ColorTransform::alpha(percent / 100.0);
-                        edited = true;
-                    }
-                });
-            }
-            ColorEffect::Tint { color, amount } => {
-                let mut tint = to_egui(color);
-                let mut percent = amount * 100.0;
-
-                property_row(ui, "Tint", None, |ui| {
-                    if ui.color_edit_button_srgba(&mut tint).changed() {
-                        new_color =
-                            buzz_scene::ColorTransform::tint(from_egui(tint), percent / 100.0);
-                        edited = true;
-                    }
-                });
-
-                property_row(ui, "Amount", None, |ui| {
-                    if ui
-                        .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
-                        .changed()
-                    {
-                        new_color =
-                            buzz_scene::ColorTransform::tint(from_egui(tint), percent / 100.0);
-                        edited = true;
-                    }
-                });
-            }
-            ColorEffect::Advanced => {
-                property_row(ui, "Advanced", None, |ui| {
-                    ui.label(RichText::new("Set by a tween or an import").small().weak())
-                        .on_hover_text(
-                            "This colour effect is not one of Animate's four named ones. \
-                         Choosing a style above replaces it.",
-                        );
-                });
-            }
-            ColorEffect::None => {}
+        if let Some(t) = color_effect_controls(ui, "instance-effect", egui::Id::new(id), &instance.color) {
+            new_color = t;
+            edited = true;
         }
     });
 
@@ -1820,6 +2059,10 @@ fn instance_properties(
                 }
             });
         }
+    }
+
+    if new_kind != symbol_kind {
+        edited |= scene.set_symbol_kind(instance.symbol, new_kind);
     }
 
     // The set actions, each its own edit. A pick keys the layer at the
@@ -3293,10 +3536,35 @@ pub fn properties_panel(
     view: &mut ViewSettings,
     at: EditAt,
 ) -> bool {
+    properties_panel_with(ui, scene, selection, style, view, at, &mut |_, _| None)
+}
+
+/// A picture of one frame of a symbol, for the Frame Picker: `None` until the
+/// app has drawn it. The app's thumbnail cache answers; see
+/// `buzz_app::thumbnails`.
+pub type FrameThumbnails<'a> =
+    &'a mut dyn FnMut(buzz_scene::SymbolId, u32) -> Option<egui::TextureId>;
+
+/// [`properties_panel`], with pictures for the instance's Frame Picker.
+pub fn properties_panel_with(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    selection: &Selection,
+    style: &mut DrawStyle,
+    view: &mut ViewSettings,
+    at: EditAt,
+    thumbnail: FrameThumbnails<'_>,
+) -> bool {
     let mut changed = false;
 
     ui.heading(selection.describe(scene));
     ui.separator();
+
+    // Frames picked in the timeline: what belongs to the keyframe rather than
+    // to any one thing on it.
+    if let Some(frames) = selection.timeline() {
+        changed |= frame_properties(ui, scene, frames, at);
+    }
 
     if selection.is_empty() {
         property_section(ui, "doc-section", "Document", true, |ui| {
@@ -3390,7 +3658,7 @@ pub fn properties_panel(
     // one would need a multi-edit model that Animate itself does not have here,
     // so the section only appears for one.
     if let Some(id) = single_selected_instance(scene, selection) {
-        changed |= instance_properties(ui, scene, id, at);
+        changed |= instance_properties(ui, scene, id, at, thumbnail);
     }
 
     // Which way the selection faces in space. Animate keeps this for movie
@@ -3709,6 +3977,9 @@ pub fn color_panel(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
             ui.label(RichText::new(&swatch.name).small().weak());
         }
     });
+    if alpha_slider(ui, &mut style.stroke_color, "How much of what is underneath shows through the line") {
+        style.stroke_enabled = true;
+    }
     ui.horizontal(|ui| {
         ui.label("Fill");
         egui::ComboBox::from_id_salt("fill kind")
@@ -3734,6 +4005,9 @@ pub fn color_panel(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
                 ui.label(RichText::new(&swatch.name).small().weak());
             }
         });
+        if alpha_slider(ui, &mut style.fill_color, "How much of what is underneath shows through the fill") {
+            style.fill_enabled = true;
+        }
     } else {
         gradient_editor(ui, &mut style.fill_gradient);
         style.fill_enabled = true;
@@ -3958,6 +4232,31 @@ fn swatch_chip(ui: &mut Ui, color: Color, name: &str) -> bool {
 /// palette, every style guide and every other program already uses.
 ///
 /// Returns whether the colour changed.
+/// An **Alpha** slider, 0–100 %, for a colour in the Color panel — the
+/// colour's own transparency, which the picker hid inside its popup. Changing
+/// it changes the colour, so it reaches the selection the way picking a new
+/// colour does. True when it moved.
+fn alpha_slider(ui: &mut Ui, color: &mut Color, hint: &str) -> bool {
+    let mut percent = f64::from(color.components[3]) * 100.0;
+    let moved = ui
+        .horizontal(|ui| {
+            ui.add_space(38.0);
+            ui.add(
+                egui::Slider::new(&mut percent, 0.0..=100.0)
+                    .text("Alpha")
+                    .suffix(" %")
+                    .fixed_decimals(0),
+            )
+            .on_hover_text(hint)
+            .changed()
+        })
+        .inner;
+    if moved {
+        color.components[3] = (percent / 100.0) as f32;
+    }
+    moved
+}
+
 pub fn color_row(ui: &mut Ui, id: &str, color: &mut Color) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -4480,7 +4779,7 @@ pub fn layers_panel_filtered(
         let Some(layer) = scene.layers().get(id) else {
             continue;
         };
-        let (name, kind, visible, locked, outline, alpha, color, depth, highlight, collapsed) = (
+        let (name, kind, visible, locked, outline, _view_alpha, color, depth, highlight, collapsed) = (
             layer.name.clone(),
             layer.kind,
             layer.visible,
@@ -4902,6 +5201,15 @@ pub fn layers_panel_filtered(
         // point number field, and three of the panel's width went on it for
         // every layer in the document — width the layer's own *name* then did
         // not have. Animate keeps it in Layer Properties for the same reason.
+        // **Opacity from this frame on.** It is the layer's alpha at the
+        // playhead, and changing it makes a keyframe there and changes that
+        // keyframe and every later one — the frames before keep theirs, and
+        // the film shows it. (It used to be a working-view dimmer for the
+        // whole layer, which changed every frame at once.)
+        let alpha = scene
+            .layers()
+            .get(id)
+            .map_or(1.0, |l| f64::from(l.frames.alpha_at(frame)));
         let mut set_alpha = alpha;
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 12.0 + 18.0);
@@ -4916,9 +5224,8 @@ pub fn layers_panel_filtered(
                         .fixed_decimals(0),
                 )
                 .on_hover_text(
-                    "How solid this layer is drawn while you work \u{2014} dim one \
-                     to draw over it, or to see what is behind it. A working \
-                     view only: the export draws every layer at full strength.",
+                    "How solid this layer is from this frame on \u{2014} the frames \
+                     before keep their opacity. In the film too.",
                 )
                 .changed()
             {
@@ -4926,7 +5233,7 @@ pub fn layers_panel_filtered(
             }
         });
         if set_alpha != alpha {
-            scene.update_layer(id, |l| l.alpha = set_alpha);
+            scene.set_layer_alpha_from(id, frame, set_alpha as f32);
         }
 
         // **Ignore lights** (F1): captions, title cards and other overlays sit

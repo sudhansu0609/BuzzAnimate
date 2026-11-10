@@ -1175,6 +1175,58 @@ mod tests {
         }
     }
 
+    /// **A keyframe's alpha is in the film.** Frame 1 made its own keyframe
+    /// at half alpha comes out pink over the white stage; frame 0, before it,
+    /// stays solid red. (Unlike the layer's alpha, which export ignores.)
+    #[test]
+    fn a_keyframes_alpha_reaches_the_export_and_only_its_frames() {
+        let Ok(mut exporter) = Exporter::new(&GpuPreference::Automatic) else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let mut scene = document();
+        let layer = scene.layers().iter().find(|l| l.name == "Art").expect("the layer").id;
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(1);
+        });
+        assert!(scene.set_keyframe_alpha(layer, 1, 1, 0.5, true));
+        let settings = ExportSettings::for_stage(&scene);
+        let solid = exporter.render(&scene, 0, &settings).expect("renders").pixel(275, 200);
+        let faded = exporter.render(&scene, 1, &settings).expect("renders").pixel(275, 200);
+        assert!(solid[0] > 200 && solid[1] < 40, "frame 0 stays solid red: {solid:?}");
+        assert!(
+            faded[0] > 200 && (90..170).contains(&faded[1]),
+            "frame 1 is red at half strength over white: {faded:?}"
+        );
+    }
+
+    /// Brightness on one keyframe is in the film too: frame 1 at -50 %
+    /// brightness comes out dark red, frame 0 stays bright red.
+    #[test]
+    fn a_keyframes_brightness_reaches_the_export() {
+        let Ok(mut exporter) = Exporter::new(&GpuPreference::Automatic) else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let mut scene = document();
+        let layer = scene.layers().iter().find(|l| l.name == "Art").expect("the layer").id;
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(1);
+        });
+        assert!(scene.set_keyframe_color(
+            layer,
+            1,
+            1,
+            buzz_scene::ColorTransform::brightness(-0.5),
+            true
+        ));
+        let settings = ExportSettings::for_stage(&scene);
+        let bright = exporter.render(&scene, 0, &settings).expect("renders").pixel(275, 200);
+        let dark = exporter.render(&scene, 1, &settings).expect("renders").pixel(275, 200);
+        assert!(bright[0] > 200, "frame 0 stays bright: {bright:?}");
+        assert!((60..170).contains(&dark[0]) && dark[1] < 40, "frame 1 is darkened: {dark:?}");
+    }
+
     #[test]
     fn stage_settings_match_the_document() {
         let scene = document();

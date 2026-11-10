@@ -1162,6 +1162,8 @@ fn bake_motion_object(
         let mut object = (**base).clone();
         object.transform = compose(tick);
         buzz_scene::Keyframe {
+            // Animate has no keyframe colour effect; every imported keyframe is plain.
+            color: buzz_scene::ColorTransform::default(),
             start,
             objects: std::sync::Arc::new(vec![std::sync::Arc::new(object)]),
             label,
@@ -2854,6 +2856,8 @@ impl FrameContext {
         }
 
         self.keyframes.push(buzz_scene::Keyframe {
+            // Animate has no keyframe colour effect; every imported keyframe is plain.
+            color: buzz_scene::ColorTransform::default(),
             start: frame.start,
             objects: std::sync::Arc::new(frame.objects),
             label: frame.label,

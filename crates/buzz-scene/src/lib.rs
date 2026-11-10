@@ -689,6 +689,16 @@ impl Scene {
         }
     }
 
+    /// The layer depth the shot around an open symbol is seen at: the depth of
+    /// the layer it was opened from, while it is open in place; `depth`
+    /// otherwise. The partner of [`Self::context_frame`].
+    pub fn context_depth(&self, depth: f64) -> f64 {
+        match self.edit_shot {
+            Some((_, at)) if !self.editing.is_empty() => at,
+            _ => depth,
+        }
+    }
+
     /// The document frame the stage around an open symbol shows: the one it
     /// was opened on, not the symbol's own playhead. `frame` on the main
     /// timeline, and for a symbol opened from the Library.
@@ -1013,6 +1023,19 @@ impl Scene {
     pub fn library_mut(&mut self) -> &mut Library {
         self.revision += 1;
         &mut self.library
+    }
+
+    /// Change a symbol's type — Movie Clip, Graphic or Button — as Animate's
+    /// Symbol Properties does. Every instance of it follows: a graphic plays
+    /// on its parent's timeline (and takes Loop, Play Once or Single Frame),
+    /// a movie clip holds its first frame while authoring. The instances keep
+    /// their first frame and looping, so switching back loses nothing. False
+    /// when there is no such symbol or it is already that type.
+    pub fn set_symbol_kind(&mut self, id: SymbolId, kind: SymbolKind) -> bool {
+        if self.library.get(id).is_none_or(|s| s.kind == kind) {
+            return false;
+        }
+        self.library_mut().update(id, |s| s.kind = kind)
     }
 
     // -- lighting ------------------------------------------------------------
@@ -1968,6 +1991,91 @@ impl Scene {
             self.bump();
         }
         ok
+    }
+
+    /// **Frame ▸ Alpha** over a frame selection on one layer: the keyframe
+    /// owning `first` — made a keyframe of its own first when `own` is set, so
+    /// the frames before keep their alpha — and every keyframe starting
+    /// after it up to `last`. A locked layer is left alone. False when
+    /// nothing changed.
+    pub fn set_keyframe_alpha(
+        &mut self,
+        layer: LayerId,
+        first: u32,
+        last: u32,
+        alpha: f32,
+        own: bool,
+    ) -> bool {
+        self.edit_keyframes(layer, first, last, own, |frames, at, own| {
+            frames.set_alpha(at, alpha, own)
+        })
+    }
+
+    /// **Frame ▸ Color Effect** — alpha, brightness, tint — over a frame
+    /// selection on one layer, by the same rule as
+    /// [`Self::set_keyframe_alpha`]: the keyframe owning `first` (made its own
+    /// first when `own` is set, so the frames before are untouched) and every
+    /// keyframe starting after it up to `last`.
+    pub fn set_keyframe_color(
+        &mut self,
+        layer: LayerId,
+        first: u32,
+        last: u32,
+        color: ColorTransform,
+        own: bool,
+    ) -> bool {
+        self.edit_keyframes(layer, first, last, own, |frames, at, own| {
+            frames.set_color(at, color, own)
+        })
+    }
+
+    /// **A layer's opacity, from this frame on.** Changing a layer's alpha at
+    /// the playhead makes `frame` a keyframe and sets it there and on every
+    /// later keyframe of the layer; the frames before keep what they had. In
+    /// the film as well as on the stage.
+    pub fn set_layer_alpha_from(&mut self, layer: LayerId, frame: u32, alpha: f32) -> bool {
+        self.edit_keyframes(layer, frame, u32::MAX, true, |frames, at, own| {
+            frames.set_alpha(at, alpha, own)
+        })
+    }
+
+    /// **A layer's brightness, from this frame on** — by the same rule as
+    /// [`Self::set_layer_alpha_from`], keeping each keyframe's alpha.
+    pub fn set_layer_brightness_from(&mut self, layer: LayerId, frame: u32, amount: f32) -> bool {
+        self.edit_keyframes(layer, frame, u32::MAX, true, |frames, at, own| {
+            frames.set_brightness(at, amount, own)
+        })
+    }
+
+    fn edit_keyframes(
+        &mut self,
+        layer: LayerId,
+        first: u32,
+        last: u32,
+        own: bool,
+        mut edit: impl FnMut(&mut LayerTimeline, u32, bool) -> bool,
+    ) -> bool {
+        if self.layers().is_effectively_locked(layer) {
+            return false;
+        }
+        let mut changed = false;
+        let found = self.active_layers_mut().update(layer, |l| {
+            changed |= edit(&mut l.frames, first, own);
+            let later: Vec<u32> = l
+                .frames
+                .keyframes()
+                .iter()
+                .map(|k| k.start)
+                .filter(|start| *start > first && *start <= last)
+                .collect();
+            for start in later {
+                changed |= edit(&mut l.frames, start, false);
+            }
+        });
+        if found && changed {
+            self.bump();
+        }
+        changed
     }
 
     /// Place a shape on a layer at `frame`.
@@ -3384,6 +3492,29 @@ mod tests {
     }
 
     /// Cloning a scene must be a pointer copy of the library, and editing one
+    /// **A movie clip switched to a graphic plays.** The flame inside a lamp
+    /// was a movie clip and held its first frame; as a graphic the same
+    /// instance loops with the timeline it sits in, and switching back holds
+    /// it again — the instance's own settings untouched either way.
+    #[test]
+    fn changing_a_symbols_type_changes_how_its_instances_play() {
+        let mut scene = Scene::default();
+        let flame = scene.add_symbol("Flame", SymbolKind::MovieClip, None);
+        let instance = SymbolInstance::new(flame);
+        let kind = |s: &Scene| s.library().get(flame).unwrap().kind;
+        assert_eq!(instance.resolve_frame(kind(&scene), 7, 30), 0, "a movie clip holds frame 1");
+
+        let revision = scene.revision();
+        assert!(scene.set_symbol_kind(flame, SymbolKind::Graphic));
+        assert!(scene.revision() > revision, "an undoable edit");
+        assert_eq!(instance.resolve_frame(kind(&scene), 7, 30), 7, "a graphic follows the timeline");
+        assert_eq!(instance.resolve_frame(kind(&scene), 37, 30), 7, "and loops");
+
+        assert!(!scene.set_symbol_kind(flame, SymbolKind::Graphic), "already a graphic");
+        assert!(scene.set_symbol_kind(flame, SymbolKind::MovieClip));
+        assert_eq!(instance.resolve_frame(kind(&scene), 7, 30), 0);
+    }
+
     /// symbol must change **only that symbol's** `Arc` address — the invariant
     /// the thumbnail and lighting caches key on. This is the correctness pin for
     /// the Arc-wrapped library maps (plan item 1.5).

@@ -371,6 +371,9 @@ const AUTOSAVE_POLL: Duration = Duration::from_secs(1);
 /// long enough that a burst of edits is one write, short enough that work is
 /// on disk before anyone thinks to reach for Cmd+S.
 const AUTO_SAVE_QUIET: Duration = Duration::from_millis(1500);
+/// How often an idle window checks back on a pending Auto-Save: a write on
+/// the background pool, or a save held off by a mouse button.
+const AUTO_SAVE_RETRY: Duration = Duration::from_millis(250);
 
 /// File ▸ Auto-Save's state between frames.
 struct AutoSaveState {
@@ -5247,8 +5250,11 @@ impl App {
                 let selection = &editor.selection;
                 let style = &mut editor.style;
                 let view = &mut editor.view;
+                let thumbnails = &mut self.thumbnails;
                 editor.doc.edit("Document Properties", |scene| {
-                    panels::properties_panel(ui, scene, selection, style, view, at);
+                    panels::properties_panel_with(ui, scene, selection, style, view, at, &mut |symbol, frame| {
+                        thumbnails.get_frame(symbol, frame)
+                    });
                 });
 
                 // A text object gets a content/size editor here — regenerating
@@ -5492,19 +5498,14 @@ impl App {
                 }
             }
 
-            Color => {
-                let editor = &mut self.editor;
-                panels::color_panel(ui, editor.doc.scene(), &mut editor.style);
-                // Choosing the Texture fill needs a tile in the document to
-                // paint with; this bakes one the first time and then does
-                // nothing until the recipe changes.
-                editor.ensure_fill_texture();
-
+            // **Window ▸ Textures**: its own panel, so it can be rolled up,
+            // docked anywhere or closed like the rest — it used to sit at the
+            // foot of Color, where it could be none of those.
+            Textures => {
+                self.editor.ensure_fill_texture();
                 // Textures fill the selected shapes: procedural tiles baked from
                 // the fill (foreground) and stroke (background) colours, plus any
                 // image used as a fill. Applied to the selection, so it needs one.
-                ui.separator();
-                ui.label("Texture");
                 let has_shape = self.editor.selection.iter().next().is_some();
                 ui.add_enabled_ui(has_shape, |ui| {
                     // **Under family headings, not in one wrapped wall.** There
@@ -5700,6 +5701,15 @@ impl App {
                         self.editor.retexture(edited, Some(placement));
                     }
                 }
+            }
+
+            Color => {
+                let editor = &mut self.editor;
+                panels::color_panel(ui, editor.doc.scene(), &mut editor.style);
+                // Choosing the Texture fill needs a tile in the document to
+                // paint with; this bakes one the first time and then does
+                // nothing until the recipe changes.
+                editor.ensure_fill_texture();
 
                 // Perspective guides: a horizon + rays to 1–3 vanishing points.
                 ui.separator();
@@ -6088,6 +6098,8 @@ impl App {
     /// are two decisions, and an animator who regrets one should not lose both.
     fn filter_panel(&mut self, ui: &mut egui::Ui) {
         let editor = &mut self.editor;
+        // Layer opacity and brightness are read and set at the playhead.
+        let frame = editor.current_frame;
 
         // What the panel is editing: the selected object, or the active layer.
         let object = editor.selection.iter().next();
@@ -6111,9 +6123,11 @@ impl App {
                 (
                     found.map(|l| l.filters.clone()).unwrap_or_default(),
                     found.map(|l| l.blend),
+                    // Opacity and brightness as they are at the playhead:
+                        // they are set from this frame on, per keyframe.
                     found.map(|l| buzz_ui::LayerEffects {
-                        alpha: l.alpha,
-                        brightness: l.brightness,
+                        alpha: f64::from(l.frames.alpha_at(frame)),
+                        brightness: l.frames.color_at(frame).brightness_part(),
                         tint: l.tint,
                         tint_amount: l.tint_amount,
                         blend: l.blend,
@@ -6229,15 +6243,16 @@ impl App {
         if let Some(alpha) = response.set_layer_alpha
             && let Some(id) = layer
         {
+            // From this frame on: the frames before keep their opacity.
             editor.doc.edit("Layer Opacity", |scene| {
-                scene.update_layer(id, |l| l.alpha = alpha);
+                scene.set_layer_alpha_from(id, frame, alpha as f32);
             });
         }
         if let Some(brightness) = response.set_layer_brightness
             && let Some(id) = layer
         {
             editor.doc.edit("Layer Brightness", |scene| {
-                scene.update_layer(id, |l| l.brightness = brightness);
+                scene.set_layer_brightness_from(id, frame, brightness);
             });
         }
         if let Some((tint, amount)) = response.set_layer_tint
@@ -8312,7 +8327,7 @@ impl App {
                                     .suffix(" %"),
                             );
                             if response.changed() {
-                                self.editor.camera.set_zoom_percent(percent);
+                                self.editor.set_zoom_centred(percent);
                             }
 
                             if ui
@@ -8338,7 +8353,7 @@ impl App {
                             .ui(ui, |ui| {
                                 for preset in [25.0, 50.0, 100.0, 200.0, 400.0, 800.0] {
                                     if ui.button(format!("{preset:.0}%")).clicked() {
-                                        self.editor.camera.set_zoom_percent(preset);
+                                        self.editor.set_zoom_centred(preset);
                                         ui.close();
                                     }
                                 }
@@ -8789,11 +8804,10 @@ impl App {
         if response.hovered() {
             let (zoom, scroll) = ctx.input(|i| (i.zoom_delta() as f64, i.smooth_scroll_delta));
 
-            if zoom != 1.0
-                && let Some(pos) = ctx.input(|i| i.pointer.hover_pos())
-            {
-                // About the pointer, so the thing under it stays under it.
-                self.editor.camera.zoom_by_at(zoom, local(pos));
+            if zoom != 1.0 {
+                // About the stage, as the zoom commands are: the stage stays
+                // in the middle of the view however far in it goes.
+                self.editor.zoom_by(zoom);
             } else if scroll != egui::Vec2::ZERO {
                 // Taken as it comes: egui has already applied Shift for
                 // horizontal and Alt for vertical, which is where the old
@@ -14609,12 +14623,14 @@ impl App {
     /// snapshot, so editing carries on meanwhile; what changed during it is
     /// picked up by the next one. Untitled work has nowhere to go and keeps
     /// to the recovery autosave until it is saved once.
-    fn poll_auto_save(&mut self) {
+    fn poll_auto_save(&mut self) -> bool {
         // A finished write first, whether or not the switch is still on.
+        let mut finished = false;
         if let Some(rx) = &self.auto_save.in_flight
             && let Ok((plan, result)) = rx.try_recv()
         {
             self.auto_save.in_flight = None;
+            finished = true;
             match result {
                 Ok(()) => {
                     if self.editor.doc.mark_saved(&plan) {
@@ -14625,7 +14641,7 @@ impl App {
             }
         }
         if !self.editor.workspace.auto_save || self.auto_save.in_flight.is_some() {
-            return;
+            return finished;
         }
         let revision = self.editor.doc.combined_revision();
         if self.auto_save.revision != Some(revision) {
@@ -14633,17 +14649,17 @@ impl App {
             self.auto_save.changed_at = Instant::now();
         }
         if self.auto_save.changed_at.elapsed() < AUTO_SAVE_QUIET {
-            return;
+            return finished;
         }
         let pointer_down = self
             .active
             .as_ref()
             .is_some_and(|a| a.egui_ctx.input(|i| i.pointer.any_down()));
         if pointer_down {
-            return;
+            return finished;
         }
         let Some(plan) = self.editor.doc.save_plan() else {
-            return;
+            return finished;
         };
         let (tx, rx) = std::sync::mpsc::channel();
         self.auto_save.in_flight = Some(rx);
@@ -14651,6 +14667,35 @@ impl App {
             let result = plan.write().map_err(|e| e.to_string());
             let _ = tx.send((plan, result));
         });
+        finished
+    }
+
+    /// When the event loop has to wake for File ▸ Auto-Save, if at all.
+    ///
+    /// An idle document draws no frames (see [`Self::wants_frame`]), and
+    /// [`Self::poll_auto_save`] used to run only from a frame — so an edit
+    /// was written not [`AUTO_SAVE_QUIET`] after it but whenever the pointer
+    /// next moved, and never while the window sat untouched. This is the
+    /// wake that runs it: at the end of the quiet spell, then every
+    /// [`AUTO_SAVE_RETRY`] while a write is out or a held button keeps it
+    /// waiting. `None` when there is nothing it could write.
+    fn auto_save_wake(&self) -> Option<Instant> {
+        if !self.editor.workspace.auto_save {
+            return None;
+        }
+        let now = Instant::now();
+        if self.auto_save.in_flight.is_some() {
+            return Some(now + AUTO_SAVE_RETRY);
+        }
+        let doc = &self.editor.doc;
+        if doc.path().is_none() || !doc.is_dirty() {
+            return None;
+        }
+        // An edit no poll has seen yet starts its quiet spell now.
+        if self.auto_save.revision != Some(doc.combined_revision()) {
+            return Some(now);
+        }
+        Some((self.auto_save.changed_at + AUTO_SAVE_QUIET).max(now + AUTO_SAVE_RETRY))
     }
 
     /// An [`Ahead`] over this app's own fields (for callers that do not hold
@@ -16109,6 +16154,15 @@ impl ApplicationHandler<UserEvent> for App {
         // the fix for a static file burning a whole core (and a GPU) doing
         // nothing. Input events and the egui wake callback both request a
         // redraw of their own, so nothing is missed.
+        // File ▸ Auto-Save does not need a frame, only a turn: the check is
+        // run here, and a frame is asked for only once a write lands, to
+        // clear the tab's `*`.
+        if self.poll_auto_save()
+            && let Some(active) = &self.active
+        {
+            active.window.request_redraw();
+        }
+        let auto_save = self.auto_save_wake();
         match self.wants_frame() {
             Redraw::Now => {
                 if let Some(active) = &self.active {
@@ -16117,10 +16171,14 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.set_control_flow(ControlFlow::Poll);
             }
             Redraw::At(instant) => {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(instant));
+                let until = auto_save.map_or(instant, |at| at.min(instant));
+                event_loop.set_control_flow(ControlFlow::WaitUntil(until));
             }
             Redraw::Idle => {
-                event_loop.set_control_flow(ControlFlow::Wait);
+                event_loop.set_control_flow(match auto_save {
+                    Some(at) => ControlFlow::WaitUntil(at),
+                    None => ControlFlow::Wait,
+                });
             }
         }
     }
@@ -19263,6 +19321,51 @@ mod idle_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **An idle window still auto-saves.** No frame is drawn once editing
+    /// stops, so the wake has to come from the event loop: an unsaved edit to
+    /// a saved document asks to be woken when its quiet spell ends, and a
+    /// clean, untitled or switched-off document asks for nothing.
+    #[test]
+    fn auto_save_asks_to_be_woken_when_the_changes_settle() {
+        let dir = std::env::temp_dir().join(format!("buzz-auto-save-wake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.editor.workspace.auto_save = true;
+        let layer = app.editor.doc.scene().layers().iter().next().expect("a layer").id;
+        let draw = |app: &mut App| {
+            let shape = buzz_scene::ShapeData::filled(
+                buzz_geom::Shape::to_path(&buzz_geom::Rect::new(0.0, 0.0, 10.0, 10.0), 1e-9),
+                peniko::Color::BLACK,
+            );
+            app.editor.doc.edit("Draw", |s| {
+                s.add_shape(layer, shape);
+            });
+        };
+
+        draw(&mut app);
+        assert_eq!(app.auto_save_wake(), None, "untitled work has no file to write");
+
+        app.editor.doc.save_as(&dir.join("film.buzz")).unwrap();
+        assert_eq!(app.auto_save_wake(), None, "a clean document has nothing to write");
+
+        draw(&mut app);
+        let unseen = app.auto_save_wake().expect("an edit asks for a wake");
+        assert!(unseen <= Instant::now(), "an edit no poll has seen is looked at at once");
+
+        app.poll_auto_save();
+        let settles = app.auto_save_wake().expect("still waiting to write");
+        let quiet_ends = app.auto_save.changed_at + AUTO_SAVE_QUIET;
+        assert!(
+            settles >= quiet_ends && settles < quiet_ends + AUTO_SAVE_RETRY,
+            "woken when the quiet spell ends, not on the next pointer move"
+        );
+
+        app.editor.workspace.auto_save = false;
+        assert_eq!(app.auto_save_wake(), None, "switched off, nothing to wake for");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ai_models_dialog_opens_and_renders_through_ui() {
         let mut app = App::new(GpuPreference::Automatic);
@@ -20532,14 +20635,14 @@ mod idle_tests {
                     section.panels
                 );
             }
-            assert_eq!(section.panels.len(), 13);
+            assert_eq!(section.panels.len(), 14);
         }
 
         /// **Grip-dragging the inspector onto the stage floats one window**,
-        /// not eight — the whole section, not just the panel that was gripped.
-        /// Eight: the inspector's one tab stack holds Properties, Effects,
-        /// Tool Options, Color and Swatches alongside Library, Assets and
-        /// Cast.
+        /// not nine — the whole section, not just the panel that was gripped.
+        /// Nine: the inspector's one tab stack holds Properties, Effects,
+        /// Tool Options, Color, Swatches and Textures alongside Library,
+        /// Assets and Cast.
         #[test]
         fn grip_dragging_the_inspector_onto_the_stage_floats_one_window() {
             let mut d = Drive::new();
@@ -20558,7 +20661,7 @@ mod idle_tests {
                 .expect("still on screen");
             assert_eq!(
                 section.panels.len(),
-                8,
+                9,
                 "the whole inspector should have floated together: {:?}",
                 section.panels
             );
@@ -24863,6 +24966,117 @@ mod frame_move_drag_tests {
         assert!(
             (6..=7).contains(&selection.first_frame) && selection.last_frame == 8,
             "a new selection: {selection:?}"
+        );
+    }
+
+    /// **Moving frames scrolls the timeline.** With more layers than fit,
+    /// a selection dragged down to the bottom edge and held there scrolls the
+    /// rows up under it, and lets go onto a layer that was out of view when
+    /// the drag began.
+    #[test]
+    fn dragging_frames_past_the_edge_scrolls_to_layers_out_of_view() {
+        let mut drive = Drive::new();
+        let rows = layers_with_a_drawing_at_2(&mut drive, 60, 8);
+        let top = rows[0];
+        drive
+            .app
+            .editor
+            .selection
+            .set_timeline(buzz_ui::TimelineSelection::new([top], 2, 3, top, 2));
+        drive.frame(vec![]);
+        let screen_bottom = 1000.0;
+        // Rows past the bottom of the timeline are not drawn at all.
+        let last_in_view = rows
+            .iter()
+            .rposition(|&id| {
+                drive
+                    .ctx
+                    .data(|d| {
+                        d.get_temp::<(egui::Rect, f32, f32)>(egui::Id::new((
+                            buzz_ui::timeline_panel::ROW_GEOMETRY,
+                            id,
+                        )))
+                    })
+                    .is_some_and(|(row, ..)| row.max.y < screen_bottom)
+            })
+            .expect("some rows in view");
+        assert!(last_in_view + 5 < rows.len(), "the layers run past the window");
+
+        let from = drive.cell(top, 2);
+        let edge = egui::pos2(from.x, screen_bottom - 1.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        drive.frame(vec![egui::Event::PointerMoved(from), button(from, true)]);
+        for step in 1..=8 {
+            let t = step as f32 / 8.0;
+            drive.frame(vec![egui::Event::PointerMoved(from + (edge - from) * t)]);
+        }
+        // Held at the edge: the timeline keeps scrolling.
+        for _ in 0..60 {
+            drive.frame(vec![egui::Event::PointerMoved(edge)]);
+        }
+        drive.frame(vec![button(edge, false)]);
+        drive.frame(vec![]);
+
+        let selection = drive.app.editor.selection.timeline().expect("the moved frames");
+        let landed = rows
+            .iter()
+            .position(|id| selection.layers.contains(id))
+            .expect("landed on one of the layers");
+        assert!(
+            landed > last_in_view,
+            "landed on row {landed}, but row {last_in_view} was the last in view: the drag did not scroll"
+        );
+        assert_eq!(drive.layer(top).frames.frame_kind(2), buzz_scene::FrameKind::BlankKeyframe, "moved, not copied");
+
+        // **And back up.** Now scrolled down, drag the frames past the top
+        // edge: the timeline scrolls back and they land above every row that
+        // was in view when this drag began.
+        drive.frame(vec![]);
+        let geometry = |drive: &Drive, id: LayerId| {
+            drive.ctx.data(|d| {
+                d.get_temp::<(egui::Rect, f32, f32)>(egui::Id::new((
+                    buzz_ui::timeline_panel::ROW_GEOMETRY,
+                    id,
+                )))
+            })
+        };
+        let drawn: Vec<LayerId> = drive
+            .ctx
+            .data(|d| d.get_temp::<(u64, Vec<LayerId>)>(egui::Id::new(buzz_ui::timeline_panel::ROWS_DRAWN)))
+            .map(|(_, rows)| rows)
+            .unwrap_or_default();
+        let first_in_view = rows
+            .iter()
+            .position(|id| {
+                drawn.contains(id)
+                    && geometry(&drive, *id).is_some_and(|(row, ..)| row.min.y > 0.0 && row.max.y < screen_bottom)
+            })
+            .expect("rows in view");
+        assert!(first_in_view > 5, "scrolled down: row {first_in_view} is the top one in view");
+        let landed_id = rows[landed];
+        let from = drive.cell(landed_id, 2);
+        let (top_row, ..) = geometry(&drive, rows[first_in_view]).unwrap();
+        let above = egui::pos2(from.x, top_row.min.y - 40.0);
+        drive.frame(vec![egui::Event::PointerMoved(from), button(from, true)]);
+        for step in 1..=8 {
+            let t = step as f32 / 8.0;
+            drive.frame(vec![egui::Event::PointerMoved(from + (above - from) * t)]);
+        }
+        for _ in 0..60 {
+            drive.frame(vec![egui::Event::PointerMoved(above)]);
+        }
+        drive.frame(vec![button(above, false)]);
+        drive.frame(vec![]);
+        let selection = drive.app.editor.selection.timeline().expect("the moved frames");
+        let back = rows.iter().position(|id| selection.layers.contains(id)).expect("landed");
+        assert!(
+            back < first_in_view,
+            "landed on row {back}, not above row {first_in_view}: dragging up did not scroll"
         );
     }
 

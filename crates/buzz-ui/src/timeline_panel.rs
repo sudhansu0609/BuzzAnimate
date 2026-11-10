@@ -225,6 +225,10 @@ pub struct MoveFrames {
 /// `(row rect, x of frame 0's left edge, cell width)`. Recorded every frame a
 /// row is drawn so a headless test can press on a given frame cell.
 pub const ROW_GEOMETRY: &str = "timeline-row-geometry";
+/// The layer rows painted in the current pass, stamped with it. A row's
+/// [`ROW_GEOMETRY`] outlives the row being on screen, so whatever asks "which
+/// rows are in view now" reads this rather than trusting a stale rectangle.
+pub const ROWS_DRAWN: &str = "timeline-rows-drawn";
 
 /// Temp-data key of the [`FrameMoveDrag`] in progress.
 const FRAME_MOVE_DRAG: &str = "timeline_frame_move_drag";
@@ -1379,6 +1383,7 @@ pub fn timeline_panel_with_tools_slot(
 
             // The rows a frame drag covers, now that every row has been laid out.
             frame_drag_select(ui, scene, columns, state, &mut response);
+            frame_move_autoscroll(ui, scene, state);
 
             // **The playhead runs down through every row.** Animate's playhead
             // is one line from the ruler to the bottom of the timeline, so the
@@ -2675,6 +2680,20 @@ fn light_tween_tint() -> Color32 {
 /// smuggling it into the layer stack would mean every piece of code that walks
 /// layers had to know to skip it. Animate shows it as a layer; underneath, it
 /// is the camera.
+/// What one cell of the Camera row shows: a key, the held span after it up
+/// to `end`, the end of that span, or nothing.
+fn camera_cell(camera: &buzz_scene::CameraTrack, frame: u32, end: u32) -> FrameKind {
+    if camera.has_key_at(frame) {
+        FrameKind::Keyframe
+    } else if !camera.is_empty() && frame < end {
+        FrameKind::Span
+    } else if !camera.is_empty() && frame == end {
+        FrameKind::SpanEnd
+    } else {
+        FrameKind::Empty
+    }
+}
+
 fn camera_row(
     ui: &mut Ui,
     scene: &Scene,
@@ -2702,6 +2721,12 @@ fn camera_row(
     );
     let camera = scene.camera();
     let last = camera.last_frame();
+    // **Held to the end of the film.** After its last key the camera stays
+    // where that key put it (`CameraTrack::state_at`) for as long as anything
+    // plays, so the row runs to the last frame of the longest layer on the
+    // main timeline, the way a layer's held keyframe does — rather than
+    // stopping at the last key as if the shot ended there.
+    let end = last.max(scene.stage_layers().frame_count().saturating_sub(1));
     let tint = camera_tween_tint();
 
     for frame in visible_columns(ui.clip_rect(), grid_left, cell_width, columns) {
@@ -2709,16 +2734,10 @@ fn camera_row(
         let cell =
             egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_width, height));
 
-        let kind = if camera.has_key_at(frame) {
-            FrameKind::Keyframe
-        } else if !camera.is_empty() && frame < last {
-            FrameKind::Span
-        } else if !camera.is_empty() && frame == last {
-            FrameKind::SpanEnd
-        } else {
-            FrameKind::Empty
-        };
-        let tween = (!camera.is_empty() && frame <= last && !camera.has_key_at(frame)).then_some(
+        let kind = camera_cell(camera, frame, end);
+        // The tween wash between keys only; the hold after the last key is a
+        // plain span.
+        let tween = (!camera.is_empty() && frame < last && !camera.has_key_at(frame)).then_some(
             TweenCell {
                 tint,
                 complete: true,
@@ -2735,7 +2754,7 @@ fn camera_row(
             frame == state.current_frame,
             None,
             Some(camera_fill()),
-            !camera.is_empty() && frame == last,
+            !camera.is_empty() && frame == end,
         );
     }
 
@@ -3093,11 +3112,17 @@ fn layer_row(
     // Where this row's frame cells are, for tests that drive the timeline
     // with pointer events the way a hand would (`ROW_GEOMETRY`). One small
     // entry per drawn row.
+    let pass = ui.ctx().cumulative_pass_nr();
     ui.ctx().data_mut(|d| {
         d.insert_temp(
             egui::Id::new((ROW_GEOMETRY, layer.id)),
             (rect, grid_left, cell_width),
-        )
+        );
+        let drawn = d.get_temp_mut_or_default::<(u64, Vec<LayerId>)>(egui::Id::new(ROWS_DRAWN));
+        if drawn.0 != pass {
+            *drawn = (pass, Vec::new());
+        }
+        drawn.1.push(layer.id);
     });
 
     // -- frame grid, clipped to the area right of the pinned column -------
@@ -4330,7 +4355,62 @@ fn frame_drag_select(ui: &mut Ui, scene: &Scene, columns: u32, state: &TimelineS
         grid.rect_stroke(block, 0.0, Stroke::new(1.5, Palette::active()), StrokeKind::Inside);
     }
 
-    // Auto-scroll at the edges, faster the further past them the pointer is.
+    edge_scroll(ui, pos);
+}
+
+/// **Moving frames scrolls the timeline too.** Dragging a selection of
+/// frames up or down to another layer used to stop at the edge of the view:
+/// a layer scrolled out of sight could not be reached without letting go.
+/// Now the drag scrolls the rows (and the frames) under it, exactly as
+/// sweeping out a selection does; the row under the pointer is read from where
+/// each row is drawn, so the ghost and the drop follow the scroll.
+///
+/// Past the top or bottom edge the pointer is over no row, so the drag aims
+/// at the first or last row in view — the one the scroll keeps bringing in.
+fn frame_move_autoscroll(ui: &mut Ui, scene: &Scene, state: &TimelineState) {
+    let id = egui::Id::new(FRAME_MOVE_DRAG);
+    let Some(mut drag) = ui.ctx().data(|d| d.get_temp::<FrameMoveDrag>(id)) else {
+        return;
+    };
+    let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())) else {
+        return;
+    };
+    let clip = ui.clip_rect();
+    if pos.y < clip.min.y || pos.y >= clip.max.y {
+        let rows = display_rows(scene, &state.row_filter);
+        let pass = ui.ctx().cumulative_pass_nr();
+        let drawn: Vec<LayerId> = ui
+            .ctx()
+            .data(|d| d.get_temp::<(u64, Vec<LayerId>)>(egui::Id::new(ROWS_DRAWN)))
+            .filter(|(stamp, _)| *stamp == pass)
+            .map(|(_, rows)| rows)
+            .unwrap_or_default();
+        let in_view: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| drawn.contains(layer))
+            .filter_map(|(index, &layer)| {
+                ui.ctx()
+                    .data(|d| d.get_temp::<(egui::Rect, f32, f32)>(egui::Id::new((ROW_GEOMETRY, layer))))
+                    .filter(|(row, ..)| row.min.y >= clip.min.y - 0.5 && row.max.y <= clip.max.y + 0.5)
+                    .map(|_| index)
+            })
+            .collect();
+        let edge_row = if pos.y < clip.min.y { in_view.first() } else { in_view.last() };
+        if let (Some(&here), Some(pressed)) =
+            (edge_row, rows.iter().position(|&layer| layer == drag.press_layer))
+        {
+            drag.rows = here as i32 - pressed as i32;
+            ui.ctx().data_mut(|d| d.insert_temp(id, drag));
+        }
+    }
+    edge_scroll(ui, pos);
+}
+
+/// Auto-scroll at the edges of the timeline while a drag is on, faster the
+/// further past them the pointer is.
+fn edge_scroll(ui: &mut Ui, pos: egui::Pos2) {
+    let clip = ui.clip_rect();
     const EDGE: f32 = 12.0;
     let mut delta = egui::Vec2::ZERO;
     if pos.y > clip.max.y - EDGE {
@@ -4515,6 +4595,28 @@ fn draw_tween_mark(painter: &egui::Painter, cell: egui::Rect, tween: TweenCell) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The Camera row runs to the end of the film**: a camera keyed at 0
+    /// and 10 on a timeline whose longest layer is 40 frames shows its span
+    /// to frame 39 — the hold after its last key — and nothing past it.
+    #[test]
+    fn the_camera_row_runs_to_the_longest_layer() {
+        let mut scene = Scene::default();
+        let layer = scene.add_layer("Long", LayerKind::Normal);
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(39);
+        });
+        let centre = scene.stage().stage_rect().center();
+        scene.camera_mut().enabled = true;
+        scene.camera_mut().set_key(buzz_scene::CameraKey::new(0, centre));
+        scene.camera_mut().set_key(buzz_scene::CameraKey::new(10, centre));
+        let end = scene.camera().last_frame().max(scene.stage_layers().frame_count() - 1);
+        assert_eq!(end, 39);
+        assert_eq!(camera_cell(scene.camera(), 10, end), FrameKind::Keyframe);
+        assert_eq!(camera_cell(scene.camera(), 25, end), FrameKind::Span, "held after the last key");
+        assert_eq!(camera_cell(scene.camera(), 39, end), FrameKind::SpanEnd);
+        assert_eq!(camera_cell(scene.camera(), 40, end), FrameKind::Empty);
+    }
     use buzz_geom::Shape as _;
     use buzz_scene::ShapeData;
     use kurbo::Rect;

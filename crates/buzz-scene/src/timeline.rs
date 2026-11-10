@@ -44,6 +44,13 @@ pub struct Keyframe {
     /// A sound starting here — Animate attaches sound to a keyframe rather
     /// than to a layer, so one layer can carry a whole scene's effects.
     pub sound: Option<crate::sound::SoundRef>,
+    /// **This keyframe's colour effect** — alpha, brightness, tint or an
+    /// advanced mix — over everything on it, on the stage and in the film. Its
+    /// own, so dimming the fog on one keyframe leaves the keyframes before it
+    /// as they were; with a tween to the next keyframe it blends across the
+    /// span (see [`LayerTimeline::color_at`]). Identity for nearly every
+    /// keyframe. Unlike the layer's alpha, which the export ignores.
+    pub color: crate::ColorTransform,
 }
 
 impl Keyframe {
@@ -55,6 +62,7 @@ impl Keyframe {
             tween: crate::tween::Tween::default(),
             ease_curve: None,
             sound: None,
+            color: crate::ColorTransform::default(),
         }
     }
 
@@ -425,6 +433,9 @@ impl LayerTimeline {
             .keyframe_at(frame)
             .map(|k| Arc::clone(&k.objects))
             .unwrap_or_default();
+        // F6 keeps the look of the frame it was pressed on, colour effect
+        // included.
+        let color = self.color_at(frame);
 
         self.length = self.length.max(frame + 1);
         self.push_keyframe(Keyframe {
@@ -437,8 +448,65 @@ impl LayerTimeline {
             // dialogue layer would otherwise start the whole take again from
             // the new frame, on top of the one already playing.
             sound: None,
+            color,
         });
         true
+    }
+
+    /// The keyframe colour effect in force at `frame`: the owning keyframe's
+    /// own, or — when that keyframe tweens into the next — the way between the
+    /// two, so a tweened fade or brighten is gradual and not a jump at the next
+    /// keyframe. Identity where there is no keyframe.
+    pub fn color_at(&self, frame: u32) -> crate::ColorTransform {
+        let keys = self.keyframes();
+        let Some(index) = keys.iter().rposition(|k| k.start <= frame) else {
+            return crate::ColorTransform::default();
+        };
+        let key = &keys[index];
+        if key.tween.kind != crate::tween::TweenKind::None
+            && let Some(next) = keys.get(index + 1)
+            && next.start > key.start
+        {
+            let t = (frame - key.start) as f32 / (next.start - key.start) as f32;
+            return key.color.lerp(&next.color, t.clamp(0.0, 1.0));
+        }
+        key.color
+    }
+
+    /// The alpha part of [`Self::color_at`].
+    pub fn alpha_at(&self, frame: u32) -> f32 {
+        self.color_at(frame).multiply[3].clamp(0.0, 1.0)
+    }
+
+    /// Set the colour effect of the keyframe owning `frame` — making `frame`
+    /// a keyframe first when `own` is set and it is not one, so the change
+    /// starts there and the frames before keep theirs. False when nothing
+    /// changed.
+    pub fn set_color(&mut self, frame: u32, color: crate::ColorTransform, own: bool) -> bool {
+        if own && !self.is_keyframe(frame) && frame < self.length {
+            self.insert_keyframe(frame);
+        }
+        match self.keyframe_at_mut(frame) {
+            Some(key) if key.color != color => {
+                key.color = color;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Set only the alpha of that keyframe's colour effect, keeping the rest.
+    pub fn set_alpha(&mut self, frame: u32, alpha: f32, own: bool) -> bool {
+        let mut color = self.color_at(frame);
+        color.multiply[3] = alpha.clamp(0.0, 1.0);
+        self.set_color(frame, color, own)
+    }
+
+    /// Set only the brightness of that keyframe's colour effect, keeping its
+    /// alpha.
+    pub fn set_brightness(&mut self, frame: u32, amount: f32, own: bool) -> bool {
+        let color = self.color_at(frame).with_brightness(amount);
+        self.set_color(frame, color, own)
     }
 
     /// **F7** — insert an empty keyframe at `frame`.
@@ -799,6 +867,59 @@ impl LayerTimeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Frame ▸ Alpha changes only its keyframe.** Set on a frame inside a
+    /// span with `own` on, it makes that frame a keyframe and leaves the
+    /// frames before at full strength; with a tween into the next keyframe
+    /// it fades across the span instead of jumping.
+    #[test]
+    fn a_keyframes_alpha_is_its_own_and_tweens_to_the_next() {
+        let mut timeline = LayerTimeline::default();
+        timeline.insert_frame(29);
+        assert_eq!(timeline.alpha_at(0), 1.0);
+
+        assert!(timeline.set_alpha(10, 0.2, true));
+        assert!(timeline.is_keyframe(10), "frame 10 became a keyframe of its own");
+        assert_eq!(timeline.alpha_at(9), 1.0, "the frames before keep their alpha");
+        assert!((timeline.alpha_at(10) - 0.2).abs() < 1e-6);
+        assert!((timeline.alpha_at(29) - 0.2).abs() < 1e-6);
+
+        // Without `own`, inside a span, it is that span's keyframe that changes.
+        assert!(timeline.set_alpha(15, 0.5, false));
+        assert!(!timeline.is_keyframe(15));
+        assert!((timeline.alpha_at(10) - 0.5).abs() < 1e-6);
+
+        // F6 keeps the alpha of the frame it is pressed on.
+        timeline.insert_keyframe(20);
+        assert!((timeline.alpha_at(20) - 0.5).abs() < 1e-6);
+        assert!(timeline.set_alpha(20, 1.0, false));
+
+        // A tween from 10 to 20 fades 0.5 → 1.0 across the span.
+        timeline.keyframe_at_mut(10).unwrap().tween.kind = crate::tween::TweenKind::Classic;
+        assert!((timeline.alpha_at(15) - 0.75).abs() < 1e-6, "half way through the fade");
+        assert!((timeline.alpha_at(20) - 1.0).abs() < 1e-6);
+    }
+
+    /// **Brightness or tint on one keyframe** stays on that keyframe, and
+    /// setting it keeps nothing of an alpha the keyframe had before — it is one
+    /// colour effect, chosen by style.
+    #[test]
+    fn a_keyframes_colour_effect_is_its_own() {
+        let mut timeline = LayerTimeline::default();
+        timeline.insert_frame(29);
+        let darker = crate::ColorTransform::brightness(-0.4);
+        assert!(timeline.set_color(12, darker, true));
+        assert!(timeline.color_at(11).is_identity(), "frames before are untouched");
+        assert_eq!(timeline.color_at(12), darker);
+        assert_eq!(timeline.color_at(29), darker);
+
+        // Tweened into a plain keyframe at 22, it lightens back across the span.
+        timeline.insert_keyframe(22);
+        assert!(timeline.set_color(22, crate::ColorTransform::default(), false));
+        timeline.keyframe_at_mut(12).unwrap().tween.kind = crate::tween::TweenKind::Classic;
+        let half = timeline.color_at(17);
+        assert!((half.add[0] - darker.add[0] / 2.0).abs() < 1e-6 || (half.multiply[0] - (1.0 + darker.multiply[0]) / 2.0).abs() < 1e-6);
+    }
     use crate::object::ShapeData;
     use buzz_geom::Shape as _;
     use kurbo::Rect;

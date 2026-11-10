@@ -1343,7 +1343,20 @@ pub struct KeyframeDto {
     /// A sound starting on this keyframe. Version 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sound: Option<SoundDto>,
+    /// The keyframe's own colour effect. Defaulted and skipped when plain,
+    /// so a file with no such keyframe saves exactly as it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<buzz_scene::ColorTransform>,
+    /// Read only: the alpha-only form a build of the same day wrote before
+    /// `color` replaced it. Never written.
+    #[serde(default = "one_f32", skip_serializing)]
+    pub alpha: f32,
 }
+
+fn one_f32() -> f32 {
+    1.0
+}
+
 
 /// A sound placed on a keyframe.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -2634,6 +2647,8 @@ impl LayerDto {
                         .collect(),
                     tween: k.tween,
                     ease_curve: k.ease_curve.clone(),
+                    color: (!k.color.is_identity()).then_some(k.color),
+                    alpha: 1.0,
                     sound: k.sound.map(|s| SoundDto {
                         sound: s.sound.0,
                         sync: s.sync,
@@ -2705,6 +2720,8 @@ impl LayerDto {
                 tween: Tween::default(),
                 ease_curve: None,
                 sound: None,
+                color: None,
+                alpha: 1.0,
             }]
         } else {
             self.keyframes.clone()
@@ -2722,6 +2739,7 @@ impl LayerDto {
                 label: k.label.clone(),
                 tween: k.tween,
                 ease_curve: k.ease_curve.clone(),
+                color: k.color.unwrap_or_else(|| buzz_scene::ColorTransform::alpha(k.alpha)),
                 sound: k.sound.map(|s| buzz_scene::SoundRef {
                     sound: buzz_scene::SoundId(s.sound),
                     sync: s.sync,
@@ -3790,6 +3808,48 @@ mod tests {
         scene.update_layer(marked, |l| l.highlight = None);
         let cleared_json = serde_json::to_string(&DocumentDto::from_scene(&scene)).unwrap();
         assert!(!cleared_json.contains("highlight"));
+    }
+
+    /// A keyframe's alpha survives save and load, and a solid keyframe does
+    /// not gain a new field in the file.
+    #[test]
+    fn a_keyframes_alpha_round_trips() {
+        let mut scene = Scene::empty();
+        let layer = scene.add_layer("Fog", LayerKind::Normal);
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(19);
+        });
+        let plain = DocumentDto::from_scene(&scene);
+        for key in plain.layers.iter().flat_map(|l| l.keyframes.iter()) {
+            let json = serde_json::to_string(key).unwrap();
+            assert!(!json.contains("color"), "a plain keyframe writes no colour effect: {json}");
+            assert!(!json.contains("alpha"), "nor the old alpha: {json}");
+        }
+
+        assert!(scene.set_keyframe_alpha(layer, 10, 10, 0.3, true));
+        assert!(scene.set_keyframe_color(
+            layer,
+            15,
+            15,
+            buzz_scene::ColorTransform::brightness(-0.5),
+            true
+        ));
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        let frames = &back.layers().get(layer).unwrap().frames;
+        assert!((frames.alpha_at(12) - 0.3).abs() < 1e-6);
+        assert!((frames.alpha_at(5) - 1.0).abs() < 1e-6);
+        assert_eq!(frames.color_at(16), buzz_scene::ColorTransform::brightness(-0.5));
+    }
+
+    /// A keyframe written by the alpha-only build of the same day opens with
+    /// that alpha as its colour effect.
+    #[test]
+    fn an_alpha_only_keyframe_opens_as_a_colour_effect() {
+        let dto: KeyframeDto = serde_json::from_str(r#"{"start":0,"alpha":0.25}"#).unwrap();
+        assert!(dto.color.is_none());
+        assert!((dto.alpha - 0.25).abs() < 1e-6);
+        let plain: KeyframeDto = serde_json::from_str(r#"{"start":0}"#).unwrap();
+        assert!((plain.alpha - 1.0).abs() < 1e-6, "an older keyframe is solid");
     }
 
     /// A symbol's set survives save and load, and a symbol with no set does

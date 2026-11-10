@@ -36,7 +36,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::command::Command;
-use crate::tools::ToolId;
 use crate::workspace::{KeyChord, Workspace, command_id};
 
 /// What an Animate binding drives here.

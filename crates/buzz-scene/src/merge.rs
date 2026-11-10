@@ -156,6 +156,7 @@ impl Remapper<'_> {
                 label: k.label.clone(),
                 tween: k.tween,
                 ease_curve: k.ease_curve.clone(),
+                color: k.color,
                 // Sound ids are remapped by the caller alongside symbol ids;
                 // a merge that kept the source's id would point at whichever
                 // local sound happened to share the number.

@@ -453,6 +453,8 @@ impl Track {
             // previous artwork would keep showing through it.
             if start > end && !keyframes.is_empty() {
                 keyframes.push(buzz_scene::Keyframe {
+                    // Animate has no keyframe colour effect; every imported keyframe is plain.
+                    color: buzz_scene::ColorTransform::default(),
                     start: end,
                     objects: std::sync::Arc::new(Vec::new()),
                     label: None,
@@ -483,6 +485,8 @@ impl Track {
             };
 
             keyframes.push(buzz_scene::Keyframe {
+                // Animate has no keyframe colour effect; every imported keyframe is plain.
+                color: buzz_scene::ColorTransform::default(),
                 start,
                 objects: std::sync::Arc::new(objects),
                 label: None,
@@ -532,6 +536,8 @@ fn build_shape_symbol(id: CharacterId, paths: &[StyledPath], ids: &mut IdSource)
     let mut layer = Layer::normal(LayerId(ids.take()), "Layer_1");
     layer.frames = buzz_scene::LayerTimeline::from_parts(
         vec![buzz_scene::Keyframe {
+            // Animate has no keyframe colour effect; every imported keyframe is plain.
+            color: buzz_scene::ColorTransform::default(),
             start: 0,
             objects: std::sync::Arc::new(objects),
             label: None,

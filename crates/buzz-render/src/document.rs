@@ -4260,6 +4260,21 @@ fn shadow_role<'a>(
     clippy::too_many_arguments,
     reason = "one call site; a struct would only move the arguments"
 )]
+/// `effect` with the colour effect of `layer`'s keyframe at `frame` composed
+/// inside it — the keyframe's alpha, brightness or tint, part of the film —
+/// and unchanged, at no cost, for the plain keyframe nearly every layer has.
+fn keyframe_effect(
+    layer: &buzz_scene::Layer,
+    frame: u32,
+    effect: buzz_scene::ColorTransform,
+) -> buzz_scene::ColorTransform {
+    let own = layer.frames.color_at(frame);
+    if own.is_identity() {
+        return effect;
+    }
+    own.compose(&effect)
+}
+
 fn draw_layer(
     builder: &mut SceneBuilder<'_>,
     scene: &Scene,
@@ -4506,7 +4521,10 @@ fn draw_layer(
             tint,
             faded,
             ghost: layer_alpha,
-            effect: options.effect,
+            // The keyframe's own alpha — part of the film, unlike the layer's
+            // above — composed into the colour effect every object is drawn
+            // through, so it reaches into symbols too.
+            effect: keyframe_effect(layer, frame, options.effect),
             adjust: None,
             gradient_map: None,
             blur: None,
@@ -6525,6 +6543,7 @@ fn draw_symbol_contents(
                     .map(|k| k.start)
                     .unwrap_or(0)
                     .min(inner),
+            effect: keyframe_effect(layer, inner, inner_ctx.effect),
             ..inner_ctx.clone()
         };
         // A symbol's layers can follow each other too, which is
@@ -6647,6 +6666,11 @@ fn try_stamp_layer(
         return false;
     }
     if options.layer_alpha && layer.alpha < 0.999 {
+        return false;
+    }
+    // A keyframe with a colour effect draws live: the stamp is keyed on what
+    // the frame shows, not on how it is coloured.
+    if !layer.frames.color_at(frame).is_identity() {
         return false;
     }
     if !layer.filters.is_empty() {

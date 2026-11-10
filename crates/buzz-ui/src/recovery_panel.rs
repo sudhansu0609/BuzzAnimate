@@ -132,42 +132,53 @@ fn body(ui: &mut Ui, state: &RecoveryState, choice: &mut RecoveryChoice) {
     );
     ui.add_space(6.0);
 
-    for entry in &state.found {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(entry.title()).strong());
-                let what = if entry.is_unsaved_work() {
-                    "never saved".to_string()
-                } else {
-                    "unsaved changes".to_string()
-                };
-                ui.label(
-                    RichText::new(format!("{what} \u{00B7} {}", entry.when()))
-                        .small()
-                        .weak(),
-                )
-                .on_hover_text(entry.path.display().to_string());
-            });
+    // **Scrolls.** A long list of autosaves ran off the bottom of the
+    // window, taking Later with it; the list scrolls now, and Later stays in
+    // view below it.
+    let tallest = (ui.ctx().content_rect().height() * 0.6).max(160.0);
+    egui::ScrollArea::vertical()
+        .id_salt("recovery-list")
+        .max_height(tallest)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for entry in &state.found {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(entry.title()).strong());
+                        let what = if entry.is_unsaved_work() {
+                            "never saved".to_string()
+                        } else {
+                            "unsaved changes".to_string()
+                        };
+                        ui.label(
+                            RichText::new(format!("{what} \u{00B7} {}", entry.when()))
+                                .small()
+                                .weak(),
+                        )
+                        .on_hover_text(entry.path.display().to_string());
+                    });
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("Discard")
-                    .on_hover_text("Delete this autosave")
-                    .clicked()
-                {
-                    *choice = RecoveryChoice::Discard(entry.clone());
-                }
-                if ui
-                    .button("Recover")
-                    .on_hover_text("Open it as a document")
-                    .clicked()
-                {
-                    *choice = RecoveryChoice::Recover(entry.clone());
-                }
-            });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("Discard")
+                            .on_hover_text("Delete this autosave")
+                            .clicked()
+                        {
+                            *choice = RecoveryChoice::Discard(entry.clone());
+                        }
+                        if ui
+                            .button("Recover")
+                            .on_hover_text("Open it as a document")
+                            .clicked()
+                        {
+                            *choice = RecoveryChoice::Recover(entry.clone());
+                        }
+                    });
+                });
+                ui.separator();
+            }
         });
-        ui.separator();
-    }
+    ui.add_space(4.0);
 
     ui.horizontal(|ui| {
         if ui.button("Later").clicked() {

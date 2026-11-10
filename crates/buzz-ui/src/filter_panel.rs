@@ -139,6 +139,7 @@ pub fn filter_panel(
         let mut opacity = current.alpha * 100.0;
         if ui
             .add(egui::Slider::new(&mut opacity, 0.0..=100.0).text("Opacity %"))
+            .on_hover_text("From this frame on: the frames before keep their opacity. In the film too.")
             .changed()
         {
             out.set_layer_alpha = Some((opacity / 100.0).clamp(0.0, 1.0));
@@ -146,6 +147,7 @@ pub fn filter_panel(
         let mut brightness = current.brightness * 100.0;
         if ui
             .add(egui::Slider::new(&mut brightness, -100.0..=100.0).text("Brightness %"))
+            .on_hover_text("From this frame on: the frames before keep their brightness.")
             .changed()
         {
             out.set_layer_brightness = Some((brightness / 100.0).clamp(-1.0, 1.0));

@@ -94,6 +94,8 @@ pub enum PanelId {
     /// key; the shelf's shared settings; importing Animate's keymap. Below
     /// Voices in the far-right column.
     Commands,
+    /// Fill textures for the selected shapes, beside Color.
+    Textures,
 }
 
 impl PanelId {
@@ -124,6 +126,7 @@ impl PanelId {
             Self::Storyboard => "Storyboard",
             Self::Voices => "Voices",
             Self::Commands => "Commands",
+            Self::Textures => "Textures",
         }
     }
 
@@ -154,7 +157,7 @@ impl PanelId {
         !matches!(self, Self::Tools | Self::Timeline | Self::Sequence | Self::Ai)
     }
 
-    pub const ALL: [PanelId; 24] = [
+    pub const ALL: [PanelId; 25] = [
         PanelId::Tools,
         PanelId::ToolOptions,
         PanelId::Layers,
@@ -179,6 +182,7 @@ impl PanelId {
         PanelId::Storyboard,
         PanelId::Voices,
         PanelId::Commands,
+        PanelId::Textures,
     ];
 }
 
@@ -525,6 +529,12 @@ pub struct Workspace {
     /// rest of this struct, not a property of any one film.
     #[serde(default = "default_auto_save")]
     pub auto_save: bool,
+    /// **Auto Keyframe**, remembered: a change at a frame with no keyframe of
+    /// its own makes one there first, so it never reaches back into the
+    /// frames before. On unless switched off — a change on one keyframe
+    /// leaving the earlier ones alone is what people expect.
+    #[serde(default = "default_auto_keyframe")]
+    pub auto_keyframe: bool,
     /// **Exports at once** — how many exports the queue runs side by side
     /// (step P of `docs/PRODUCTION_SPEED_PLAN.md`), set in the Tasks panel.
     /// The queue still holds it under what the GPU's free memory allows. A
@@ -987,6 +997,10 @@ fn default_auto_save() -> bool {
     true
 }
 
+fn default_auto_keyframe() -> bool {
+    true
+}
+
 /// 4 — the knee of P0's measurements: four scenes in about a third of the
 /// serial time, without filling the card.
 fn default_exports_at_once() -> u8 {
@@ -1257,6 +1271,18 @@ impl Workspace {
                     false,
                     false,
                 ),
+                // Textures, its own tab beside Color — it used to be a section
+                // at the foot of the Color panel that could be neither rolled
+                // up, docked elsewhere nor closed.
+                tab(
+                    PanelId::Textures,
+                    Dock::Right,
+                    6,
+                    Dock::Right,
+                    GROUP_INSPECTOR,
+                    false,
+                    false,
+                ),
                 // **One tab stack.** Library, Assets and Cast join Properties,
                 // Effects and Tool Options rather than keep a second column of
                 // their own — a character is an asset with a face, and the
@@ -1268,7 +1294,7 @@ impl Workspace {
                 tab(
                     PanelId::Library,
                     Dock::Right,
-                    6,
+                    7,
                     Dock::Right,
                     GROUP_INSPECTOR,
                     false,
@@ -1277,7 +1303,7 @@ impl Workspace {
                 tab(
                     PanelId::Assets,
                     Dock::Right,
-                    7,
+                    8,
                     Dock::Right,
                     GROUP_INSPECTOR,
                     false,
@@ -1286,7 +1312,7 @@ impl Workspace {
                 tab(
                     PanelId::Cast,
                     Dock::Right,
-                    8,
+                    9,
                     Dock::Right,
                     GROUP_INSPECTOR,
                     false,
@@ -1297,7 +1323,7 @@ impl Workspace {
                 tab(
                     PanelId::Story,
                     Dock::Right,
-                    9,
+                    10,
                     Dock::Right,
                     GROUP_UTILITY,
                     true,
@@ -1306,7 +1332,7 @@ impl Workspace {
                 tab(
                     PanelId::Depth,
                     Dock::Right,
-                    10,
+                    11,
                     Dock::Right,
                     GROUP_UTILITY,
                     false,
@@ -1315,7 +1341,7 @@ impl Workspace {
                 tab(
                     PanelId::Rig,
                     Dock::Right,
-                    11,
+                    12,
                     Dock::Right,
                     GROUP_UTILITY,
                     false,
@@ -1324,7 +1350,7 @@ impl Workspace {
                 tab(
                     PanelId::Lighting,
                     Dock::Right,
-                    12,
+                    13,
                     Dock::Right,
                     GROUP_UTILITY,
                     false,
@@ -1333,7 +1359,7 @@ impl Workspace {
                 tab(
                     PanelId::Sound,
                     Dock::Right,
-                    13,
+                    14,
                     Dock::Right,
                     GROUP_UTILITY,
                     false,
@@ -1390,6 +1416,7 @@ impl Workspace {
             rig: RigOptions::default(),
             pan_speed: default_pan_speed(),
             auto_save: default_auto_save(),
+            auto_keyframe: default_auto_keyframe(),
             exports_at_once: default_exports_at_once(),
             brush_tips: crate::brush::BrushTips::default(),
             drawing_modes: crate::style::ToolDrawingModes::default(),
@@ -3958,6 +3985,7 @@ mod migration_tests {
                 PanelId::ToolOptions,
                 PanelId::Color,
                 PanelId::Swatches,
+                PanelId::Textures,
                 PanelId::Library,
                 PanelId::Assets,
                 PanelId::Cast,
@@ -3973,8 +4001,8 @@ mod migration_tests {
         }
         assert_eq!(
             workspace.on(Dock::RightOuter),
-            vec![PanelId::Voices],
-            "RightOuter holds only the Voices panel now the tab stack holds everything it used to"
+            vec![PanelId::Voices, PanelId::Commands],
+            "RightOuter holds only Voices and Commands now the tab stack holds everything it used to"
         );
     }
 
@@ -4023,6 +4051,7 @@ mod migration_tests {
                 PanelId::ToolOptions,
                 PanelId::Color,
                 PanelId::Swatches,
+                PanelId::Textures,
                 PanelId::Library,
                 PanelId::Assets,
                 PanelId::Cast,
@@ -4555,7 +4584,7 @@ mod group_tests {
         assert_eq!(floating.len(), 1, "one window, not several");
         assert_eq!(
             floating[0].panels.len(),
-            8,
+            9,
             "the whole inspector should have floated: {:?}",
             floating[0].panels
         );
@@ -4598,6 +4627,7 @@ mod group_tests {
             PanelId::ToolOptions,
             PanelId::Color,
             PanelId::Swatches,
+            PanelId::Textures,
         ] {
             assert!(
                 section.panels.contains(&id),
@@ -4605,7 +4635,7 @@ mod group_tests {
                 section.panels
             );
         }
-        assert_eq!(section.panels.len(), 8);
+        assert_eq!(section.panels.len(), 9);
     }
 
     /// **A floated inspector docks back as one section**, in the same tab
@@ -4622,13 +4652,14 @@ mod group_tests {
             .section_of(PanelId::Properties)
             .expect("docked");
         assert_eq!(section.front, PanelId::Properties);
-        assert_eq!(section.panels.len(), 8);
+        assert_eq!(section.panels.len(), 9);
         for id in [
             PanelId::Properties,
             PanelId::Filters,
             PanelId::ToolOptions,
             PanelId::Color,
             PanelId::Swatches,
+            PanelId::Textures,
             PanelId::Library,
             PanelId::Assets,
             PanelId::Cast,
@@ -4671,7 +4702,7 @@ mod group_tests {
             .section_of(PanelId::Properties)
             .expect("still on screen");
         assert_eq!(section.front, PanelId::Properties);
-        assert_eq!(section.panels.len(), 8);
+        assert_eq!(section.panels.len(), 9);
     }
 
     /// The layout the last build shipped: Color and Swatches tabbed together

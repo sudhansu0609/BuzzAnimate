@@ -278,6 +278,7 @@ pub fn encode_plain(
         ..FrameOptions::default()
     };
     draw_frame_within(&mut builder, scene, frame, camera, &live, cache);
+    camera_veil(&mut builder, scene, &inputs.camera);
     (builder.encoded_segments(), builder.estimated_lines())
 }
 
@@ -560,7 +561,38 @@ fn encode(
         _ => {}
     }
 
+    camera_veil(&mut builder, scene, &editor.camera);
+
     (builder.encoded_segments(), builder.estimated_lines())
+}
+
+/// **What the camera does not see, dimmed.** With the camera on, the stage
+/// rectangle is the shot — the camera moves the artwork, never the frame — so
+/// everything drawn outside it is off camera. A dark veil over the pasteboard
+/// makes the edge of the shot plain at a glance, while what is out there stays
+/// visible to be worked on. Four strips around the frame rather than one shape
+/// with a hole, so no fill rule is involved.
+///
+/// Drawn by **both** stage paths — [`encode`] (a symbol open, onion skins…)
+/// and [`encode_plain`] (the main timeline as it usually is); it was in the
+/// first alone, so the veil showed inside a symbol and never on the main
+/// timeline.
+fn camera_veil(builder: &mut SceneBuilder<'_>, scene: &buzz_scene::Scene, view: &buzz_geom::Camera) {
+    if !scene.camera().enabled {
+        return;
+    }
+    let shot = scene.stage().stage_rect();
+    let seen = view.visible_doc_rect();
+    let all = seen.union(shot).inflate(seen.width(), seen.height());
+    let veil = peniko::Color::from_rgba8(0x10, 0x10, 0x14, 0x80);
+    for strip in [
+        Rect::new(all.x0, all.y0, all.x1, shot.y0),
+        Rect::new(all.x0, shot.y1, all.x1, all.y1),
+        Rect::new(all.x0, shot.y0, shot.x0, shot.y1),
+        Rect::new(shot.x1, shot.y0, all.x1, shot.y1),
+    ] {
+        builder.fill_shape(&strip, veil);
+    }
 }
 
 /// Draw the chrome over the rendered stage.
@@ -1822,6 +1854,30 @@ mod tests {
             rotate_hint_at(quad, far).is_none(),
             "out here a drag marquees, and the mark must not say otherwise"
         );
+    }
+
+    /// **The camera's veil is on the main timeline too.** The plain stage
+    /// path — the one the main timeline takes — draws the four strips around
+    /// the shot when the camera is on, as the full path does inside a symbol.
+    #[test]
+    fn the_main_timeline_dims_what_the_camera_does_not_see() {
+        let mut editor = Editor::default();
+        editor.camera.viewport = buzz_geom::Size::new(1000.0, 800.0);
+        assert!(is_plain(&editor), "the main timeline takes the plain path");
+        let area = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let segments = |editor: &Editor| {
+            let inputs = StageInputs::from_editor(editor, area, 1.0);
+            let mut vello = vello::Scene::new();
+            let mut cache = DrawCache::default();
+            cache.begin();
+            let (segments, _) = encode_plain(&mut vello, &inputs, &mut cache, None);
+            cache.end();
+            segments
+        };
+        let off = segments(&editor);
+        editor.doc.edit("Camera", |scene| scene.camera_mut().enabled = true);
+        let on = segments(&editor);
+        assert!(on >= off + 16, "four strips of four sides each: {off} -> {on}");
     }
 
     fn editor_with_art() -> Editor {

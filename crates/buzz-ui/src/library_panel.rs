@@ -698,6 +698,17 @@ fn draw_symbol_row(
                 state.renaming = Some((id, name.to_string()));
                 ui.close();
             }
+            // Animate's Symbol Properties ▸ Type: a movie clip holds its first
+            // frame while authoring, a graphic plays on the timeline it sits
+            // in — the switch that makes a nested animation play.
+            ui.menu_button("Type", |ui| {
+                for to in [SymbolKind::Graphic, SymbolKind::MovieClip, SymbolKind::Button] {
+                    if ui.radio(kind == to, to.label()).clicked() {
+                        scene.set_symbol_kind(id, to);
+                        ui.close();
+                    }
+                }
+            });
         });
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

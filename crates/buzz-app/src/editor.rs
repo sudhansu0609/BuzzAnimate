@@ -149,8 +149,8 @@ pub struct Editor {
     /// **Auto Keyframe.** With it on, changing artwork at a frame that has no
     /// keyframe of its own makes one first, so the change begins where the
     /// playhead is instead of reaching back to wherever the span started.
-    /// Off by default: it is a mode, and a mode that silently adds keyframes
-    /// must be one the user asked for.
+    /// Remembered in the workspace and on until switched off: an edit on one
+    /// frame changing the frames before it surprised everyone who met it.
     pub auto_keyframe: bool,
     /// K2: what `auto_keyframe` was before Protect Other Keyframes forced it
     /// on, restored when protect is turned off.
@@ -716,6 +716,7 @@ impl Editor {
             sequence_scrub: None,
             bounds_cache: std::cell::RefCell::new(None),
         };
+        editor.auto_keyframe = editor.workspace.auto_keyframe;
         // K2: a saved Protect Other Keyframes is on from the start.
         if editor.workspace.protect_keyframes {
             editor.auto_keyframe_before_protect = Some(editor.auto_keyframe);
@@ -4153,10 +4154,19 @@ impl Editor {
 
         let table = self.symbol_bounds();
         let pivot = scene.pivot_of_with(object, &table);
+        // **The shot the symbol is seen through, not one at its own frame.**
+        // Inside a symbol opened in place the playhead is the symbol's, while
+        // the stage around it — and the artwork in it — is drawn through the
+        // camera as it stands on the document frame it was opened on
+        // (`Scene::edit_camera`). Asking the camera at the symbol's frame put
+        // the selection's outline and handles wherever the camera happened to
+        // be at that frame of the film: off the part that had just been
+        // clicked, often off screen, so nothing looked selected and a drag
+        // missed it.
         let projection = scene.camera().projection_for_object(
-            frame,
+            scene.context_frame(frame),
             scene.stage().size,
-            depth,
+            scene.context_depth(depth),
             pivot,
             &object.spatial,
         )?;
@@ -5384,7 +5394,7 @@ impl Editor {
 
             ZoomIn => self.zoom_by(2.0),
             ZoomOut => self.zoom_by(0.5),
-            ZoomActual => self.camera.set_zoom_percent(100.0),
+            ZoomActual => self.set_zoom_centred(100.0),
             ZoomFitInWindow => self.zoom_fit(),
             ZoomShowFrame => {
                 let stage = self.doc.scene().stage().stage_rect();
@@ -5564,6 +5574,8 @@ impl Editor {
                     );
                 } else {
                     self.auto_keyframe = !self.auto_keyframe;
+                    self.workspace.auto_keyframe = self.auto_keyframe;
+                    self.workspace.save();
                 }
             }
             ToggleProtectKeyframes => {
@@ -13904,12 +13916,28 @@ impl Editor {
 
     // -- view ----------------------------------------------------------------
 
+    /// Zoom In / Zoom Out, the zoom buttons, Ctrl+wheel and a pinch: **about
+    /// the stage**, which ends up in the middle of the view — Animate's View ▸
+    /// Zoom keeps the stage centred rather than whatever had been scrolled to
+    /// the middle. The Zoom tool still zooms where it is clicked.
     pub fn zoom_by(&mut self, factor: f64) {
         let centre = Point::new(
             self.camera.viewport.width / 2.0,
             self.camera.viewport.height / 2.0,
         );
         self.camera.zoom_by_at(factor, centre);
+        self.centre_on_stage();
+    }
+
+    /// Set the zoom to `percent` with the stage in the middle of the view.
+    pub fn set_zoom_centred(&mut self, percent: f64) {
+        self.camera.set_zoom_percent(percent);
+        self.centre_on_stage();
+    }
+
+    /// Scroll so the stage's centre is the view's centre, zoom unchanged.
+    pub fn centre_on_stage(&mut self) {
+        self.camera.center = self.doc.scene().stage().stage_rect().center();
     }
 
     pub fn zoom_fit(&mut self) {
@@ -14350,7 +14378,11 @@ fn object_contains(
             // they were drawn at rest meant a click on a raised arm missed it
             // and fell through to whatever was behind — which is the object
             // behind getting selected.
-            symbol.layers.selectable().any(|l| {
+            //
+            // **Locked layers count.** A lock inside a symbol guards editing
+            // that symbol; it does not make the symbol unclickable from
+            // outside. See `LayerStack::hittable_from_outside`.
+            symbol.layers.hittable_from_outside().any(|l| {
                 let follows = symbol.layers.inherited_transform(l.id, inner);
                 let local = match invert(follows) {
                     Some(back) => back * local,
@@ -14435,7 +14467,7 @@ fn sampled_paint(
             let symbol = scene.library().get(instance.symbol)?;
             let inner = instance.resolve_frame(symbol.kind, frame, symbol.length());
             let mut hit = None;
-            for layer in symbol.layers.selectable() {
+            for layer in symbol.layers.hittable_from_outside() {
                 // The same reverse trip through the symbol's rigging that
                 // `object_contains` makes; sampling a colour has to look where
                 // the paint is drawn.
@@ -23580,6 +23612,8 @@ mod tests {
     #[test]
     fn drawing_lands_on_the_keyframe_that_owns_the_current_frame() {
         let mut e = editor();
+        // About where a drawing goes with no keyframe made for it.
+        e.auto_keyframe = false;
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
         // A held *drawing*: frame 0 has artwork, carried across the span.
         draw_square(&mut e, 0.0, 0.0, 50.0, Color::WHITE);
@@ -24605,13 +24639,15 @@ mod tests {
         object.bounds().center()
     }
 
-    /// **Off — the behaviour every earlier phase had.** Moving artwork inside a
-    /// span changes the keyframe that owns the span, so frame 0 moves too.
+    /// **Off — switched off by hand.** Moving artwork inside a span changes
+    /// the keyframe that owns the span, so frame 0 moves too.
     #[test]
     fn without_auto_keyframe_an_edit_reaches_back_to_the_keyframe() {
         let mut e = editor();
         let id = span(&mut e);
-        assert!(!e.auto_keyframe, "off by default");
+        e.run(Command::ToggleAutoKeyframe);
+        assert!(!e.auto_keyframe, "switched off");
+        assert!(!e.workspace.auto_keyframe, "and remembered off");
 
         e.transform_selection(Affine::translate((100.0, 0.0)), "Move");
 
@@ -24639,8 +24675,7 @@ mod tests {
     fn auto_keyframe_keys_the_frame_being_edited() {
         let mut e = editor();
         let id = span(&mut e);
-        e.run(Command::ToggleAutoKeyframe);
-        assert!(e.auto_keyframe);
+        assert!(e.auto_keyframe, "on by default");
 
         let before = at_frame(&e, 0, id);
         e.transform_selection(Affine::translate((100.0, 0.0)), "Move");
@@ -26326,6 +26361,210 @@ mod tests {
             e.scene().find_object(part).is_some(),
             "the selected part should be inside the open symbol"
         );
+    }
+
+    /// **A symbol whose own layers are locked can still be clicked.** A
+    /// lock inside a symbol guards editing *that* symbol, as in Animate; it
+    /// used to make every instance of it unclickable — the flame inside a lamp,
+    /// its one layer locked, could not be selected on the stage or once the
+    /// lamp was opened, and nor could anything holding only it.
+    #[test]
+    fn locked_layers_inside_a_symbol_do_not_stop_it_being_selected() {
+        let mut e = editor();
+        let character = place_nested_character(&mut e);
+        let parts: Vec<buzz_scene::SymbolId> = e
+            .scene()
+            .library()
+            .iter()
+            .filter(|s| s.layers.iter().all(|l| l.objects_at(0).iter().all(|o| o.instance().is_none())))
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(parts.len(), 3, "three part symbols, each holding a square");
+        e.doc.edit("Lock", |scene| {
+            for part in &parts {
+                let stack = scene.library_mut().layers_mut(*part).expect("a part");
+                let ids: Vec<_> = stack.iter().map(|l| l.id).collect();
+                for id in ids {
+                    stack.update(id, |l| l.locked = true);
+                }
+            }
+        });
+
+        let on_the_body = Point::new(270.0, 240.0);
+        let screen = e.camera.doc_to_screen(on_the_body);
+        assert_eq!(
+            e.object_at(e.screen_to_edit(screen), 2.0),
+            Some(character),
+            "the character is clicked on the stage although its parts' layers are locked"
+        );
+
+        e.enter_or_leave_at(screen);
+        assert!(!e.scene().edit_path().is_empty(), "double-clicking opened it");
+        let part = e
+            .object_at(e.screen_to_edit(screen), 2.0)
+            .expect("a part with locked layers inside is still selectable");
+        assert!(e.scene().find_object(part).is_some(), "a part of the open symbol");
+    }
+
+    /// **Inside a symbol, with the camera on.** A shot zoomed and moved draws
+    /// the character somewhere else than its stage position; the click that
+    /// opens it and the click on a part inside must both be carried back
+    /// through the camera and through where the instance stands.
+    #[test]
+    fn with_the_camera_on_parts_inside_a_symbol_can_be_selected() {
+        let mut e = editor();
+        let character = place_nested_character(&mut e);
+        let centre = e.scene().stage().stage_rect().center();
+        e.doc.edit("Camera", |scene| {
+            scene.camera_mut().enabled = true;
+            let mut key = buzz_scene::CameraKey::new(0, Point::new(centre.x + 60.0, centre.y - 40.0));
+            key.zoom = 1.5;
+            scene.camera_mut().set_key(key);
+        });
+
+        // Where the character is actually drawn now: scan the screen.
+        let mut on_it = None;
+        for y in (0..800).step_by(4) {
+            for x in (0..1000).step_by(4) {
+                let screen = Point::new(x as f64, y as f64);
+                if e.object_at(e.screen_to_edit(screen), 2.0) == Some(character) {
+                    on_it = Some(screen);
+                }
+            }
+        }
+        let screen = on_it.expect("the character can be clicked on the stage through the camera");
+
+        e.enter_or_leave_at(screen);
+        assert!(!e.scene().edit_path().is_empty(), "double-clicking opened it");
+        let mut parts = std::collections::HashSet::new();
+        for y in (0..800).step_by(4) {
+            for x in (0..1000).step_by(4) {
+                if let Some(part) = e.object_at(e.screen_to_edit(Point::new(x as f64, y as f64)), 2.0) {
+                    parts.insert(part);
+                }
+            }
+        }
+        assert!(
+            e.object_at(e.screen_to_edit(screen), 2.0).is_some(),
+            "the spot that opened it is on a part inside it"
+        );
+        assert_eq!(parts.len(), 3, "every one of the three parts can be clicked: {parts:?}");
+    }
+
+    /// **Opened on its own (Edit Symbol), with the camera on**, the parts of
+    /// a character can be clicked wherever they are drawn.
+    #[test]
+    fn with_the_camera_on_a_symbol_opened_alone_can_be_selected_inside() {
+        let mut e = editor();
+        let character = place_nested_character(&mut e);
+        let centre = e.scene().stage().stage_rect().center();
+        e.doc.edit("Camera", |scene| {
+            scene.camera_mut().enabled = true;
+            let mut key = buzz_scene::CameraKey::new(0, Point::new(centre.x + 60.0, centre.y - 40.0));
+            key.zoom = 1.5;
+            scene.camera_mut().set_key(key);
+        });
+        e.selection.select_one(character);
+        e.run(Command::EditSymbol);
+        assert!(!e.scene().edit_path().is_empty(), "opened");
+        e.selection.clear();
+        let mut parts = std::collections::HashSet::new();
+        for y in (0..800).step_by(4) {
+            for x in (0..1000).step_by(4) {
+                if let Some(part) = e.object_at(e.screen_to_edit(Point::new(x as f64, y as f64)), 2.0) {
+                    parts.insert(part);
+                }
+            }
+        }
+        assert_eq!(parts.len(), 3, "every one of the three parts can be clicked: {parts:?}");
+        // And through the pointer, as a click is really made.
+        let (_, part) = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter().map(move |o| (l.id, o.id)))
+            .next()
+            .unwrap();
+        let _ = part;
+    }
+
+    /// **A moving camera, a symbol opened in place.** The symbol's own
+    /// playhead is not the document's, and the camera moves between the two:
+    /// the outline of a part selected inside must sit on the part — measured
+    /// through the shot the symbol was opened on — or nothing looks selected
+    /// and a drag misses it.
+    #[test]
+    fn inside_a_symbol_opened_under_a_moving_camera_the_selection_sits_on_the_part() {
+        let mut e = editor();
+        let character = place_nested_character(&mut e);
+        let centre = e.scene().stage().stage_rect().center();
+        let layer = e.scene().find_object(character).unwrap().0;
+        e.doc.edit("Camera", |scene| {
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(29);
+            });
+            scene.camera_mut().enabled = true;
+            scene.camera_mut().set_key(buzz_scene::CameraKey::new(0, centre));
+            let mut later = buzz_scene::CameraKey::new(20, Point::new(centre.x + 150.0, centre.y + 90.0));
+            later.zoom = 1.8;
+            scene.camera_mut().set_key(later);
+        });
+        e.set_frame(20);
+
+        let mut on_it = None;
+        for y in (0..800).step_by(4) {
+            for x in (0..1000).step_by(4) {
+                let screen = Point::new(x as f64, y as f64);
+                if e.object_at(e.screen_to_edit(screen), 2.0) == Some(character) {
+                    on_it = Some(screen);
+                }
+            }
+        }
+        e.enter_or_leave_at(on_it.expect("the character is on screen at frame 20"));
+        assert!(!e.scene().edit_path().is_empty(), "opened in place");
+        // The symbol's own playhead: frame 0, where the camera is elsewhere.
+        e.set_frame(0);
+
+        let part = e
+            .scene()
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).iter().map(|o| o.id))
+            .next()
+            .expect("a part");
+        let (_, quad) = e.focal_local_and_quad(part).expect("drawn");
+        let middle = Point::new(
+            quad.iter().map(|p| p.x).sum::<f64>() / 4.0,
+            quad.iter().map(|p| p.y).sum::<f64>() / 4.0,
+        );
+        let screen = e.camera.doc_to_screen(e.edit_to_stage().map_point(middle).unwrap());
+        assert_eq!(
+            e.object_at(e.screen_to_edit(screen), 2.0),
+            Some(part),
+            "the middle of the part's outline is on the part"
+        );
+        e.set_tool(ToolId::Selection);
+        e.selection.clear();
+        e.pointer_down(screen, Mods::default());
+        e.pointer_up(screen);
+        assert_eq!(e.selection.iter().collect::<Vec<_>>(), vec![part], "and a click there selects it");
+    }
+
+    /// **Zoom keeps the stage in the middle.** Scrolled off to one side, Zoom
+    /// In, Zoom Out and 100% all bring the stage's centre back to the view's.
+    #[test]
+    fn zooming_centres_the_stage() {
+        let mut e = editor();
+        let stage = e.scene().stage().stage_rect().center();
+        for command in [Command::ZoomIn, Command::ZoomOut, Command::ZoomActual] {
+            e.camera.center = Point::new(-3000.0, 4000.0);
+            e.run(command);
+            assert!((e.camera.center - stage).hypot() < 1e-6, "{command:?} left the view off the stage");
+        }
+        e.camera.center = Point::new(-3000.0, 4000.0);
+        e.set_zoom_centred(250.0);
+        assert!((e.camera.zoom_percent() - 250.0).abs() < 1e-9);
+        assert!((e.camera.center - stage).hypot() < 1e-6);
     }
 
     /// The same for a **symbol instance**, which is the case that matters:

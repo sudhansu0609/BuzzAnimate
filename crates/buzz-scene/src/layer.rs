@@ -1115,6 +1115,20 @@ impl LayerStack {
         })
     }
 
+    /// The layers a click on an **instance of this symbol** is tested
+    /// against: every layer that shows, locked or not.
+    ///
+    /// A lock is about editing the timeline it is on. Animate honours it only
+    /// while that symbol is open; from outside, a symbol whose layers are all
+    /// locked is clicked like any other. Testing an instance through
+    /// [`Self::selectable`] made exactly those symbols unclickable — a flame
+    /// whose one layer was locked could not be selected on the stage or inside
+    /// the lamp it sat in, and neither could anything holding it.
+    pub fn hittable_from_outside(&self) -> impl Iterator<Item = &Arc<Layer>> {
+        self.paint_order()
+            .filter(|l| l.kind.holds_artwork() && self.is_effectively_visible(l.id))
+    }
+
     /// Layers the user can select on, **in the order they are painted**.
     ///
     /// `by_depth` mirrors the stage's `sort_by_depth`. A hit test walks these

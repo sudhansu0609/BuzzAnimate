@@ -176,6 +176,8 @@ fn build(doc: &PdfDocument) -> Result<(Scene, ImportReport), ImportError> {
 
         report.pages += 1;
         keyframes.push(buzz_scene::Keyframe {
+            // Animate has no keyframe colour effect; every imported keyframe is plain.
+            color: buzz_scene::ColorTransform::default(),
             start: index as u32,
             objects: std::sync::Arc::new(objects),
             label: None,

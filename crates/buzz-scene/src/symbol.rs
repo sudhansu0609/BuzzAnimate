@@ -155,6 +155,28 @@ impl ColorTransform {
         }
     }
 
+    /// This transform with its colour part replaced by Brightness `amount`,
+    /// its alpha kept — so a layer's brightness and opacity can be set
+    /// separately on the same keyframe.
+    pub fn with_brightness(&self, amount: f32) -> Self {
+        let mut out = Self::brightness(amount);
+        out.multiply[3] = self.multiply[3];
+        out.add[3] = self.add[3];
+        out
+    }
+
+    /// The Brightness this transform's colour part amounts to, -1..=1; 0 for a
+    /// colour part that is not a brightness.
+    pub fn brightness_part(&self) -> f32 {
+        if self.add[0] > 0.0 && self.add[0] == self.add[1] && self.add[1] == self.add[2] {
+            self.add[0]
+        } else if self.add[..3] == [0.0; 3] {
+            self.multiply[0] - 1.0
+        } else {
+            0.0
+        }
+    }
+
     /// Apply to a colour.
     pub fn apply(&self, color: Color) -> Color {
         let [r, g, b, a] = color.to_rgba8().to_u8_array();

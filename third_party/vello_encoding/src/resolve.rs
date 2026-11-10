@@ -525,6 +525,14 @@ impl Resolver {
                     if self.image_cache.bump_size() {
                         // We were able to increase the atlas size. Restart the outer loop.
                         continue 'outer;
+                    } else if self.image_cache.can_fit_image(&pending_image.image)
+                        && self.image_cache.evict_least_recent()
+                    {
+                        // The atlas is as big as it goes and full of images this frame does
+                        // not use (a cut to a new background): free the least recently used
+                        // one and try again, rather than leaving this image undrawn until
+                        // the others go stale.
+                        continue;
                     } else {
                         // If the atlas is already maximum size, there's nothing we can do. Set
                         // the xy field to None so this image isn't rendered and then carry on--

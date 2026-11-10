@@ -181,6 +181,35 @@ impl ImageCache {
         self.evicted_in_resolve != 0
     }
 
+    /// Evict the least recently used resident image that the current resolve pass has not
+    /// asked for, so a new image can take its place *now*.
+    ///
+    /// [`Self::evict_stale_entries`] only frees images unused for
+    /// [`EVICT_AFTER_GENERATIONS`] passes. With the atlas already at its maximum size that
+    /// leaves a newly needed image unallocated — and so not drawn at all — for that many
+    /// frames whenever the previous frame's images fill the atlas: a cut to a new full-frame
+    /// background drew the stage's background colour for two frames, a white flash. This is
+    /// the fallback for exactly that case. An image already used by this pass is never
+    /// evicted, so nothing the frame has placed can lose its slot; returns `false` when every
+    /// resident image is in use.
+    pub(crate) fn evict_least_recent(&mut self) -> bool {
+        let generation = self.generation;
+        let Some(id) = self
+            .map
+            .iter()
+            .filter(|(_, resident)| resident.last_used_generation != generation)
+            .min_by_key(|(_, resident)| resident.last_used_generation)
+            .map(|(id, _)| *id)
+        else {
+            return false;
+        };
+        if let Some(resident) = self.map.remove(&id) {
+            self.atlas.deallocate(resident.alloc_id);
+            self.evicted_in_resolve += 1;
+        }
+        true
+    }
+
     fn repack_to_size(&mut self, size: i32) -> bool {
         let mut atlas = AtlasAllocator::new(size2(size, size));
         let mut entries: Vec<_> = self.map.iter().collect();
@@ -329,6 +358,48 @@ mod tests {
 
         assert!(cache.evict_stale_entries());
         assert!(!cache.evict_stale_entries());
+    }
+
+    /// The white flash: the atlas is at its maximum size and full of the previous frame's
+    /// images, and the next frame needs a new one. It must fit on *this* frame, by evicting
+    /// an image this frame does not use — not two frames later when that image is stale.
+    #[test]
+    fn a_full_atlas_makes_room_for_a_new_image_at_once() {
+        let mut cache = ImageCache::new_with_sizes(16, 16);
+        // Two 16x8 images fill a 16x16 atlas, as two 5120x2880 backgrounds fill 8192x8192.
+        let a = image(1, 16, 8);
+        let b = image(2, 16, 8);
+        let c = image(3, 16, 8);
+
+        cache.begin_resolve();
+        assert!(cache.get_or_insert(&a).is_some());
+        assert!(cache.get_or_insert(&b).is_some());
+        cache.finish_resolve();
+
+        // The next frame keeps B and cuts to C.
+        cache.begin_resolve();
+        assert!(cache.get_or_insert(&b).is_some());
+        assert!(cache.get_or_insert(&c).is_none(), "the atlas is full");
+        assert!(!cache.evict_stale_entries(), "A was used one frame ago: not stale yet");
+        assert!(!cache.bump_size(), "the atlas is at its maximum size");
+        assert!(cache.evict_least_recent());
+        assert!(cache.get_or_insert(&c).is_some(), "C is drawn on this frame");
+        assert!(!cache.map.contains_key(&a.data.id()), "A, unused this frame, made way");
+        assert!(cache.map.contains_key(&b.data.id()), "B, used this frame, kept its slot");
+        assert_eq!(cache.images.last().map(|i| i.0.data.id()), Some(c.data.id()), "C is uploaded");
+    }
+
+    #[test]
+    fn an_image_used_by_this_frame_is_never_evicted() {
+        let mut cache = ImageCache::new_with_sizes(16, 16);
+        let (a, b, c) = (image(1, 16, 8), image(2, 16, 8), image(3, 16, 8));
+        cache.begin_resolve();
+        assert!(cache.get_or_insert(&a).is_some());
+        assert!(cache.get_or_insert(&b).is_some());
+        // The same frame asks for a third: there is nothing it may take.
+        assert!(cache.get_or_insert(&c).is_none());
+        assert!(!cache.evict_least_recent());
+        assert_eq!(cache.map.len(), 2);
     }
 
     #[test]

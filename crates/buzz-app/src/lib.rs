@@ -16,6 +16,7 @@ pub mod app;
 pub mod cast_build;
 pub mod comfy;
 pub mod comfy_profile;
+pub mod commands_panel;
 pub mod generate_image;
 pub mod prompt_image;
 pub mod definition;

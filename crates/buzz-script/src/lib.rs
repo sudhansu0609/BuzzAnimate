@@ -124,35 +124,50 @@ pub struct ScriptContext {
 
 /// Where a shelf of JSFL commands lives on this machine.
 ///
-/// BuzzAnimate's own folder first, then Animate's — because somebody with a
-/// shelf of commands built up over years has it in Animate's Configuration
-/// directory, and asking them to move it to use it here would be the whole
-/// cost of switching for no benefit. Newest Animate first, since a script
-/// shelf follows the version it was written against.
+/// BuzzAnimate's own Configuration folder first, then its saved-commands
+/// folder, then Animate's (Windows and Mac) — because somebody with a shelf of
+/// commands built up over years has it in Animate's Configuration directory,
+/// and asking them to move it to use it here would be the whole cost of
+/// switching for no benefit. Newest Animate first, since a script shelf
+/// follows the version it was written against. Whichever holds a `Commands`
+/// folder of `.jsfl` files wins ([`pick_config_dir`]).
 ///
 /// `None` when neither exists, which turns `fl.runScript` off rather than
 /// pointing it somewhere arbitrary.
 pub fn default_config_dir() -> Option<std::path::PathBuf> {
+    pick_config_dir(config_dir_candidates())
+}
+
+/// Every place a shelf may live, in order of preference.
+pub fn config_dir_candidates() -> Vec<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
 
-    // Ours first: the very folder saved commands already live in
-    // (`buzz_doc::commands::commands_root`). Animate's Configuration folder
-    // has a nested `Commands/` beneath it because that folder holds more than
-    // scripts; ours holds nothing else, so `fl.configURI` points straight at
-    // it and a ported command drops the `"Commands/"` segment it used to
-    // concatenate — the one deliberate difference from the original's path,
-    // recorded here rather than left to be rediscovered as a bug.
-    candidates.push(buzz_doc::commands::commands_root());
-
-    // `%APPDATA%/BuzzAnimate/Configuration`, kept as a second BuzzAnimate
-    // candidate for anyone who already has scripts filed the old way.
+    // `<config>/BuzzAnimate/Configuration`, laid out exactly as Animate's
+    // Configuration folder is — a `Commands/` folder beneath it — so a shelf
+    // copied over from Animate works unchanged, `fl.configURI + "Commands/…"`
+    // and all. On Windows that is `%APPDATA%`, on a Mac `~/.config`.
     if let Some(dir) = dirs_next_config() {
         candidates.push(dir);
     }
 
-    // Animate's, newest first.
+    // The folder saved commands already live in
+    // (`buzz_doc::commands::commands_root`). It holds nothing but scripts, so
+    // `fl.configURI` points straight at it and a command written for it drops
+    // the `"Commands/"` segment.
+    candidates.push(buzz_doc::commands::commands_root());
+
+    // Animate's, newest first: Windows keeps them under `%LOCALAPPDATA%`, a
+    // Mac under `~/Library/Application Support`.
+    let mut adobe_roots: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let adobe = std::path::Path::new(&local).join("Adobe");
+        adobe_roots.push(std::path::Path::new(&local).join("Adobe"));
+    }
+    if cfg!(target_os = "macos")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        adobe_roots.push(std::path::PathBuf::from(home).join("Library/Application Support/Adobe"));
+    }
+    for adobe in adobe_roots {
         let mut versions: Vec<std::path::PathBuf> = std::fs::read_dir(&adobe)
             .into_iter()
             .flatten()
@@ -169,18 +184,44 @@ pub fn default_config_dir() -> Option<std::path::PathBuf> {
             candidates.push(version.join("en_US").join("Configuration"));
         }
     }
-
-    candidates.into_iter().find(|path| path.is_dir())
+    candidates
 }
 
-/// `%APPDATA%/BuzzAnimate/Configuration`, if the platform has such a place.
-fn dirs_next_config() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
-    Some(
-        std::path::PathBuf::from(base)
-            .join("BuzzAnimate")
-            .join("Configuration"),
-    )
+/// Does `dir` hold a shelf — a `Commands` folder with at least one `.jsfl`?
+pub fn has_jsfl_shelf(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir.join("Commands")).into_iter().flatten().flatten().any(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("jsfl"))
+    })
+}
+
+/// The first candidate that holds a shelf of JSFL commands; failing that, the
+/// first that exists at all.
+///
+/// A folder of saved Actions scripts must not shadow a real shelf further down
+/// the list: that is how a Mac — where only BuzzAnimate's own folder used to be
+/// looked at — ended up with `fl.configURI` pointing somewhere without
+/// `Commands/commonVariables.jsfl`, and every command that opens by reading it
+/// running with its settings undefined.
+fn pick_config_dir(candidates: Vec<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    candidates
+        .iter()
+        .find(|path| has_jsfl_shelf(path))
+        .or_else(|| candidates.iter().find(|path| path.is_dir()))
+        .cloned()
+}
+
+/// `<config>/BuzzAnimate/Configuration`: `%APPDATA%` on Windows, otherwise
+/// `$XDG_CONFIG_HOME` or `~/.config` — the same base the workspace and saved
+/// commands use, so everything BuzzAnimate keeps for a person is in one place.
+pub fn dirs_next_config() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(base.join("BuzzAnimate").join("Configuration"))
 }
 
 /// A way for the host to stop a script that is already running.
@@ -905,6 +946,25 @@ var CONFIG = { moveAmount: 5, browFrames: 10 };
             "reading outside the script folder must fail, not succeed quietly"
         );
         let _ = std::fs::remove_file(&secret);
+    }
+
+    /// **A folder with a shelf wins over one without**, wherever it is in
+    /// the list — the Mac case, where BuzzAnimate's saved-scripts folder came
+    /// first and has no `Commands/commonVariables.jsfl` beneath it.
+    #[test]
+    fn the_folder_holding_a_shelf_is_preferred() {
+        let tmp = std::env::temp_dir().join(format!("buzz-shelf-pick-{}", std::process::id()));
+        let saved = tmp.join("commands");
+        let config = tmp.join("Configuration");
+        std::fs::create_dir_all(&saved).unwrap();
+        std::fs::create_dir_all(config.join("Commands")).unwrap();
+        std::fs::write(config.join("Commands").join("eyeLeft.jsfl"), "fl.trace(1)").unwrap();
+
+        assert_eq!(pick_config_dir(vec![saved.clone(), config.clone()]), Some(config.clone()));
+        // With no shelf anywhere, the first folder that exists.
+        std::fs::remove_file(config.join("Commands").join("eyeLeft.jsfl")).unwrap();
+        assert_eq!(pick_config_dir(vec![tmp.join("missing"), saved.clone(), config]), Some(saved));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// **What a real shelf of JSFL commands does in this engine.**

@@ -475,6 +475,8 @@ pub enum Pick {
     GenerateWorkflow,
     /// A recording to use as the Voices panel's take.
     VoiceTake,
+    /// An Animate keyboard-shortcut file to bring over.
+    AnimateKeymap,
 }
 
 /// A compact UTC timestamp, `YYYY-MM-DD HHhMM`, for naming a snapshot. Built
@@ -1213,6 +1215,8 @@ pub struct App {
     /// Window ▸ Voices: the take, the voice being designed, who speaks with
     /// what. See [`crate::voices_panel`].
     voices: crate::voices_panel::VoicesPanel,
+    /// Window ▸ Commands: the JSFL shelf. See [`crate::commands_panel`].
+    commands_ui: crate::commands_panel::CommandsPanel,
     arrange_rx: Option<crossbeam_channel::Receiver<ArrangeMsg>>,
     /// The open character's loaded document, and the wardrobe and poses derived
     /// from it. Held here rather than re-read from disk every frame: a
@@ -1554,6 +1558,7 @@ impl App {
             episode_parts_rx: None,
             storyboard: crate::storyboard_panel::StoryboardPanel::default(),
             voices: crate::voices_panel::VoicesPanel::default(),
+            commands_ui: crate::commands_panel::CommandsPanel::default(),
             arrange_rx: None,
             cast_sheet: None,
             preview: crate::preview::Preview::default(),
@@ -2800,7 +2805,7 @@ fn script_samples() -> Vec<buzz_ui::SampleEntry> {
 /// shortcut in the command map, printed beside it in a menu, and still do
 /// nothing when pressed — which is exactly what had happened to F8 and
 /// Ctrl+E. `every_shortcut_is_reachable_from_the_keyboard` guards it now.
-const KEYBOARD_COMMANDS: &[Command] = &[
+pub const KEYBOARD_COMMANDS: &[Command] = &[
     // The bracket keys re-weight the selected outlines, which is a thing done
     // repeatedly and by eye and so wants a key rather than a menu.
     Command::ThickenStroke,
@@ -2891,24 +2896,76 @@ const KEYBOARD_COMMANDS: &[Command] = &[
     Command::LastFrame,
 ];
 
-/// Collect commands raised by the keyboard.
-fn keyboard_commands(ctx: &egui::Context, editor: &mut Editor) -> Vec<Command> {
+/// What a key can be bound to.
+enum Bound {
+    Command(Command),
+    /// A JSFL command on the shelf, by file stem.
+    Script(String),
+}
+
+/// How many modifiers a shortcut holds — the order bindings are tried in.
+fn modifier_count(m: egui::Modifiers) -> usize {
+    [m.command || m.mac_cmd, m.ctrl && !m.command, m.alt, m.shift]
+        .into_iter()
+        .filter(|on| *on)
+        .count()
+}
+
+/// Collect commands raised by the keyboard, and the shelf scripts whose keys
+/// were pressed.
+fn keyboard_commands(ctx: &egui::Context, editor: &mut Editor) -> (Vec<Command>, Vec<String>) {
     let mut out = Vec::new();
+    let mut scripts = Vec::new();
 
     // A focused text field owns the keyboard; stealing single letters from it
     // would make renaming a layer impossible.
     if ctx.memory(|m| m.focused().is_some()) {
-        return out;
+        return (out, scripts);
     }
 
-    let all = KEYBOARD_COMMANDS;
-    for &command in all {
+    // **One list: commands, tools and the shelf's scripts, most specific
+    // first.** egui matches a shortcut *logically* — an extra Shift or Alt held
+    // down is ignored — so a bare `1` would also fire on ⌥⌘1, and `R` on
+    // Shift+R, unless the bindings with more modifiers are tried first. A
+    // keymap brought over from Animate is full of exactly those pairs (an eye
+    // on `1` and its reverse on ⌥⌘1), which is why commands, tools and scripts
+    // cannot each be matched in a loop of their own.
+    let plain = ctx.input(|i| !i.modifiers.any());
+    let mut bound: Vec<(egui::KeyboardShortcut, Bound)> = Vec::new();
+    // The person's own commands first: at equal specificity a key they gave a
+    // shelf command beats a built-in default left on the same key.
+    for (name, chords) in &editor.workspace.script_keys {
+        for shortcut in chords.iter().filter_map(buzz_ui::workspace::KeyChord::to_shortcut) {
+            bound.push((shortcut, Bound::Script(name.clone())));
+        }
+    }
+    for &command in KEYBOARD_COMMANDS {
         // The user's keymap override wins over the built-in shortcut; an
-        // unbound command resolves to `None` and matches no key.
-        if let Some(shortcut) = editor.workspace.shortcut_for(command)
-            && ctx.input_mut(|i| i.consume_shortcut(&shortcut))
+        // unbound command has no main key and matches nothing but its extras.
+        for shortcut in editor.workspace.shortcuts_for(command) {
+            bound.push((shortcut, Bound::Command(command)));
+        }
+    }
+    for tool in tool_catalogue::all_tools() {
+        for shortcut in editor.workspace.shortcuts_for(Command::SelectTool(tool)) {
+            bound.push((shortcut, Bound::Command(Command::SelectTool(tool))));
+        }
+    }
+    bound.sort_by_key(|(shortcut, _)| std::cmp::Reverse(modifier_count(shortcut.modifiers)));
+    for (shortcut, target) in bound {
+        // Bare letters select tools only when no modifier is held at all, as
+        // they always have.
+        if matches!(target, Bound::Command(Command::SelectTool(_)))
+            && shortcut.modifiers.is_none()
+            && !plain
         {
-            out.push(command);
+            continue;
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+            match target {
+                Bound::Command(command) => out.push(command),
+                Bound::Script(name) => scripts.push(name),
+            }
         }
     }
 
@@ -2971,24 +3028,14 @@ fn keyboard_commands(ctx: &egui::Context, editor: &mut Editor) -> Vec<Command> {
         }
     }
 
-    // Bare letters select tools, but only without modifiers.
-    let plain = ctx.input(|i| !i.modifiers.any());
-    if plain {
-        for tool in tool_catalogue::all_tools() {
-            if let Some(key) = tool.shortcut()
-                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key))
-            {
-                out.push(Command::SelectTool(tool));
-            }
-        }
-        // `J` toggles the current tool's object drawing, as in Animate.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::J)) {
-            // Handled directly; there is no menu command for it.
-            editor.toggle_drawing_mode();
-        }
+    // `J` toggles the current tool's object drawing, as in Animate. Tool
+    // letters were matched above, with everything else.
+    if plain && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::J)) {
+        // Handled directly; there is no menu command for it.
+        editor.toggle_drawing_mode();
     }
 
-    out
+    (out, scripts)
 }
 
 /// One `VectorPartCandidate` per non-empty layer of `symbol`, covering
@@ -4321,17 +4368,24 @@ impl App {
             commands.push(command);
         }
 
-        commands.extend(keyboard_commands(&ctx, &mut self.editor));
+        let (keyed, keyed_scripts) = keyboard_commands(&ctx, &mut self.editor);
+        commands.extend(keyed);
         commands.extend(self.space_tap(&ctx));
         // While a script owns the document — or an import is being merged —
         // nothing else may touch it, keyboard shortcuts included, which the
         // modal backdrop does not catch. The one thing still live is the
         // overlay's own Stop button.
+        if let Some(action) = self.commands_ui.dialog(&ctx) {
+            self.commands_action(action);
+        }
         if self.doc_available() {
             for command in commands {
                 if self.user_command_allowed(command) {
                     self.dispatch(command);
                 }
+            }
+            for name in keyed_scripts {
+                self.run_shelf_command(&name, None);
             }
         }
         if self.scripting.is_some() {
@@ -5863,6 +5917,7 @@ impl App {
             MotionEditor => self.motion_editor_panel(ui),
             Sequence => self.sequence_panel(ui),
             Voices => self.voices_panel(ui),
+            Commands => self.commands_panel(ui),
         }
     }
 
@@ -6349,6 +6404,98 @@ impl App {
             }
             None => {}
         }
+    }
+
+    /// **Window ▸ Commands**: the JSFL shelf.
+    fn commands_panel(&mut self, ui: &mut egui::Ui) {
+        let config = buzz_script::default_config_dir();
+        let keys: std::collections::BTreeMap<String, Vec<String>> = self
+            .editor
+            .workspace
+            .script_keys
+            .iter()
+            .map(|(name, chords)| (name.clone(), chords.iter().map(buzz_ui::workspace::KeyChord::label).collect()))
+            .collect();
+        if let Some(action) = self.commands_ui.ui(ui, config.as_deref(), &keys) {
+            self.commands_action(action);
+        }
+    }
+
+    fn commands_action(&mut self, action: crate::commands_panel::CommandsAction) {
+        use crate::commands_panel::CommandsAction;
+        match action {
+            CommandsAction::Run { name, answers } => self.run_shelf_command(&name, answers),
+            CommandsAction::ImportKeymap(path) => self.import_animate_keymap(&path),
+            CommandsAction::PickKeymap => self.ask_for_path(
+                crate::dialogs::Request::open_file()
+                    .title("Animate keyboard shortcuts")
+                    .filter("Animate keymap", &["xml"]),
+                Pick::AnimateKeymap,
+            ),
+        }
+    }
+
+    /// **Run a JSFL command from the shelf** — from its key, its button, or
+    /// its questions dialog — as one undo step. A command that asks questions
+    /// is asked first (`answers: None`), then run with the answers given.
+    fn run_shelf_command(&mut self, name: &str, answers: Option<Vec<String>>) {
+        let config = buzz_script::default_config_dir();
+        self.commands_ui.ensure(config.as_deref());
+        let Some(command) = self.commands_ui.find(name).cloned() else {
+            self.editor.status = Some(format!("No command called {name} on the shelf"));
+            return;
+        };
+        let source = match std::fs::read_to_string(&command.path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.editor.status = Some(format!("Could not read {}: {e}", command.path.display()));
+                return;
+            }
+        };
+        let asked = answers.is_some();
+        let outcome = self.editor.run_script_source(name, &source, answers.unwrap_or_default(), true);
+        if !asked && !outcome.prompts.is_empty() && outcome.error.is_none() {
+            self.commands_ui.ask(name, outcome.prompts.clone());
+            return;
+        }
+        let mut status = format!("{name}: {}", outcome.summary());
+        if let Some(alert) = outcome.alerts.first() {
+            status.push_str(&format!(" \u{2014} {alert}"));
+        }
+        if let Some(error) = &outcome.error {
+            status = format!("{name} stopped: {}", error.lines().next().unwrap_or(error));
+        }
+        self.commands_ui.status = status.clone();
+        self.editor.status = Some(status);
+    }
+
+    /// Bring an Animate keymap over: its keys for menus and tools, and for the
+    /// shelf's commands. Saved at once, like every other shortcut change.
+    fn import_animate_keymap(&mut self, path: &std::path::Path) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.commands_ui.status = format!("Could not read {}: {e}", path.display());
+                return;
+            }
+        };
+        let bindings = buzz_ui::animate_keys::parse(&text);
+        let report = buzz_ui::animate_keys::apply(&mut self.editor.workspace, &bindings, KEYBOARD_COMMANDS);
+        self.editor.workspace.save();
+        let mut status = format!(
+            "Imported {}: {} command and tool keys, {} shelf commands",
+            path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+            report.commands,
+            report.scripts
+        );
+        if !report.unbound.is_empty() {
+            status.push_str(&format!(". Moved off their keys: {}", report.unbound.join(", ")));
+        }
+        if !report.conflicts.is_empty() {
+            status.push_str(&format!(". Keys given twice: {}", report.conflicts.join("; ")));
+        }
+        self.commands_ui.status = status.clone();
+        self.editor.status = Some(status);
     }
 
     fn light_panel(&mut self, ui: &mut egui::Ui) {
@@ -9692,6 +9839,7 @@ impl App {
             Pick::SequenceFolder => self.sequence_folder_from(path),
             Pick::ImportSound => self.import_sound_from(path),
             Pick::VoiceTake => self.voices.load_take(&path),
+            Pick::AnimateKeymap => self.import_animate_keymap(&path),
             Pick::SetMasterAudio => self.set_master_audio_from(path),
             Pick::SetMasterAudioForMode => {
                 self.set_master_audio_from(path);
@@ -18379,6 +18527,57 @@ mod idle_tests {
         drive(&mut app, vec![]);
         assert!(app.editor.selection.contains(ids[0]), "the right-clicked square stays selected");
         assert!(!app.editor.selection.contains(ids[1]), "the square the pointer crossed is not selected");
+    }
+
+    /// **A keymap from Animate fires the most specific binding.** egui ignores
+    /// an extra Shift or Alt when matching, so with an eye on `1` and its
+    /// reverse on Cmd+Option+1, pressing the latter must run the reverse — and
+    /// Shift+R must run its own command rather than the one on R. Tools and
+    /// commands moved by the keymap answer to their new keys.
+    #[test]
+    fn imported_keys_fire_the_most_specific_binding() {
+        use buzz_ui::workspace::KeyChord;
+        let mut app = App::new(GpuPreference::Automatic);
+        let chord = |command: bool, alt: bool, shift: bool, key: &str| KeyChord { command, ctrl: false, alt, shift, key: key.into() };
+        let ws = &mut app.editor.workspace;
+        ws.script_keys.insert("eyeBottomLeft".into(), vec![chord(false, false, false, "1")]);
+        ws.script_keys.insert("RevEyeBottomLeft".into(), vec![chord(true, true, false, "1")]);
+        ws.script_keys.insert("renameSymbol".into(), vec![chord(false, false, false, "R")]);
+        ws.script_keys.insert("renameHeadLayers".into(), vec![chord(false, false, true, "R")]);
+        ws.script_keys.insert("eyeUp".into(), vec![chord(false, false, false, "8")]);
+        ws.script_keys.insert("rotateEyeBrowUp".into(), vec![chord(false, false, true, "8")]);
+        ws.keymap.insert("SelectTool(Camera)".into(), Some(chord(false, false, false, "M")));
+        ws.keymap.insert("SelectTool(Bone)".into(), None);
+        ws.keymap.insert("SelectTool(InkBottle)".into(), None);
+        ws.extra_keys.insert("InsertKeyframe".into(), vec![chord(false, false, false, "S")]);
+        // What the import switches off for these keys.
+        ws.keymap.insert("RenameFaceLayers".into(), None);
+
+        let ctx = egui::Context::default();
+        let mut press = |key: egui::Key, modifiers: egui::Modifiers| {
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }],
+                modifiers,
+                ..Default::default()
+            };
+            let mut got = (Vec::new(), Vec::new());
+            let _ = ctx.run_ui(input, |ui| got = keyboard_commands(ui.ctx(), &mut app.editor));
+            got
+        };
+        let none = egui::Modifiers::NONE;
+        let cmd_opt = egui::Modifiers::COMMAND | egui::Modifiers::ALT;
+        let shift = egui::Modifiers::SHIFT;
+
+        assert_eq!(press(egui::Key::Num1, none).1, vec!["eyeBottomLeft".to_string()]);
+        assert_eq!(press(egui::Key::Num1, cmd_opt).1, vec!["RevEyeBottomLeft".to_string()]);
+        let (commands, scripts) = press(egui::Key::R, shift);
+        assert_eq!(scripts, vec!["renameHeadLayers".to_string()]);
+        assert!(commands.is_empty(), "Shift+R ran {commands:?} as well");
+        assert_eq!(press(egui::Key::R, none).1, vec!["renameSymbol".to_string()], "R renames the symbol, not the Rectangle tool");
+        assert_eq!(press(egui::Key::Num8, shift).1, vec!["rotateEyeBrowUp".to_string()]);
+        assert_eq!(press(egui::Key::Num8, none).1, vec!["eyeUp".to_string()]);
+        assert_eq!(press(egui::Key::M, none).0, vec![Command::SelectTool(buzz_ui::ToolId::Camera)]);
+        assert_eq!(press(egui::Key::S, none).0, vec![Command::InsertKeyframe], "S inserts a keyframe, not the Ink Bottle");
     }
 
     /// Play/Pause from the keyboard: Enter (Animate's key), a tap of Space

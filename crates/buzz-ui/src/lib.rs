@@ -13,6 +13,7 @@ pub mod ai_models_dialog;
 pub mod ai_panel;
 pub mod ai_rename_dialog;
 pub mod align;
+pub mod animate_keys;
 pub mod arrange_dialog;
 pub mod assets_panel;
 pub mod brush;

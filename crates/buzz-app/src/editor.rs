@@ -8053,8 +8053,31 @@ impl Editor {
             self.status = Some("Write a script in the Actions panel first".into());
             return;
         }
-
         let source = self.actions.source.clone();
+        let outcome = self.run_script_source("Run Script", &source, Vec::new(), false);
+        let summary = outcome.summary();
+        self.actions.report(outcome.trace, outcome.error, summary);
+    }
+
+    /// **Run `source` as one undo step** — the Actions panel's Run, and every
+    /// JSFL command on the shelf.
+    ///
+    /// `answers` are the replies to the script's `prompt()` questions, in the
+    /// order it asks them; empty, each is answered with its own default.
+    ///
+    /// With `ask_first`, a script that asks questions *and was given no
+    /// answers* is run on a copy only: nothing is committed and the outcome's
+    /// `prompts` say what to ask. The caller asks, and runs it again with the
+    /// answers. A script that asks nothing is committed straight away, so the
+    /// shelf's one-key commands (an eye, a brow) run once, not twice.
+    pub fn run_script_source(
+        &mut self,
+        label: &str,
+        source: &str,
+        answers: Vec<String>,
+        ask_first: bool,
+    ) -> buzz_script::ScriptOutcome {
+        let asking = answers.is_empty();
         let context = buzz_script::ScriptContext {
             current_frame: self.current_frame,
             selection: self.selection.ids(),
@@ -8066,39 +8089,39 @@ impl Editor {
             asset_root: buzz_doc::AssetLibrary::user()
                 .root()
                 .map(|p| p.to_path_buf()),
-            // No interactive answers yet (J1 parked): `prompt` keeps its
-            // unattended default-answer behaviour.
-            prompt_answers: Vec::new(),
+            prompt_answers: answers,
         };
 
         let mut working = self.doc.scene().clone();
         let outcome = buzz_script::run(
             &mut working,
             context,
-            &source,
+            source,
             &buzz_script::Limits::default(),
         );
-
-        if outcome.changed {
-            self.doc.edit("Run Script", |scene| *scene = working);
-            self.doc.end_gesture();
+        if ask_first && asking && !outcome.prompts.is_empty() {
+            // A rehearsal, to find out what to ask: thrown away.
+            return outcome;
         }
 
-        let summary = outcome.summary();
+        if outcome.changed {
+            self.doc.edit(label, |scene| *scene = working);
+            self.doc.end_gesture();
+        }
 
         // The script's view of the editor becomes the editor's, so
         // `t.currentFrame = 5` moves the playhead the user can see and
         // `d.selectAll()` leaves the artwork actually selected.
         self.set_frame(outcome.context.current_frame);
-        self.selection.set(outcome.context.selection);
+        self.selection.set(outcome.context.selection.clone());
         self.selection.prune(self.doc.scene());
         if let Some(layer) = outcome.context.active_layer {
             self.selection.set_active_layer(Some(layer));
         }
         self.selection.ensure_active_layer(self.doc.scene());
 
-        self.status = Some(summary.clone());
-        self.actions.report(outcome.trace, outcome.error, summary);
+        self.status = Some(outcome.summary());
+        outcome
     }
 
     // -- symbols -------------------------------------------------------------

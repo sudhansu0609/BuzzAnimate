@@ -90,6 +90,10 @@ pub enum PanelId {
     /// and put a character's line on the timeline with only that character's
     /// mouth lip-synced over it. A column of its own on the far right.
     Voices,
+    /// **The JSFL command shelf** — every command a button, grouped, with its
+    /// key; the shelf's shared settings; importing Animate's keymap. Below
+    /// Voices in the far-right column.
+    Commands,
 }
 
 impl PanelId {
@@ -119,6 +123,7 @@ impl PanelId {
             Self::Ai => "AI",
             Self::Storyboard => "Storyboard",
             Self::Voices => "Voices",
+            Self::Commands => "Commands",
         }
     }
 
@@ -149,7 +154,7 @@ impl PanelId {
         !matches!(self, Self::Tools | Self::Timeline | Self::Sequence | Self::Ai)
     }
 
-    pub const ALL: [PanelId; 23] = [
+    pub const ALL: [PanelId; 24] = [
         PanelId::Tools,
         PanelId::ToolOptions,
         PanelId::Layers,
@@ -173,6 +178,7 @@ impl PanelId {
         PanelId::Ai,
         PanelId::Storyboard,
         PanelId::Voices,
+        PanelId::Commands,
     ];
 }
 
@@ -557,6 +563,16 @@ pub struct Workspace {
     /// here because a keymap belongs to the person, not to any one film.
     #[serde(default)]
     pub keymap: std::collections::BTreeMap<String, Option<KeyChord>>,
+    /// **Second (and further) keys for a command or tool**, by the same id as
+    /// [`Self::keymap`] — Animate lets one command have several (Insert
+    /// Keyframe on both F6 and S), and a keymap brought over from it should
+    /// keep them all.
+    #[serde(default)]
+    pub extra_keys: std::collections::BTreeMap<String, Vec<KeyChord>>,
+    /// **Keys that run a JSFL command from the shelf**, by its file stem
+    /// (`eyeLeft` → `Commands/eyeLeft.jsfl`). See [`crate::animate_keys`].
+    #[serde(default)]
+    pub script_keys: std::collections::BTreeMap<String, Vec<KeyChord>>,
     /// Settings for local AI models, vision, and LLM backends.
     #[serde(default)]
     pub ai: AiSettings,
@@ -639,7 +655,7 @@ impl Default for AiSettings {
 
 /// A serialisable keyboard chord — the modifiers and the key, stored by name so
 /// the keymap is plain, editable JSON.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct KeyChord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub command: bool,
@@ -682,14 +698,19 @@ impl KeyChord {
         Some(egui::KeyboardShortcut::new(modifiers, key))
     }
 
-    /// How this chord reads on screen — "Ctrl+Shift+S" and the like.
+    /// How this chord reads on screen — "Ctrl+Shift+S" on Windows, "⌘⇧S"-style
+    /// names on a Mac, where the command key is ⌘ and Alt is Option.
     pub fn label(&self) -> String {
+        let mac = cfg!(target_os = "macos");
         let mut parts: Vec<&str> = Vec::new();
-        if self.command || self.ctrl {
+        if self.ctrl && (mac || !self.command) {
             parts.push("Ctrl");
         }
+        if self.command {
+            parts.push(if mac { "Cmd" } else { "Ctrl" });
+        }
         if self.alt {
-            parts.push("Alt");
+            parts.push(if mac { "Option" } else { "Alt" });
         }
         if self.shift {
             parts.push("Shift");
@@ -1038,6 +1059,23 @@ impl Workspace {
     }
 
     /// Whether the user has changed this command's shortcut from its default.
+    /// **Every key that raises `command`**: its main key (the override, else
+    /// the built-in one) and any extra keys a keymap gave it. A tool's main key
+    /// is its letter unless the keymap moved or removed it.
+    pub fn shortcuts_for(&self, command: crate::command::Command) -> Vec<egui::KeyboardShortcut> {
+        let id = command_id(command);
+        let main = match (self.keymap.get(&id), command) {
+            (Some(chord), _) => chord.as_ref().and_then(KeyChord::to_shortcut),
+            (None, crate::command::Command::SelectTool(tool)) => tool
+                .shortcut()
+                .map(|key| egui::KeyboardShortcut::new(egui::Modifiers::NONE, key)),
+            (None, other) => other.shortcut(),
+        };
+        main.into_iter()
+            .chain(self.extra_keys.get(&id).into_iter().flatten().filter_map(KeyChord::to_shortcut))
+            .collect()
+    }
+
     pub fn has_shortcut_override(&self, command: crate::command::Command) -> bool {
         self.keymap.contains_key(&command_id(command))
     }
@@ -1328,6 +1366,7 @@ impl Workspace {
                 // list of sliders, and the lines go to whichever character is
                 // selected on the stage beside it.
                 slot(PanelId::Voices, Dock::RightOuter, 0, Dock::RightOuter),
+                slot(PanelId::Commands, Dock::RightOuter, 1, Dock::RightOuter),
             ],
             locked: false,
             theme: crate::theme::Theme::default(),
@@ -1359,6 +1398,8 @@ impl Workspace {
             trace: buzz_scene::TraceOptions::default(),
             asset_thumbnail_size: crate::assets_panel::ThumbnailSize::default(),
             keymap: std::collections::BTreeMap::new(),
+            extra_keys: std::collections::BTreeMap::new(),
+            script_keys: std::collections::BTreeMap::new(),
             ai: AiSettings::default(),
             ui_scale: default_ui_scale(),
             reduce_motion: false,

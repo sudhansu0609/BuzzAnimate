@@ -45,6 +45,7 @@ pub mod producer_panel;
 pub mod casting_dialog;
 pub mod recovery_panel;
 pub mod rig_panel;
+pub mod screen_color;
 pub mod selection;
 pub mod sequence_panel;
 pub mod shortcut_editor;

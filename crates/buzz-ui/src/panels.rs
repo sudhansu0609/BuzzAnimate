@@ -4608,17 +4608,39 @@ fn alpha_slider(ui: &mut Ui, color: &mut Color, hint: &str) -> bool {
     moved
 }
 
+/// A colour swatch with its picker, a screen eyedropper and a hex field.
+///
+/// Clicking the swatch opens the picker: a colour field and hue strip, the
+/// eyedropper, and (on macOS) the system Colors window. The eyedropper beside
+/// the swatch takes the exact colour of any pixel on the screen — the stage,
+/// a placed picture, another program — which the Eyedropper tool, reading
+/// vector paint, cannot.
 pub fn color_row(ui: &mut Ui, id: &str, color: &mut Color) -> bool {
     let mut changed = false;
+    let target = egui::Id::new(("color-row", id));
+    if let Some(picked) = crate::screen_color::take(target)
+        .or_else(|| crate::screen_color::poll_panel(ui.ctx(), target))
+        && picked != *color
+    {
+        *color = picked;
+        changed = true;
+    }
     ui.horizontal(|ui| {
         let mut egui_color = to_egui(*color);
-        if ui
-            .color_edit_button_srgba(&mut egui_color)
-            .on_hover_text("Pick a colour")
-            .changed()
-        {
+        if color_swatch_picker(ui, target, &mut egui_color) {
             *color = from_egui(egui_color);
             changed = true;
+        }
+        if crate::screen_color::available()
+            && ui
+                .button("\u{1F4A7}")
+                .on_hover_text(
+                    "Eyedropper: take the exact colour of any pixel on the screen. \
+                     Click to pick, Esc to cancel.",
+                )
+                .clicked()
+        {
+            crate::screen_color::pick(ui.ctx(), target);
         }
 
         // The field is authoritative only while it is being typed in: while
@@ -4648,6 +4670,56 @@ pub fn color_row(ui: &mut Ui, id: &str, color: &mut Color) -> bool {
             ui.memory_mut(|m| m.data.remove::<String>(key));
         }
     });
+    changed
+}
+
+/// The swatch itself, and the picker it opens when clicked.
+fn color_swatch_picker(ui: &mut Ui, target: egui::Id, color: &mut Color32) -> bool {
+    let size = egui::vec2(ui.spacing().interact_size.x, ui.spacing().interact_size.y);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let response = response.on_hover_text("Click to choose a colour");
+    if ui.is_rect_visible(rect) {
+        egui::color_picker::show_color_at(ui.painter(), *color, rect);
+        let stroke = if response.hovered() {
+            ui.visuals().widgets.hovered.fg_stroke
+        } else {
+            egui::Stroke::new(1.0, Palette::hairline())
+        };
+        ui.painter().rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+    }
+
+    let mut changed = false;
+    egui::Popup::from_toggle_button_response(&response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.spacing_mut().slider_width = 220.0;
+            changed |= egui::color_picker::color_picker_color32(
+                ui,
+                color,
+                egui::color_picker::Alpha::OnlyBlend,
+            );
+            if crate::screen_color::available() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("\u{1F4A7} Pick from screen")
+                        .on_hover_text("Take the exact colour of any pixel on the screen")
+                        .clicked()
+                    {
+                        crate::screen_color::pick(ui.ctx(), target);
+                        ui.close();
+                    }
+                    if ui
+                        .button("Colours\u{2026}")
+                        .on_hover_text("Open the macOS Colors window, linked to this swatch")
+                        .clicked()
+                    {
+                        crate::screen_color::open_panel(target, from_egui(*color));
+                        ui.close();
+                    }
+                });
+            }
+        });
     changed
 }
 

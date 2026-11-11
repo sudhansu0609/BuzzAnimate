@@ -45,6 +45,10 @@ const MAX_FRAME: u32 = 999_999;
 /// it, so the history folds the drag into one step.
 const ALT_COPY_LABEL: &str = "Duplicate";
 
+/// What a camera edit says when the camera is locked: the lock is a small
+/// icon on the Camera row, easy to forget, so the message says where it is.
+pub const CAMERA_LOCKED: &str = "The camera is locked \u{2014} click the lock on the Camera row to unlock it";
+
 /// The shortest drag that counts as drawing a bone, in screen pixels.
 ///
 /// A click with the Bone tool is far more likely to be a misfire than a
@@ -5928,7 +5932,7 @@ impl Editor {
             RemoveCameraKeyframe => {
                 // C1: a locked camera refuses removing a key too.
                 if self.doc.scene().camera().locked {
-                    self.status = Some("The camera is locked".into());
+                    self.status = Some(CAMERA_LOCKED.into());
                 } else {
                     let frame = self.current_frame;
                     self.doc.edit("Remove Camera Keyframe", |scene| {
@@ -9582,7 +9586,7 @@ impl Editor {
             let frame = self.current_frame;
             let camera = self.doc.scene().camera();
             if camera.locked {
-                self.status = Some("The camera is locked".into());
+                self.status = Some(CAMERA_LOCKED.into());
                 return;
             }
             let Some(start) = camera.keys().iter().rev().find(|k| k.frame <= frame).copied()
@@ -11710,7 +11714,7 @@ impl Editor {
             return false;
         }
         if self.doc.scene().camera().locked {
-            self.status = Some("The camera is locked".into());
+            self.status = Some(CAMERA_LOCKED.into());
             return true;
         }
         let frame = self.current_frame;
@@ -12955,7 +12959,7 @@ impl Editor {
         // C1: a locked camera refuses a new key — the same protection a
         // locked layer's frames get.
         if self.doc.scene().camera().locked {
-            self.status = Some("The camera is locked".into());
+            self.status = Some(CAMERA_LOCKED.into());
             return;
         }
         let frame = self.current_frame;
@@ -12985,7 +12989,7 @@ impl Editor {
         // C1: a locked camera refuses a named move, the same as any other
         // camera edit.
         if self.doc.scene().camera().locked {
-            self.status = Some("The camera is locked".into());
+            self.status = Some(CAMERA_LOCKED.into());
             return;
         }
         let from = self.current_frame;
@@ -13241,7 +13245,7 @@ impl Editor {
         // C1: a locked camera refuses `MoveCamera` — the same protection a
         // locked layer's artwork gets against a stray drag.
         if self.doc.scene().camera().locked {
-            self.status = Some("The camera is locked".into());
+            self.status = Some(CAMERA_LOCKED.into());
             return;
         }
         let frame = self.current_frame;

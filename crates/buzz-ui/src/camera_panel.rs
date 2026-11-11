@@ -91,7 +91,7 @@ pub fn camera_panel(
                     .logarithmic(true)
                     .fixed_decimals(2),
             )
-            .changed();
+            .edited();
     });
 
     changed |= angle(
@@ -148,7 +148,7 @@ pub fn camera_panel(
                 "How far the camera sits from the stage. Closer exaggerates the \
                  perspective; further flattens it.",
             )
-            .changed()
+            .edited()
         {
             out.set_focal_distance = Some(distance);
         }
@@ -229,6 +229,21 @@ pub fn camera_panel(
     out
 }
 
+/// **Changed by the person, not by the widget.** A field showing fewer
+/// decimals than the value has (zoom 88.64 % shown as "89 %") rounds the value
+/// and reports it as changed on a frame nobody touched it, and a camera field
+/// that changes writes a key — so every in-between frame the playhead stopped
+/// on gained a stray key. Only a drag, a click or typing counts.
+trait Edited {
+    fn edited(&self) -> bool;
+}
+
+impl Edited for egui::Response {
+    fn edited(&self) -> bool {
+        self.changed() && (self.dragged() || self.drag_stopped() || self.clicked() || self.has_focus() || self.lost_focus())
+    }
+}
+
 /// One angle, in degrees. Returns whether it changed.
 fn angle(ui: &mut Ui, label: &str, radians: &mut f64, limit: f64, hint: &str) -> bool {
     let mut degrees = radians.to_degrees();
@@ -242,7 +257,7 @@ fn angle(ui: &mut Ui, label: &str, radians: &mut f64, limit: f64, hint: &str) ->
                     .fixed_decimals(0),
             )
             .on_hover_text(hint)
-            .changed()
+            .edited()
         {
             *radians = degrees.to_radians();
             changed = true;
@@ -332,7 +347,7 @@ pub fn camera_hud(ui: &mut Ui, camera: &CameraTrack, frame: u32, driving: bool) 
                     .fixed_decimals(0),
             )
             .on_hover_text("Drag, or type a percentage")
-            .changed()
+            .edited()
         {
             key.zoom = percent / 100.0;
             changed = true;
@@ -356,7 +371,7 @@ pub fn camera_hud(ui: &mut Ui, camera: &CameraTrack, frame: u32, driving: bool) 
                     .fixed_decimals(1),
             )
             .on_hover_text("Roll: the horizon tipping")
-            .changed()
+            .edited()
         {
             key.rotation = degrees.to_radians();
             changed = true;
@@ -383,7 +398,7 @@ pub fn camera_hud(ui: &mut Ui, camera: &CameraTrack, frame: u32, driving: bool) 
                     .fixed_decimals(1),
             )
             .on_hover_text("Pitch: the camera nodding up and down")
-            .changed()
+            .edited()
         {
             key.pitch = pitch.to_radians();
             changed = true;
@@ -399,7 +414,7 @@ pub fn camera_hud(ui: &mut Ui, camera: &CameraTrack, frame: u32, driving: bool) 
                     .fixed_decimals(1),
             )
             .on_hover_text("Yaw: the camera turning left and right")
-            .changed()
+            .edited()
         {
             key.yaw = yaw.to_radians();
             changed = true;

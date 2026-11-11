@@ -6541,7 +6541,13 @@ impl App {
             self.editor.run(Command::ToggleCamera);
         }
 
-        if let Some(key) = response.set {
+        // C1: a locked camera refuses a typed or dragged shot, and a cut to
+        // an angle, the same as it refuses the Camera tool and F6.
+        let locked = self.editor.scene().camera().locked;
+        if locked && (response.set.is_some() || response.cut_angle.is_some()) {
+            self.editor.status = Some(crate::editor::CAMERA_LOCKED.into());
+        }
+        if let Some(key) = response.set.filter(|_| !locked) {
             self.editor.doc.edit("Camera", |scene| {
                 scene.camera_mut().enabled = true;
                 scene.camera_mut().set_key(key.clamped());
@@ -6587,7 +6593,7 @@ impl App {
             self.editor.doc.end_gesture();
             self.editor.status = Some("Angle saved".into());
         }
-        if let Some(i) = response.cut_angle {
+        if let Some(i) = response.cut_angle.filter(|_| !locked) {
             // Cut to a saved angle: key the camera to its state at the playhead,
             // so the shot jumps to that viewpoint here.
             self.editor.doc.edit("Cut to Angle", |scene| {
@@ -27572,5 +27578,121 @@ mod gen_background_tests {
             .count();
         println!("bold-stroked shapes on Mid/Ground: {bold_strokes}");
         assert!(bold_strokes > 0, "the plates carry no bold outlines");
+    }
+}
+
+#[cfg(test)]
+mod camera_row_ui_tests {
+    use super::*;
+
+    fn input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+            ..Default::default()
+        }
+    }
+
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::default() }
+    }
+
+    fn run(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let _ = ctx.run_ui(input(events), |ui| {
+            app.build_ui(ui);
+        });
+    }
+
+    fn keys(app: &App) -> Vec<u32> {
+        app.editor.scene().camera().keys().iter().map(|k| k.frame).collect()
+    }
+
+    /// A camera keyed at 0 (100 %) and 20 (80 %), so frame 10 sits between
+    /// them at a zoom no whole percentage shows.
+    fn tweened_camera() -> (App, egui::Context) {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.editor.doc.edit("Length", |s| {
+            s.set_frame_count(60);
+        });
+        app.editor.run(Command::ToggleCamera);
+        app.editor.doc.edit("Key", |s| {
+            let mut k = s.camera().keys()[0];
+            k.frame = 20;
+            k.zoom = 0.8;
+            s.camera_mut().set_key(k);
+        });
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        for _ in 0..3 {
+            run(&mut app, &ctx, vec![]);
+        }
+        (app, ctx)
+    }
+
+    /// Clicks the Camera row on `frame`.
+    fn click_camera_row(app: &mut App, ctx: &egui::Context, frame: u32) {
+        let row: egui::Rect = ctx.data(|d| d.get_temp(egui::Id::new("timeline-camera-row-rect"))).expect("the camera row is drawn");
+        let at = egui::pos2(row.min.x + 210.0 + app.editor.workspace.frame_width * (frame as f32 + 0.5), row.center().y);
+        run(app, ctx, vec![egui::Event::PointerMoved(at), button(at, true)]);
+        run(app, ctx, vec![button(at, false)]);
+        run(app, ctx, vec![]);
+    }
+
+    fn f6(app: &mut App, ctx: &egui::Context) {
+        let key = egui::Event::Key { key: egui::Key::F6, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::default() };
+        run(app, ctx, vec![key]);
+        run(app, ctx, vec![]);
+    }
+
+    fn drag_stage(app: &mut App, ctx: &egui::Context) {
+        let from = egui::pos2(700.0, 350.0);
+        run(app, ctx, vec![egui::Event::PointerMoved(from), button(from, true)]);
+        for i in 1..=6 {
+            run(app, ctx, vec![egui::Event::PointerMoved(from + egui::vec2(10.0 * i as f32, 0.0))]);
+        }
+        run(app, ctx, vec![button(from + egui::vec2(60.0, 0.0), false)]);
+        run(app, ctx, vec![]);
+    }
+
+    /// **Stopping on an in-between frame writes nothing.** The stage's camera
+    /// strip shows zoom as a whole percentage; at 89.x % egui rounded the field
+    /// and called it a change, and the strip keyed the camera there — locked
+    /// or not — so every frame the playhead rested on gained a stray key.
+    #[test]
+    fn selecting_the_camera_row_between_keys_adds_no_key() {
+        let (mut app, ctx) = tweened_camera();
+        click_camera_row(&mut app, &ctx, 7);
+        assert!(app.editor.camera_selected && app.editor.tool() == ToolId::Camera);
+        assert_eq!(app.editor.current_frame, 7);
+        for _ in 0..5 {
+            run(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(keys(&app), vec![0, 20], "looking at frame 7 must not key it");
+    }
+
+    #[test]
+    fn f6_and_the_camera_tool_key_the_camera_on_its_row() {
+        let (mut app, ctx) = tweened_camera();
+        click_camera_row(&mut app, &ctx, 10);
+        f6(&mut app, &ctx);
+        assert_eq!(keys(&app), vec![0, 10, 20], "F6 keys the camera at the playhead");
+
+        let before = app.editor.scene().camera().state_at(10).unwrap().center;
+        drag_stage(&mut app, &ctx);
+        let after = app.editor.scene().camera().state_at(10).unwrap().center;
+        assert!(after.x < before.x, "dragging right moves the camera left: {before:?} -> {after:?}");
+        assert_eq!(keys(&app), vec![0, 10, 20], "the pan moves the key at the playhead, adds none");
+    }
+
+    #[test]
+    fn a_locked_camera_says_how_to_unlock_it() {
+        let (mut app, ctx) = tweened_camera();
+        app.editor.doc.edit("Lock Camera", |s| s.camera_mut().locked = true);
+        click_camera_row(&mut app, &ctx, 10);
+        f6(&mut app, &ctx);
+        drag_stage(&mut app, &ctx);
+        assert_eq!(keys(&app), vec![0, 20]);
+        assert_eq!(app.editor.status.as_deref(), Some(crate::editor::CAMERA_LOCKED));
     }
 }

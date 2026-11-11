@@ -3033,6 +3033,56 @@ impl Scene {
         changed
     }
 
+    /// **Delete an object where the playhead is** — from the keyframe the
+    /// playhead is on, and under Edit Multiple Frames from every keyframe
+    /// beginning in the range.
+    ///
+    /// Partway into a keyframe's span, the frame is made a keyframe first, so
+    /// the frames before the playhead keep the object: deleting on frame 1915
+    /// must not reach back and empty frame 1533. [`Self::remove_object`]
+    /// takes the *first* keyframe holding the id, and F6 copies share ids,
+    /// so it used to delete from a keyframe long before the playhead.
+    pub fn remove_object_where(&mut self, at: EditAt, id: ObjectId) -> bool {
+        let Some((layer_id, _)) = self.find_object(id) else {
+            return false;
+        };
+        let mut changed = false;
+        let remove = |keyframe: &mut Keyframe| {
+            match keyframe.objects.iter().position(|o| o.id == id) {
+                Some(index) => {
+                    Arc::make_mut(&mut keyframe.objects).remove(index);
+                    true
+                }
+                None => false,
+            }
+        };
+        self.active_layers_mut().update(layer_id, |layer| {
+            let frames = &mut layer.frames;
+            if let Some((first, last)) = at.span {
+                for keyframe in frames.keyframes_mut() {
+                    if (first..=last).contains(&keyframe.start) {
+                        changed |= remove(keyframe);
+                    }
+                }
+                return;
+            }
+            let here = frames.keyframe_at(at.frame).is_some_and(|k| k.objects.iter().any(|o| o.id == id));
+            if !here {
+                return;
+            }
+            if !frames.is_keyframe(at.frame) {
+                frames.insert_keyframe(at.frame);
+            }
+            if let Some(keyframe) = frames.keyframe_at_mut(at.frame) {
+                changed |= remove(keyframe);
+            }
+        });
+        if changed {
+            self.bump();
+        }
+        changed
+    }
+
     /// Edit an object where the playhead is: making a keyframe first when Auto
     /// Keyframe is on, and across every keyframe in range under Edit Multiple
     /// Frames.

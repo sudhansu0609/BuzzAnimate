@@ -11759,6 +11759,29 @@ impl Editor {
         true
     }
 
+    /// The layers among `layers` that carry sound: a keyframe's sound, the
+    /// master audio, or an audio guide. Frame commands spanning other layers
+    /// leave these alone, so the dialogue stays under its picture.
+    fn sound_layers_among(&self, layers: impl IntoIterator<Item = LayerId>) -> Vec<LayerId> {
+        let scene = self.doc.scene();
+        let master = self.doc.master_audio().map(|(_, layer)| layer);
+        let mut out: Vec<LayerId> = Vec::new();
+        for id in layers {
+            if out.contains(&id) {
+                continue;
+            }
+            let carries = Some(id) == master
+                || scene
+                    .layers()
+                    .get(id)
+                    .is_some_and(|l| l.audio_guide || l.frames.keyframes().iter().any(|k| k.sound.is_some()));
+            if carries {
+                out.push(id);
+            }
+        }
+        out
+    }
+
     /// Apply a frame operation to all selected cells in one undo transaction.
     fn frame_op(&mut self, op: FrameOp) {
         if self.camera_selected && self.camera_frame_op(op) {
@@ -11770,6 +11793,18 @@ impl Editor {
         }
         targets.sort_by_key(|(layer, frame)| (*layer, std::cmp::Reverse(*frame)));
         targets.dedup();
+        // **The sound stays in sync.** A frame command across several layers
+        // leaves the layers carrying sound (a keyframe's sound, the master
+        // audio, an audio guide) as they are: inserting or removing frames on
+        // the picture must not slide the dialogue under it. Selected on its
+        // own, a sound layer is edited like any other.
+        let sound_layers = self.sound_layers_among(targets.iter().map(|(l, _)| *l));
+        let mut kept_sound = 0usize;
+        if targets.iter().any(|(l, _)| !sound_layers.contains(l)) {
+            let before = targets.len();
+            targets.retain(|(l, _)| !sound_layers.contains(l));
+            kept_sound = before - targets.len();
+        }
         let label = op.label();
         let mut changed = 0usize;
         let mut skipped = 0usize;
@@ -11805,7 +11840,8 @@ impl Editor {
         });
 
         self.status = Some(format!(
-            "{label}: {changed} cell(s) changed, {skipped} skipped"
+            "{label}: {changed} cell(s) changed, {skipped} skipped{}",
+            if kept_sound > 0 { " \u{2014} the sound layer kept in sync" } else { "" }
         ));
         // Removing frames can shorten the document past the playhead.
         self.set_frame(self.current_frame);
@@ -12012,6 +12048,13 @@ impl Editor {
             true
         });
         spans.retain(|(_, a, b)| a <= b);
+        // The sound stays in sync: across several layers, the sound layers
+        // are neither taken nor cut.
+        let sound = self.sound_layers_among(spans.iter().map(|(l, ..)| *l));
+        if spans.iter().any(|(l, ..)| !sound.contains(l)) {
+            spans.retain(|(l, ..)| !sound.contains(l));
+        }
+        let scene = self.doc.scene();
         let Some(first) = spans.iter().map(|(_, a, _)| *a).min() else {
             self.status = Some("There is no frame here to copy".into());
             return;
@@ -13443,9 +13486,11 @@ impl Editor {
             return;
         }
         let ids = self.selection.ids();
+        // Where the playhead is: frames before it keep what they had.
+        let at = self.edit_at();
         self.doc.edit("Delete", |scene| {
             for id in ids {
-                scene.remove_object(id);
+                scene.remove_object_where(at, id);
             }
         });
         self.selection.clear();
@@ -19113,6 +19158,80 @@ mod tests {
             assert_eq!(on_frame(&e, 10, *layer), 1, "a layer's artwork did not come back onto its own layer");
             assert_eq!(on_frame(&e, 0, *layer), 1, "the originals are untouched");
         }
+    }
+
+    /// **Frame commands across layers leave the sound in sync.** Selecting
+    /// frame 5 on the picture and the sound layer and pressing F5 or Shift+F5
+    /// used to slide the dialogue along with the picture.
+    #[test]
+    fn frame_commands_across_layers_leave_the_sound_layer_alone() {
+        let mut e = editor();
+        let art = e.selection.active_layer().expect("a layer");
+        let sound = e.doc_add_layer("sound", buzz_scene::LayerKind::Normal);
+        e.doc.edit("Setup", |s| {
+            for layer in [art, sound] {
+                s.update_layer(layer, |l| {
+                    l.frames.insert_frame(29);
+                    l.frames.insert_keyframe(10);
+                });
+            }
+            s.update_layer(sound, |l| {
+                l.frames.keyframe_at_mut(10).unwrap().sound = Some(buzz_scene::SoundRef::stream(buzz_scene::SoundId(1)));
+            });
+        });
+        let starts = |e: &Editor, l: LayerId| e.scene().layers().get(l).unwrap().frames.keyframes().iter().map(|k| k.start).collect::<Vec<_>>();
+
+        e.selection.set_timeline(buzz_ui::TimelineSelection::new([art, sound], 5, 5, art, 5));
+        e.run(Command::InsertFrame);
+        assert_eq!(starts(&e, art), vec![0, 11], "the picture moves along");
+        assert_eq!(starts(&e, sound), vec![0, 10], "the sound stays where it was");
+        assert!(e.status.as_deref().unwrap_or("").contains("sound"));
+
+        e.run(Command::RemoveFrame);
+        assert_eq!((starts(&e, art), starts(&e, sound)), (vec![0, 10], vec![0, 10]));
+
+        // Picked on its own, the sound layer is edited.
+        e.selection.set_timeline(buzz_ui::TimelineSelection::new([sound], 5, 5, sound, 5));
+        e.run(Command::InsertFrame);
+        assert_eq!(starts(&e, sound), vec![0, 11]);
+    }
+
+    /// **Delete takes the object from the frame you are on, not before it.**
+    /// F6 copies share ids, and Delete used to take the object out of the
+    /// first keyframe holding that id — on frame 30 it emptied frames 0–9.
+    #[test]
+    fn deleting_on_a_later_frame_leaves_the_earlier_frames_alone() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let layer = e.selection.active_layer().expect("a layer");
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE),
+            label: "Draw",
+        });
+        e.doc.edit("Frames", |s| {
+            s.update_layer(layer, |l| {
+                l.frames.insert_frame(49);
+                l.frames.insert_keyframe(10);
+                l.frames.insert_keyframe(40);
+            });
+        });
+        let on = |e: &Editor, f: u32| e.scene().layers().get(layer).unwrap().objects_at(f).len();
+        let id = e.scene().layers().get(layer).unwrap().objects_at(30)[0].id;
+
+        // Picked on the stage at frame 30, partway into the 10–39 span.
+        e.set_frame(30);
+        e.selection.select_one(id);
+        e.run(Command::Delete);
+        assert_eq!((on(&e, 0), on(&e, 10), on(&e, 29)), (1, 1, 1), "the frames before keep it");
+        assert_eq!((on(&e, 30), on(&e, 39)), (0, 0), "gone from the playhead on");
+        assert_eq!(on(&e, 40), 1, "the next keyframe's drawing is its own");
+
+        // A frame clicked in the timeline, then Delete: the same.
+        e.run(Command::Undo);
+        e.selection.set_timeline(buzz_ui::TimelineSelection::new([layer], 30, 30, layer, 30));
+        e.selection.select_timeline_contents(e.doc.scene(), 30);
+        e.run(Command::Delete);
+        assert_eq!((on(&e, 29), on(&e, 30)), (1, 0));
     }
 
     /// **Cut Frames cuts the frame selected, nothing else.** Cmd+Opt+X on

@@ -2875,6 +2875,7 @@ pub const KEYBOARD_COMMANDS: &[Command] = &[
     Command::ToggleLightGizmos,
     Command::ToggleBoneRig,
     Command::ToggleBoneMode,
+    Command::ToggleRotateMode,
     // The user's Animate key for renaming face layers (N2).
     Command::RenameFaceLayers,
     // Timeline. Animators press these constantly, so they must be live.
@@ -4875,6 +4876,7 @@ impl App {
             templates: template_names,
             sequence: sequence_menu,
             library_symbol: self.editor.library.selected.is_some(),
+            rotate_mode: self.editor.machine.rotate_mode(),
         }
     }
 
@@ -5211,6 +5213,35 @@ impl App {
                 }
                 if tool == buzz_ui::ToolId::Bone {
                     self.bone_tool_joint_options(ui);
+                }
+                if tool == buzz_ui::ToolId::FreeTransform {
+                    // **Rotate Mode**, as a button beside the tool it changes.
+                    // Raised as the command, so the button, Shift+Q and the
+                    // Modify menu are one switch.
+                    let on = self.editor.machine.rotate_mode();
+                    let shortcut = buzz_ui::command::shortcut_text(ui.ctx(), Command::ToggleRotateMode);
+                    if ui
+                        .selectable_label(on, "\u{21bb} Rotate only")
+                        .on_hover_text(format!(
+                            "Drag anywhere on the selection to turn it about its \
+                             transformation point. Scaling, skewing and moving are \
+                             switched off, so a limb can be posed about its joint \
+                             without being stretched or shifted. ({shortcut})"
+                        ))
+                        .clicked()
+                    {
+                        commands.push(Command::ToggleRotateMode);
+                    }
+                    if on {
+                        ui.label(
+                            egui::RichText::new(
+                                "Press a part and drag to rotate it. Drag the white circle \
+                                 to put the pivot on the joint first.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
                 }
                 if tool == buzz_ui::ToolId::FreeTransform && self.selection_has_followers() {
                     ui.separator();
@@ -8052,7 +8083,9 @@ impl App {
         };
         let corners = frame.corners().map(on_screen);
         let edges = frame.mid_edges().map(on_screen);
-        return match crate::tools::transform_zone(frame, pivot, at, grab) {
+        // Rotate Mode folded in, so every grip that only turns shows the turn.
+        let rotate_only = self.editor.machine.rotate_only();
+        return match crate::tools::effective_zone(rotate_only, frame, pivot, at, grab) {
             crate::tools::TransformZone::Rotate | crate::tools::TransformZone::Pivot => {
                 Some(egui::CursorIcon::Grab)
             }

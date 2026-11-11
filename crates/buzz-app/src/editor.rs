@@ -2594,9 +2594,13 @@ impl Editor {
         // Free Transform only grabs with Alt held: Alt-dragging an object that
         // is not selected yet copies it, so it is selected first. Without Alt a
         // press that is not on its gizmo is a marquee, as it has always been.
+        //
+        // **In Rotate Mode a press grabs what it is on**, as the arrow does: a
+        // limb is pressed and swung in one go, with no click to select it
+        // first. Nothing moves, so there is no copy to worry about.
         let grabs = match tool {
             ToolId::Selection => !mods.shift,
-            ToolId::FreeTransform => mods.alt && !mods.shift,
+            ToolId::FreeTransform => (mods.alt || self.machine.rotate_only()) && !mods.shift,
             _ => false,
         };
         let top = (tool == ToolId::Selection || grabs && !on_gizmo)
@@ -5367,6 +5371,12 @@ impl Editor {
             Distribute(op) => self.distribute_selection(op),
             MatchSize(op) => self.match_selection_size(op),
             MoveFrames { to, rows, copy } => self.move_frames(to, rows, copy),
+            // Rotate Mode means the selection does not move, from the keys
+            // either.
+            Nudge { .. } if self.machine.rotate_only() => {
+                self.status =
+                    Some("Rotate Mode is on \u{2014} Shift+Q to move the selection".into());
+            }
             Nudge { x, y } => {
                 if self.anchors_selected() {
                     // The anchors, not the object they belong to.
@@ -5433,6 +5443,23 @@ impl Editor {
                     self.workspace.rig.mode = mode;
                     self.status = Some(format!("Bone tool: {}", mode.label()));
                 }
+            }
+            // Shift+Q: Free Transform only turns. Turning it on picks the tool
+            // up, since that is the only tool it changes; turning it off leaves
+            // whatever is in hand where it is.
+            ToggleRotateMode => {
+                let on = !self.machine.rotate_mode();
+                self.machine.set_rotate_only(on);
+                if on && self.tool() != ToolId::FreeTransform {
+                    self.set_tool(ToolId::FreeTransform);
+                }
+                self.status = Some(if on {
+                    "Rotate Mode on \u{2014} drag to turn about the transformation point; \
+                     scale and move are off (Shift+Q to leave)"
+                        .into()
+                } else {
+                    "Rotate Mode off \u{2014} Free Transform scales, skews and moves again".into()
+                });
             }
             ToggleGuides => self.view.show_guides = !self.view.show_guides,
             ToggleSnapping => self.view.snap.to_objects = !self.view.snap.to_objects,
@@ -20920,6 +20947,123 @@ mod tests {
             "the point it was turned about moved to {now:?}, so the rotation \
              turned about something else"
         );
+    }
+
+    /// Drag in document space through the screen, as the window would.
+    fn rotate_mode_drag(e: &mut Editor, from: Point, to: Point) {
+        let camera = e.camera.clone();
+        let screen = |p: Point| camera.doc_to_screen(p);
+        e.pointer_down(screen(from), Mods::default());
+        e.pointer_move(screen(to), Mods::default());
+        e.pointer_up(screen(to));
+    }
+
+    /// **Rotate Mode: a corner turns instead of scaling.** The hinge stays put
+    /// and the square stays a square — a 100-unit square turned a little has a
+    /// bounding box wider than 100 and as tall as it is wide, where a corner
+    /// scale would have left it 100 by 150.
+    #[test]
+    fn rotate_mode_turns_from_a_corner_instead_of_scaling() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        e.run(Command::ToggleRotateMode);
+        assert_eq!(e.tool(), ToolId::FreeTransform, "Rotate Mode picks up Free Transform");
+        assert!(e.machine.rotate_only());
+
+        let hinge = Point::new(100.0, 100.0);
+        e.apply(ToolAction::SetTransformPoint { at: hinge });
+        rotate_mode_drag(&mut e, Point::new(200.0, 200.0), Point::new(200.0, 250.0));
+
+        let after = e.scene().find_object(id).expect("still there").1.bounds();
+        assert!(after.width() > 101.0, "it did not turn: {after:?}");
+        assert!(
+            (after.width() - after.height()).abs() < 0.5,
+            "a corner drag scaled it instead of turning it: {after:?}"
+        );
+        assert!((e.pivot().expect("a pivot") - hinge).hypot() < 1e-6, "the hinge moved");
+    }
+
+    /// **Rotate Mode: a drag inside the box turns, it does not move.** About
+    /// the centre, the centre is where it was.
+    #[test]
+    fn rotate_mode_turns_from_inside_instead_of_moving() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        e.run(Command::ToggleRotateMode);
+
+        // An eighth of a turn: a quarter would leave a square's box unchanged.
+        rotate_mode_drag(&mut e, Point::new(150.0, 110.0), Point::new(180.0, 120.0));
+
+        let after = e.scene().find_object(id).expect("still there").1.bounds();
+        assert!(after.width() > 101.0, "it did not turn: {after:?}");
+        assert!(
+            (after.center() - Point::new(150.0, 150.0)).hypot() < 0.5,
+            "it moved: {after:?}"
+        );
+    }
+
+    /// **Rotate Mode: the arrow keys do not nudge** — moving is off.
+    #[test]
+    fn rotate_mode_ignores_the_nudge_keys() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        e.run(Command::ToggleRotateMode);
+        let before = e.scene().find_object(id).expect("there").1.bounds();
+        e.run(Command::Nudge { x: 8, y: 0 });
+        assert_eq!(e.scene().find_object(id).expect("there").1.bounds(), before);
+    }
+
+    /// **Rotate Mode: press a part and swing it**, with no click to select it
+    /// first. The part that was selected before is left alone.
+    #[test]
+    fn rotate_mode_grabs_the_part_under_the_press() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let a = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a");
+        let b = draw_square(&mut e, 300.0, 300.0, 100.0, Color::WHITE).expect("b");
+        e.selection.select_one(a);
+        e.run(Command::ToggleRotateMode);
+        let a_before = e.scene().find_object(a).expect("a").1.bounds();
+
+        rotate_mode_drag(&mut e, Point::new(350.0, 310.0), Point::new(380.0, 320.0));
+
+        assert!(e.selection.contains(b), "the pressed part was not selected");
+        let b_after = e.scene().find_object(b).expect("b").1.bounds();
+        assert!(b_after.width() > 101.0, "the pressed part did not turn: {b_after:?}");
+        assert!(
+            (b_after.center() - Point::new(350.0, 350.0)).hypot() < 0.5,
+            "the pressed part moved: {b_after:?}"
+        );
+        assert_eq!(e.scene().find_object(a).expect("a").1.bounds(), a_before);
+    }
+
+    /// **Shift+Q toggles Rotate Mode**, and the mode survives putting Free
+    /// Transform down — it only restricts Free Transform, so the arrow still
+    /// moves things meanwhile.
+    #[test]
+    fn rotate_mode_is_shift_q_and_survives_a_tool_change() {
+        let shortcut = Command::ToggleRotateMode.shortcut().expect("a shortcut");
+        assert_eq!(
+            (shortcut.modifiers, shortcut.logical_key),
+            (egui::Modifiers::SHIFT, egui::Key::Q)
+        );
+        let mut e = editor();
+        e.run(Command::ToggleRotateMode);
+        assert!(e.machine.rotate_mode());
+        e.set_tool(ToolId::Selection);
+        assert!(e.machine.rotate_mode(), "picking up the arrow dropped the mode");
+        assert!(!e.machine.rotate_only(), "the mode restricted the arrow");
+        e.set_tool(ToolId::FreeTransform);
+        assert!(e.machine.rotate_only());
+        e.run(Command::ToggleRotateMode);
+        assert!(!e.machine.rotate_mode());
+        assert_eq!(e.tool(), ToolId::FreeTransform, "turning it off changed the tool");
     }
 
     /// **A transformation point parked on a joint must not swallow the

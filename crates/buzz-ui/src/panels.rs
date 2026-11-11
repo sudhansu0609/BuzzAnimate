@@ -72,6 +72,8 @@ pub struct MenuState<'a> {
     /// A symbol is chosen in the Library — with a stage instance selected,
     /// what AI ▸ Rig Character as Layers… works on.
     pub library_symbol: bool,
+    /// Free Transform is in Rotate Mode, for the tick in Modify ▸ Transform.
+    pub rotate_mode: bool,
 }
 
 /// What the Sequence and Shot menus need about the active scene and the
@@ -114,6 +116,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         templates,
         sequence,
         library_symbol,
+        rotate_mode,
     } = *state;
     let mut raised = Vec::new();
 
@@ -958,6 +961,25 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                     Command::RotateAnticlockwise,
                 ] {
                     item(ui, c, has_selection, &mut raised);
+                }
+                ui.separator();
+                // A mode, not an action, so it carries a tick like the View
+                // toggles do — and is always enabled: it can be set up before
+                // anything is selected.
+                let mark = if rotate_mode { "✔ " } else { "   " };
+                let command = Command::ToggleRotateMode;
+                let button = egui::Button::new(format!("{mark}{}", command.label()))
+                    .shortcut_text(shortcut_text(ui.ctx(), command));
+                if ui
+                    .add(button)
+                    .on_hover_text(
+                        "Free Transform only rotates, about the transformation point. \
+                         Scaling, skewing and moving are switched off.",
+                    )
+                    .clicked()
+                {
+                    raised.push(command);
+                    ui.close();
                 }
             });
         });
@@ -5908,6 +5930,7 @@ mod tests {
                     templates: &[],
                     sequence: &sequence,
                     library_symbol: false,
+                    rotate_mode: false,
                 },
             );
             let _ = tool_bar(ui, ToolId::Selection, &mut style);
@@ -6049,6 +6072,7 @@ mod tests {
                     templates: &[],
                     sequence: &sequence,
                     library_symbol: false,
+                    rotate_mode: false,
                 },
             );
             let _ = properties_panel(

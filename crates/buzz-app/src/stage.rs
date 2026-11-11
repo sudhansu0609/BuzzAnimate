@@ -1063,6 +1063,20 @@ fn draw_selection(
         return;
     }
 
+    // **Rotate Mode has nothing to scale**, so it draws no square handles —
+    // squares are a promise of resizing. A round grip at each corner says
+    // "turn from here" instead, and the ring hint is left out because the
+    // whole box turns, not only the band outside the corners.
+    if editor.machine.rotate_only() {
+        const GRIP: f32 = 3.5;
+        for corner in corners {
+            painter.circle_filled(corner, GRIP, Palette::handle_fill());
+            painter.circle_stroke(corner, GRIP, Stroke::new(1.0, Palette::handle_stroke()));
+        }
+        draw_pivot(painter, editor, &to_screen);
+        return;
+    }
+
     draw_rotate_hint(painter, corners, pointer);
     const HANDLE: f32 = 6.0;
     for corner in handles {

@@ -157,6 +157,7 @@ pub fn route(command: Command) -> Route {
         | DeleteSymbol | NewLibraryFolder | BrushFromSelection | ToggleLayoutLock | ToggleTheme
         | ToggleReduceMotion | ResetWorkspace | SaveWorkspace | AddSun | AddSky | AddLamp
         | AddGloom | AddFire | AddStorm | ToggleLightGizmos | ToggleBoneRig | ToggleBoneMode
+        | ToggleRotateMode
         | AddScene
         | DuplicateScene | AddPerson | ClearModifiers | BakeModifiers | SetReverse
         | ClearReverse | AddProfileRight | AddProfileLeft | AddThreeQuarterRight

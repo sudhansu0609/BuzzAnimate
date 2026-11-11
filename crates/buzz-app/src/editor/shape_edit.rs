@@ -113,7 +113,10 @@ impl Editor {
             ToolId::Selection if !mods.shift && !mods.alt => {
                 self.edit_gesture_at(doc, screen, mods)
             }
-            ToolId::FreeTransform if mods.ctrl => self.distort_gesture_at(doc, screen, mods),
+            // Distort reshapes, which Rotate Mode has switched off.
+            ToolId::FreeTransform if mods.ctrl && !self.machine.rotate_only() => {
+                self.distort_gesture_at(doc, screen, mods)
+            }
             _ => None,
         };
         let began = gesture.is_some();

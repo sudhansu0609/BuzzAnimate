@@ -344,6 +344,11 @@ pub enum Command {
     /// **BM**: switch the Bone tool between Create bones and Move bones.
     /// Does nothing unless the Bone tool is the active tool.
     ToggleBoneMode,
+    /// **Rotate Mode**: Free Transform only turns the selection about its
+    /// transformation point. Scaling, skewing and moving are switched off, so
+    /// posing a limb about its joint cannot stretch or shift it by a mis-grab.
+    /// Turning it on picks up Free Transform.
+    ToggleRotateMode,
 
     // Staging and performance
     /// **Set a scene**: ground, backdrop, lights and a cast standing in it.
@@ -816,6 +821,7 @@ command_table! {
             ToggleLightGizmos => "toggle_light_gizmos",
             ToggleBoneRig => "toggle_bone_rig",
             ToggleBoneMode => "toggle_bone_mode",
+            ToggleRotateMode => "toggle_rotate_mode",
             SetScene => "set_scene",
             DirectScene => "direct_scene",
             SceneryFor => "scenery_for",
@@ -1274,6 +1280,7 @@ impl Command {
             ToggleLightGizmos => "Light Handles",
             ToggleBoneRig => "Bones",
             ToggleBoneMode => "Bone Tool: Create / Move",
+            ToggleRotateMode => "Rotate Mode",
 
             SetScene => "Set the Scene\u{2026}",
             DirectScene => "Direct a Story\u{2026}",
@@ -1545,6 +1552,9 @@ impl Command {
             // BM: Shift+M, beside the Bone tool's own `M`. Only does anything
             // while the Bone tool is held (see `Editor::run`).
             ToggleBoneMode => sc(Modifiers::SHIFT, Key::M),
+            // Shift+Q, beside Free Transform's own `Q`, as Shift+M sits beside
+            // the Bone tool's `M`. Free in Animate's defaults.
+            ToggleRotateMode => sc(Modifiers::SHIFT, Key::Q),
 
             // Voice commands. F5-F9 are taken (frames, symbols, Actions);
             // F12 and Shift+F12 were free.
@@ -1830,6 +1840,7 @@ pub fn palette_commands() -> Vec<Command> {
         ToggleLightGizmos,
         ToggleBoneRig,
         ToggleBoneMode,
+        ToggleRotateMode,
         SetScene,
         DirectScene,
         AddScene,
@@ -2071,6 +2082,7 @@ mod tests {
             ToggleLightGizmos,
             ToggleBoneRig,
             ToggleBoneMode,
+            ToggleRotateMode,
             SetScene,
             DirectScene,
             AddScene,
@@ -2217,7 +2229,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            235
+            236
         );
     }
 

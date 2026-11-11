@@ -522,6 +522,16 @@ pub struct ToolMachine {
     /// Screen-space position, for the navigation tools.
     last_screen: Point,
     clock: Clock,
+    /// **Rotate Mode** (Shift+Q): Free Transform only turns.
+    ///
+    /// Every part of the gizmo — corner, side handle, edge, ring, and the
+    /// artwork inside the box — becomes a grip that rotates about the
+    /// transformation point, and nothing scales, skews or moves. Posing a
+    /// limb is a long run of turns about its joint, and one grab that lands a
+    /// few pixels onto a corner and stretches the forearm undoes the pose.
+    /// The transformation point itself can still be dragged, because placing
+    /// it on the joint is what makes the turns right.
+    rotate_only: bool,
 }
 
 /// A drag shorter than this is a click, not a drag.
@@ -540,7 +550,34 @@ impl ToolMachine {
             gesture: Gesture::Idle,
             last_screen: Point::ORIGIN,
             clock: Clock::Wall(std::time::Instant::now()),
+            rotate_only: false,
         }
+    }
+
+    /// Turn Rotate Mode on or off. See [`Self::rotate_only`].
+    ///
+    /// Kept across tool changes: it is a way of working, and putting Free
+    /// Transform down to pick something with the arrow must not drop it.
+    pub fn set_rotate_only(&mut self, on: bool) {
+        self.rotate_only = on;
+    }
+
+    /// Is Rotate Mode switched on, whichever tool is in hand?
+    pub fn rotate_mode(&self) -> bool {
+        self.rotate_only
+    }
+
+    /// Is Free Transform restricted to rotation? Only means anything while
+    /// Free Transform is the tool in hand.
+    pub fn rotate_only(&self) -> bool {
+        self.rotate_only && self.tool == ToolId::FreeTransform
+    }
+
+    /// The gizmo zone a press at `at` lands in, **as this machine will act on
+    /// it** — Rotate Mode folded in. Every Free Transform decision goes through
+    /// here so the press, the preview and the release agree.
+    fn zone_at(&self, frame: TransformBox, pivot: Point, at: Point, grab: f64) -> TransformZone {
+        effective_zone(self.rotate_only(), frame, pivot, at, grab)
     }
 
     /// Drive stroke timing from a supplied clock instead of wall time.
@@ -633,7 +670,7 @@ impl ToolMachine {
         {
             let pivot = ctx.pivot.unwrap_or_else(|| frame.center());
             let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
-            if transform_zone(frame, pivot, doc, grab) == TransformZone::Pivot {
+            if self.zone_at(frame, pivot, doc, grab) == TransformZone::Pivot {
                 self.begin_pivot_drag(doc, screen, pivot);
                 return ToolAction::None;
             }
@@ -798,8 +835,10 @@ impl ToolMachine {
             _ => return false,
         };
         let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+        // In Rotate Mode the inside of the box turns rather than moves, so the
+        // zone is never `Inside` there and this answers no.
         if !matches!(
-            transform_zone(frame, pivot, at, grab),
+            self.zone_at(frame, pivot, at, grab),
             TransformZone::Inside
         ) {
             return false;
@@ -837,7 +876,7 @@ impl ToolMachine {
         // the pivot is explicitly moved.
         let pivot = ctx.pivot.unwrap_or_else(|| frame.center());
         let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
-        let zone = transform_zone(frame, pivot, at, grab);
+        let zone = self.zone_at(frame, pivot, at, grab);
         matches!(
             zone,
             TransformZone::Rotate
@@ -861,14 +900,21 @@ impl ToolMachine {
     /// another object, and reaching for the handle to resize must not pick that
     /// object up instead. A press that grabs the gizmo is left for the gizmo.
     /// Only Free Transform has one.
+    ///
+    /// **The drawn gizmo, whatever Rotate Mode does with it.** In Rotate Mode
+    /// the artwork inside the box turns too, but a press on another part
+    /// inside the box must still be able to pick that part up — so only the
+    /// handles, ring, edges and point count here, as they always have.
     pub fn press_on_gizmo(&self, at: Point, ctx: &ToolContext<'_>) -> bool {
-        self.begins_a_transform(at, ctx).is_some()
-            || (self.tool == ToolId::FreeTransform
-                && ctx.selection_box.is_some_and(|frame| {
-                    let pivot = ctx.pivot.unwrap_or_else(|| frame.center());
-                    transform_zone(frame, pivot, at,
-                        TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE)) == TransformZone::Pivot
-                }))
+        if self.tool != ToolId::FreeTransform {
+            return false;
+        }
+        let Some(frame) = ctx.selection_box else {
+            return false;
+        };
+        let pivot = ctx.pivot.unwrap_or_else(|| frame.center());
+        let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+        !matches!(transform_zone(frame, pivot, at, grab), TransformZone::Inside)
     }
 
     pub fn pointer_move(&mut self, doc: Point, screen: Point, mods: Mods) -> ToolAction {
@@ -1347,7 +1393,7 @@ impl ToolMachine {
                     let zone = match (ctx.pivot, ctx.selection_box) {
                         (Some(pivot), Some(frame)) if self.tool == ToolId::FreeTransform => {
                             let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
-                            Some((pivot, frame, transform_zone(frame, pivot, *origin, grab)))
+                            Some((pivot, frame, self.zone_at(frame, pivot, *origin, grab)))
                         }
                         _ => None,
                     };
@@ -1643,7 +1689,7 @@ impl ToolMachine {
                 // it does, exactly as in Animate: the pointer's shape there is
                 // the promise, and changing the answer half way through a drag
                 // would break it.
-                let zone = transform_zone(frame, pivot, origin, grab);
+                let zone = self.zone_at(frame, pivot, origin, grab);
                 match zone {
                     TransformZone::Pivot => {
                         if was_click {
@@ -1659,6 +1705,17 @@ impl ToolMachine {
                     // artwork, and picking whatever happens to lie under a
                     // corner would take the selection away from the very thing
                     // the user was lining up to transform.
+                    // In Rotate Mode the artwork inside the box is a rotate
+                    // grip too, but a click on it is still how another object
+                    // inside the box gets chosen.
+                    TransformZone::Rotate
+                        if was_click && self.rotate_only() && frame.contains(origin) =>
+                    {
+                        ToolAction::PickAt {
+                            point: end,
+                            additive: mods.shift,
+                        }
+                    }
                     TransformZone::Corner
                     | TransformZone::Rotate
                     | TransformZone::Edge(_)
@@ -2409,6 +2466,31 @@ pub(crate) fn transform_zone(
     TransformZone::Inside
 }
 
+/// [`transform_zone`], with **Rotate Mode** folded in when `rotate_only`.
+///
+/// The transformation point stays the transformation point, and empty stage
+/// outside the box stays `Inside` (a marquee). Everything else — every handle,
+/// every edge, the ring and the artwork within the box — turns.
+///
+/// Public to the crate so the cursor asks the same question the press does.
+pub(crate) fn effective_zone(
+    rotate_only: bool,
+    frame: TransformBox,
+    pivot: Point,
+    at: Point,
+    grab: f64,
+) -> TransformZone {
+    let zone = transform_zone(frame, pivot, at, grab);
+    if !rotate_only {
+        return zone;
+    }
+    match zone {
+        TransformZone::Pivot => TransformZone::Pivot,
+        TransformZone::Inside if !frame.contains(at) => TransformZone::Inside,
+        _ => TransformZone::Rotate,
+    }
+}
+
 /// The corner of the box opposite the one nearest `at` — what an Alt-rotation
 /// holds still. Measured on the focal plane against the box's turned corners, so
 /// "opposite" is the box's own opposite however far it has turned.
@@ -2697,6 +2779,32 @@ mod tests {
 
     fn box_10() -> Rect {
         Rect::new(0.0, 0.0, 100.0, 100.0)
+    }
+
+    /// **Rotate Mode turns every grip into a rotation** — corners, side
+    /// handles, edges and the inside of the box — but keeps the
+    /// transformation point draggable and empty stage a marquee.
+    #[test]
+    fn rotate_mode_folds_every_grip_into_rotation() {
+        let frame = TransformBox::axis_aligned(box_10());
+        let pivot = Point::new(50.0, 50.0);
+        let zone = |x: f64, y: f64| effective_zone(true, frame, pivot, Point::new(x, y), 8.0);
+        assert_eq!(zone(50.0, 50.0), TransformZone::Pivot, "the point");
+        for (x, y, what) in [
+            (0.0, 0.0, "a corner"),
+            (50.0, 0.0, "a side handle"),
+            (75.0, 0.0, "an edge"),
+            (-15.0, -15.0, "the ring"),
+            (30.0, 30.0, "inside"),
+        ] {
+            assert_eq!(zone(x, y), TransformZone::Rotate, "{what}");
+        }
+        assert_eq!(zone(300.0, 300.0), TransformZone::Inside, "empty stage");
+        // Off, it is exactly the plain zone.
+        assert_eq!(
+            effective_zone(false, frame, pivot, Point::new(0.0, 0.0), 8.0),
+            TransformZone::Corner
+        );
     }
 
     /// Which part of the gizmo a drag lands on. Getting this wrong means a

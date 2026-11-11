@@ -158,6 +158,88 @@ pub struct Request {
     /// Open ComfyUI's own page on this workflow, with this request's values
     /// in it, so the run can be watched there node by node.
     pub show_in_comfy: bool,
+    /// Load a GGUF copy of each model when one is installed: Q8 is about
+    /// 60% of the memory at nearly the same picture. See [`use_gguf`].
+    pub small_models: bool,
+}
+
+/// The ComfyUI-GGUF loaders, and the input that names the file.
+const GGUF_LOADERS: [(&str, &str, &str); 2] = [("UNETLoader", "UnetLoaderGGUF", "unet_name"), ("CLIPLoader", "CLIPLoaderGGUF", "clip_name")];
+
+/// What a model file is, without its precision: `z_image_turbo_bf16.safetensors`
+/// and `z_image_turbo-Q8_0.gguf` are both `zimageturbo`; `qwen_3_4b` and
+/// `Qwen3-4B-UD-Q8_K_XL` both `qwen34b`.
+fn model_key(file: &str) -> String {
+    let stem = Path::new(file).file_stem().and_then(|s| s.to_str()).unwrap_or(file).to_ascii_lowercase();
+    let marker = |t: &str| {
+        matches!(t, "bf16" | "fp16" | "fp32" | "f16" | "f32" | "ud" | "gguf")
+            || ["fp8", "e4m3", "e5m2"].iter().any(|p| t.starts_with(p))
+            || quant_bits(t).is_some()
+    };
+    stem.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| !t.is_empty()).take_while(|t| !marker(t)).collect()
+}
+
+/// `q8` → 8, `iq4` → 4: the bits of a GGUF quant token.
+fn quant_bits(token: &str) -> Option<u8> {
+    let t = token.strip_prefix("iq").or_else(|| token.strip_prefix('q'))?;
+    let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() || !t[digits.len()..].chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The best GGUF copy of `full` among `choices`: the same model, the most
+/// bits up to Q8 (an F16 GGUF saves nothing).
+fn gguf_for(full: &str, choices: &[&str]) -> Option<String> {
+    let key = model_key(full);
+    choices
+        .iter()
+        .filter(|c| c.to_ascii_lowercase().ends_with(".gguf") && !key.is_empty() && model_key(c) == key)
+        .filter_map(|c| {
+            let stem = Path::new(c).file_stem()?.to_str()?.to_ascii_lowercase();
+            let bits = stem.split(|ch: char| !ch.is_ascii_alphanumeric()).find_map(quant_bits)?;
+            (bits <= 8).then_some((bits, c.len(), *c))
+        })
+        // Most bits; of equals, the plainest name (Q8_0 before UD-Q8_K_XL).
+        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+        .map(|(_, _, c)| c.to_string())
+}
+
+/// **Smaller models**: each UNET / CLIP loader of the API copy is swapped for
+/// ComfyUI-GGUF's when a GGUF of the same model is installed. `info` gives a
+/// GGUF loader class's `/object_info` entry (`{}` when it is not installed).
+/// Returns what to tell the user.
+pub fn use_gguf(api: &mut Value, info: impl Fn(&str) -> Value) -> Vec<String> {
+    let mut notes = Vec::new();
+    let Some(map) = api.as_object_mut() else {
+        return notes;
+    };
+    for (full_class, gguf_class, input) in GGUF_LOADERS {
+        let wanted: Vec<&mut Value> = map.values_mut().filter(|n| n.get("class_type").and_then(Value::as_str) == Some(full_class)).collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let entry = info(gguf_class);
+        let Some(files) = entry.pointer(&format!("/{gguf_class}/input/required/{input}/0")).and_then(Value::as_array) else {
+            notes.push(format!("{gguf_class} is not installed in ComfyUI (ComfyUI-GGUF), so the full-size models were used"));
+            continue;
+        };
+        let files: Vec<&str> = files.iter().filter_map(Value::as_str).collect();
+        for node in wanted {
+            let Some(inputs) = node.get_mut("inputs").and_then(Value::as_object_mut) else { continue };
+            let Some(full) = inputs.get(input).and_then(Value::as_str).map(str::to_string) else { continue };
+            let Some(small) = gguf_for(&full, &files) else {
+                notes.push(format!("no GGUF copy of {full} is installed, so it was loaded full size"));
+                continue;
+            };
+            // The GGUF loaders take only the file (and a CLIP's type).
+            inputs.retain(|k, _| k == input || (full_class == "CLIPLoader" && k == "type"));
+            inputs.insert(input.into(), Value::from(small));
+            node["class_type"] = Value::from(gguf_class);
+        }
+    }
+    notes
 }
 
 /// A finished picture.
@@ -225,6 +307,9 @@ pub fn prepare(req: &Request, client: &ComfyClient) -> Result<(Value, Vec<String
     apply_loras(&mut api, &req.loras);
     if req.skip_upscale {
         comfy_profile::strip_upscale(&mut api);
+    }
+    if req.small_models {
+        notes.extend(use_gguf(&mut api, |class| client.node_info(class).unwrap_or_default()));
     }
     // A WAS "Image Save" writes wherever its own path says; as a plain
     // SaveImage the picture lands in ComfyUI's output and is read back here.
@@ -684,6 +769,7 @@ mod tests {
             skip_upscale: true,
             start_comfy: false,
             show_in_comfy: true,
+            small_models: false,
         };
         fill_ui_workflow(&mut ui, &req, &bound);
         let w = |i: usize| ui["nodes"][i]["widgets_values"].clone();
@@ -733,6 +819,33 @@ mod tests {
         assert_eq!(api["15"]["inputs"]["strength_01"], json!(0.9));
         assert_eq!(api["30"]["inputs"]["strength_model"], json!(0.25));
         assert_eq!(api["30"]["inputs"]["strength_clip"], json!(0.25));
+    }
+
+    #[test]
+    fn small_models_swap_in_the_q8_gguf_of_the_same_model() {
+        let mut api = json!({
+            "1": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_4b.safetensors", "type": "lumina2", "device": "default"}},
+            "8": {"class_type": "UNETLoader", "inputs": {"unet_name": "z_image_turbo_bf16.safetensors", "weight_dtype": "default"}},
+            "2": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}}
+        });
+        let info = |class: &str| match class {
+            "UnetLoaderGGUF" => json!({"UnetLoaderGGUF": {"input": {"required": {"unet_name": [[
+                "flux-Q8_0.gguf", "z_image_turbo-Q4_K_M.gguf", "z_image_turbo-Q8_0.gguf", "z_image_turbo-F16.gguf"
+            ]]}}}}),
+            "CLIPLoaderGGUF" => json!({"CLIPLoaderGGUF": {"input": {"required": {"clip_name": [[
+                "Qwen3-4B-UD-Q8_K_XL.gguf", "Qwen3-4B-Q8_0.gguf", "t5xxl-Q8_0.gguf"
+            ]]}}}}),
+            _ => json!({}),
+        };
+        assert!(use_gguf(&mut api, info).is_empty());
+        assert_eq!(api["8"], json!({"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "z_image_turbo-Q8_0.gguf"}}));
+        assert_eq!(api["1"], json!({"class_type": "CLIPLoaderGGUF", "inputs": {"clip_name": "Qwen3-4B-Q8_0.gguf", "type": "lumina2"}}));
+        assert_eq!(api["2"]["class_type"], "VAELoader");
+
+        // No ComfyUI-GGUF: the workflow's own loaders, and a note saying so.
+        let mut plain = json!({"8": {"class_type": "UNETLoader", "inputs": {"unet_name": "z_image_turbo_bf16.safetensors"}}});
+        assert_eq!(use_gguf(&mut plain, |_| json!({})).len(), 1);
+        assert_eq!(plain["8"]["class_type"], "UNETLoader");
     }
 
     #[test]

@@ -296,6 +296,18 @@ impl ComfyClient {
             .map_err(|e| format!("ComfyUI /object_info: {e}"))
     }
 
+    /// `GET /object_info/<class>`: one node class, `{}` when it is not
+    /// installed. Its file lists are read fresh, so a model just downloaded
+    /// is already in them.
+    pub fn node_info(&self, class: &str) -> Result<Value, String> {
+        agent(Duration::from_secs(30))
+            .get(&format!("{}/object_info/{class}", self.base_url))
+            .call()
+            .map_err(|e| format!("ComfyUI /object_info/{class}: {e}"))?
+            .into_json()
+            .map_err(|e| format!("ComfyUI /object_info/{class}: {e}"))
+    }
+
     /// [`Self::queue`] **without a client id**, so ComfyUI broadcasts the
     /// job's progress to every open page — its own web UI shows the run live
     /// (the running node outlined, the sampler's steps) as well as

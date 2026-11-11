@@ -50,6 +50,9 @@ pub struct Settings {
     /// Unload ComfyUI's models before a trace, Split Picture or Remove
     /// Object, which need the same memory.
     pub free_before_tasks: bool,
+    /// Load GGUF (Q8) copies of the workflow's models when they are
+    /// installed: about 11 GB instead of 19 GB, so nothing swaps.
+    pub small_models: bool,
 }
 
 impl Default for Settings {
@@ -70,6 +73,7 @@ impl Default for Settings {
             lora_strengths: Default::default(),
             keep_models_loaded: true,
             free_before_tasks: true,
+            small_models: true,
         }
     }
 }
@@ -250,6 +254,7 @@ impl GenerateImage {
             skip_upscale: self.settings.skip_upscale,
             start_comfy: self.settings.start_comfy,
             show_in_comfy: self.settings.show_in_comfy,
+            small_models: self.settings.small_models,
         };
         let keep = self.settings.keep_models_loaded;
         let shared = Arc::new(Mutex::new(JobState::Running("Starting…".into(), None)));
@@ -525,6 +530,12 @@ impl GenerateImage {
                     .on_hover_text(
                         "Trace Bitmap, Split Picture into Layers and Remove Object need the same memory. \
                          The models load again with the next picture.",
+                    );
+                ui.checkbox(&mut self.settings.small_models, "Use the smaller models (GGUF Q8) when installed")
+                    .on_hover_text(
+                        "Loads the GGUF copy of the workflow's picture model and text encoder from ComfyUI's \
+                         models folder (needs the ComfyUI-GGUF node): about 11 GB instead of 19 GB, at nearly \
+                         the same picture. Off, or no GGUF copy: the workflow's own files.",
                     );
                 let memory = self.memory.lock().unwrap().clone();
                 let mut restart = None;

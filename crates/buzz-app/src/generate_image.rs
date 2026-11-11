@@ -44,6 +44,12 @@ pub struct Settings {
     pub destination: Destination,
     /// Strengths by LoRA file name, so a slider survives reopening.
     pub lora_strengths: std::collections::BTreeMap<String, f32>,
+    /// Keep ComfyUI's models loaded between pictures, so only the first one
+    /// waits for them. Off: they are unloaded after every picture.
+    pub keep_models_loaded: bool,
+    /// Unload ComfyUI's models before a trace, Split Picture or Remove
+    /// Object, which need the same memory.
+    pub free_before_tasks: bool,
 }
 
 impl Default for Settings {
@@ -62,8 +68,34 @@ impl Default for Settings {
             show_in_comfy: true,
             destination: Destination::Library,
             lora_strengths: Default::default(),
+            keep_models_loaded: true,
+            free_before_tasks: true,
         }
     }
+}
+
+impl Settings {
+    /// Hand the memory choices to the ComfyUI client, which acts on them
+    /// when it starts ComfyUI and before a heavy task.
+    fn apply_memory(&self) {
+        crate::comfy::set_keep_models_loaded(self.keep_models_loaded);
+        crate::comfy::set_free_before_tasks(self.free_before_tasks);
+    }
+}
+
+/// What the running ComfyUI does with its models, as far as it is known.
+#[derive(Debug, Clone, PartialEq)]
+enum ComfyMemory {
+    Unknown,
+    Asking,
+    NotRunning,
+    /// It keeps them loaded.
+    Keeps,
+    /// Started with these of [`crate::comfy::OFFLOAD_FLAGS`], at this URL.
+    Drops(Vec<String>, String),
+    Restarting,
+    Freed,
+    Failed(String),
 }
 
 /// `~/.config/BuzzAnimate/generate_image.json`, beside the workspace.
@@ -106,14 +138,20 @@ pub struct GenerateImage {
     /// When the running job began: the window shows the seconds, so a cold
     /// model load that is quiet for minutes reads as working, not hung.
     job_began: Option<std::time::Instant>,
+    /// What the running ComfyUI does with its models; asked when the window
+    /// opens and after each picture, off the UI thread.
+    memory: Arc<Mutex<ComfyMemory>>,
+    /// The window was open last frame — so opening it is noticed.
+    was_open: bool,
 }
 
 impl Default for GenerateImage {
     fn default() -> Self {
-        let settings = std::fs::read_to_string(settings_path())
+        let settings: Settings = std::fs::read_to_string(settings_path())
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
+        settings.apply_memory();
         Self {
             open: false,
             settings,
@@ -124,6 +162,8 @@ impl Default for GenerateImage {
             status: None,
             preview: None,
             job_began: None,
+            memory: Arc::new(Mutex::new(ComfyMemory::Unknown)),
+            was_open: false,
         }
     }
 }
@@ -211,6 +251,7 @@ impl GenerateImage {
             start_comfy: self.settings.start_comfy,
             show_in_comfy: self.settings.show_in_comfy,
         };
+        let keep = self.settings.keep_models_loaded;
         let shared = Arc::new(Mutex::new(JobState::Running("Starting…".into(), None)));
         self.job = Some(Arc::clone(&shared));
         self.job_began = Some(std::time::Instant::now());
@@ -224,6 +265,13 @@ impl GenerateImage {
                     ctx.request_repaint();
                 };
                 let result = prompt_image::generate(&req, &output_dir(), &progress);
+                // Not kept: unload them now the picture is in, so the memory
+                // is free for whatever comes next.
+                if !keep
+                    && let Ok(client) = prompt_image::connect(&req.url, false, &|_, _| {})
+                {
+                    let _ = client.free_memory();
+                }
                 *shared.lock().unwrap() = JobState::Done(result);
                 ctx.request_repaint();
             })
@@ -241,6 +289,7 @@ impl GenerateImage {
             }
         };
         self.job = None;
+        self.ask_memory(ctx);
         match done {
             Err(e) => self.status = Some(format!("Failed: {e}")),
             Ok((picture, notes)) => {
@@ -279,12 +328,78 @@ impl GenerateImage {
         }
     }
 
+    /// Ask the running ComfyUI how it was started, off the UI thread.
+    fn ask_memory(&self, ctx: &egui::Context) {
+        let memory = Arc::clone(&self.memory);
+        if matches!(*memory.lock().unwrap(), ComfyMemory::Asking | ComfyMemory::Restarting) {
+            return;
+        }
+        *memory.lock().unwrap() = ComfyMemory::Asking;
+        let url = self.settings.url.clone();
+        let ctx = ctx.clone();
+        let _ = std::thread::Builder::new().name("comfy-memory".into()).spawn(move || {
+            let found = match prompt_image::connect(&url, false, &|_, _| {}) {
+                Err(_) => ComfyMemory::NotRunning,
+                Ok(client) => match client.offload_flags() {
+                    None => ComfyMemory::Unknown,
+                    Some(flags) if flags.is_empty() => ComfyMemory::Keeps,
+                    Some(flags) => ComfyMemory::Drops(flags, client.base_url.clone()),
+                },
+            };
+            *memory.lock().unwrap() = found;
+            ctx.request_repaint();
+        });
+    }
+
+    /// Stop the running ComfyUI and start it without the offloading flags.
+    fn restart_comfy(&self, ctx: &egui::Context, url: String) {
+        let memory = Arc::clone(&self.memory);
+        *memory.lock().unwrap() = ComfyMemory::Restarting;
+        let ctx = ctx.clone();
+        let _ = std::thread::Builder::new().name("comfy-restart".into()).spawn(move || {
+            let client = crate::comfy::ComfyClient::new(url);
+            let outcome = match client.restart_keeping_models(std::time::Duration::from_secs(300)) {
+                Ok(fresh) => match fresh.offload_flags() {
+                    Some(flags) if flags.is_empty() => ComfyMemory::Keeps,
+                    Some(flags) => ComfyMemory::Drops(flags, fresh.base_url.clone()),
+                    None => ComfyMemory::Unknown,
+                },
+                Err(e) => ComfyMemory::Failed(e),
+            };
+            *memory.lock().unwrap() = outcome;
+            ctx.request_repaint();
+        });
+    }
+
+    /// Unload ComfyUI's models now.
+    fn free_now(&self, ctx: &egui::Context) {
+        let memory = Arc::clone(&self.memory);
+        let url = self.settings.url.clone();
+        let ctx = ctx.clone();
+        let _ = std::thread::Builder::new().name("comfy-free-now".into()).spawn(move || {
+            let outcome = match prompt_image::connect(&url, false, &|_, _| {}) {
+                Err(_) => ComfyMemory::NotRunning,
+                Ok(client) => match client.free_memory() {
+                    Ok(()) => ComfyMemory::Freed,
+                    Err(e) => ComfyMemory::Failed(e),
+                },
+            };
+            *memory.lock().unwrap() = outcome;
+            ctx.request_repaint();
+        });
+    }
+
     /// Draw the window; returns what the shell must do for it.
     pub fn show(&mut self, ctx: &egui::Context, editor: &mut Editor) -> Option<Action> {
         // A job finishes whether or not the window is still open.
         self.finish(ctx, editor);
         if !self.open {
+            self.was_open = false;
             return None;
+        }
+        if !self.was_open {
+            self.was_open = true;
+            self.ask_memory(ctx);
         }
         self.refresh_workflow();
         let mut action = None;
@@ -395,6 +510,81 @@ impl GenerateImage {
                     ui.end_row();
                 });
 
+                // **Memory**: whether ComfyUI keeps its models between
+                // pictures, and gives the memory back for BuzzAnimate's own
+                // heavy work. The models are 19 GB on a 24 GB Mac.
+                ui.separator();
+                ui.label("Memory");
+                ui.checkbox(&mut self.settings.keep_models_loaded, "Keep models loaded between pictures")
+                    .on_hover_text(
+                        "Only the first picture waits for the models to load; the next ones go straight to \
+                         drawing. They stay in memory while ComfyUI is idle. Off: they are unloaded after \
+                         every picture.",
+                    );
+                ui.checkbox(&mut self.settings.free_before_tasks, "Unload them before tracing or splitting a picture")
+                    .on_hover_text(
+                        "Trace Bitmap, Split Picture into Layers and Remove Object need the same memory. \
+                         The models load again with the next picture.",
+                    );
+                let memory = self.memory.lock().unwrap().clone();
+                let mut restart = None;
+                let mut free = false;
+                ui.horizontal_wrapped(|ui| {
+                    match &memory {
+                        ComfyMemory::Drops(flags, url) if self.settings.keep_models_loaded => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "\u{26a0} ComfyUI was started with {}, so it reloads every model for every picture.",
+                                    flags.join(" ")
+                                ))
+                                .small()
+                                .color(ui.visuals().warn_fg_color),
+                            );
+                            if ui
+                                .button("Restart ComfyUI to keep them")
+                                .on_hover_text("Stops ComfyUI and starts it again without those flags (about a minute)")
+                                .clicked()
+                            {
+                                restart = Some(url.clone());
+                            }
+                        }
+                        ComfyMemory::Drops(..) => {
+                            ui.label(egui::RichText::new("ComfyUI unloads its models after every run.").small().weak());
+                        }
+                        ComfyMemory::Keeps => {
+                            ui.label(egui::RichText::new("ComfyUI keeps its models loaded between runs.").small().weak());
+                        }
+                        ComfyMemory::Asking => {
+                            ui.label(egui::RichText::new("Asking ComfyUI\u{2026}").small().weak());
+                        }
+                        ComfyMemory::Restarting => {
+                            ui.spinner();
+                            ui.label(egui::RichText::new("Restarting ComfyUI\u{2026}").small().weak());
+                        }
+                        ComfyMemory::Freed => {
+                            ui.label(egui::RichText::new("Models unloaded.").small().weak());
+                        }
+                        ComfyMemory::NotRunning => {
+                            ui.label(egui::RichText::new("ComfyUI is not running; it will start without the unloading flags.").small().weak());
+                        }
+                        ComfyMemory::Failed(e) => {
+                            ui.label(egui::RichText::new(e).small().color(ui.visuals().warn_fg_color));
+                        }
+                        ComfyMemory::Unknown => {}
+                    }
+                    if !matches!(memory, ComfyMemory::NotRunning | ComfyMemory::Restarting)
+                        && ui.small_button("Unload now").on_hover_text("Give ComfyUI's memory back now").clicked()
+                    {
+                        free = true;
+                    }
+                });
+                if let Some(url) = restart {
+                    self.restart_comfy(ui.ctx(), url);
+                }
+                if free {
+                    self.free_now(ui.ctx());
+                }
+
                 ui.separator();
                 ui.horizontal(|ui| {
                     let ready = !self.settings.positive.trim().is_empty() && !self.settings.workflow.trim().is_empty();
@@ -447,6 +637,12 @@ impl GenerateImage {
             });
         if !open {
             self.open = false;
+        }
+        if self.settings.keep_models_loaded != before.keep_models_loaded
+            || self.settings.free_before_tasks != before.free_before_tasks
+        {
+            self.settings.apply_memory();
+            self.save();
         }
         if self.settings.url != before.url || self.settings.workflow != before.workflow {
             self.save();

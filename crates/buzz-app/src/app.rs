@@ -12667,6 +12667,8 @@ impl App {
     /// [`Self::ai_split_picture_async`], tracing the plates and the objects
     /// with bold outlines when `bold` (Generate Background's one-go path).
     pub(crate) fn ai_split_picture_with(&mut self, bold: bool) {
+        // SAM 2, LaMa and the tracer share the memory ComfyUI's models sit in.
+        crate::comfy::free_for_heavy_task();
         if self.selected_picture().is_some() {
             // Same route as Trace Bold + Split (T17); the old flat-plate
             // picture path below only runs when the trace made nothing.
@@ -12889,6 +12891,7 @@ impl App {
             self.editor.status = Some("Remove Object works on traced vector artwork".into());
             return;
         }
+        crate::comfy::free_for_heavy_task();
         let scene = self.editor.doc.scene().clone();
         let (send, receive) = crossbeam_channel::bounded(1);
         self.last_ai_task = None;
@@ -14034,6 +14037,7 @@ impl App {
             self.editor.status = Some("A trace is already running".into());
             return;
         }
+        crate::comfy::free_for_heavy_task();
         let (send, receive) = crossbeam_channel::bounded(1);
         let work = job.clone();
         let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Trace, "Trace Bitmap", move |ctx| {

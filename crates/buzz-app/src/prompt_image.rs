@@ -310,7 +310,15 @@ pub fn generate(req: &Request, out_dir: &Path, progress: Progress<'_>) -> Result
     let bytes = client.view(pick)?;
     std::fs::create_dir_all(out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
     let ext = Path::new(&pick.filename).extension().and_then(|e| e.to_str()).unwrap_or("png");
-    let file = out_dir.join(format!("{}.{ext}", file_stem(&req.positive, req.seed)));
+    // Never over an earlier picture: the name keeps only five digits of the
+    // seed, so a second take can land on a name already used.
+    let stem = file_stem(&req.positive, req.seed);
+    let mut file = out_dir.join(format!("{stem}.{ext}"));
+    let mut take = 2;
+    while file.exists() {
+        file = out_dir.join(format!("{stem}_{take}.{ext}"));
+        take += 1;
+    }
     std::fs::write(&file, &bytes).map_err(|e| format!("{}: {e}", file.display()))?;
     Ok((Generated { bytes, file, seed: req.seed }, notes))
 }
@@ -528,16 +536,70 @@ fn best_output(outputs: &[Output]) -> Option<&Output> {
     outputs.iter().find(|o| o.kind == "output").or_else(|| outputs.first())
 }
 
-/// `gen_<first words of the prompt>_<seed>`, safe as a file and library name.
+/// Words that say how a picture is shot or painted, or join the words that
+/// say what is in it — never what a picture *is*. Left out of its name.
+const NOT_A_SUBJECT: &[&str] = &[
+    // joining words
+    "a", "an", "the", "of", "at", "in", "on", "during", "with", "and", "or", "for", "to", "from",
+    "by", "into", "over", "under", "near", "is", "are", "was", "were", "be", "this", "that", "its",
+    "their", "his", "her", "some", "very", "while", "as", "s",
+    // framing
+    "cinematic", "wide", "shot", "close", "closeup", "up", "medium", "long", "establishing", "view",
+    "angle", "aerial", "low", "high", "overhead", "scene", "frame", "framing", "composition",
+    // medium and quality
+    "image", "photo", "photograph", "picture", "illustration", "render", "rendering", "style",
+    "styled", "detailed", "highly", "quality", "hd", "4k", "8k", "masterpiece", "realistic",
+    "photorealistic", "digital", "painting", "art", "artwork", "concept", "2d", "3d", "cartoon",
+    "anime", "lighting", "lit", "beautiful", "stunning", "vibrant", "dramatic", "soft", "natural",
+    "epic", "gorgeous", "featuring", "prominently", "showing", "depicting", "depicts",
+    // general colour words that describe rather than name
+    "rugged", "semi", "rustic", "early", "late", "era",
+];
+
+/// **A short name for a picture, from what its prompt is about**:
+/// `rural_indian_village_market_lane_night_diwali_28188`.
+///
+/// Prompts are long descriptions, and their first words are usually how the
+/// picture is shot ("Cinematic wide shot of a…"), which named every picture
+/// alike. The subject is in the opening sentence, so the name is that
+/// sentence's words less [`NOT_A_SUBJECT`] and numbers, up to seven of them,
+/// with the seed's last five digits to tell two takes apart. Safe as a file
+/// and as a Library name.
 pub fn file_stem(prompt: &str, seed: u64) -> String {
-    let words: Vec<String> = prompt
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .take(4)
-        .map(str::to_lowercase)
-        .collect();
-    let head = if words.is_empty() { "image".to_string() } else { words.join("_") };
-    format!("gen_{head}_{seed}")
+    let keywords = |text: &str| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for word in text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
+            let word = word.to_lowercase();
+            if NOT_A_SUBJECT.contains(&word.as_str())
+                || word.chars().all(|c| c.is_ascii_digit())
+                || word.chars().next().is_some_and(|c| c.is_ascii_digit())
+                || out.contains(&word)
+            {
+                continue;
+            }
+            out.push(word);
+        }
+        out
+    };
+    let opening = prompt.split(['.', ';', '\n']).find(|s| !s.trim().is_empty()).unwrap_or("");
+    let mut words = keywords(opening);
+    if words.len() < 2 {
+        words = keywords(prompt);
+    }
+    let mut name = String::new();
+    for word in words.iter().take(7) {
+        if !name.is_empty() && name.len() + 1 + word.len() > 56 {
+            break;
+        }
+        if !name.is_empty() {
+            name.push('_');
+        }
+        name.push_str(word);
+    }
+    if name.is_empty() {
+        name.push_str("image");
+    }
+    format!("{name}_{:05}", seed % 100_000)
 }
 
 /// Ask ComfyUI to stop the job it is running (best effort).
@@ -675,7 +737,21 @@ mod tests {
 
     #[test]
     fn names_are_safe() {
-        assert_eq!(file_stem("A rainy Village, at night!", 42), "gen_a_rainy_village_at_42");
-        assert_eq!(file_stem("  ", 7), "gen_image_7");
+        assert_eq!(file_stem("A rainy Village, at night!", 42), "rainy_village_night_00042");
+        assert_eq!(file_stem("  ", 7), "image_00007");
+    }
+
+    /// **The name says what the picture is of**, not how it was shot: the
+    /// framing words a prompt opens with are left out, and it comes from the
+    /// opening sentence rather than the whole description.
+    #[test]
+    fn a_long_prompt_is_named_by_its_subject() {
+        let prompt = "Cinematic wide shot of a rugged semi-rural Indian village market lane at \
+                      night during Diwali, early 2000s era. Rutted dirt road lined with rustic \
+                      mud-and-brick shopfronts.";
+        assert_eq!(
+            file_stem(prompt, 319156850728188),
+            "rural_indian_village_market_lane_night_diwali_28188"
+        );
     }
 }

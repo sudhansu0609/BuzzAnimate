@@ -14152,6 +14152,7 @@ impl Editor {
     /// and tests use this; UI clicks use [`Self::trace_in_background`].
     pub fn trace_with(&mut self, options: buzz_scene::TraceOptions) {
         let Some(job) = self.prepare_trace(options) else { return };
+        crate::comfy::free_for_heavy_task();
         match run_trace_job(&job, &|| false) {
             Ok(result) => self.apply_trace(job, result),
             Err(message) => self.status = Some(message),

@@ -42,6 +42,57 @@ fn default_comfyui_dir() -> PathBuf {
 }
 const CLIENT_ID: &str = "buzzanimate_client";
 
+/// **The launch flags that make ComfyUI drop its models after every run.**
+///
+/// Comfy Desktop saves `--cache-none --disable-smart-memory` as an install's
+/// launch arguments, and BuzzAnimate starts ComfyUI with them. `--cache-none`
+/// re-runs every loader for every prompt, so each picture reads the whole
+/// model (11.7 GB) and text encoder (7.7 GB) from disk again; with
+/// `--disable-smart-memory` they are also pushed out as soon as a run ends.
+/// Measured on an M5 Pro: 8 s of sampling inside a 56–62 s picture.
+pub const OFFLOAD_FLAGS: &[&str] = &["--cache-none", "--disable-smart-memory"];
+
+/// Keep ComfyUI's models loaded between pictures (Generate Image ▸ Memory).
+/// When on, a ComfyUI that BuzzAnimate starts is started without
+/// [`OFFLOAD_FLAGS`].
+static KEEP_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// Free ComfyUI's memory before a heavy task of BuzzAnimate's own (a trace,
+/// Split Picture, Remove Object), which needs the same unified memory.
+static FREE_BEFORE_TASKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_keep_models_loaded(on: bool) {
+    KEEP_LOADED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn keep_models_loaded() -> bool {
+    KEEP_LOADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_free_before_tasks(on: bool) {
+    FREE_BEFORE_TASKS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Comfy Desktop's saved launch arguments, less [`OFFLOAD_FLAGS`] when the
+/// models are wanted kept.
+fn launch_args(saved: &[String], keep: bool) -> Vec<String> {
+    saved.iter().filter(|a| !(keep && OFFLOAD_FLAGS.contains(&a.as_str()))).cloned().collect()
+}
+
+/// **A heavy task is about to start: give ComfyUI's memory back**, if that is
+/// switched on and a ComfyUI is running. On a background thread, so the task
+/// does not wait on the network; ComfyUI unloads in well under a second, long
+/// before a trace or a segmentation reaches its peak.
+pub fn free_for_heavy_task() {
+    if !FREE_BEFORE_TASKS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("comfy-free".into()).spawn(|| {
+        if let Some(client) = ComfyClient::discover() {
+            let _ = client.free_memory();
+        }
+    });
+}
+
 /// Where one finished picture is, as ComfyUI's history lists it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Output {
@@ -108,6 +159,91 @@ impl ComfyClient {
     /// Is this one up?
     pub fn alive(&self) -> bool {
         probe(&self.base_url, PROBE)
+    }
+
+    /// The command line this ComfyUI was started with, as `/system_stats`
+    /// reports it.
+    pub fn argv(&self) -> Option<Vec<String>> {
+        let stats: Value = agent(Duration::from_secs(3))
+            .get(&format!("{}/system_stats", self.base_url))
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        stats["system"]["argv"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+    }
+
+    /// Which of [`OFFLOAD_FLAGS`] it was started with — empty when it keeps
+    /// its models loaded; `None` when it cannot be asked.
+    pub fn offload_flags(&self) -> Option<Vec<String>> {
+        let argv = self.argv()?;
+        Some(argv.into_iter().filter(|a| OFFLOAD_FLAGS.contains(&a.as_str())).collect())
+    }
+
+    /// **Stop this ComfyUI and start it again without [`OFFLOAD_FLAGS`]**, so
+    /// its models stay loaded between pictures. Only a ComfyUI running
+    /// `main.py` on this machine is stopped — found by the port it listens on
+    /// — and it is started the way BuzzAnimate always starts one.
+    #[cfg(unix)]
+    pub fn restart_keeping_models(&self, wait: Duration) -> Result<Self, String> {
+        let port = self
+            .base_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .ok_or_else(|| format!("no port in {}", self.base_url))?;
+        let out = std::process::Command::new("lsof")
+            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+            .output()
+            .map_err(|e| format!("lsof: {e}"))?;
+        let pid = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse::<u32>().ok())
+            .ok_or_else(|| format!("nothing found listening on port {port}"))?;
+        let command = std::process::Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        if !command.contains("main.py") {
+            return Err(format!(
+                "port {port} is not a ComfyUI BuzzAnimate can restart ({}); restart it yourself without {}",
+                command.trim(),
+                OFFLOAD_FLAGS.join(" ")
+            ));
+        }
+        let signal = |sig: &str| {
+            let _ = std::process::Command::new("kill").args([sig, &pid.to_string()]).status();
+        };
+        signal("-TERM");
+        let stopping = Instant::now();
+        while self.alive() && stopping.elapsed() < Duration::from_secs(15) {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if self.alive() {
+            signal("-KILL");
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        set_keep_models_loaded(true);
+        let started = launch_local()?;
+        let port = started.port.ok_or("ComfyUI started without a port")?;
+        let client = Self::new(format!("http://127.0.0.1:{port}"));
+        let began = Instant::now();
+        while began.elapsed() < wait {
+            std::thread::sleep(Duration::from_secs(2));
+            if client.alive() {
+                return Ok(client);
+            }
+        }
+        Err(format!("ComfyUI did not come back within {} s (log: ~/.config/BuzzAnimate/comfyui.log)", wait.as_secs()))
+    }
+
+    #[cfg(not(unix))]
+    pub fn restart_keeping_models(&self, _wait: Duration) -> Result<Self, String> {
+        Err(format!("restart ComfyUI yourself without {}", OFFLOAD_FLAGS.join(" ")))
     }
 
     /// A running ComfyUI: found, or (with `launch`) the portable install
@@ -701,7 +837,7 @@ impl Install {
         command
             .arg("main.py")
             .args(["--listen", "127.0.0.1", "--port", &port.to_string()])
-            .args(&self.args)
+            .args(launch_args(&self.args, keep_models_loaded()))
             .current_dir(&self.dir)
             .stdin(std::process::Stdio::null())
             .stdout(out)
@@ -763,6 +899,18 @@ fn start_detached(bat: &std::path::Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Kept models: the flags that drop them after every run are not passed
+    /// on; everything else Comfy Desktop saved is, in order.
+    #[test]
+    fn keeping_models_drops_only_the_unloading_flags() {
+        let saved: Vec<String> = ["--enable-manager", "--disable-smart-memory", "--cache-none", "--port-x"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(launch_args(&saved, true), vec!["--enable-manager", "--port-x"]);
+        assert_eq!(launch_args(&saved, false), saved);
+    }
+
     use super::*;
 
     /// Comfy Desktop's own files are enough to start its instance the way it

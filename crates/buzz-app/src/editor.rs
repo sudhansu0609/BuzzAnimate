@@ -45,6 +45,20 @@ const MAX_FRAME: u32 = 999_999;
 /// it, so the history folds the drag into one step.
 const ALT_COPY_LABEL: &str = "Duplicate";
 
+/// One layer's share of Copy Frames: where its selected frames start (from
+/// the selection's first frame), how many there were, and the drawings that
+/// start among them, each by its offset from the selection's first frame.
+#[derive(Debug, Clone)]
+pub struct ClippedLayer {
+    pub layer: LayerId,
+    pub offset: u32,
+    pub length: u32,
+    pub drawings: Vec<(u32, Vec<std::sync::Arc<Object>>)>,
+}
+
+/// The frame clipboard: Copy Frames' layers, in the order they were met.
+pub type FrameClip = Vec<ClippedLayer>;
+
 /// What a camera edit says when the camera is locked: the lock is a small
 /// icon on the Camera row, easy to forget, so the message says where it is.
 pub const CAMERA_LOCKED: &str = "The camera is locked \u{2014} click the lock on the Camera row to unlock it";
@@ -252,7 +266,7 @@ pub struct Editor {
     /// is never what anybody means. The layer each came from is kept so the
     /// paste puts it back where it belongs rather than piling every layer's
     /// artwork onto whichever one happens to be active.
-    pub frame_clipboard: Option<Vec<(LayerId, Vec<std::sync::Arc<Object>>)>>,
+    pub frame_clipboard: Option<FrameClip>,
     /// Copy Motion's clipboard (C1).
     pub motion_clip: Option<MotionClip>,
     /// Copy Pose's clipboard (C2).
@@ -11965,76 +11979,104 @@ impl Editor {
 
     /// **Copy Frames**, and **Cut Frames** when `and_clear`.
     ///
-    /// The artwork the playhead is standing on, **across every layer** — the
-    /// character, the background and the overlay together, because that is
-    /// what "this frame" means to the person looking at it. It used to take
-    /// the active layer alone, which made copying a drawing a job of selecting
-    /// each layer and repeating yourself.
+    /// The frames selected in the timeline — those layers, those frames —
+    /// as Animate does; with no frame selection, the selected layers (else
+    /// the active layer) at the playhead. It used to take every layer at the
+    /// playhead whatever was selected, so Cut Frames on one frame emptied the
+    /// whole picture, and it emptied each layer's whole keyframe span rather
+    /// than the frames picked.
     ///
-    /// Animate copies a *selected span* of frames; there is still no span
-    /// selection in the timeline here, so this is the one frame the playhead
-    /// is on — recorded in §7.
+    /// Each layer keeps the drawings that start inside the selection (its
+    /// first frame always counts), by their offset from the selection's first
+    /// frame, and how many frames it covered.
     fn copy_frames(&mut self, and_clear: bool) {
-        let frame = self.current_frame;
+        let targets = self.timeline_targets();
         let scene = self.doc.scene();
-        let taken: Vec<(LayerId, Vec<std::sync::Arc<Object>>)> = scene
-            .layers()
-            .iter()
-            .filter_map(|layer| {
-                let contents = layer.frames.frame_contents(frame)?;
-                Some((layer.id, contents))
-            })
-            .collect();
-
-        if taken.is_empty() {
+        // Each layer's span of selected frames, in the order first met.
+        let mut spans: Vec<(LayerId, u32, u32)> = Vec::new();
+        for (layer, frame) in targets {
+            match spans.iter_mut().find(|(l, ..)| *l == layer) {
+                Some((_, a, b)) => {
+                    *a = (*a).min(frame);
+                    *b = (*b).max(frame);
+                }
+                None => spans.push((layer, frame, frame)),
+            }
+        }
+        // Folders hold no artwork, and frames past a layer's end hold none.
+        spans.retain_mut(|(layer, _, b)| {
+            let Some(l) = scene.layers().get(*layer).filter(|l| l.kind != LayerKind::Folder) else {
+                return false;
+            };
+            *b = (*b).min(l.frames.length().saturating_sub(1));
+            true
+        });
+        spans.retain(|(_, a, b)| a <= b);
+        let Some(first) = spans.iter().map(|(_, a, _)| *a).min() else {
             self.status = Some("There is no frame here to copy".into());
             return;
-        }
-        let layers = taken.len();
-        let count: usize = taken.iter().map(|(_, objects)| objects.len()).sum();
-        self.frame_clipboard = Some(taken);
+        };
+        let clip: FrameClip = spans
+            .iter()
+            .filter_map(|&(id, a, b)| {
+                let frames = &scene.layers().get(id)?.frames;
+                let drawings: Vec<(u32, Vec<std::sync::Arc<Object>>)> = (a..=b)
+                    .filter(|&f| f == a || frames.is_keyframe(f))
+                    .filter_map(|f| Some((f - first, frames.frame_contents(f)?)))
+                    .collect();
+                Some(ClippedLayer { layer: id, offset: a - first, length: b - a + 1, drawings })
+            })
+            .collect();
+        let count: usize = clip.iter().flat_map(|c| &c.drawings).map(|(_, objects)| objects.len()).sum();
+        let layers = clip.len();
+        let last = spans.iter().map(|(_, _, b)| *b).max().unwrap_or(first);
+        self.frame_clipboard = Some(clip);
 
+        let mut locked = 0;
         if and_clear {
-            // Cleared on every layer it was taken from, or a cut would leave
-            // most of the drawing where it was.
-            let layers: Vec<LayerId> = self
-                .frame_clipboard
-                .iter()
-                .flatten()
-                .map(|(layer, _)| *layer)
-                .collect();
             self.doc.edit("Cut Frames", |scene| {
-                for layer in layers {
+                for &(layer, a, b) in &spans {
                     if scene.layers().is_effectively_locked(layer) {
+                        locked += 1;
                         continue;
                     }
                     scene.update_layer(layer, |l| {
-                        l.frames.clear_frames(frame);
+                        let f = &mut l.frames;
+                        // The drawing carries on after the cut, as it was.
+                        if b + 1 < f.length() {
+                            f.insert_keyframe(b + 1);
+                        }
+                        let inside: Vec<u32> = (a + 1..=b).filter(|&k| f.is_keyframe(k)).collect();
+                        for k in inside {
+                            f.clear_keyframe(k);
+                        }
+                        f.insert_blank_keyframe(a);
                     });
                 }
             });
             self.selection.prune(self.doc.scene());
         }
+        let frames = if last == first { format!("frame {}", first + 1) } else { format!("frames {}\u{2013}{}", first + 1, last + 1) };
         self.status = Some(format!(
-            "{} {count} object{} from frame {} of {layers} layer{}",
+            "{} {count} object{} from {frames} of {layers} layer{}{}",
             if and_clear { "Cut" } else { "Copied" },
             if count == 1 { "" } else { "s" },
-            frame + 1,
             if layers == 1 { "" } else { "s" },
+            if locked > 0 { format!(" \u{2014} {locked} locked layer(s) left as they were") } else { String::new() },
         ));
     }
 
-    /// **Paste Frames** onto the frame the playhead is on.
+    /// **Paste Frames** at the playhead.
     ///
-    /// Each layer's artwork goes back onto **the layer it came from**, so a
+    /// Each layer's frames go back onto **the layer they came from**, so a
     /// copied drawing arrives assembled rather than flattened onto whichever
     /// layer happened to be active. A layer that has since been deleted is
     /// skipped rather than guessed at.
     ///
-    /// A keyframe is made on each of them first, as Animate does: pasting into
-    /// the middle of a span would otherwise change the artwork from wherever
-    /// that span began. The objects are given fresh ids, so pasting twice
-    /// gives two drawings rather than one shared between two frames.
+    /// As Animate's Paste Frames: the copied frames are *inserted* — what was
+    /// at the playhead moves along to make room, and carries on after the
+    /// pasted frames as it was. The objects are given fresh ids, so pasting
+    /// twice gives two drawings rather than one shared between two frames.
     fn paste_frames(&mut self) {
         let Some(clipboard) = self.frame_clipboard.clone() else {
             self.status = Some("There are no frames on the clipboard".into());
@@ -12046,23 +12088,37 @@ impl Editor {
         let mut layers = 0usize;
         let mut locked = 0usize;
         self.doc.edit("Paste Frames", |scene| {
-            for (layer, objects) in &clipboard {
-                if scene.layers().get(*layer).is_none() {
+            for clipped in &clipboard {
+                let layer = clipped.layer;
+                if scene.layers().get(layer).is_none() {
                     continue;
                 }
-                if scene.layers().is_effectively_locked(*layer) {
+                if scene.layers().is_effectively_locked(layer) {
                     locked += 1;
                     continue;
                 }
-                scene.update_layer(*layer, |l| {
-                    l.frames.insert_frame(frame);
-                    l.frames.insert_blank_keyframe(frame);
+                let at = frame + clipped.offset;
+                scene.update_layer(layer, |l| {
+                    let f = &mut l.frames;
+                    let inside = at < f.length();
+                    for _ in 0..clipped.length {
+                        f.insert_frame(at);
+                    }
+                    // What stood at the playhead resumes after the paste.
+                    if inside {
+                        f.insert_keyframe(at + clipped.length);
+                    }
+                    for (offset, _) in &clipped.drawings {
+                        f.insert_blank_keyframe(frame + offset);
+                    }
                 });
-                for object in objects {
-                    let mut copy = (**object).clone();
-                    copy.id = scene.next_object_id();
-                    if scene.add_object_at(*layer, frame, copy).is_some() {
-                        pasted += 1;
+                for (offset, objects) in &clipped.drawings {
+                    for object in objects {
+                        let mut copy = (**object).clone();
+                        copy.id = scene.next_object_id();
+                        if scene.add_object_at(layer, frame + offset, copy).is_some() {
+                            pasted += 1;
+                        }
                     }
                 }
                 layers += 1;
@@ -12082,7 +12138,7 @@ impl Editor {
             return;
         }
         self.status = Some(format!(
-            "Pasted {pasted} object{} onto frame {} of {layers} layer{}{}",
+            "Pasted {pasted} object{} at frame {} on {layers} layer{}{}",
             if pasted == 1 { "" } else { "s" },
             frame + 1,
             if layers == 1 { "" } else { "s" },
@@ -19019,11 +19075,11 @@ mod tests {
         );
     }
 
-    /// **Copy Frames takes every layer.** A frame of a drawing is a frame of
-    /// the whole drawing — character, background and overlay — and copying one
-    /// layer of it was never what anybody meant.
+    /// **Copy Frames takes the selected frames' layers.** Selecting frame 0
+    /// on all three layers copies all three, and the paste puts each back on
+    /// the layer it came from.
     #[test]
-    fn copying_a_frame_takes_every_layer_and_pastes_them_all_back() {
+    fn copying_selected_frames_pastes_each_layer_back_onto_its_own() {
         let mut e = editor();
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
 
@@ -19048,31 +19104,22 @@ mod tests {
                 .map(|l| l.objects_at(frame).len())
                 .unwrap_or(0)
         };
-        for layer in &layers {
-            assert_eq!(on_frame(&e, 0, *layer), 1, "each layer drew something");
-        }
-
+        e.selection.set_timeline(buzz_ui::TimelineSelection::new(layers.clone(), 0, 0, layers[0], 0));
         e.run(buzz_ui::Command::CopyFrames);
         e.set_frame(10);
         e.run(buzz_ui::Command::PasteFrames);
 
-        // Every layer got its own artwork back, on the layer it came from.
         for layer in &layers {
-            assert_eq!(
-                on_frame(&e, 10, *layer),
-                1,
-                "a layer's artwork did not come back onto its own layer"
-            );
-        }
-        // And the originals are untouched.
-        for layer in &layers {
-            assert_eq!(on_frame(&e, 0, *layer), 1);
+            assert_eq!(on_frame(&e, 10, *layer), 1, "a layer's artwork did not come back onto its own layer");
+            assert_eq!(on_frame(&e, 0, *layer), 1, "the originals are untouched");
         }
     }
 
-    /// Cut clears every layer it took from, or most of the drawing stays put.
+    /// **Cut Frames cuts the frame selected, nothing else.** Cmd+Opt+X on
+    /// frame 5 of one layer emptied every layer, and the whole span that
+    /// frame was in: the drawing before and after it, on every layer.
     #[test]
-    fn cutting_a_frame_clears_every_layer_it_took_from() {
+    fn cutting_a_frame_cuts_only_that_frame() {
         let mut e = editor();
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
         let first = e.selection.active_layer().expect("a layer");
@@ -19083,20 +19130,38 @@ mod tests {
                 shape: ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE),
                 label: "Draw",
             });
+            e.doc.edit("Frames", |s| {
+                s.update_layer(layer, |l| {
+                    l.frames.insert_frame(19);
+                });
+            });
         }
-        assert_eq!(e.scene().shape_count_at(0), 2);
+        let on = |e: &Editor, layer: LayerId, frame: u32| e.scene().layers().get(layer).unwrap().objects_at(frame).len();
 
+        e.set_frame(5);
+        e.selection.set_timeline(buzz_ui::TimelineSelection::new([first], 5, 5, first, 5));
         e.run(buzz_ui::Command::CutFrames);
-        assert_eq!(
-            e.scene().shape_count_at(0),
-            0,
-            "a cut should empty the frame on every layer, not just the active one"
-        );
-        assert!(e.frame_clipboard.is_some(), "and it is on the clipboard");
+        assert!(e.frame_clipboard.is_some(), "it is on the clipboard");
+        assert_eq!(on(&e, first, 5), 0, "the frame is empty");
+        for f in (0..5).chain(6..20) {
+            assert_eq!(on(&e, first, f), 1, "frame {f} of the same layer keeps its drawing");
+        }
+        for f in 0..20 {
+            assert_eq!(on(&e, second, f), 1, "frame {f} of the other layer is untouched");
+        }
 
-        e.set_frame(6);
+        // A span: frames 8–10 go, 11 on carries on.
+        e.selection.set_timeline(buzz_ui::TimelineSelection::new([first], 8, 10, first, 8));
+        e.run(buzz_ui::Command::CutFrames);
+        assert_eq!((on(&e, first, 7), on(&e, first, 8), on(&e, first, 10), on(&e, first, 11)), (1, 0, 0, 1));
+
+        // Paste inserts the three frames at 15; what was there moves along.
+        let length = e.scene().layers().get(first).unwrap().frames.length();
+        e.set_frame(15);
         e.run(buzz_ui::Command::PasteFrames);
-        assert_eq!(e.scene().shape_count_at(6), 2, "both layers came back");
+        assert_eq!(e.scene().layers().get(first).unwrap().frames.length(), length + 3);
+        assert_eq!((on(&e, first, 15), on(&e, first, 17), on(&e, first, 18)), (1, 1, 1));
+        assert_eq!(on(&e, second, 15), 1, "the other layer is not pasted onto");
     }
 
     /// Pasting when the layers are gone says so and leaves no empty step in

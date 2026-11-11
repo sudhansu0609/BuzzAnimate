@@ -6651,6 +6651,7 @@ impl App {
                         // they are set from this frame on, per keyframe.
                     found.map(|l| buzz_ui::LayerEffects {
                         alpha: f64::from(l.frames.alpha_at(frame)),
+                        whole_layer_alpha: l.alpha,
                         brightness: l.frames.color_at(frame).brightness_part(),
                         tint: l.tint,
                         tint_amount: l.tint_amount,
@@ -6763,6 +6764,13 @@ impl App {
                     }
                 }
             }
+        }
+        if response.reset_whole_layer_alpha
+            && let Some(id) = layer
+        {
+            editor.doc.edit("Layer Opacity", |scene| {
+                scene.update_layer(id, |l| l.alpha = 1.0);
+            });
         }
         if let Some(alpha) = response.set_layer_alpha
             && let Some(id) = layer

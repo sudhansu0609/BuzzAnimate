@@ -51,6 +51,8 @@ pub struct FilterResponse {
     /// A new blend mode for the selected object.
     pub set_blend: Option<Blend>,
     pub set_layer_alpha: Option<f64>,
+    /// Put the layer's old whole-layer opacity back to 100 %.
+    pub reset_whole_layer_alpha: bool,
     pub set_layer_brightness: Option<f32>,
     pub set_layer_tint: Option<(peniko::Color, f32)>,
     /// Attach this live modifier to the selected object.
@@ -64,6 +66,10 @@ pub struct FilterResponse {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerEffects {
     pub alpha: f64,
+    /// The layer's own opacity from before opacity was per keyframe: it
+    /// still fades the whole layer on the stage, every frame, so it is shown
+    /// (and can be put back to 100 %) rather than left where no slider reads it.
+    pub whole_layer_alpha: f64,
     pub brightness: f32,
     pub tint: peniko::Color,
     pub tint_amount: f32,
@@ -143,6 +149,26 @@ pub fn filter_panel(
             .changed()
         {
             out.set_layer_alpha = Some((opacity / 100.0).clamp(0.0, 1.0));
+        }
+        if current.whole_layer_alpha < 0.999 {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "\u{26a0} The whole layer is also at {:.0}% on the stage \u{2014} everything on it, every frame. \
+                         An opacity set before opacity was per frame.",
+                        current.whole_layer_alpha * 100.0
+                    ))
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+                );
+                if ui
+                    .small_button("Reset to 100%")
+                    .on_hover_text("Only the slider above sets this layer's opacity from then on")
+                    .clicked()
+                {
+                    out.reset_whole_layer_alpha = true;
+                }
+            });
         }
         let mut brightness = current.brightness * 100.0;
         if ui

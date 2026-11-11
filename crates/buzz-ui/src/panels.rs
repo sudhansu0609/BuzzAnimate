@@ -2022,6 +2022,11 @@ fn instance_properties(
     let mut from_start: bool = ui
         .data_mut(|d| d.get_persisted(start_key))
         .unwrap_or(is_character);
+    // What else fades it on screen: its layer's old whole-layer opacity
+    // and its keyframe's own alpha. Shown under its Alpha, so a 100 % there
+    // is not taken for what the stage shows.
+    let fade = scene.layers().get(layer).map(|l| (l.name.clone(), l.alpha, f64::from(l.frames.alpha_at(at.frame))));
+    let mut reset_whole_layer = false;
     let mut picked: Option<buzz_scene::SymbolId> = None;
     let mut include: Option<buzz_scene::SymbolId> = None;
     let mut remove: Option<buzz_scene::SymbolId> = None;
@@ -2286,7 +2291,46 @@ fn instance_properties(
             new_color = t;
             edited = true;
         }
+        if let Some((name, whole, keyed)) = &fade
+            && (*whole < 0.999 || *keyed < 0.999)
+        {
+            let own = f64::from(instance.color.multiply[3]);
+            let mut parts = Vec::new();
+            if *whole < 0.999 {
+                parts.push(format!("the whole layer \u{201c}{name}\u{201d} at {:.0}%", whole * 100.0));
+            }
+            if *keyed < 0.999 {
+                parts.push(format!("this keyframe at {:.0}%", keyed * 100.0));
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "\u{26a0} Shown at {:.0}%: {}.",
+                        own * whole * keyed * 100.0,
+                        parts.join(" and ")
+                    ))
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+                )
+                .on_hover_text(
+                    "The keyframe's alpha is in the Frame section (select the frame). The whole-layer \
+                     opacity is from before opacity was per frame and shows on the stage only.",
+                );
+                if *whole < 0.999
+                    && ui
+                        .small_button("Layer to 100%")
+                        .on_hover_text("Put the layer's old whole-layer opacity back to 100%")
+                        .clicked()
+                {
+                    reset_whole_layer = true;
+                }
+            });
+        }
     });
+    if reset_whole_layer {
+        scene.update_layer(layer, |l| l.alpha = 1.0);
+        edited = true;
+    }
 
     if edited {
         scene.update_object_where(at, id, |o| {

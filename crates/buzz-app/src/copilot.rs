@@ -1275,7 +1275,7 @@ fn rebuild_scenes(out: &Path, scenes: &[u32], say: &mut dyn FnMut(&str), cancel:
     apply_to_casting(&ov, &mut casting_v, &bg, &pose_rigs);
     write_json(&out.join("casting.json"), &casting_v)?;
     let casting = Casting::from_json(&casting_v.to_string()).map_err(anyhow::Error::msg)?;
-    let mut opts = BuildOptions { width: ctx.size.0, height: ctx.size.1, fps: ctx.fps, captions: ctx.captions, ..BuildOptions::default() };
+    let mut opts = BuildOptions { width: ctx.size.0, height: ctx.size.1, fps: ctx.fps, captions: ctx.captions, audio_cues: crate::comfy_profile::profile_for(&ctx.series).is_some_and(|p| p.audio_layers), ..BuildOptions::default() };
     if let Some(path) = &ctx.index
         && let Some(index) = crate::asset_sets::load_index_file(path)
     {

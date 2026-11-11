@@ -124,6 +124,7 @@ fn tracing_replaces_the_picture_with_shapes() {
 
     editor.selection.select_one(id);
     editor.run(Command::TraceLineArt);
+    editor.finish_pending_trace_now();
 
     assert!(
         editor.doc.scene().find_object(id).is_none(),
@@ -152,6 +153,7 @@ fn the_artwork_lands_where_the_picture_was() {
     let (mut editor, id) = with_picture();
     editor.selection.select_one(id);
     editor.run(Command::TraceLineArt);
+    editor.finish_pending_trace_now();
 
     let shapes = shapes_on_stage(&editor);
     assert_eq!(shapes.len(), 1, "line art should be the ink alone");
@@ -178,6 +180,7 @@ fn one_undo_brings_the_picture_back() {
     let (mut editor, id) = with_picture();
     editor.selection.select_one(id);
     editor.run(Command::TraceLineArt);
+    editor.finish_pending_trace_now();
     assert!(editor.doc.scene().find_object(id).is_none());
 
     editor.run(Command::Undo);
@@ -201,11 +204,13 @@ fn colour_and_line_art_differ_in_what_they_keep() {
     let (mut editor, id) = with_picture();
     editor.selection.select_one(id);
     editor.run(Command::TraceBitmap);
+    editor.finish_pending_trace_now();
     let colour = shapes_on_stage(&editor).len();
 
     let (mut editor, id) = with_picture();
     editor.selection.select_one(id);
     editor.run(Command::TraceLineArt);
+    editor.finish_pending_trace_now();
     let ink = shapes_on_stage(&editor).len();
 
     assert!(
@@ -243,6 +248,7 @@ fn tracing_a_drawing_explains_itself() {
 
     editor.selection.select_one(id);
     editor.run(Command::TraceBitmap);
+    editor.finish_pending_trace_now();
 
     assert!(
         editor.doc.scene().find_object(id).is_some(),

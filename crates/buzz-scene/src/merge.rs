@@ -134,6 +134,7 @@ impl Remapper<'_> {
             copy.height = layer.height;
             copy.depth = layer.depth;
             copy.collapsed = layer.collapsed;
+            copy.cast_source = layer.cast_source.clone();
             copy.filters = layer.filters.clone();
             copy.frames = self.timeline(&layer.frames);
             out.insert(index, copy);
@@ -430,6 +431,35 @@ impl Scene {
 
         self.bump();
         report
+    }
+
+    /// **Unpack a symbol's own layers onto the stage** (CAST_POSES_PLAN C2): copies
+    /// of `symbol`'s layers, with fresh layer, object and parent/follow ids,
+    /// inserted into the timeline being edited at row `at`. Instances inside them
+    /// keep pointing at the same library symbols (nothing is duplicated there).
+    /// Returns the new layers in stack order; empty when `symbol` is unknown.
+    pub fn unpack_symbol_layers(&mut self, symbol: SymbolId, at: usize) -> Vec<LayerId> {
+        let Some(sym) = self.library.get(symbol).cloned() else {
+            return Vec::new();
+        };
+        let symbols: HashMap<SymbolId, SymbolId> = self.library.iter().map(|s| (s.id, s.id)).collect();
+        let sounds: HashMap<crate::sound::SoundId, crate::sound::SoundId> = self.sounds.iter().map(|s| (s.id, s.id)).collect();
+        let mut remap = Remapper {
+            ids: &mut self.ids,
+            symbols,
+            sounds,
+            objects: 0,
+        };
+        let stack = remap.layer_stack(&sym.layers);
+        let arriving: Vec<_> = stack.iter().cloned().collect();
+        let ids: Vec<LayerId> = arriving.iter().map(|l| l.id).collect();
+        let dest = self.active_layers_mut();
+        let at = at.min(dest.len());
+        for (index, layer) in arriving.into_iter().enumerate() {
+            dest.insert(at + index, (*layer).clone());
+        }
+        self.bump();
+        ids
     }
 }
 

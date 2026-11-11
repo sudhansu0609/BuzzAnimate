@@ -27,3 +27,6 @@
 /dataset2/
 installer/setup.running
 /dist
+
+# macOS app bundle made by tools/make-macos-app.sh
+/BuzzAnimate.app/

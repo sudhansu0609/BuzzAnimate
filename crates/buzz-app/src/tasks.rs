@@ -70,6 +70,8 @@ pub enum TaskKind {
     /// S9: preparing a document for playback (the warm-up at open).
     Warm,
     Ai,
+    /// Trace Bitmap on a picture, off the UI thread.
+    Trace,
 }
 
 impl TaskKind {
@@ -85,6 +87,7 @@ impl TaskKind {
             Self::Resample => "Resample",
             Self::Warm => "Prepare",
             Self::Ai => "AI",
+            Self::Trace => "Trace",
         }
     }
 
@@ -98,7 +101,7 @@ impl TaskKind {
     pub fn can_cancel(self) -> bool {
         matches!(
             self,
-            Self::Export | Self::ConcatFilm | Self::Import | Self::Open | Self::Script | Self::Warm | Self::Ai
+            Self::Export | Self::ConcatFilm | Self::Import | Self::Open | Self::Script | Self::Warm | Self::Ai | Self::Trace
         )
     }
 

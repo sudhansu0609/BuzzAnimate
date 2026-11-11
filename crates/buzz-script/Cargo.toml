@@ -23,6 +23,8 @@ buzz-audio.workspace = true
 # The asset library on disk -- the one directory a script may write to. See
 # `ScriptContext::asset_root`.
 buzz-doc.workspace = true
+# Layer filters (`setFiltersAtFrame`).
+buzz-fx.workspace = true
 
 kurbo.workspace = true
 # Several of the film-making calls take more arguments than rquickjs will bind

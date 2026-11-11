@@ -31,6 +31,8 @@ const DRAFT_LINE_PX: f64 = 3.0;
 const MEASURE_GRID: usize = 1024;
 /// Paper kept round the ink in a mask, in pixels.
 const PAD_PX: f64 = 4.0;
+/// The most pixels a set's mask has before it is traced coarser (T12).
+const MAX_CELLS: f64 = 4.0e6;
 /// Ink shapes closer than this in colour (CIELAB ΔE) are done together.
 const GROUP_DELTA_E: f64 = 3.0;
 
@@ -94,6 +96,26 @@ pub struct EvenLines {
 }
 
 impl EvenLines {
+    /// [`Self::set_widths`] with every line left on its own centreline, not
+    /// moved to keep an edge of the silhouette (T15: a bold black line covers
+    /// the edge anyway, and building the pins at a wide width is slow).
+    pub fn set_widths_centred(&mut self, width: f64, keep_weight: bool) {
+        let width = width.max(0.01);
+        let median = self.measured_median.unwrap_or(width).max(1e-9);
+        for (i, (shape, &m)) in self.shapes[self.solids..].iter_mut().zip(&self.measured).enumerate() {
+            if let Some(stroke) = shape.stroke.as_mut() {
+                stroke.width = if keep_weight {
+                    (width * m / median).clamp(0.5 * width, 2.0 * width)
+                } else {
+                    width
+                };
+                if let Some(pin) = self.pins.get(i).and_then(|p| p.as_ref()) {
+                    shape.path = pin.original.clone();
+                }
+            }
+        }
+    }
+
     /// Give every stroke its width for `width` / `keep_weight` (see
     /// [`EvenLinesOptions`]).
     pub fn set_widths(&mut self, width: f64, keep_weight: bool) {
@@ -278,6 +300,19 @@ pub fn even_lines(shapes: &[ShapeData], opts: &EvenLinesOptions) -> EvenLines {
 /// ink's was (the stroke thins or grows inward); a line inside it on both
 /// sides stays centred. Empty: no pinning (as [`even_lines`]).
 pub fn even_lines_within(shapes: &[ShapeData], silhouette: &[ShapeData], opts: &EvenLinesOptions) -> EvenLines {
+    even_lines_within_boxed(shapes, silhouette, None, None, opts)
+}
+
+/// [`even_lines_within`] with the silhouette shapes' bounding boxes already
+/// known (`boxes`, one per shape): a street's thousands of shapes are not
+/// measured again for every small set of ink.
+pub fn even_lines_within_boxed(
+    shapes: &[ShapeData],
+    silhouette: &[ShapeData],
+    boxes: Option<&[Rect]>,
+    measured_hint: Option<f64>,
+    opts: &EvenLinesOptions,
+) -> EvenLines {
     let mut solids: Vec<ShapeData> = Vec::new();
     // E1e: original ink kept as drawn (among `solids`).
     let mut kept = 0usize;
@@ -286,15 +321,24 @@ pub fn even_lines_within(shapes: &[ShapeData], silhouette: &[ShapeData], opts: &
     let straighten = opts.straighten.clamp(0.0, 1.0);
     let mut deepest = 0.0f64;
 
-    for (colour, group) in group_by_colour(shapes) {
+    let groups = group_by_colour(shapes);
+    // The caller's measure of `shapes` is each group's when there is one.
+    let hint = measured_hint.filter(|_| groups.len() == 1);
+    for (colour, group) in groups {
         let Some(bounds) = bounds_of(&group) else {
             continue;
         };
-        let Some(measured) = measure(&group, bounds) else {
+        let Some(measured) = hint.or_else(|| measure(&group, bounds)) else {
             continue;
         };
         let target = if opts.draft { DRAFT_LINE_PX } else { TARGET_LINE_PX };
-        let ppu = cap_ppu(bounds, MAX_GRID, target / measured.max(1e-6));
+        let mut ppu = cap_ppu(bounds, MAX_GRID, target / measured.max(1e-6));
+        // A huge set (a street's outline) is traced at fewer pixels per line
+        // than a character's: the work grows with the grid's area (T12).
+        let cells = (bounds.width() * ppu + 2.0 * PAD_PX) * (bounds.height() * ppu + 2.0 * PAD_PX);
+        if cells > MAX_CELLS {
+            ppu *= (MAX_CELLS / cells).sqrt();
+        }
         let mask = rasterise(&group, bounds, ppu);
         if !mask.ink.iter().any(|&v| v) {
             continue;
@@ -335,7 +379,7 @@ pub fn even_lines_within(shapes: &[ShapeData], silhouette: &[ShapeData], opts: &
         // E1d: every stroke measured against the silhouette, in mask pixels.
         let mut pins: Vec<Option<Pin>> = Vec::new();
         if !silhouette.is_empty() {
-            let probe = Probe::new(&mask, &group, silhouette, opts.draft, target);
+            let probe = Probe::new(&mask, &group, silhouette, boxes, opts.draft, target);
             pins = report
                 .shapes
                 .par_iter()
@@ -740,6 +784,54 @@ impl ExactSil {
     }
 }
 
+/// `path` with every curve that lies wholly above `y0` or below `y1` replaced
+/// by a line to its end (the same inside test for rows in between, far fewer
+/// segments to flatten).
+fn cull_rows(path: &BezPath, y0: f64, y1: f64) -> BezPath {
+    let out_of = |ys: &[f64]| {
+        let lo = ys.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        lo > y1 || hi < y0
+    };
+    let mut out = BezPath::new();
+    let mut cur = Point::ZERO;
+    let mut start = Point::ZERO;
+    for el in path.elements() {
+        match *el {
+            PathEl::MoveTo(p) => {
+                out.move_to(p);
+                cur = p;
+                start = p;
+            }
+            PathEl::LineTo(p) => {
+                out.line_to(p);
+                cur = p;
+            }
+            PathEl::QuadTo(a, p) => {
+                if out_of(&[cur.y, a.y, p.y]) {
+                    out.line_to(p);
+                } else {
+                    out.quad_to(a, p);
+                }
+                cur = p;
+            }
+            PathEl::CurveTo(a, b, p) => {
+                if out_of(&[cur.y, a.y, b.y, p.y]) {
+                    out.line_to(p);
+                } else {
+                    out.curve_to(a, b, p);
+                }
+                cur = p;
+            }
+            PathEl::ClosePath => {
+                out.close_path();
+                cur = start;
+            }
+        }
+    }
+    out
+}
+
 /// What a stroke is measured against (all in one group's mask pixels).
 struct Probe {
     w: usize,
@@ -755,19 +847,24 @@ struct Probe {
 }
 
 impl Probe {
-    fn new(mask: &Mask, group: &[&ShapeData], silhouette: &[ShapeData], draft: bool, line_px: f64) -> Self {
+    fn new(mask: &Mask, group: &[&ShapeData], silhouette: &[ShapeData], boxes: Option<&[Rect]>, draft: bool, line_px: f64) -> Self {
         let fwd = Affine::scale(mask.ppu) * Affine::translate((-mask.area.x0, -mask.area.y0));
         let area = mask.area;
         let mut paths: Vec<BezPath> = Vec::new();
-        for s in silhouette.iter().chain(group.iter().copied()) {
+        let known = |i: usize| boxes.and_then(|b| b.get(i)).copied();
+        let all = silhouette.iter().enumerate().map(|(i, s)| (s, known(i))).chain(group.iter().map(|s| (*s, None)));
+        for (s, b) in all {
             if s.fill.is_none() {
                 continue;
             }
-            let b = s.path.bounding_box();
+            let b = b.unwrap_or_else(|| s.path.bounding_box());
             if b.x1 < area.x0 || b.x0 > area.x1 || b.y1 < area.y0 || b.y0 > area.y1 {
                 continue;
             }
-            paths.push(fwd * s.path.clone());
+            // Only the rows of the mask matter: a curve wholly above or below
+            // them is a straight run to its end (a street's big shapes are
+            // not flattened in full for every small set of ink).
+            paths.push(fwd * cull_rows(&s.path, area.y0, area.y1));
         }
         let exact = ExactSil::new(&paths, mask.h);
         let mut sil = exact.mask(mask.w, mask.h);
@@ -1243,5 +1340,92 @@ impl Pin {
         } else {
             catmull_rom(&simplified)
         })
+    }
+}
+
+/// The longest side of the picture [`Coverage`] paints, in pixels.
+const COVERAGE_GRID: f64 = 2048.0;
+
+/// Where a picture's solid shapes cover, at a coarse scale, answering "is this
+/// whole box well inside them?" in constant time (T12): a set of ink deep
+/// inside the silhouette has no edge to be measured against, so the silhouette
+/// (thousands of shapes on a traced street) need not be flattened for it.
+#[derive(Debug)]
+pub struct Coverage {
+    w: usize,
+    h: usize,
+    area: Rect,
+    ppu: f64,
+    /// Summed-area table of the uncovered pixels, `(w + 1) × (h + 1)`.
+    uncovered: Vec<u32>,
+}
+
+impl Coverage {
+    /// The union of `shapes` (solid fills, each shape's box in `boxes`).
+    pub fn new(shapes: &[ShapeData], boxes: &[Rect]) -> Option<Self> {
+        let mut area: Option<Rect> = None;
+        for b in boxes {
+            if b.x0.is_finite() && b.y0.is_finite() && b.x1.is_finite() && b.y1.is_finite() {
+                area = Some(area.map_or(*b, |o| o.union(*b)));
+            }
+        }
+        let area = area.filter(|a| a.width() > 1e-9 && a.height() > 1e-9)?;
+        let ppu = (COVERAGE_GRID / area.width().max(area.height())).min(4.0);
+        let (w, h) = ((area.width() * ppu).ceil() as usize + 1, (area.height() * ppu).ceil() as usize + 1);
+        let mut covered = vec![false; w * h];
+        for (s, b) in shapes.iter().zip(boxes) {
+            if s.fill.is_none() || !(b.x0.is_finite() && b.y0.is_finite() && b.x1.is_finite() && b.y1.is_finite()) {
+                continue;
+            }
+            let gx0 = (((b.x0 - area.x0) * ppu).floor().max(0.0) as usize).min(w - 1);
+            let gy0 = (((b.y0 - area.y0) * ppu).floor().max(0.0) as usize).min(h - 1);
+            let gx1 = (((b.x1 - area.x0) * ppu).ceil().max(0.0) as usize + 1).min(w);
+            let gy1 = (((b.y1 - area.y0) * ppu).ceil().max(0.0) as usize + 1).min(h);
+            if gx1 <= gx0 || gy1 <= gy0 {
+                continue;
+            }
+            let mut grid = Grid::new(gx1 - gx0, gy1 - gy0);
+            let sub = Rect::new(
+                area.x0 + gx0 as f64 / ppu,
+                area.y0 + gy0 as f64 / ppu,
+                area.x0 + gx1 as f64 / ppu,
+                area.y0 + gy1 as f64 / ppu,
+            );
+            rasterise_fill(&s.path, &mut grid, sub, ppu);
+            for y in 0..grid.h {
+                for x in 0..grid.w {
+                    if grid.get(x, y) {
+                        covered[(gy0 + y) * w + gx0 + x] = true;
+                    }
+                }
+            }
+        }
+        let mut uncovered = vec![0u32; (w + 1) * (h + 1)];
+        for y in 0..h {
+            let mut row = 0u32;
+            for x in 0..w {
+                row += u32::from(!covered[y * w + x]);
+                uncovered[(y + 1) * (w + 1) + x + 1] = uncovered[y * (w + 1) + x + 1] + row;
+            }
+        }
+        Some(Self { w, h, area, ppu, uncovered })
+    }
+
+    /// Is every pixel within `margin` (units) of `rect` covered?
+    pub fn covers(&self, rect: Rect, margin: f64) -> bool {
+        let m = margin + 2.0 / self.ppu;
+        let x0 = ((rect.x0 - m - self.area.x0) * self.ppu).floor();
+        let y0 = ((rect.y0 - m - self.area.y0) * self.ppu).floor();
+        let x1 = ((rect.x1 + m - self.area.x0) * self.ppu).ceil();
+        let y1 = ((rect.y1 + m - self.area.y0) * self.ppu).ceil();
+        if !(x0 >= 0.0 && y0 >= 0.0 && x1 <= self.w as f64 && y1 <= self.h as f64) {
+            return false;
+        }
+        let (x0, y0, x1, y1) = (x0 as usize, y0 as usize, x1 as usize, y1 as usize);
+        let stride = self.w + 1;
+        let sum = self.uncovered[y1 * stride + x1] + self.uncovered[y0 * stride + x0]
+            - self.uncovered[y0 * stride + x1]
+            - self.uncovered[y1 * stride + x0];
+        sum == 0
     }
 }

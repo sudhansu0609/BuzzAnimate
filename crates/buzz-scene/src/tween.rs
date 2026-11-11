@@ -2648,6 +2648,41 @@ mod tests {
     }
 
     #[test]
+    fn a_tween_blends_an_instances_colour_effect() {
+        let object = |color: crate::ColorTransform| {
+            let mut inst = crate::SymbolInstance::new(crate::SymbolId(1));
+            inst.color = color;
+            Object {
+                id: ObjectId(4),
+                name: None,
+                transform: Affine::IDENTITY,
+                kind: ObjectKind::Instance(inst),
+                locked: false,
+                visible: true,
+                filters: Vec::new(),
+                blend: Default::default(),
+                spatial: Default::default(),
+                pivot: None,
+                modifiers: Vec::new(),
+                text: None,
+                turnaround: Default::default(),
+                drawing_object: false,
+            }
+        };
+        let mid = interpolate_object(
+            &object(crate::ColorTransform::default()),
+            &object(crate::ColorTransform::alpha(0.0)),
+            &Tween::classic(),
+            EasedProgress::uniform(0.5),
+            None,
+        );
+        let ObjectKind::Instance(i) = &mid.kind else {
+            panic!("expected an instance");
+        };
+        assert!((i.color.multiply[3] - 0.5).abs() < 1e-6, "{:?}", i.color);
+    }
+
+    #[test]
     fn a_tween_between_warps_moves_the_handles() {
         let shape = ShapeData::filled(
             Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9),

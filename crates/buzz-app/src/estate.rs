@@ -1339,7 +1339,7 @@ impl App {
                         }
                         DialogKind::Transcribe => {
                             if sounds.is_empty() {
-                                ui.label("The library has no sounds: File \u{25b8} Import Sound first.");
+                                ui.label("The library has no sounds: File \u{25b8} Import to Library first.");
                             } else {
                                 egui::ComboBox::from_id_salt("estate_transcribe_sound")
                                     .selected_text(sounds.get(d.sound).cloned().unwrap_or_default())

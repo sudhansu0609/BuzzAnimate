@@ -1105,7 +1105,7 @@ fn draw_selection_hatch(
     editor: &Editor,
     to_screen: &impl Fn(Point) -> egui::Pos2,
 ) {
-    let shapes = editor.selected_drawn_shapes();
+    let shapes = editor.selected_drawn_shapes_cached();
     if shapes.is_empty() {
         return;
     }

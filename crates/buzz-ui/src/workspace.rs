@@ -626,6 +626,11 @@ pub struct Workspace {
     /// a `.buzz` file.
     #[serde(default)]
     pub pasteboard: Option<[u8; 4]>,
+    /// **Where the progress window was last dropped** (top-left, points), so
+    /// the next long operation opens it there. `None` means centred on the
+    /// stage. Q2 of `docs/AI_QUIET_ACTIONS_PLAN.md`.
+    #[serde(default)]
+    pub progress_window_pos: Option<[f32; 2]>,
 }
 
 /// User preferences for local AI models, vision, and LLM backends.
@@ -1422,7 +1427,12 @@ impl Workspace {
             drawing_modes: crate::style::ToolDrawingModes::default(),
             protect_keyframes: false,
             protect_from_here: false,
-            trace: buzz_scene::TraceOptions::default(),
+            trace: buzz_scene::TraceOptions {
+                soft_tones: true,
+                optimize_after: true,
+                even_lines: Some(0.0),
+                ..buzz_scene::TraceOptions::default()
+            },
             asset_thumbnail_size: crate::assets_panel::ThumbnailSize::default(),
             keymap: std::collections::BTreeMap::new(),
             extra_keys: std::collections::BTreeMap::new(),
@@ -1431,6 +1441,7 @@ impl Workspace {
             ui_scale: default_ui_scale(),
             reduce_motion: false,
             pasteboard: None,
+            progress_window_pos: None,
         }
     }
 

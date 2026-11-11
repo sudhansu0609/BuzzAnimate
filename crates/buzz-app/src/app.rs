@@ -586,6 +586,9 @@ struct ImportBatch {
     total: usize,
     /// Name and reason, one entry per file that could not be read or merged.
     failed: Vec<(String, String)>,
+    /// How many pictures the batch has handled so far, for the stagger of
+    /// those landing on the stage (`App::stagger_offset`).
+    pictures: usize,
 }
 
 /// What a background AI task produced.
@@ -639,6 +642,29 @@ enum AiResult {
     /// pipeline, ready to be added to the document on the UI thread, rigged
     /// as the call's `rig` asked (layers unless it said bones).
     Character(Box<buzz_ai::character::AssembledCharacter>, buzz_rig::RigKind),
+    /// AI ▸ Split Picture into Layers: the plates and objects of the selected
+    /// picture as a scene in `backdrop::STAGE` space, and the picture they came
+    /// from (layer, object, bitmap, and the affine from `STAGE` space onto where
+    /// the picture sits) so the commit can check it is still there.
+    SplitPicture {
+        scene: Box<buzz_scene::Scene>,
+        placed: Vec<crate::bg_objects::Placed>,
+        notes: Vec<String>,
+        source: (buzz_scene::LayerId, buzz_scene::ObjectId, Arc<buzz_scene::ImageAsset>, buzz_geom::Affine),
+    },
+    /// AI ▸ Generate Background: the pictures drawn (png, seed), and what to do
+    /// with them without asking (the agent's pick, and whether to trace + split).
+    Backgrounds {
+        pictures: Vec<(std::path::PathBuf, u64)>,
+        auto: Option<(usize, bool)>,
+    },
+    /// AI ▸ Split Picture into Layers on traced artwork (S5): what to move
+    /// where, decided off the UI thread.
+    SplitArtwork(Box<crate::split_artwork::ArtworkPlan>),
+    /// AI ▸ Remove Object: the picture rendered and encoded, ready for clicks.
+    RemovePrepared(Box<crate::split_artwork::Prepared>),
+    /// Remove from Picture: what to take out and the patch, decided off the UI thread.
+    RemoveArtwork(Box<crate::split_artwork::RemovePlan>),
     /// The pose sheet of a character just created from an image (F7.0).
     PoseSheet(Vec<(String, image::RgbaImage)>),
     /// AI ▸ Direct Story's background half: a parsed director script, still
@@ -672,8 +698,19 @@ enum AiResult {
     /// File > AI > Story to Screenplay (ANIMATE_COPILOT_PLAN B1): the cast
     /// lines and where `screenplay.md` was written.
     StoryConverted { cast: Vec<String>, screenplay: std::path::PathBuf },
+    /// Sequence > Lip Sync All Characters (E3): the dialogue heard and matched to the script's lines.
+    LipSyncAllHeard {
+        lines: Vec<crate::scene_life::SpokenLine>,
+        visemes: buzz_audio::VisemeTrack,
+        start: u32,
+        notes: Vec<String>,
+        secs: f64,
+        model: String,
+    },
     /// The Producer window / a co-pilot tool (B4): what one action changed.
     Copilot { out: std::path::PathBuf, result: Box<crate::copilot::ActionResult> },
+    /// File > AI > Casting > Import cast FLA / the `import_cast_fla` tool (ALAXMI plan B1a).
+    CastFlaImported { report: Box<crate::cast_fla::CastFlaReport> },
 }
 
 /// What the Assistant's `transcribe` listens to.
@@ -846,6 +883,29 @@ fn layer_rig_plan_json(scene: &buzz_scene::Scene, plan: &crate::rigging::LayerRi
     })
 }
 
+/// What a Remove from Picture job takes out.
+pub(crate) enum RemoveWhat {
+    /// These shapes, whole (Delete and Fill).
+    Shapes(Vec<buzz_scene::ObjectId>),
+    /// SAM 2 point prompts in the layer's space `(point, positive)`.
+    Points(Vec<(Point, bool)>),
+    /// A picked mask on an already-encoded picture (the Remove Object tool).
+    Mask(Arc<crate::split_artwork::Prepared>, image::GrayImage),
+}
+
+/// AI ▸ Remove Object between its start and its removal.
+struct RemovePick {
+    layer: buzz_scene::LayerId,
+    frame: u32,
+    /// `None` while the picture is still being rendered and encoded.
+    prep: Option<Arc<crate::split_artwork::Prepared>>,
+    /// Clicks in the layer's space, positive or not.
+    points: Vec<(Point, bool)>,
+    mask: Option<image::GrayImage>,
+    /// The mask's outline in picture pixels.
+    outline: Vec<Vec<Point>>,
+}
+
 /// What `wait_for_jobs` reports for a finished AI job, from what the task
 /// produced (the commit adds the status line to it).
 fn ai_job_summary(result: &AiResult) -> serde_json::Value {
@@ -998,6 +1058,8 @@ struct ScriptRun {
     id: crate::tasks::TaskId,
     /// The working scene and what the run made of it, sent back together.
     result: crossbeam_channel::Receiver<(buzz_scene::Scene, buzz_script::ScriptOutcome)>,
+    /// The undo step's name: "Run Script", or the Animate command that ran.
+    label: String,
 }
 
 pub struct App {
@@ -1052,6 +1114,8 @@ pub struct App {
     /// a frame whose layout has not settled hands out `Rect::NOTHING`, and
     /// drawing through that is what a black stage is.
     last_stage_area: Option<egui::Rect>,
+    /// The progress window is collapsed to its slim bar (Q2).
+    progress_hidden: bool,
     /// The OS window title as it was last set, so `render` calls `set_title`
     /// only when the document's display name actually changes.
     last_window_title: String,
@@ -1185,6 +1249,8 @@ pub struct App {
     /// press and release with no button between is a tap — Play/Pause; with
     /// one it was the hold-to-pan gesture and plays nothing.
     space_held: Option<bool>,
+    /// AI ▸ Remove Object while it waits for clicks on the stage.
+    remove_pick: Option<RemovePick>,
     thumbnails: crate::thumbnails::Thumbnails,
     /// Pictures for the Assets panel. Separate from [`Self::thumbnails`]
     /// because an asset is a file on disk rather than a symbol in the open
@@ -1206,6 +1272,9 @@ pub struct App {
     reload_paths: std::collections::BTreeSet<std::path::PathBuf>,
     story: buzz_ui::produce_dialog::StoryDialogState,
     story_task: Option<crate::tasks::TaskId>,
+    /// **AI > Generate Background...** (E1): the dialog and its drawing task.
+    gen_bg: crate::gen_background::GenBackground,
+    gen_bg_task: Option<crate::tasks::TaskId>,
     /// **File > AI > Casting...** (ANIMATE_COPILOT_PLAN B2): who plays whom.
     casting: buzz_ui::casting_dialog::CastingDialogState,
     /// **File > AI > New Episode...** (ANIMATE_COPILOT_PLAN B7): the guided window.
@@ -1272,6 +1341,12 @@ pub struct App {
     /// the target holds anything else (a single-pass frame, a new document).
     /// With an equal stage stamp it means the banded picture is still there.
     banded_on_target: Option<(u32, u32, Color)>,
+    /// **The retained lit stage (T14b).** Set once the single pass has
+    /// rendered `active.vello` into `Active::target`: the target's size and the
+    /// pasteboard it was drawn over. `None` whenever the target holds anything
+    /// else. With the encoding reused (an equal stage stamp) it means the
+    /// target already is this frame, so an idle redraw only blits it.
+    rendered_on_target: Option<(u32, u32, Color)>,
     /// Sounds being decoded off the UI thread, and where the results land.
     ///
     /// `Scene::merge` can bring in a whole soundtrack at once; decoding it inline
@@ -1293,6 +1368,10 @@ pub struct App {
     /// frozen window — a script *is* briefly in sole charge of the document —
     /// and it is the difference between "working" and "hung".
     scripting: Option<ScriptRun>,
+    /// The user's Animate commands: the Commands menu, their settings and keys.
+    jsfl: crate::jsfl_ui::JsflState,
+    /// The dialogs a running script asks (prompt, confirm, XMLUI) — J6.
+    script_dialogs: crate::jsfl_dialog::ScriptDialogs,
     /// Files being read on a thread, by the task that is reading them.
     ///
     /// A map rather than a single slot because the registry is free to run
@@ -1305,6 +1384,33 @@ pub struct App {
     /// off the UI thread, and what it built lands here to be committed through
     /// one `Document::edit` on the frame that collects it.
     ai_results: std::collections::HashMap<crate::tasks::TaskId, crossbeam_channel::Receiver<AiResult>>,
+    /// The Trace Bitmap running on a task thread: its task, the job it was
+    /// started from (to apply the result against), and where the result comes.
+    trace_running: Option<(
+        crate::tasks::TaskId,
+        crate::editor::TraceJob,
+        crossbeam_channel::Receiver<Result<crate::editor::TraceResult, String>>,
+    )>,
+    /// Trace Bold + Split into Layers (T16b): the trace in `trace_running` is to
+    /// be followed by Split Picture into Layers on the artwork it makes.
+    split_after_trace: bool,
+    /// The next Split Picture into Layers asks the VLM again instead of reusing the saved
+    /// object list (Shift held on the menu command, the agent's `redetect`); the split
+    /// that starts takes it.
+    pub(crate) split_redetect: bool,
+    /// The Even Out Lines work running on a task thread (T12): its task, the
+    /// generation it answers, and where the result comes.
+    /// The Optimize Shapes work running on a task thread (T13), as above.
+    optimize_running: Option<(
+        crate::tasks::TaskId,
+        u64,
+        crossbeam_channel::Receiver<crate::optimize::OptimizeDone>,
+    )>,
+    even_lines_running: Option<(
+        crate::tasks::TaskId,
+        u64,
+        crossbeam_channel::Receiver<crate::editor::EvenLinesDone>,
+    )>,
     /// **The AI panel** (F7.0): its own state, and the AI tasks started from
     /// it — whose results wait in the panel for Build/Apply rather than
     /// being committed the moment they arrive, as the menu commands' are.
@@ -1340,9 +1446,9 @@ pub struct App {
     pub(crate) last_ai_task: Option<crate::tasks::TaskId>,
     /// The file picker, if one is open, and what it was opened for.
     picker: crate::dialogs::Pending<Pick>,
-    /// The multi-file picker (D3), for the four Import dialogs that accept
-    /// more than one file at once: Import to Stage, Import to Library,
-    /// Import Sound and Import Image.
+    /// The multi-file picker (D3), for the Import dialogs that accept more
+    /// than one file at once: Import to Stage and Import to Library (which
+    /// Import Sound and Import Image now open too).
     picker_many: crate::dialogs::PendingMany<Pick>,
     /// Files queued for `Pick::ImportInto` once more than one was chosen —
     /// each merged in turn, off the picker, so only one read-and-merge
@@ -1501,6 +1607,7 @@ impl App {
             stage_stamp: None,
             last_rig: 0,
             last_stage_area: None,
+            progress_hidden: false,
             last_window_title: String::new(),
             title_bar: crate::title_bar::TitleBar::for_platform(),
             window_requests: Vec::new(),
@@ -1544,6 +1651,7 @@ impl App {
             merging: false,
             stage_area_min: egui::Pos2::ZERO,
             space_held: None,
+            remove_pick: None,
             thumbnails: crate::thumbnails::Thumbnails::default(),
             asset_thumbnails: crate::thumbnails::AssetThumbnails::default(),
             arrange: buzz_ui::ArrangeDialogState::default(),
@@ -1555,6 +1663,8 @@ impl App {
             reload_paths: std::collections::BTreeSet::new(),
             story: buzz_ui::produce_dialog::StoryDialogState::default(),
             story_task: None,
+            gen_bg: crate::gen_background::GenBackground::default(),
+            gen_bg_task: None,
             casting: buzz_ui::casting_dialog::CastingDialogState::default(),
             episode: buzz_ui::episode_window::EpisodeState::default(),
             episode_task: None,
@@ -1574,11 +1684,19 @@ impl App {
             band_frames_since_ladder: 0,
             band_last_frame: 0,
             banded_on_target: None,
+            rendered_on_target: None,
             sound_decode: None,
             usage_cache: UsageCache::default(),
             scripting: None,
+            jsfl: crate::jsfl_ui::JsflState::default(),
+            script_dialogs: crate::jsfl_dialog::ScriptDialogs::default(),
             loading: std::collections::HashMap::new(),
             ai_results: std::collections::HashMap::new(),
+            trace_running: None,
+            split_after_trace: false,
+            split_redetect: false,
+            even_lines_running: None,
+            optimize_running: None,
             ai_panel: buzz_ui::ai_panel::AiPanelState::default(),
             agent_bridge: Default::default(),
             api: Default::default(),
@@ -2890,6 +3008,8 @@ pub const KEYBOARD_COMMANDS: &[Command] = &[
     Command::Copy,
     Command::Paste,
     Command::PasteInPlace,
+    // Shift+Delete: the selection goes and the hole it leaves is patched.
+    Command::DeleteAndFill,
     Command::Delete,
     Command::SelectAll,
     Command::Deselect,
@@ -4166,6 +4286,10 @@ impl App {
         // Before `poll_tasks`, so a BuzzEdit or Studio flow that has just
         // answered lands its result before its task is reported as ended.
         self.estate_pump();
+        // Also before `poll_tasks`: the result is sent before the task ends.
+        self.poll_trace();
+        self.poll_even_lines();
+        self.poll_optimize();
         self.poll_tasks();
         self.voice_tick(&ctx);
         // The Assistant's tool calls run here, on the UI thread, one frame at a time.
@@ -4195,6 +4319,11 @@ impl App {
         // somewhere to live; it is drawn after the panels so it sits over
         // everything, and gates pointer input to the document beneath it.
         self.script_overlay(&ctx);
+        if self.scripting.is_none() {
+            // The run ended (stopped, say) with a question still up.
+            self.script_dialogs.close();
+        }
+        self.script_dialogs.show(&ctx);
         self.quit_prompt_dialog(&ctx);
         self.close_prompt_dialog(&ctx);
         self.export_dialog(&ctx);
@@ -4205,8 +4334,11 @@ impl App {
         // Even Out Lines (E2): the editor previews and applies what it asks.
         let even_lines = buzz_ui::even_lines_dialog(&ctx, &mut self.editor.even_lines_dialog);
         self.editor.even_lines_action(even_lines);
+        let optimize = buzz_ui::optimize_dialog(&ctx, &mut self.editor.optimize.dialog);
+        self.editor.optimize_action(optimize);
         self.produce_dialog(&ctx);
         self.story_dialog(&ctx);
+        self.gen_background_dialog(&ctx);
         self.producer_window(&ctx);
         self.casting_dialog(&ctx);
         self.episode_window(&ctx);
@@ -4253,6 +4385,43 @@ impl App {
                 self.editor.status = Some(format!("Applied AI renames to {count} assets"));
             }
             buzz_ui::AiRenameAction::None => {}
+        }
+        // AI actions stay quiet (Q1): while the panel is closed a running task
+        // shows a small card (the Tasks panel lists them itself, so not then),
+        // and a review that waits for the user gets a window of its own.
+        // Every long operation shows in one movable progress window (Q2); the
+        // Tasks panel lists them itself, and the AI panel its own tasks.
+        if !self.editor.workspace.is_open(buzz_ui::PanelId::Tasks) {
+            let rows = self.progress_rows(!ai_panel_open);
+            let stage = self.last_stage_area.unwrap_or(FALLBACK_STAGE_AREA);
+            let out = buzz_ui::ai_panel::progress_window(
+                &ctx,
+                &rows,
+                stage,
+                self.editor.workspace.progress_window_pos,
+                &mut self.progress_hidden,
+            );
+            if let Some(id) = out.cancel {
+                self.tasks.cancel(crate::tasks::TaskId(id));
+            }
+            if let Some(pos) = out.moved {
+                self.editor.workspace.progress_window_pos = Some(pos);
+                self.editor.workspace.save();
+            }
+        }
+        if !ai_panel_open {
+            let sounds: Vec<String> = self.editor.doc.scene().sounds().iter().map(|s| s.name.clone()).collect();
+            let rig_target = self.ai_rig_target_name();
+            let actions = buzz_ui::ai_panel::ai_review_windows(
+                &ctx,
+                &mut self.ai_panel,
+                &self.editor.workspace.ai,
+                &sounds,
+                rig_target.as_deref(),
+            );
+            for action in actions {
+                self.ai_panel_action(action);
+            }
         }
 
         // Assets ▸ Arrange by type & style… (AS2).
@@ -4433,6 +4602,9 @@ impl App {
             commands.push(command);
         }
 
+        // The user's Animate commands first: their keys win over a BuzzAnimate
+        // command on the same key.
+        self.jsfl_frame(&ctx);
         let (keyed, keyed_scripts) = keyboard_commands(&ctx, &mut self.editor);
         commands.extend(keyed);
         commands.extend(self.space_tap(&ctx));
@@ -4446,6 +4618,10 @@ impl App {
         if self.doc_available() {
             for command in commands {
                 if self.user_command_allowed(command) {
+                    if command == Command::AiSplitPictureIntoLayers {
+                        // Shift held while choosing it: ask the VLM again, not the saved list.
+                        self.split_redetect = ctx.input(|i| i.modifiers.shift);
+                    }
                     self.dispatch(command);
                 }
             }
@@ -4560,6 +4736,11 @@ impl App {
         };
 
         let mut state = std::mem::take(&mut self.editor.cast_panel);
+        // What the sheet's pose list, Add Pose and Save changes need from the shell.
+        state.library_symbols = self.editor.doc.scene().library().iter().map(|s| s.name.clone()).collect();
+        state.character_poses = self.cast_sheet.as_ref().map(|s| crate::cast_pose_edit::pose_names(&s.scene)).unwrap_or_default();
+        state.save_target =
+            crate::cast_pose_edit::source_of(self.editor.doc.scene(), &self.editor.assets, self.editor.selection.iter().next());
         let thumbs = &mut self.asset_thumbnails;
         let action = buzz_ui::cast_panel(
             ui,
@@ -4574,6 +4755,47 @@ impl App {
 
         if let Some(action) = action {
             self.apply_cast_action(action);
+        }
+    }
+
+    /// **Cast into the shot** for a combined Cast character (E2): [`crate::scene_life::cast_into_shot`] in
+    /// one undo step, the character arriving selected; with "Add breath + blinks" ticked it breathes and
+    /// blinks from the playhead to the scene's end.
+    fn cast_into_shot(&mut self, asset: buzz_doc::Asset) {
+        let library = self.editor.assets.clone();
+        let life = !self.editor.cast_panel.life_off;
+        let frame = self.editor.current_frame;
+        let before: std::collections::HashSet<buzz_scene::ObjectId> =
+            self.editor.doc.scene().layers().iter().flat_map(|l| l.objects_at(frame).iter().map(|o| o.id)).collect();
+        let mut outcome = None;
+        self.editor.doc.edit("Cast into the Shot", |scene| {
+            outcome = Some(crate::scene_life::cast_into_shot(scene, &library, &asset, life, frame));
+        });
+        self.editor.doc.end_gesture();
+        match outcome {
+            Some(Ok(cast)) => {
+                let arrived: Vec<buzz_scene::ObjectId> = self
+                    .editor
+                    .doc
+                    .scene()
+                    .layers()
+                    .iter()
+                    .flat_map(|l| l.objects_at(frame).iter().map(|o| o.id))
+                    .filter(|id| !before.contains(id))
+                    .collect();
+                self.editor.selection.set(arrived);
+                self.editor.selection.ensure_active_layer(self.editor.doc.scene());
+                self.editor.status = Some(if cast.life.characters.is_empty() {
+                    format!("Cast {} into the shot", asset.name)
+                } else {
+                    format!("Cast {} into the shot, breathing and blinking from frame {frame}", asset.name)
+                });
+            }
+            Some(Err(e)) => {
+                self.editor.doc.undo();
+                self.editor.status = Some(format!("Could not cast {}: {e}", asset.name));
+            }
+            None => {}
         }
     }
 
@@ -4622,8 +4844,45 @@ impl App {
             // The panel already recorded which character is open in its own
             // state; the sheet loads on the next frame.
             Open(_) => {}
-            Cast(asset) => self.apply_asset_action(buzz_ui::AssetAction::Place(asset)),
+            Cast(asset) => {
+                // A combined character (a set of poses) is unpacked as a layer rig with its own head and
+                // given breath and blinks (E2); any other asset is placed as it always was.
+                let combined = self.editor.assets.load(&asset).ok().and_then(|s| crate::cast_combine::main_symbol(&s)).is_some();
+                if combined {
+                    self.cast_into_shot(asset);
+                } else {
+                    self.apply_asset_action(buzz_ui::AssetAction::Place(asset));
+                }
+            }
             AddSelection => self.add_to_cast(),
+            AddPose { asset, label, source } => self.cast_add_pose(asset, label, source),
+            RemovePose { asset, pose } => {
+                let stamp = crate::cast_fresh::backup_stamp();
+                let status = match crate::cast_pose_edit::remove_pose(&mut self.editor.assets, &asset, &pose, &stamp) {
+                    Ok(()) => format!("Removed pose {pose} from {} (the old file is in _cast_backup)", asset.name),
+                    Err(e) => format!("Could not remove the pose: {e}"),
+                };
+                self.cast_pose_edited();
+                self.editor.status = Some(status);
+            }
+            RenamePose { asset, pose, label } => {
+                let stamp = crate::cast_fresh::backup_stamp();
+                let status = match crate::cast_pose_edit::rename_pose(&mut self.editor.assets, &asset, &pose, &label, &stamp) {
+                    Ok(full) => format!("Renamed {pose} to {full}"),
+                    Err(e) => format!("Could not rename the pose: {e}"),
+                };
+                self.cast_pose_edited();
+                self.editor.status = Some(status);
+            }
+            SaveChanges(asset) => {
+                let stamp = crate::cast_fresh::backup_stamp();
+                let status = match crate::cast_pose_edit::save_changes(&mut self.editor.assets, self.editor.doc.scene(), &asset, &stamp) {
+                    Ok(n) => format!("Saved {n} layers back to {} (the old file is in _cast_backup)", asset.name),
+                    Err(e) => format!("Could not save changes: {e}"),
+                };
+                self.cast_pose_edited();
+                self.editor.status = Some(status);
+            }
             Rename { asset, name } => {
                 if let Err(e) = self.editor.assets.rename(&asset, &name) {
                     self.editor.status = Some(format!("Could not rename: {e}"));
@@ -4637,29 +4896,146 @@ impl App {
                 }
             }
             Delete(asset) => self.delete_from_cast(asset),
+            AskDelete(assets) => {
+                let root = self.editor.assets.root().map(std::path::Path::to_path_buf).unwrap_or_default();
+                let cast_in_series = crate::cast_fresh::cast_in_series(&root, &assets);
+                self.editor.cast_panel.delete_ask = Some(buzz_ui::DeleteAsk { assets, cast_in_series });
+            }
+            CombinePoses(assets) => {
+                let roles: Vec<String> = assets
+                    .iter()
+                    .map(|a| crate::cast_combine::pose_of(&a.name).map(|(r, _)| r).unwrap_or_else(|| a.name.clone()))
+                    .collect();
+                let stamp = crate::cast_fresh::backup_stamp();
+                let (done, failed) = crate::cast_combine::combine_many(&mut self.editor.assets, Some(&roles), &stamp);
+                self.editor.cast_panel.selected.clear();
+                self.cast_sheet = None;
+                self.asset_thumbnails.forget();
+                let mut status = match done.len() {
+                    0 => "Combine poses: nothing to combine".to_string(),
+                    n => format!("Combine poses: {n} characters combined \u{2014} separate files moved to {}", done[0].backup.display()),
+                };
+                if let Some(first) = failed.first() {
+                    status.push_str(&format!(" ({} failed: {first})", failed.len()));
+                }
+                self.editor.status = Some(status);
+            }
+            DeleteMany(assets) => {
+                let _ = self.delete_cast_many(&assets);
+            }
             Recolour { asset, from, to } => self.recolour_character(&asset, from, to),
             Rescan => {
                 self.editor.assets.rescan();
                 self.asset_thumbnails.forget();
                 self.cast_sheet = None;
             }
+            StartFresh { asset, keep } => {
+                let _ = self.start_fresh_cast(asset, keep);
+            }
+        }
+    }
+
+    /// **Start Fresh** (CAST_FRESH_PLAN F1): clear every keyframe of one Cast
+    /// character (`None`: all of them), keeping the pose at frame `keep` (`None`:
+    /// the first frame). Each file is backed up under `_cast_backup/<stamp>/`
+    /// first; the status line says where. Returns what was done to each.
+    pub(crate) fn start_fresh_cast(
+        &mut self,
+        asset: Option<buzz_doc::Asset>,
+        keep: Option<u32>,
+    ) -> Result<Vec<crate::cast_fresh::FreshOutcome>, String> {
+        let targets = match asset {
+            Some(one) => vec![one],
+            None => crate::cast_fresh::cast_characters(&self.editor.assets),
+        };
+        if targets.is_empty() {
+            let message = "There are no characters in the cast".to_string();
+            self.editor.status = Some(message.clone());
+            return Err(message);
+        }
+        let keep = keep.map_or(buzz_scene::KeepPose::First, buzz_scene::KeepPose::Frame);
+        let stamp = crate::cast_fresh::backup_stamp();
+        let mut done = Vec::new();
+        let mut failed = Vec::new();
+        for target in &targets {
+            match crate::cast_fresh::start_fresh_asset(&mut self.editor.assets, target, keep, &stamp) {
+                Ok(outcome) => done.push(outcome),
+                Err(e) => failed.push(e),
+            }
+        }
+        self.asset_thumbnails.forget();
+        self.cast_sheet = None;
+        let backups = self
+            .editor
+            .assets
+            .root()
+            .map(|r| r.join(crate::cast_fresh::BACKUP_FOLDER).join(&stamp).display().to_string())
+            .unwrap_or_default();
+        let mut status = match done.len() {
+            0 => "Start Fresh: nothing was cleared".to_string(),
+            1 => format!("Start Fresh: {} cleared \u{2014} backup in {backups}", done[0].name),
+            n => format!("Start Fresh: {n} characters cleared \u{2014} backups in {backups}"),
+        };
+        if let Some(first) = failed.first() {
+            status.push_str(&format!(" ({} failed: {first})", failed.len()));
+        }
+        self.editor.status = Some(status);
+        if done.is_empty() {
+            Err(failed.join("; "))
+        } else {
+            Ok(done)
         }
     }
 
     /// Keep the selected character as a new member of the cast and open its
     /// sheet. Filed under [`buzz_ui::CAST_FOLDER`], which is what tells a
     /// character apart from a prop in the same library.
+    /// The sheet and thumbnails are stale after a pose edit wrote the asset.
+    fn cast_pose_edited(&mut self) {
+        self.cast_sheet = None;
+        self.asset_thumbnails.forget();
+    }
+
+    /// **Add Pose** (CAST_POSES_PLAN C2 e1): build the pose from its source, add it
+    /// to the character's set and save the asset back, backup first.
+    fn cast_add_pose(&mut self, asset: buzz_doc::Asset, label: String, source: buzz_ui::PoseSource) {
+        let stamp = crate::cast_fresh::backup_stamp();
+        let doc = self.editor.doc.scene().clone();
+        let result = match &source {
+            buzz_ui::PoseSource::LibrarySymbol(name) => crate::cast_pose_edit::add_pose(
+                &mut self.editor.assets,
+                &asset,
+                &label,
+                crate::cast_pose_edit::PoseInput::LibrarySymbol(&doc, name),
+                &stamp,
+            ),
+            buzz_ui::PoseSource::Picture(path) => {
+                let scratch = std::env::temp_dir().join(format!("buzz-pose-{stamp}"));
+                let built = crate::cast_pose_edit::rig_from_picture(path, &scratch, &mut |_| {});
+                let _ = std::fs::remove_dir_all(&scratch);
+                built.and_then(|rig| {
+                    crate::cast_pose_edit::add_pose(&mut self.editor.assets, &asset, &label, crate::cast_pose_edit::PoseInput::Rig(rig), &stamp)
+                })
+            }
+            buzz_ui::PoseSource::FlaSymbol { fla, symbol } => crate::cast_pose_edit::rig_from_fla(fla, symbol).and_then(|rig| {
+                crate::cast_pose_edit::add_pose(&mut self.editor.assets, &asset, &label, crate::cast_pose_edit::PoseInput::Rig(rig), &stamp)
+            }),
+        };
+        self.cast_pose_edited();
+        self.editor.status = Some(match result {
+            Ok(full) => format!("Added pose {full} to {} (the old file is in _cast_backup)", asset.name),
+            Err(e) => format!("Could not add the pose: {e}"),
+        });
+    }
+
     fn add_to_cast(&mut self) {
         let ids = self.editor.selection.ids();
         if ids.is_empty() {
             self.editor.status = Some("Select a character to add to the cast".into());
             return;
         }
-        let doc = self
-            .editor
-            .doc
-            .scene()
-            .extract(self.editor.current_frame, &ids);
+        // The symbol set of an instance travels with it (CAST_POSES_PLAN C2 e3).
+        let doc = crate::cast_pose_edit::extract_with_sets(self.editor.doc.scene(), self.editor.current_frame, &ids);
         let name = self
             .editor
             .assets
@@ -4691,8 +5067,8 @@ impl App {
             return;
         }
         self.editor.cast_panel.confirm_delete = None;
-        match self.editor.assets.delete(&asset) {
-            Ok(()) => {
+        match self.delete_cast_many(std::slice::from_ref(&asset)) {
+            Ok(_) => {
                 if self.editor.cast_panel.open.as_deref() == Some(asset.path.as_path()) {
                     self.editor.cast_panel.open = None;
                 }
@@ -4701,6 +5077,52 @@ impl App {
                 self.editor.status = Some(format!("Removed {} from the cast", asset.name));
             }
             Err(e) => self.editor.status = Some(format!("Could not remove {}: {e}", asset.name)),
+        }
+    }
+
+    /// **Delete = move** (CAST_POSES C1): every asset goes to
+    /// `<root>/_cast_backup/<stamp>_deleted/<rel path>` with its thumbnail;
+    /// nothing is erased. The status line says where, and which of them a
+    /// series' casting.json still points at.
+    pub(crate) fn delete_cast_many(
+        &mut self,
+        assets: &[buzz_doc::Asset],
+    ) -> Result<Vec<crate::cast_fresh::DeletedOutcome>, String> {
+        if assets.is_empty() {
+            let message = "Nothing is selected to delete".to_string();
+            self.editor.status = Some(message.clone());
+            return Err(message);
+        }
+        let root = self.editor.assets.root().map(std::path::Path::to_path_buf).unwrap_or_default();
+        let cast_in_series = crate::cast_fresh::cast_in_series(&root, assets);
+        let stamp = crate::cast_fresh::backup_stamp();
+        let (done, failed) = crate::cast_fresh::delete_to_backup(&mut self.editor.assets, assets, &stamp)?;
+        let moved: Vec<&buzz_doc::Asset> = assets.iter().filter(|a| done.iter().any(|d| d.name == a.name)).collect();
+        if let Some(open) = self.editor.cast_panel.open.clone()
+            && moved.iter().any(|a| a.path == open)
+        {
+            self.editor.cast_panel.open = None;
+        }
+        self.editor.cast_panel.selected.clear();
+        self.editor.cast_panel.delete_ask = None;
+        self.cast_sheet = None;
+        self.asset_thumbnails.forget();
+        let backups = crate::cast_fresh::deleted_folder(&root, &stamp).display().to_string();
+        let mut status = format!("Moved {} characters to {backups}", done.len());
+        if !cast_in_series.is_empty() {
+            status.push_str(&format!(
+                " \u{2014} still named in casting.json: {}",
+                cast_in_series.join(", ")
+            ));
+        }
+        if let Some(first) = failed.first() {
+            status.push_str(&format!(" ({} failed: {first})", failed.len()));
+        }
+        self.editor.status = Some(status);
+        if done.is_empty() {
+            Err(failed.join("; "))
+        } else {
+            Ok(done)
         }
     }
 
@@ -5937,6 +6359,10 @@ impl App {
                 });
                 if let Some(command) = raised {
                     commands.push(command);
+                }
+                // A picture or sound: place it, or delete it if unused.
+                if let Some(request) = self.editor.library.media_request.take() {
+                    self.editor.run_library_media(request);
                 }
             }
 
@@ -8644,6 +9070,7 @@ impl App {
         let has_selection = !self.editor.selection.is_empty();
         let mut raised: Option<Command> = None;
         let mut save_asset = false;
+        let mut pose_pick: Option<(crate::cast_combine::PoseTarget, buzz_scene::SymbolId)> = None;
 
         // A probe for the test that drives the real window: the popup egui
         // opens has an id of its own, and this is the honest way to ask the
@@ -8691,6 +9118,7 @@ impl App {
             item(ui, Command::Paste, true);
             item(ui, Command::PasteInPlace, true);
             item(ui, Command::Delete, has_selection);
+            item(ui, Command::DeleteAndFill, has_selection);
             ui.separator();
 
             item(ui, Command::RotateClockwise, has_selection);
@@ -8719,8 +9147,25 @@ impl App {
                     .is_some_and(|(_, o)| o.instance().is_some())
             });
             item(ui, Command::ClearAllKeyframes, has_instance);
+            // Pose > list, for a Cast character (CAST_POSES_PLAN C2): switches it
+            // from the playhead on.
+            if let Some((target, shown, poses)) = crate::cast_combine::pose_choices(
+                self.editor.doc.scene(),
+                self.editor.selection.iter().next(),
+                self.editor.edit_at().frame,
+            ) {
+                ui.menu_button("Pose", |ui| {
+                    for (id, name) in &poses {
+                        if ui.selectable_label(*name == shown, name).clicked() && *name != shown {
+                            pose_pick = Some((target, *id));
+                            ui.close();
+                        }
+                    }
+                });
+            }
             item(ui, Command::RigHead, has_instance);
             item(ui, Command::EvenLines, has_selection);
+            item(ui, Command::OptimizeShapes, has_selection);
             item(ui, Command::RemoveBackgroundSpecks, has_selection);
             // Copy Motion / Paste Motion (C1), on what was right-clicked.
             let has_motion = self.editor.motion_clip.is_some();
@@ -8757,6 +9202,14 @@ impl App {
             && self.user_command_allowed(command)
         {
             self.dispatch(command);
+        }
+        if let Some((target, pose)) = pose_pick
+            && !self.agent_active()
+        {
+            let frame = self.editor.edit_at().frame;
+            self.editor.doc.edit("Pose", |scene| {
+                crate::cast_combine::pick_pose(scene, target, frame, pose);
+            });
         }
         if save_asset && !self.agent_active() {
             let folder = self.editor.assets_panel.selected_folder.clone();
@@ -8870,6 +9323,35 @@ impl App {
             }
         }
 
+        // **A picture or sound dragged out of the Library.** A picture lands
+        // where it is let go; a sound has no place on the stage, so it goes on
+        // a layer of its own. Taken before the tools, for the same reason as
+        // the symbol above.
+        if egui::DragAndDrop::has_payload_of_type::<buzz_ui::library_panel::DraggedMedia>(&ctx) {
+            let over = ctx
+                .input(|i| i.pointer.hover_pos())
+                .is_some_and(|p| area.contains(p));
+            if over {
+                ctx.set_cursor_icon(egui::CursorIcon::Copy);
+                if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
+                    ui.painter().circle_stroke(
+                        p,
+                        7.0,
+                        egui::Stroke::new(1.5, buzz_ui::Palette::active()),
+                    );
+                }
+            }
+            if over && ctx.input(|i| i.pointer.any_released()) {
+                if let Some(dropped) =
+                    egui::DragAndDrop::take_payload::<buzz_ui::library_panel::DraggedMedia>(&ctx)
+                    && let Some(p) = ctx.input(|i| i.pointer.interact_pos())
+                {
+                    self.editor.drop_library_media(dropped.0, local(p));
+                }
+                return;
+            }
+        }
+
         // **A slot in the Rigging panel is waiting for a drawing.**
         //
         // Taken before the tools, because every tool already means something on
@@ -8891,6 +9373,10 @@ impl App {
                 self.pick_part_for_slot(slot, local(pos));
                 return;
             }
+        }
+
+        if self.remove_pick.is_some() && self.remove_pick_input(ui, &response, area) {
+            return;
         }
 
         // **Ctrl+wheel zooms; the wheel alone scrolls.** Animate's arrangement,
@@ -9177,8 +9663,13 @@ impl App {
             self.master_audio_confirm = false;
         }
         match command {
-            Command::ImportSound => self.import_sound_dialog(),
+            // No longer menu entries: the same dialog as Import to Stage,
+            // which takes pictures and sound as well (`import_dialog`).
+            Command::ImportSound | Command::ImportImage => {
+                self.import_dialog(buzz_scene::ImportTarget::Stage)
+            }
             Command::SetMasterAudio => self.set_master_audio_dialog(),
+            Command::LipSyncAllCharacters => self.lip_sync_all_start(),
             Command::ToggleMasterAudioMode => self.toggle_master_audio_mode(),
             Command::ImportCaptions => self.ask_for_path(
                 crate::dialogs::Request::open_file().filter("Subtitles", &["srt", "vtt"]),
@@ -9192,7 +9683,6 @@ impl App {
             ),
             Command::ImportVideoReference => self.video_reference_dialog(),
             Command::ImportSequenceFolder => self.sequence_folder_dialog(),
-            Command::ImportImage => self.import_image_dialog(),
             Command::LipSync => self.open_lip_sync(),
             Command::ExportFla => self.export_fla_dialog(),
             Command::ExportImage => self.open_export(buzz_ui::ExportKind::Image),
@@ -9233,22 +9723,18 @@ impl App {
             // first — so both are intercepted here rather than reaching
             // `Editor::run`. See `ai_scene_from_image_dialog` and
             // `ai_direct_story_async`.
-            Command::AiSceneFromImage => {
-                self.editor.workspace.reveal(buzz_ui::PanelId::Ai);
-                self.ai_scene_from_image_dialog()
-            }
-            Command::AiDirectStory => {
-                self.editor.workspace.reveal(buzz_ui::PanelId::Ai);
-                self.ai_direct_story_async()
-            }
+            Command::AiSceneFromImage => self.ai_scene_from_image_dialog(),
+            Command::AiRemoveObject => self.ai_remove_object_begin(),
+            Command::DeleteAndFill => self.delete_and_fill(),
+            Command::AiSplitPictureIntoLayers => self.ai_split_picture_async(),
+            Command::TraceBoldSplit => self.trace_bold_split_async(),
+            Command::AiGenerateBackground => self.gen_bg.open = true,
+            Command::AiDirectStory => self.ai_direct_story_async(),
             // Auto-rigging renders the symbol on the GPU and runs pose
             // detection on it — both too slow for the UI thread, and the GPU
             // render needs its own `Exporter`, which `Editor` has no way to
             // build. See `ai_rig_vector_character_async`.
-            Command::AiRigVectorCharacter => {
-                self.editor.workspace.reveal(buzz_ui::PanelId::Ai);
-                self.ai_rig_vector_character_async()
-            }
+            Command::AiRigVectorCharacter => self.ai_rig_vector_character_async(),
             // Pose detection again, off the UI thread; the review dialog
             // opens when the plan is ready. See `ai_rig_layers_async`.
             Command::AiRigLayers => self.ai_rig_layers_async(0, None),
@@ -9443,7 +9929,19 @@ impl App {
                     .collect();
                 let mut outcome = None;
                 self.editor.doc.edit("Place Asset", |scene| {
+                    let layers_before: std::collections::HashSet<buzz_scene::LayerId> =
+                        scene.layers().iter().map(|l| l.id).collect();
                     outcome = Some(library.place(&asset, scene));
+                    // A Cast character remembers its asset (CAST_POSES_PLAN C2 e2), so
+                    // "Save changes to <name>" can write the edited copy back.
+                    if matches!(outcome, Some(Ok(_))) && is_cast(&asset.folder) {
+                        let key = format!("{}/{}", asset.folder, asset.name);
+                        let arrived: Vec<buzz_scene::LayerId> =
+                            scene.layers().iter().map(|l| l.id).filter(|id| !layers_before.contains(id)).collect();
+                        for id in arrived {
+                            scene.update_layer(id, |l| l.cast_source = Some(key.clone()));
+                        }
+                    }
                 });
                 match outcome {
                     Some(Ok(report)) => {
@@ -9980,9 +10478,9 @@ impl App {
     }
 
     /// Act on whatever the multi-file picker came back with (D3): Import to
-    /// Stage / Library, Import Sound and Import Image, the four dialogs that
-    /// accept a batch. Every other purpose only ever asks through the
-    /// single-file picker.
+    /// Stage / Library, the dialogs that accept a batch (the Import Sound and
+    /// Import Image purposes are still answered, though no dialog asks them
+    /// now). Every other purpose only ever asks through the single-file picker.
     fn poll_picker_many(&mut self) {
         let Some((purpose, paths)) = self.picker_many.poll() else {
             return;
@@ -10031,22 +10529,41 @@ impl App {
         }
 
         let source = self.editor.actions.source.clone();
+        self.start_script(source, buzz_script::default_config_dir(), Vec::new(), "Run Script".into());
+    }
+
+    /// Run script text on a thread of its own, as one undo step named `label`.
+    /// Used by the Actions panel and by the Commands menu.
+    fn start_script(
+        &mut self,
+        source: String,
+        config_dir: Option<std::path::PathBuf>,
+        overrides: Vec<(String, String, String)>,
+        label: String,
+    ) {
+        if self.scripting.is_some() {
+            self.editor.status = Some("A script is already running".into());
+            return;
+        }
         let context = buzz_script::ScriptContext {
             current_frame: self.editor.current_frame,
             selection: self.editor.selection.ids(),
             active_layer: self.editor.selection.active_layer(),
-            config_dir: buzz_script::default_config_dir(),
+            config_dir,
             // The Assets panel's own folder. A script filing a cast there
             // is filing it where the panel will show it, which is the
             // whole point of an asset outliving its document.
             asset_root: buzz_doc::AssetLibrary::user()
                 .root()
                 .map(|p| p.to_path_buf()),
-            // No interactive answers yet (J1 parked): `prompt` keeps its
-            // unattended default-answer behaviour.
+            // Questions are put to the person in a dialog (the hooks below);
+            // these are only for a run with no hook.
             prompt_answers: Vec::new(),
+            hooks: Default::default(),
+            overrides,
         };
         let mut working = self.editor.doc.scene().clone();
+        let asker = self.script_dialogs.sender();
 
         let (send, result) = crossbeam_channel::bounded(1);
         let id = self
@@ -10058,6 +10575,12 @@ impl App {
                 let cancel = ctx.cancel.clone();
                 let stop: buzz_script::StopSignal =
                     std::sync::Arc::new(move || cancel.is_cancelled());
+                let waiting = ctx.cancel.clone();
+                let mut context = context;
+                context.hooks = crate::jsfl_hooks::hooks(Some(crate::jsfl_dialog::ask_hook(
+                    asker,
+                    std::sync::Arc::new(move || waiting.is_cancelled()),
+                )));
                 let outcome = buzz_script::run_until(
                     &mut working,
                     context,
@@ -10070,7 +10593,7 @@ impl App {
                 crate::tasks::TaskOutcome::Finished(summary)
             });
 
-        self.scripting = Some(ScriptRun { id, result });
+        self.scripting = Some(ScriptRun { id, result, label });
     }
 
     /// A script finished — committed, applied, and reported.
@@ -10078,6 +10601,7 @@ impl App {
         let Some(run) = self.scripting.take_if(|r| r.id == id) else {
             return;
         };
+        let label = run.label.clone();
         let Ok((working, outcome)) = run.result.try_recv() else {
             self.editor.status = Some("The script finished but returned nothing".into());
             return;
@@ -10088,9 +10612,11 @@ impl App {
         // they did not want it. `changed` is the revision actually moving, so a
         // read-only script leaves no empty undo step behind.
         if outcome.changed {
-            self.editor.doc.edit("Run Script", |scene| *scene = working);
+            self.editor.doc.edit(label.as_str(), |scene| *scene = working);
             self.editor.doc.end_gesture();
         }
+        // `document.save()` in a script: the run is committed, so save it.
+        let wants_save = outcome.save_requested;
 
         // Computed before the outcome is taken apart below.
         let summary = outcome.summary();
@@ -10122,7 +10648,173 @@ impl App {
                 output.push(format!("alert: {asked}"));
             }
         }
-        self.editor.actions.report(output, outcome.error, summary);
+        // The error comes with its line (`at <anonymous> (eval_script:12:5)`);
+        // the Output area shows it with the command name.
+        let error = outcome.error.map(|e| format!("{label}: {e}"));
+        // A command run from its key leaves the panel closed; only an error
+        // is worth opening it for. What the script asked (`alert`) goes to
+        // the status bar instead.
+        if error.is_some() && !self.editor.workspace.is_open(buzz_ui::PanelId::Actions) {
+            self.editor.workspace.toggle(buzz_ui::PanelId::Actions);
+        } else if let Some(asked) = outcome.alerts.last() {
+            self.editor.status = Some(format!("{label}: {asked}"));
+        }
+        self.editor.actions.report(output, error, summary);
+        if wants_save {
+            self.save(false);
+        }
+    }
+
+    /// Run one of the user's Animate commands from the Commands menu or its key.
+    fn run_jsfl(&mut self, name: &str) {
+        let Some(entry) = self.jsfl.entry(name).cloned() else {
+            self.editor.status = Some(format!("No command called {name}"));
+            return;
+        };
+        if entry.internal {
+            self.editor.status = Some(format!("{} is one of Animate's own commands", entry.label));
+            return;
+        }
+        // A command just runs, as in Animate: the Actions panel opens only if
+        // the run ends in an error (see `collect_script`).
+        match self.jsfl.store.prepare(&entry) {
+            Ok((source, shared)) => {
+                self.start_script(source, Some(entry.config_dir.clone()), shared, entry.label.clone());
+            }
+            Err(e) => self.editor.status = Some(e),
+        }
+    }
+
+    /// The Commands menu per-frame work: keep its list current, run what was
+    /// clicked or pressed, and draw the settings window.
+    fn jsfl_frame(&mut self, ctx: &egui::Context) {
+        use buzz_ui::jsfl_menu::{self, JsflAction};
+        if jsfl_menu::take_shown(ctx) {
+            self.jsfl.rescan_if_stale();
+        }
+        if !self.jsfl.precedence_applied {
+            self.jsfl.precedence_applied = true;
+            self.apply_jsfl_precedence();
+        }
+        jsfl_menu::publish(ctx, self.jsfl.menu());
+        let pressed = self.jsfl.pressed(ctx);
+        if self.doc_available() {
+            for name in pressed {
+                self.run_jsfl(&name);
+            }
+        }
+        if let Some(action) = jsfl_menu::take_action(ctx) {
+            match action {
+                JsflAction::Run(name) => {
+                    if self.doc_available() {
+                        self.run_jsfl(&name);
+                    }
+                }
+                JsflAction::Settings(name) => self.jsfl.open_settings(name),
+                JsflAction::ImportCommands => {
+                    let from = self
+                        .jsfl
+                        .store
+                        .commands_dir
+                        .clone()
+                        .or_else(crate::jsfl_commands::animate_commands_dir);
+                    self.jsfl.note = Some(match from {
+                        None => "The Animate Commands folder was not found".to_string(),
+                        Some(from) => match crate::jsfl_commands::import_animate_commands(
+                            &from,
+                            &crate::jsfl_commands::app_commands_dir(),
+                        ) {
+                            Ok(r) => format!(
+                                "Imported {} commands from {} ({} skipped)",
+                                r.copied.len(),
+                                from.display(),
+                                r.skipped.len()
+                            ),
+                            Err(e) => e,
+                        },
+                    });
+                    self.jsfl.rescan();
+                    self.editor.status = self.jsfl.note.clone();
+                    self.jsfl.window_open = true;
+                }
+                JsflAction::ImportShortcuts => {
+                    match crate::jsfl_commands::animate_shortcuts_file() {
+                        Some(path) => self.import_animate_shortcuts(&path),
+                        None => self.jsfl.note = Some("The Animate shortcut file was not found".into()),
+                    }
+                    self.editor.status = self.jsfl.note.clone();
+                    self.jsfl.window_open = true;
+                }
+            }
+        }
+        self.jsfl.show_window(ctx);
+    }
+
+    /// The BuzzAnimate commands that use a chord, as (command, id, chord).
+    fn builtin_chords(&self) -> Vec<(Command, String, buzz_ui::workspace::KeyChord)> {
+        buzz_ui::command::all_with_shortcuts()
+            .into_iter()
+            .filter_map(|c| {
+                self.editor.workspace.shortcut_for(c).map(|s| {
+                    (c, buzz_ui::workspace::command_id(c), buzz_ui::workspace::KeyChord::from_shortcut(s))
+                })
+            })
+            .collect()
+    }
+
+    /// Bind Animate keys for its Commands to the imported scripts.
+    fn import_animate_shortcuts(&mut self, path: &std::path::Path) {
+        use crate::jsfl_commands as j;
+        let Ok(xml) = std::fs::read_to_string(path) else {
+            self.jsfl.note = Some(format!("Could not read {}", path.display()));
+            return;
+        };
+        let keys = j::parse_shortcuts_xml(&xml);
+        let builtin = self.builtin_chords();
+        let result = j::bind_commands(&keys, &self.jsfl.entries, &|chord| {
+            builtin
+                .iter()
+                .filter(|(_, _, b)| j::same_chord(b, chord))
+                .map(|(_, id, _)| id.clone())
+                .collect()
+        });
+        for c in &result.conflicts {
+            if let Some((cmd, _, _)) = builtin.iter().find(|(_, id, _)| *id == c.displaced) {
+                self.editor.workspace.unbind(*cmd);
+            }
+        }
+        self.jsfl.note = Some(format!(
+            "Bound {} keys to {} commands; {} BuzzAnimate shortcuts displaced; {} names unmatched",
+            result.bound.len(),
+            result
+                .bound
+                .iter()
+                .map(|b| b.script.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            result.conflicts.len(),
+            result.unmatched.len()
+        ));
+        self.jsfl.store.keys = result.bound.clone();
+        self.jsfl.last_shortcuts = Some(result);
+        self.jsfl.save();
+    }
+
+    /// The Animate key wins: a BuzzAnimate command on the same chord as a
+    /// script loses it (idempotent; once a session).
+    fn apply_jsfl_precedence(&mut self) {
+        let builtin = self.builtin_chords();
+        let mut unbind = Vec::new();
+        for b in &self.jsfl.store.keys {
+            for (cmd, _, chord) in &builtin {
+                if crate::jsfl_commands::same_chord(chord, &b.chord) {
+                    unbind.push(*cmd);
+                }
+            }
+        }
+        for c in unbind {
+            self.editor.workspace.unbind(c);
+        }
     }
 
     /// The overlay shown while a script runs.
@@ -10871,6 +11563,21 @@ impl App {
             AiResult::Character(assembled, kind) => {
                 job_value = Some(self.commit_agent_character(&assembled, kind));
             }
+            AiResult::SplitPicture { scene, placed, notes, source } => {
+                job_value = Some(self.commit_split_picture(&scene, &placed, &notes, source));
+            }
+            AiResult::Backgrounds { pictures, auto } => {
+                job_value = Some(self.commit_backgrounds(pictures, auto, job_value.is_some()));
+            }
+            AiResult::RemovePrepared(prep) => {
+                self.remove_pick_ready(*prep);
+            }
+            AiResult::RemoveArtwork(plan) => {
+                job_value = Some(self.commit_remove_artwork(&plan));
+            }
+            AiResult::SplitArtwork(plan) => {
+                job_value = Some(self.commit_split_artwork(&plan));
+            }
             AiResult::Scene { reconstructed, embed_note, review } if self.ai_from_panel.remove(&id) || self.ai_review_mode() => {
                 let _ = reconstructed;
                 self.ai_panel.scene = Some(buzz_ui::ai_panel::SceneReview {
@@ -10894,8 +11601,7 @@ impl App {
                     note: embed_note,
                 });
                 self.ai_scene_pending = Some(review);
-                self.editor.workspace.reveal(buzz_ui::PanelId::Ai);
-                self.editor.status = Some("Scene from Image: review the matches in the AI panel, then Build".into());
+                self.editor.status = Some("Scene from Image: review the matches, then Build".into());
             }
             AiResult::Scene { reconstructed, embed_note, .. } => {
                 self.commit_reconstructed_scene(&reconstructed, &embed_note);
@@ -10907,12 +11613,29 @@ impl App {
                     secs: (transcript.load_ms + transcript.run_ms) as f64 / 1000.0,
                     provider: transcript.provider.clone(),
                 });
-                self.editor.workspace.reveal(buzz_ui::PanelId::Ai);
                 self.editor.status = Some(format!(
-                    "Transcribed '{sound}': {} lines in {:.1}s \u{2014} edit them in the AI panel, then Apply",
+                    "Transcribed '{sound}': {} lines in {:.1}s \u{2014} edit them, then Apply",
                     transcript.segments.len(),
                     (transcript.load_ms + transcript.run_ms) as f64 / 1000.0
                 ));
+            }
+            AiResult::LipSyncAllHeard { lines, visemes, start, notes, secs, model } => {
+                match self.editor.lip_sync_all_apply(&lines, &visemes, start) {
+                    Ok(report) => {
+                        let mut say = format!(
+                            "Lip sync all: {} lines heard ({model}, {secs:.1} s), {} to characters on the stage, {} narrator",
+                            report.lines, report.matched, report.narrator_lines
+                        );
+                        if !report.unmatched.is_empty() {
+                            say.push_str(&format!("; no character for: {}", report.unmatched.join(" | ")));
+                        }
+                        for n in notes.iter().chain(report.warnings.iter()) {
+                            say.push_str(&format!("\n{n}"));
+                        }
+                        self.editor.status = Some(say);
+                    }
+                    Err(e) => self.editor.status = Some(format!("Lip Sync All Characters: {e}")),
+                }
             }
             AiResult::PoseSheet(images) => {
                 // Uploaded as textures by `draw_ai_panel`, which has a `Ui`.
@@ -10921,8 +11644,7 @@ impl App {
             AiResult::Directed { script, beat_count } if self.ai_from_panel.remove(&id) => {
                 self.ai_panel.story = Some(story_review(&script, beat_count));
                 self.ai_story_pending = Some(script);
-                self.editor.workspace.reveal(buzz_ui::PanelId::Ai);
-                self.editor.status = Some(format!("Direct Story: {beat_count} beats parsed \u{2014} Apply in the AI panel"));
+                self.editor.status = Some(format!("Direct Story: {beat_count} beats parsed \u{2014} review, then Apply"));
             }
             AiResult::Directed { script, beat_count } => {
                 self.commit_directed(&script, beat_count);
@@ -10938,8 +11660,7 @@ impl App {
                     secs: 0.0,
                 });
                 self.ai_rig_pending = Some((target, sym_name, rerigged));
-                self.editor.workspace.reveal(buzz_ui::PanelId::Ai);
-                self.editor.status = Some("Auto-Rig: check the layer \u{2192} bone mapping in the AI panel, then Apply".into());
+                self.editor.status = Some("Auto-Rig: check the layer \u{2192} bone mapping, then Apply".into());
             }
             AiResult::Rigged { target, sym_name, rerigged } => {
                 self.commit_rig(target, sym_name, *rerigged);
@@ -11055,6 +11776,19 @@ impl App {
                     self.reload_paths.insert(buzz.clone());
                     self.open_path(&buzz);
                 }
+                self.editor.status = Some(summary);
+            }
+            AiResult::CastFlaImported { report } => {
+                let summary = report.summary();
+                self.casting.status = Some(summary.clone());
+                if self.casting.open {
+                    self.casting_load();
+                    self.casting.status = Some(summary.clone());
+                }
+                if let Some(value) = job_value.as_mut() {
+                    *value = report.to_json();
+                }
+                self.editor.assets.rescan();
                 self.editor.status = Some(summary);
             }
             AiResult::StoryConverted { cast, screenplay } => {
@@ -11328,23 +12062,7 @@ impl App {
         }
         buzz_ai::llm::set_low_reasoning(self.editor.workspace.ai.low_reasoning);
         self.agent_refresh_label();
-        let activity: Vec<buzz_ui::TaskRow> = self
-            .tasks
-            .running()
-            .filter(|t| t.kind == crate::tasks::TaskKind::Ai)
-            .map(|task| {
-                let progress = task.progress();
-                buzz_ui::TaskRow {
-                    id: task.id.0,
-                    kind: task.kind.label().to_string(),
-                    label: task.label.clone(),
-                    progress: progress.fraction(),
-                    detail: progress.detail,
-                    elapsed_secs: task.elapsed().as_secs_f64(),
-                    can_cancel: task.kind.can_cancel(),
-                }
-            })
-            .collect();
+        let activity = self.ai_activity_rows();
         let sounds: Vec<String> = self.editor.doc.scene().sounds().iter().map(|s| s.name.clone()).collect();
         let rig_target = self.ai_rig_target_name();
         let ctx = ui.ctx().clone();
@@ -11367,6 +12085,64 @@ impl App {
         for action in actions {
             self.ai_panel_action(action);
         }
+    }
+
+    /// Every running long operation as rows for the progress window (Q2):
+    /// all task kinds except the quiet background ones (thumbnails, asset
+    /// scans, the open-time warm-up), plus the sound decode, which runs off the
+    /// registry. `with_ai` is false while the AI panel is open (it shows those).
+    fn progress_rows(&self, with_ai: bool) -> Vec<buzz_ui::TaskRow> {
+        use crate::tasks::TaskKind as K;
+        let mut rows: Vec<buzz_ui::TaskRow> = self
+            .tasks
+            .running()
+            .filter(|t| !matches!(t.kind, K::Thumbnails | K::AssetScan | K::Warm))
+            .filter(|t| with_ai || t.kind != K::Ai)
+            .map(|task| {
+                let progress = task.progress();
+                buzz_ui::TaskRow {
+                    id: task.id.0,
+                    kind: task.kind.label().to_string(),
+                    label: task.label.clone(),
+                    progress: progress.fraction(),
+                    detail: progress.detail,
+                    elapsed_secs: task.elapsed().as_secs_f64(),
+                    can_cancel: task.kind.can_cancel(),
+                }
+            })
+            .collect();
+        if self.sound_decode.is_some() {
+            rows.push(buzz_ui::TaskRow {
+                id: u64::MAX,
+                kind: "Sound".to_string(),
+                label: "Decoding audio".to_string(),
+                progress: None,
+                detail: String::new(),
+                elapsed_secs: 0.0,
+                can_cancel: false,
+            });
+        }
+        rows
+    }
+
+    /// The running AI tasks as rows, for the panel's Activity.
+    fn ai_activity_rows(&self) -> Vec<buzz_ui::TaskRow> {
+        self.tasks
+            .running()
+            .filter(|t| t.kind == crate::tasks::TaskKind::Ai)
+            .map(|task| {
+                let progress = task.progress();
+                buzz_ui::TaskRow {
+                    id: task.id.0,
+                    kind: task.kind.label().to_string(),
+                    label: task.label.clone(),
+                    progress: progress.fraction(),
+                    detail: progress.detail,
+                    elapsed_secs: task.elapsed().as_secs_f64(),
+                    can_cancel: task.kind.can_cancel(),
+                }
+            })
+            .collect()
     }
 
     /// The symbol Auto-Rig would work on: a selected stage instance's, else
@@ -11524,6 +12300,44 @@ impl App {
         self.track_ai(id, receive);
     }
 
+    /// **Sequence > Lip Sync All Characters** (E3): hear the scene's dialogue off the UI thread
+    /// (transcribe locally, find the script's lines in it, read the mouth shapes), then
+    /// `lip_sync_all_apply` writes everything as one undo step when the job finishes.
+    fn lip_sync_all_start(&mut self) {
+        let scene = self.editor.doc.scene();
+        let Some((_, start, clip)) = self.editor.sound.stage_track_trimmed(scene) else {
+            self.editor.status = Some("Lip Sync All Characters: the scene has no dialogue sound (Sequence > Set Master Audio)".into());
+            return;
+        };
+        let names: Vec<String> = crate::scene_life::stage_characters(scene).iter().map(|c| c.name.clone()).collect();
+        if names.is_empty() {
+            self.editor.status = Some("Lip Sync All Characters: there is no Cast character on the stage (Cast into the shot)".into());
+            return;
+        }
+        // The script, from the Episode window, when it holds one: who says what.
+        let text = if self.episode.screenplay_text.trim().is_empty() {
+            std::fs::read_to_string(self.episode.screenplay_path.trim()).unwrap_or_default()
+        } else {
+            self.episode.screenplay_text.clone()
+        };
+        let script = buzz_act::screenplay::Screenplay::parse(&text);
+        let fps = self.editor.doc.scene().stage().frame_rate.max(1.0);
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "Lip Sync All Characters", move |ctx| {
+            let progress = ctx.progress.clone();
+            let cancel = ctx.cancel.clone();
+            match crate::scene_life::hear_dialogue(&clip, &script, &names, fps, &mut |d, t| progress.set(d as u64, t as u64), &|| cancel.is_cancelled()) {
+                Ok(h) => {
+                    let _ = send.send(AiResult::LipSyncAllHeard { lines: h.lines, visemes: h.visemes, start, notes: h.notes, secs: h.secs, model: h.model });
+                    crate::tasks::TaskOutcome::Finished(String::new())
+                }
+                Err(e) => crate::tasks::TaskOutcome::Failed(format!("Lip Sync All Characters: {e}")),
+            }
+        });
+        self.track_ai(id, receive);
+        self.editor.status = Some("Lip Sync All Characters: listening to the dialogue\u{2026}".into());
+    }
+
     /// The panel's edited transcript → captions and lip sync.
     fn ai_apply_transcript(&mut self) {
         let Some(t) = self.ai_panel.transcript.clone() else {
@@ -11639,6 +12453,689 @@ impl App {
             job,
             &format!("Whisper ({}) is listening to '{label}' off the UI thread", model.label()),
         ))
+    }
+
+    /// The dialog behind **AI > Generate Background...** (E1).
+    fn gen_background_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(t) = self.gen_bg_task
+            && self.gen_bg.busy
+            && !self.tasks.is_running(t)
+            && !self.ai_results.get(&t).is_some_and(|r| !r.is_empty())
+        {
+            self.gen_bg.busy = false;
+            self.gen_bg_task = None;
+            self.gen_bg.status = Some("The drawing did not finish: see the Tasks panel".into());
+        }
+        match crate::gen_background::dialog(ctx, &mut self.gen_bg) {
+            crate::gen_background::GenBackgroundAction::Generate => {
+                self.start_gen_background(None);
+            }
+            crate::gen_background::GenBackgroundAction::Use(i) => {
+                let split = self.gen_bg.trace_split;
+                self.use_generated_background(i, split, false);
+            }
+            crate::gen_background::GenBackgroundAction::None => {}
+        }
+    }
+
+    /// Draw `self.gen_bg`'s prompt off the UI thread (1-4 tries in the series
+    /// look, at the stage's size). `auto` = (index, trace + split) places a
+    /// picture as soon as they are drawn (the agent's path). False, with the
+    /// reason in the dialog's status, when it did not start.
+    pub(crate) fn start_gen_background(&mut self, auto: Option<(usize, bool)>) -> bool {
+        let prompt = self.gen_bg.prompt.trim().to_string();
+        if prompt.is_empty() {
+            self.gen_bg.status = Some("Write what the background shows".into());
+            return false;
+        }
+        if self.gen_bg.busy {
+            self.gen_bg.status = Some("A background is already being drawn".into());
+            return false;
+        }
+        let series = self.gen_bg.series.trim().to_string();
+        let series = if series.is_empty() { crate::gen_background::DEFAULT_SERIES.to_string() } else { series };
+        let (seed, tries) = (self.gen_bg.seed, self.gen_bg.tries.clamp(1, crate::gen_background::MAX_TRIES));
+        let stage = self.editor.doc.scene().stage().size;
+        let size = crate::gen_background::draw_size((stage.width, stage.height));
+        let (send, receive) = crossbeam_channel::bounded(1);
+        self.last_ai_task = None;
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "AI: Generate Background", move |ctx| {
+            let progress = ctx.progress.clone();
+            let mut note = |done: u64, total: u64, what: &str| {
+                progress.set(done, total);
+                progress.detail(what);
+            };
+            match crate::gen_background::generate_tries(&series, &prompt, seed, tries, size, &mut note, &|| ctx.cancelled()) {
+                Ok(pictures) => {
+                    if ctx.cancelled() {
+                        return crate::tasks::TaskOutcome::Cancelled;
+                    }
+                    let _ = send.send(AiResult::Backgrounds { pictures, auto });
+                    crate::tasks::TaskOutcome::Finished(String::new())
+                }
+                Err(e) => crate::tasks::TaskOutcome::Failed(format!("Generate Background: {e}")),
+            }
+        });
+        self.track_ai(id, receive);
+        self.gen_bg_task = Some(id);
+        self.gen_bg.busy = true;
+        self.gen_bg.status = None;
+        self.editor.status = Some("Drawing the background\u{2026} (progress card, bottom right)".into());
+        true
+    }
+
+    /// The agent's `ai_generate_background`: fill the dialog's fields, draw,
+    /// and place picture `pick` (1-based) when done, tracing + splitting it
+    /// when `split`. The job's id.
+    pub(crate) fn agent_generate_background(
+        &mut self,
+        prompt: String,
+        series: Option<String>,
+        seed: Option<u64>,
+        tries: usize,
+        pick: usize,
+        split: bool,
+    ) -> Result<u64, String> {
+        self.gen_bg.prompt = prompt;
+        if let Some(s) = series {
+            self.gen_bg.series = s;
+        }
+        if let Some(s) = seed {
+            self.gen_bg.seed = s;
+        }
+        self.gen_bg.tries = tries.clamp(1, crate::gen_background::MAX_TRIES);
+        if !self.start_gen_background(Some((pick.saturating_sub(1).min(self.gen_bg.tries - 1), split))) {
+            return Err(self.gen_bg.status.clone().unwrap_or_else(|| "the drawing did not start".into()));
+        }
+        self.agent_track_last_job("ai_generate_background").ok_or_else(|| "the drawing task did not start".to_string())
+    }
+
+    /// The drawn pictures arrive: kept for the dialog's thumbnails, and (with
+    /// `auto`) the pick placed at once.
+    fn commit_backgrounds(&mut self, pictures: Vec<(std::path::PathBuf, u64)>, auto: Option<(usize, bool)>, agent: bool) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "pictures": pictures.iter().map(|(p, _)| p.to_string_lossy().to_string()).collect::<Vec<_>>(),
+            "seeds": pictures.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+        });
+        self.gen_bg.results = pictures.into_iter().map(|(p, s)| crate::gen_background::Try::new(p, s)).collect();
+        self.gen_bg.picked = Some(0);
+        self.gen_bg.busy = false;
+        self.gen_bg_task = None;
+        self.gen_bg.status = Some("Click the one you want, then Use picked".into());
+        self.editor.status = Some("The background pictures are ready (AI > Generate Background)".into());
+        if let Some((pick, split)) = auto {
+            let placed = self.use_generated_background(pick, split, agent);
+            if let (Some(map), Some(more)) = (value.as_object_mut(), placed.as_object()) {
+                for (k, v) in more {
+                    map.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        value
+    }
+
+    /// Put drawn picture `index` on a new bottom layer `Background`; with
+    /// `split`, go on to Trace (bold outlines) + Split into layers.
+    pub(crate) fn use_generated_background(&mut self, index: usize, split: bool, agent: bool) -> serde_json::Value {
+        let Some(path) = self.gen_bg.results.get(index).map(|t| t.path.clone()) else {
+            self.gen_bg.status = Some("There is no such picture".into());
+            return serde_json::json!({"placed": false, "error": "there is no such picture"});
+        };
+        match self.editor.place_background(&path) {
+            Ok(id) => {
+                let mut value = serde_json::json!({"placed": true, "element": id.0, "layer": "Background", "picture": path.to_string_lossy()});
+                self.editor.status = Some("The picture is on a new bottom layer named Background".into());
+                if split {
+                    self.ai_split_picture_with(true);
+                    if agent && let Some(job) = self.agent_track_last_job("ai_split_picture_into_layers") {
+                        value["split_job"] = serde_json::json!(job);
+                    }
+                }
+                if !agent {
+                    self.gen_bg.open = false;
+                }
+                value
+            }
+            Err(e) => {
+                self.gen_bg.status = Some(format!("Could not place it: {e}"));
+                serde_json::json!({"placed": false, "error": e.to_string()})
+            }
+        }
+    }
+
+    /// **AI ▸ Split Picture into Layers**: the selected picture cut into its
+    /// Sky / Far / Mid / Ground plates and the objects the VLM finds in it,
+    /// each object on its own layer, off the UI thread. The result lands in
+    /// `commit_split_picture` as one undo step.
+    ///
+    /// What the thread needs from the document is cloned up front (the
+    /// bitmap's `Arc`, where it sits on its layer), so the user can keep
+    /// working while the VLM and SAM run; the commit re-checks the picture is
+    /// still the same one.
+    pub(crate) fn ai_split_picture_async(&mut self) {
+        // A raw bitmap goes the Trace Bold + Split way (T17): one look
+        // whichever command is used.
+        if self.selected_picture().is_some() {
+            self.trace_bold_split_async();
+            return;
+        }
+        self.ai_split_picture_with(false);
+    }
+
+    /// The first selected object that is a picture (a shape with an image
+    /// fill): its layer, id, bitmap, object transform and fill transform.
+    fn selected_picture(&self) -> Option<(buzz_scene::LayerId, buzz_scene::ObjectId, std::sync::Arc<buzz_scene::ImageAsset>, buzz_geom::Affine, buzz_geom::Affine)> {
+        self.editor.selection.ids().into_iter().find_map(|id| {
+            let (layer, object) = self.editor.doc.scene().find_object(id)?;
+            let buzz_scene::ObjectKind::Shape(shape) = &object.kind else { return None };
+            let Some(buzz_scene::Paint::Image(fill)) = shape.fill.as_ref().map(|f| &f.paint) else { return None };
+            // A Keep-textures trace leaves image-filled regions (sky, ground)
+            // among its shapes; they are traced artwork, not a picture, or the
+            // split after Trace Bold would trace them again and cut a crop.
+            if fill.asset.width == 0 || fill.asset.height == 0 || buzz_scene::is_trace_texture(&fill.asset) {
+                return None;
+            }
+            Some((layer, id, fill.asset.clone(), object.transform, fill.transform))
+        })
+    }
+
+    /// **Modify ▸ Bitmap ▸ Trace Bold + Split into Layers**: the selected
+    /// picture traced with the Bold preset (Keep textures on), on a task
+    /// thread; when it lands, `poll_trace` goes on to split the artwork it
+    /// made into layers (the new shapes are the selection then).
+    pub(crate) fn trace_bold_split_async(&mut self) {
+        self.editor.trace_in_background(buzz_scene::TraceOptions::bold().with_saved_tuning());
+        if self.editor.pending_trace.is_some() {
+            self.split_after_trace = true;
+            self.editor.status = Some("Tracing, then splitting into layers\u{2026} (Tasks panel)".into());
+        }
+    }
+
+    /// The same for the agent: the trace runs here and now, the split as a
+    /// job (`ai_split_picture_into_layers`). Returns the split's job id.
+    pub(crate) fn agent_trace_bold_split(&mut self) -> Result<u64, String> {
+        self.editor.trace_with(buzz_scene::TraceOptions::bold().with_saved_tuning());
+        if self.editor.selection.is_empty() {
+            return Err(self.editor.status.clone().unwrap_or_else(|| "the trace made nothing".into()));
+        }
+        self.last_ai_task = None;
+        self.ai_split_picture_with(false);
+        self.agent_track_last_job("ai_split_picture_into_layers")
+            .ok_or_else(|| self.editor.status.clone().unwrap_or_else(|| "the split task did not start".into()))
+    }
+
+    /// [`Self::ai_split_picture_async`], tracing the plates and the objects
+    /// with bold outlines when `bold` (Generate Background's one-go path).
+    pub(crate) fn ai_split_picture_with(&mut self, bold: bool) {
+        if self.selected_picture().is_some() {
+            // Same route as Trace Bold + Split (T17); the old flat-plate
+            // picture path below only runs when the trace made nothing.
+            self.editor.trace_with(buzz_scene::TraceOptions::bold().with_saved_tuning());
+        }
+        let picked = self.selected_picture();
+        let Some((layer, object_id, asset, object_transform, fill_transform)) = picked else {
+            self.ai_split_artwork_async();
+            return;
+        };
+        let redetect = std::mem::take(&mut self.split_redetect);
+        let (send, receive) = crossbeam_channel::bounded(1);
+        self.last_ai_task = None;
+        let source_asset = asset.clone();
+        let id = self
+            .tasks
+            .spawn_thread(crate::tasks::TaskKind::Ai, "AI: Split Picture", move |ctx| {
+                let progress = ctx.progress.clone();
+                let mut step = 0u64;
+                let mut note = |what: &str| {
+                    step += 1;
+                    progress.set(step, 5);
+                    progress.detail(what);
+                };
+                note("Reading the picture");
+                let Some(full) = image::RgbaImage::from_raw(asset.width, asset.height, asset.pixels.as_ref().clone()) else {
+                    return crate::tasks::TaskOutcome::Failed("Split Picture: the picture's pixels are unreadable".into());
+                };
+                // The plates and the VLM work at stage size; a 5000 px photo
+                // would only make every step slower.
+                let long = full.width().max(full.height());
+                let picture = if long > 1920 {
+                    let s = 1920.0 / long as f64;
+                    let (w, h) = (((full.width() as f64 * s).round() as u32).max(1), ((full.height() as f64 * s).round() as u32).max(1));
+                    image::imageops::resize(&full, w, h, image::imageops::FilterType::Lanczos3)
+                } else {
+                    full
+                };
+                let (pw, ph) = picture.dimensions();
+                note("Splitting into depth plates");
+                let plates = crate::backdrop::split_plates(&picture);
+                note("Finding the objects (VLM + SAM 2)");
+                let opts = crate::bg_objects::ObjectOptions { trace: crate::backdrop::BackdropOptions { bold_outlines: bold, ..Default::default() }, redetect, ..Default::default() };
+                let cut = crate::bg_objects::extract_objects(&picture, &plates, &opts);
+                let record = crate::split_cache::take_last_run();
+                note("Tracing the plates");
+                let mut scene = crate::backdrop::trace_plates(&cut.filled_plates, &opts.trace);
+                note("Putting the objects on their layers");
+                let stem = std::path::Path::new(&asset.name)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Picture")
+                    .to_string();
+                let placed = crate::bg_objects::add_to_scene(&cut, &mut scene, &stem, (pw, ph));
+                if let Some(dir) = &record {
+                    crate::split_cache::write_json(dir, "result.json", &crate::bg_objects::result_json(&placed, &cut.notes));
+                }
+                // The result is in STAGE space, the picture scaled to cover it
+                // (`trace_plates` / `add_to_scene`); this maps that back to the
+                // picture's pixels and on to where the picture sits.
+                let (w, h) = (pw as f64, ph as f64);
+                let s = (crate::backdrop::STAGE.0 / w).max(crate::backdrop::STAGE.1 / h);
+                let stage_place = buzz_geom::Affine::translate(((crate::backdrop::STAGE.0 - w * s) / 2.0, (crate::backdrop::STAGE.1 - h * s) / 2.0))
+                    * buzz_geom::Affine::scale(s);
+                let picture_place = object_transform * fill_transform * buzz_geom::Affine::scale_non_uniform(1.0 / w, 1.0 / h);
+                let place = picture_place * stage_place.inverse();
+                let _ = send.send(AiResult::SplitPicture {
+                    scene: Box::new(scene),
+                    placed,
+                    notes: cut.notes.clone(),
+                    source: (layer, object_id, source_asset, place),
+                });
+                crate::tasks::TaskOutcome::Finished(String::new())
+            });
+        self.track_ai(id, receive);
+        self.editor.status = Some("Splitting the picture into layers\u{2026} (Tasks panel)".into());
+    }
+
+    /// Split Picture into Layers on **traced artwork** (no picture selected):
+    /// the selected vector shapes, else the active layer's frame, are rendered,
+    /// the objects found, and each object becomes one symbol on one new layer.
+    /// Off the UI thread; `commit_split_artwork` applies it as one undo step.
+    fn ai_split_artwork_async(&mut self) {
+        let redetect = std::mem::take(&mut self.split_redetect);
+        let scene = self.editor.doc.scene().clone();
+        let frame = self.editor.frame();
+        let selected: Vec<_> = self.editor.selection.ids();
+        let first = selected.iter().find_map(|id| scene.find_object(*id).map(|(l, _)| l));
+        let Some(layer) = first.or_else(|| self.editor.selection.active_layer()) else {
+            self.editor.status = Some("Select a picture or some artwork first".into());
+            return;
+        };
+        let ids: Option<Vec<_>> = first.map(|_| selected);
+        if crate::split_artwork::source_shapes(&scene, layer, frame, ids.as_deref()).is_empty() {
+            self.editor.status = Some("Select a picture or some artwork first".into());
+            return;
+        }
+        if scene.layers().get(layer).is_none_or(|l| l.frames.keyframe_count() != 1 || l.frames.keyframe_start(frame) != Some(0)) {
+            self.editor.status = Some("Split into Layers needs the artwork on a layer with a single keyframe".into());
+            return;
+        }
+        let (send, receive) = crossbeam_channel::bounded(1);
+        self.last_ai_task = None;
+        let id = self
+            .tasks
+            .spawn_thread(crate::tasks::TaskKind::Ai, "AI: Split Picture", move |ctx| {
+                let progress = ctx.progress.clone();
+                let mut step = 0u64;
+                let mut note = |what: &str| {
+                    step += 1;
+                    progress.set(step, 4);
+                    progress.detail(what);
+                };
+                let opts = crate::bg_objects::ObjectOptions { trace: crate::backdrop::BackdropOptions::default(), max_objects: 16, small_objects: true, redetect };
+                match crate::split_artwork::plan_split(&scene, layer, frame, ids.as_deref(), &opts, &mut note) {
+                    Ok(plan) => {
+                        let _ = send.send(AiResult::SplitArtwork(Box::new(plan)));
+                        crate::tasks::TaskOutcome::Finished(String::new())
+                    }
+                    Err(e) => crate::tasks::TaskOutcome::Failed(e),
+                }
+            });
+        self.track_ai(id, receive);
+        self.editor.status = Some("Splitting the artwork into layers\u{2026} (Tasks panel)".into());
+    }
+
+    /// Start a Remove from Picture job (render, choose shapes, patch, trace) off the UI thread.
+    pub(crate) fn remove_from_picture_async(&mut self, layer: buzz_scene::LayerId, frame: u32, what: RemoveWhat) {
+        let scene = self.editor.doc.scene().clone();
+        let (send, receive) = crossbeam_channel::bounded(1);
+        self.last_ai_task = None;
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "AI: Remove from Picture", move |ctx| {
+            let progress = ctx.progress.clone();
+            let mut step = 0u64;
+            let mut note = |what: &str| {
+                step += 1;
+                progress.set(step, 6);
+                progress.detail(what);
+            };
+            let opts = crate::bg_objects::ObjectOptions { trace: crate::backdrop::BackdropOptions::default(), ..Default::default() };
+            note("Rendering the artwork");
+            let owned;
+            let (prep, plan): (&crate::split_artwork::Prepared, _) = match &what {
+                RemoveWhat::Mask(prep, mask) => (prep.as_ref(), crate::split_artwork::RemoveTarget::Mask(mask)),
+                RemoveWhat::Shapes(ids) => {
+                    owned = match crate::split_artwork::prepare_remove(&scene, layer, frame, false) {
+                        Ok(p) => p,
+                        Err(e) => return crate::tasks::TaskOutcome::Failed(e),
+                    };
+                    (&owned, crate::split_artwork::RemoveTarget::Shapes(ids))
+                }
+                RemoveWhat::Points(_) => {
+                    owned = match crate::split_artwork::prepare_remove(&scene, layer, frame, true) {
+                        Ok(p) => p,
+                        Err(e) => return crate::tasks::TaskOutcome::Failed(e),
+                    };
+                    (&owned, crate::split_artwork::RemoveTarget::Shapes(&[]))
+                }
+            };
+            let points_mask;
+            let target = if let RemoveWhat::Points(pts) = &what {
+                let back = prep.to_world.inverse();
+                let px: Vec<buzz_ai::segment::Sam2Point> = pts
+                    .iter()
+                    .map(|(p, pos)| {
+                        let q = back * *p;
+                        (q.x as f32, q.y as f32, *pos)
+                    })
+                    .collect();
+                points_mask = match crate::split_artwork::mask_at(prep, &px) {
+                    Ok(m) => m,
+                    Err(e) => return crate::tasks::TaskOutcome::Failed(e),
+                };
+                crate::split_artwork::RemoveTarget::Mask(&points_mask)
+            } else {
+                plan
+            };
+            match crate::split_artwork::plan_remove(&scene, prep, target, &opts, &mut note) {
+                Ok(plan) => {
+                    let _ = send.send(AiResult::RemoveArtwork(Box::new(plan)));
+                    crate::tasks::TaskOutcome::Finished(String::new())
+                }
+                Err(e) => crate::tasks::TaskOutcome::Failed(e),
+            }
+        });
+        self.track_ai(id, receive);
+        self.editor.status = Some("Removing from the picture\u{2026} (Tasks panel)".into());
+    }
+
+    /// The layer a removal works on: the selection's, else the active one.
+    pub(crate) fn remove_layer(&self) -> Option<buzz_scene::LayerId> {
+        let scene = self.editor.doc.scene();
+        self.editor.selection.ids().iter().find_map(|id| scene.find_object(*id).map(|(l, _)| l)).or_else(|| self.editor.selection.active_layer())
+    }
+
+    /// **Delete and Fill**: the selected shapes go and the hole is patched (Shift+Delete).
+    pub(crate) fn delete_and_fill(&mut self) {
+        let ids = self.editor.selection.ids();
+        let Some(layer) = self.remove_layer().filter(|_| !ids.is_empty()) else {
+            self.editor.status = Some("Select some traced shapes first".into());
+            return;
+        };
+        let frame = self.editor.frame();
+        if crate::split_artwork::source_shapes(self.editor.doc.scene(), layer, frame, Some(&ids)).is_empty() {
+            self.editor.status = Some("Delete and Fill works on vector shapes".into());
+            return;
+        }
+        self.remove_from_picture_async(layer, frame, RemoveWhat::Shapes(ids));
+    }
+
+    /// **AI ▸ Remove Object**: render and encode the artwork off the UI thread, then take clicks on the stage.
+    pub(crate) fn ai_remove_object_begin(&mut self) {
+        let Some(layer) = self.remove_layer() else {
+            self.editor.status = Some("Select some traced artwork first".into());
+            return;
+        };
+        let frame = self.editor.frame();
+        if crate::split_artwork::source_shapes(self.editor.doc.scene(), layer, frame, None).is_empty() {
+            self.editor.status = Some("Remove Object works on traced vector artwork".into());
+            return;
+        }
+        let scene = self.editor.doc.scene().clone();
+        let (send, receive) = crossbeam_channel::bounded(1);
+        self.last_ai_task = None;
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "AI: Remove Object (preparing)", move |ctx| {
+            ctx.progress.detail("Rendering the artwork and encoding it (SAM 2)");
+            match crate::split_artwork::prepare_remove(&scene, layer, frame, true) {
+                Ok(p) => {
+                    let _ = send.send(AiResult::RemovePrepared(Box::new(p)));
+                    crate::tasks::TaskOutcome::Finished(String::new())
+                }
+                Err(e) => crate::tasks::TaskOutcome::Failed(e),
+            }
+        });
+        self.track_ai(id, receive);
+        self.remove_pick = Some(RemovePick { layer, frame, prep: None, points: Vec::new(), mask: None, outline: Vec::new() });
+        self.editor.status = Some("Remove Object: preparing the picture\u{2026}".into());
+    }
+
+    /// The picture is encoded: from now on clicks pick.
+    fn remove_pick_ready(&mut self, prep: crate::split_artwork::Prepared) {
+        if let Some(p) = self.remove_pick.as_mut().filter(|p| p.layer == prep.layer && p.frame == prep.frame) {
+            p.prep = Some(Arc::new(prep));
+            self.editor.status = Some("Remove Object: click the thing (Shift+click adds, Alt+click excludes), click it again or Enter removes, Esc cancels".into());
+        }
+    }
+
+    /// Pointer and keys of the Remove Object mode; true when the stage input was taken.
+    fn remove_pick_input(&mut self, ui: &mut egui::Ui, response: &egui::Response, area: egui::Rect) -> bool {
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.remove_pick = None;
+            self.editor.status = Some("Remove Object cancelled".into());
+            return true;
+        }
+        let Some(pick) = self.remove_pick.as_mut() else { return false };
+        if response.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        let Some(prep) = pick.prep.clone() else { return false };
+        // The outline of what would go.
+        let to_screen = |p: Point| {
+            let s = self.editor.camera.doc_to_screen(prep.to_world * p);
+            egui::pos2(area.min.x + s.x as f32, area.min.y + s.y as f32)
+        };
+        for line in &pick.outline {
+            let pts: Vec<egui::Pos2> = line.iter().map(|p| to_screen(*p)).collect();
+            ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 60, 60))));
+        }
+        for (p, pos) in &pick.points {
+            let c = self.editor.camera.doc_to_screen(*p);
+            let c = egui::pos2(area.min.x + c.x as f32, area.min.y + c.y as f32);
+            let col = if *pos { egui::Color32::from_rgb(60, 220, 60) } else { egui::Color32::from_rgb(255, 60, 60) };
+            ui.painter().circle_filled(c, 4.0, col);
+        }
+        let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let click = response.clicked().then(|| ctx.input(|i| i.pointer.interact_pos())).flatten();
+        let (shift, alt) = ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
+        let mut confirm = enter && pick.mask.is_some();
+        if let Some(pos) = click {
+            let at = self.editor.screen_to_edit(Point::new((pos.x - area.min.x) as f64, (pos.y - area.min.y) as f64));
+            let px = prep.to_world.inverse() * at;
+            let inside = pick.mask.as_ref().is_some_and(|m| px.x >= 0.0 && px.y >= 0.0 && (px.x as u32) < m.width() && (px.y as u32) < m.height() && m.get_pixel(px.x as u32, px.y as u32)[0] > 127);
+            if inside && !shift && !alt {
+                confirm = true;
+            } else {
+                if shift || alt {
+                    pick.points.push((at, !alt));
+                } else {
+                    pick.points = vec![(at, true)];
+                }
+                let pts: Vec<buzz_ai::segment::Sam2Point> = pick
+                    .points
+                    .iter()
+                    .map(|(p, pos)| {
+                        let q = prep.to_world.inverse() * *p;
+                        (q.x as f32, q.y as f32, *pos)
+                    })
+                    .collect();
+                match crate::split_artwork::mask_at(&prep, &pts) {
+                    Ok(m) => {
+                        pick.outline = crate::split_artwork::outline_points(&m, &crate::bg_objects::ObjectOptions::default());
+                        pick.mask = Some(m);
+                    }
+                    Err(e) => self.editor.status = Some(format!("Remove Object: {e}")),
+                }
+            }
+        }
+        if confirm {
+            if let Some(RemovePick { layer, frame, prep: Some(prep), mask: Some(mask), .. }) = self.remove_pick.take() {
+                self.remove_from_picture_async(layer, frame, RemoveWhat::Mask(prep, mask));
+            }
+            return true;
+        }
+        click.is_some() || response.is_pointer_button_down_on() || response.dragged()
+    }
+
+    /// Put a finished removal into the document as one undo step.
+    fn commit_remove_artwork(&mut self, plan: &crate::split_artwork::RemovePlan) -> serde_json::Value {
+        if self.editor.doc.scene().layers().get(plan.layer).is_none() {
+            self.editor.status = Some("The artwork changed while it was being removed \u{2014} nothing removed".into());
+            return serde_json::json!({"removed": false, "reason": "the layer is gone"});
+        }
+        let mut n = 0;
+        self.editor.doc.edit("Remove from Picture", |scene| {
+            n = crate::split_artwork::apply_remove(scene, plan);
+        });
+        self.editor.selection.clear();
+        self.editor.status = Some(format!(
+            "Removed from the picture: {n} shapes, hole patched {}",
+            if plan.lama { "with LaMa" } else { "with a colour fill (LaMa is not installed)" }
+        ));
+        serde_json::json!({"removed": n > 0, "shapes": n, "lama": plan.lama})
+    }
+
+    /// Put a finished artwork split into the document as one undo step. The
+    /// shapes must still be on the layer; any that moved on are left out.
+    fn commit_split_artwork(&mut self, plan: &crate::split_artwork::ArtworkPlan) -> serde_json::Value {
+        let scene = self.editor.doc.scene();
+        let Some(layer) = scene.layers().get(plan.layer) else {
+            self.editor.status = Some("The artwork changed while it was being split \u{2014} nothing split".into());
+            return serde_json::json!({"split": false, "reason": "the layer is gone"});
+        };
+        let present: std::collections::HashSet<_> = layer.frames.objects_at(plan.frame).iter().map(|o| o.id).collect();
+        let mut plan_now = crate::split_artwork::ArtworkPlan {
+            layer: plan.layer,
+            frame: plan.frame,
+            objects: Vec::new(),
+            notes: plan.notes.clone(),
+            picture: image::RgbaImage::new(1, 1),
+            to_world: plan.to_world,
+            record: plan.record.clone(),
+            removed: plan.removed.iter().copied().filter(|id| present.contains(id)).collect(),
+        };
+        for o in &plan.objects {
+            let shape_ids: Vec<_> = o.shape_ids.iter().copied().filter(|id| present.contains(id)).collect();
+            if o.plate.is_some() || !shape_ids.is_empty() || o.cuts.iter().any(|c| present.contains(&c.id)) {
+                plan_now.objects.push(crate::split_artwork::ArtworkObject {
+                    plate: o.plate,
+                    behind: o.behind,
+                    label: o.label.clone(),
+                    n: o.n,
+                    bbox: o.bbox,
+                    mask: image::GrayImage::new(1, 1),
+                    shape_ids,
+                    cuts: o.cuts.iter().filter(|c| present.contains(&c.id)).cloned().collect(),
+                    filler: o.filler.clone(),
+                    filler_at: o.filler_at,
+                });
+            }
+        }
+        let mut made = Vec::new();
+        self.editor.doc.edit("Split into Layers", |scene| {
+            made = crate::split_artwork::apply(scene, &plan_now);
+        });
+        if let Some(dir) = &plan.record {
+            crate::split_cache::write_json(dir, "result.json", &crate::split_artwork::result_json(&plan_now, &made));
+        }
+        let mut status = if made.is_empty() {
+            "Nothing split".to_string()
+        } else {
+            format!("Split into {} objects on their own layers ({})", made.len(), made.join(", "))
+        };
+        if !plan.notes.is_empty() {
+            status.push_str(&format!(" \u{2014} {}", plan.notes.join("; ")));
+        }
+        self.editor.status = Some(status);
+        serde_json::json!({"split": !made.is_empty(), "objects": made, "notes": plan.notes})
+    }
+
+    /// Put a finished split into the document, in one undo step: the new
+    /// layers (depth order kept) go where the picture's layer is, and the
+    /// picture itself moves to a hidden, locked "Source picture" layer under
+    /// them — never deleted. `source.3` maps the result's `STAGE` space onto
+    /// the picture's placement, so it is applied to every top-level object
+    /// before the merge.
+    fn commit_split_picture(
+        &mut self,
+        result: &buzz_scene::Scene,
+        placed: &[crate::bg_objects::Placed],
+        notes: &[String],
+        source: (buzz_scene::LayerId, buzz_scene::ObjectId, Arc<buzz_scene::ImageAsset>, buzz_geom::Affine),
+    ) -> serde_json::Value {
+        let (layer, object_id, asset, place) = source;
+        let same = self.editor.doc.scene().find_object(object_id).and_then(|(l, o)| {
+            let buzz_scene::ObjectKind::Shape(shape) = &o.kind else { return None };
+            match shape.fill.as_ref().map(|f| &f.paint) {
+                Some(buzz_scene::Paint::Image(fill)) if Arc::ptr_eq(&fill.asset, &asset) => Some(l),
+                _ => None,
+            }
+        });
+        let Some(layer) = same.filter(|l| *l == layer) else {
+            self.editor.status = Some("The picture changed while it was being split \u{2014} nothing split".into());
+            return serde_json::json!({"split": false, "reason": "the picture changed"});
+        };
+
+        let mut result = result.clone();
+        let ids: Vec<_> = result.stage_layers().iter().map(|l| l.id).collect();
+        for id in ids {
+            result.update_stage_layer(id, |l| {
+                if let Some(objects) = l.frames.objects_at_mut(0) {
+                    for object in objects.iter_mut() {
+                        let object = Arc::make_mut(object);
+                        object.transform = place * object.transform;
+                    }
+                }
+            });
+        }
+
+        let scene = self.editor.doc.scene();
+        let index = scene.layer_index(layer).unwrap_or(0);
+        let above: Vec<_> = scene.layers().iter().take(index).map(|l| l.id).collect();
+        let folder = scene.layers().get(layer).and_then(|l| l.parent);
+        let mut arrived = 0usize;
+        self.editor.doc.edit("Split Picture into Layers", |scene| {
+            let report = scene.merge(&result, buzz_scene::ImportTarget::Stage);
+            arrived = report.layers;
+            let new: Vec<_> = scene.layers().iter().take(arrived).map(|l| l.id).collect();
+            let source_layer = scene.add_layer("Source picture", buzz_scene::LayerKind::Normal);
+            if let Some(picture) = scene.remove_object(object_id) {
+                scene.add_object_at(source_layer, 0, (*picture).clone());
+            }
+            scene.update_layer(source_layer, |l| {
+                l.visible = false;
+                l.locked = true;
+            });
+            // Front now: Source picture, the new layers, what was above the
+            // picture's layer, then the picture's layer. Want: what was above,
+            // the new layers, Source picture, the picture's layer.
+            scene.reorder_layer(source_layer, arrived + above.len());
+            for (i, id) in above.iter().enumerate() {
+                scene.reorder_layer(*id, i);
+            }
+            for id in new.iter().chain(std::iter::once(&source_layer)) {
+                scene.update_layer(*id, |l| l.parent = folder);
+            }
+        });
+        let labels: Vec<String> = placed.iter().map(|p| format!("{} {}", p.label, p.n)).collect();
+        let mut status = format!(
+            "Split into {} objects ({}) on their own layers + Sky/Far/Mid/Ground",
+            placed.len(),
+            labels.join(", ")
+        );
+        if !notes.is_empty() {
+            status.push_str(&format!(" \u{2014} {}", notes.join("; ")));
+        }
+        self.editor.status = Some(status);
+        serde_json::json!({"split": true, "objects": labels, "layers_added": arrived, "notes": notes})
     }
 
     /// The Assistant's `ai_character_from_image` (H2): the Character from Image
@@ -12252,8 +13749,57 @@ impl App {
             buzz_ui::casting_dialog::CastingAction::Load => self.casting_load(),
             buzz_ui::casting_dialog::CastingAction::Save => self.casting_save(),
             buzz_ui::casting_dialog::CastingAction::FixRig => self.dispatch(Command::AiRigLayers),
+            buzz_ui::casting_dialog::CastingAction::ImportFla => self.start_cast_fla_import(),
             _ => {}
         }
+    }
+
+    /// **Import cast FLA** (ALAXMI plan B1a): the Casting dialog's button. The FLA is
+    /// `casting.fla`, else `cast.fla` beside the episode folder; the work runs as an AI task.
+    fn start_cast_fla_import(&mut self) {
+        let typed = self.casting.fla.trim().to_string();
+        let fla = if typed.is_empty() {
+            std::path::Path::new(self.casting.out.trim()).parent().map(|p| p.join("cast.fla")).unwrap_or_default()
+        } else {
+            std::path::PathBuf::from(typed)
+        };
+        let Some(root) = buzz_doc::AssetLibrary::user().root().map(std::path::Path::to_path_buf) else {
+            self.casting.status = Some("There is no asset library folder on this machine".into());
+            return;
+        };
+        let series = self.casting.series.trim().to_string();
+        if series.is_empty() {
+            self.casting.status = Some("Name the series first".into());
+            return;
+        }
+        self.start_cast_fla_task(crate::cast_fla::CastFlaRequest { fla, root, series, ai_rig: true, only: Vec::new() });
+        self.casting.status = Some("Importing the cast FLA: see the Tasks panel".into());
+    }
+
+    /// Run [`crate::cast_fla::import_cast_fla`] off the UI thread.
+    pub(crate) fn start_cast_fla_task(&mut self, req: crate::cast_fla::CastFlaRequest) {
+        let (send, receive) = crossbeam_channel::bounded(1);
+        self.last_ai_task = None;
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "AI: Cast from FLA", move |ctx| {
+            let progress = ctx.progress.clone();
+            let mut say = |line: &str| progress.detail(line.to_string());
+            match crate::cast_fla::import_cast_fla(&req, &mut say) {
+                Ok(report) => {
+                    let _ = send.send(AiResult::CastFlaImported { report: Box::new(report) });
+                    crate::tasks::TaskOutcome::Finished(String::new())
+                }
+                Err(e) => crate::tasks::TaskOutcome::Failed(format!("Cast from FLA: {e}")),
+            }
+        });
+        self.track_ai(id, receive);
+    }
+
+    /// The Assistant's `import_cast_fla`: the same import as a job.
+    pub(crate) fn agent_cast_fla_async(&mut self, req: crate::cast_fla::CastFlaRequest) -> Result<serde_json::Value, String> {
+        let fla = req.fla.display().to_string();
+        self.start_cast_fla_task(req);
+        let job = self.agent_track_last_job("import_cast_fla").ok_or("the cast import did not start")?;
+        Ok(crate::agent::jobs::started("import_cast_fla", job, &format!("{fla} is being imported into Cast/<series>/ off the UI thread; call wait_for_jobs for the report")))
     }
 
     /// Read the series' cast and choices into the dialog's rows (no model: the
@@ -12451,6 +13997,132 @@ impl App {
         self.track_ai(id, receive);
     }
 
+    /// Trace Bitmap off the UI thread (`Editor::trace_in_background`): start
+    /// the queued job on a task thread, and apply a finished one. The Tasks
+    /// panel keeps the frame loop repainting while it runs.
+    fn poll_trace(&mut self) {
+        if let Some((_, _, receive)) = &self.trace_running {
+            match receive.try_recv() {
+                Ok(outcome) => {
+                    if let Some((_, job, _)) = self.trace_running.take() {
+                        let split = std::mem::take(&mut self.split_after_trace);
+                        match outcome {
+                            Ok(result) => {
+                                self.editor.apply_trace(job, result);
+                                // The new artwork is the selection: cut it into layers.
+                                if split && !self.editor.selection.is_empty() {
+                                    self.ai_split_picture_with(false);
+                                }
+                            }
+                            Err(message) => {
+                                self.split_redetect = false;
+                                self.editor.status = Some(message);
+                            }
+                        }
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.trace_running = None;
+                    self.split_after_trace = false;
+                    self.split_redetect = false;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+        }
+        let Some(job) = self.editor.pending_trace.take() else { return };
+        if self.trace_running.is_some() {
+            self.editor.status = Some("A trace is already running".into());
+            return;
+        }
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let work = job.clone();
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Trace, "Trace Bitmap", move |ctx| {
+            let outcome = crate::editor::run_trace_job(&work, &|| ctx.cancelled());
+            if ctx.cancelled() {
+                return crate::tasks::TaskOutcome::Cancelled;
+            }
+            // An empty trace is a message for the status line, not a failure
+            // of the task, so it travels in the result.
+            let _ = send.send(outcome);
+            crate::tasks::TaskOutcome::Finished(String::new())
+        });
+        self.trace_running = Some((id, job, receive));
+    }
+
+    /// Even Out Lines off the UI thread (`Editor::even_lines_work`): start the
+    /// queued work on a task thread, hand a finished result to the editor, and
+    /// stop a task whose answer nobody waits for (Cancel, a newer request).
+    fn poll_even_lines(&mut self) {
+        let generation = self.editor.even_lines_gen;
+        if let Some((id, running_gen, receive)) = &self.even_lines_running {
+            let (id, running_gen) = (*id, *running_gen);
+            match receive.try_recv() {
+                Ok(done) => {
+                    self.even_lines_running = None;
+                    self.editor.finish_even_lines(running_gen, done);
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => self.even_lines_running = None,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    if running_gen != generation && self.editor.even_lines_work.is_none() {
+                        self.tasks.cancel(id);
+                        self.even_lines_running = None;
+                    }
+                }
+            }
+        }
+        if self.even_lines_running.is_some() {
+            return;
+        }
+        let Some((work_gen, work)) = self.editor.even_lines_work.take() else { return };
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Trace, "Even Out Lines", move |ctx| {
+            let done = crate::editor::run_even_lines_work(work, &|phase| ctx.progress.detail(phase));
+            if ctx.cancelled() {
+                return crate::tasks::TaskOutcome::Cancelled;
+            }
+            let _ = send.send(done);
+            crate::tasks::TaskOutcome::Finished(String::new())
+        });
+        self.even_lines_running = Some((id, work_gen, receive));
+    }
+
+    /// Optimize Shapes off the UI thread (`Editor::optimize.work`), as
+    /// [`Self::poll_even_lines`] does for Even Out Lines.
+    fn poll_optimize(&mut self) {
+        let generation = self.editor.optimize.generation;
+        if let Some((id, running_gen, receive)) = &self.optimize_running {
+            let (id, running_gen) = (*id, *running_gen);
+            match receive.try_recv() {
+                Ok(done) => {
+                    self.optimize_running = None;
+                    self.editor.finish_optimize(running_gen, done);
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => self.optimize_running = None,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    if running_gen != generation && self.editor.optimize.work.is_none() {
+                        self.tasks.cancel(id);
+                        self.optimize_running = None;
+                    }
+                }
+            }
+        }
+        if self.optimize_running.is_some() {
+            return;
+        }
+        let Some((work_gen, work)) = self.editor.optimize.work.take() else { return };
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Trace, "Optimize Shapes", move |ctx| {
+            ctx.progress.detail("Optimizing the shapes...");
+            let done = crate::optimize::run_optimize_work(&work, &|| ctx.cancelled());
+            if ctx.cancelled() {
+                return crate::tasks::TaskOutcome::Cancelled;
+            }
+            let _ = send.send(done);
+            crate::tasks::TaskOutcome::Finished(String::new())
+        });
+        self.optimize_running = Some((id, work_gen, receive));
+    }
+
     /// Collect whatever the background tasks have finished.
     ///
     /// Everything a task has to say arrives here, once, on the UI thread — so
@@ -12554,6 +14226,20 @@ impl App {
                     self.warm.declined = true;
                 }
                 return;
+            }
+            crate::tasks::TaskKind::Trace => {
+                if self.trace_running.as_ref().is_some_and(|(t, _, _)| *t == id) {
+                    self.trace_running = None;
+                }
+                // Stopped from the Tasks panel: the dialog goes with it.
+                if self.optimize_running.as_ref().is_some_and(|(t, _, _)| *t == id) {
+                    self.optimize_running = None;
+                    self.editor.optimize_action(buzz_ui::OptimizeAction::Cancel);
+                }
+                if self.even_lines_running.as_ref().is_some_and(|(t, _, _)| *t == id) {
+                    self.even_lines_running = None;
+                    self.editor.even_lines_action(buzz_ui::EvenLinesAction::Cancel);
+                }
             }
             crate::tasks::TaskKind::Ai => {
                 // Whatever the task built is dropped, unread — the document
@@ -13131,15 +14817,8 @@ impl App {
         self.tasks.running().find(|t| t.id == id).map(|t| t.progress())
     }
 
-    /// Animate's File ▸ Import Image.
-    fn import_image_dialog(&mut self) {
-        self.ask_for_paths(
-            crate::dialogs::Request::open_files()
-                .filter("Image", &["png", "jpg", "jpeg", "gif", "bmp", "webp"]),
-            Pick::ImportImage,
-        );
-    }
-
+    /// A picture put on the stage (Import to Stage, or the agent's
+    /// `import_image`).
     fn import_image_from(&mut self, path: std::path::PathBuf) {
         match self.editor.import_image(&path) {
             Ok(name) => {
@@ -13249,15 +14928,8 @@ impl App {
         }
     }
 
-    /// Animate's File ▸ Import Sound.
-    fn import_sound_dialog(&mut self) {
-        self.ask_for_paths(
-            crate::dialogs::Request::open_files()
-                .filter("Sound", &["wav", "mp3", "ogg", "flac", "m4a", "aac"]),
-            Pick::ImportSound,
-        );
-    }
-
+    /// A sound put in the library and on the timeline (Import to Stage, or
+    /// the agent's `import_sound`).
     fn import_sound_from(&mut self, path: std::path::PathBuf) {
         if let Some(refusal) = self.editor.master_audio_import_refusal() {
             self.editor.status = Some(refusal);
@@ -13270,6 +14942,22 @@ impl App {
                 } else {
                     format!("Imported {name} — put it on a keyframe with Control > Attach Sound")
                 })
+            }
+            Err(e) => self.editor.status = Some(format!("Could not import that sound: {e:#}")),
+        }
+    }
+
+    /// A sound put in the library only (Import to Library): no layer, no cue.
+    fn import_sound_to_library_from(&mut self, path: std::path::PathBuf) {
+        if let Some(refusal) = self.editor.master_audio_import_refusal() {
+            self.editor.status = Some(refusal);
+            return;
+        }
+        match self.editor.import_sound_to_library(&path) {
+            Ok(name) => {
+                self.editor.status = Some(format!(
+                    "Imported {name} into the library — put it on a keyframe with Control > Attach Sound"
+                ))
             }
             Err(e) => self.editor.status = Some(format!("Could not import that sound: {e:#}")),
         }
@@ -13562,19 +15250,23 @@ impl App {
         }
     }
 
-    /// Animate's File ▸ Import, for all three formats.
+    /// Animate's File ▸ Import — the only two imports there are (M1): scenes,
+    /// pictures and sound, each file by its kind.
     ///
     /// Each file is one [`Document::edit`], so one that brings in four
     /// hundred symbols is still a single Ctrl+Z — and choosing several at
     /// once (D3) merges them the same way, one after another.
     fn import_dialog(&mut self, target: buzz_scene::ImportTarget) {
-        // Sound sits in the "everything" filter too, or the one filter that is
-        // meant to accept anything would be the one that hid the mp3.
+        // Pictures and sound sit in the "everything" filter too, or the one
+        // filter that is meant to accept anything would be the one that hid
+        // the mp3.
         let mut importable = crate::import::IMPORTABLE.to_vec();
+        importable.extend_from_slice(crate::import::PICTURE);
         importable.extend_from_slice(crate::import::AUDIBLE);
         self.ask_for_paths(
             crate::dialogs::Request::open_files()
                 .filter("Everything BuzzAnimate can import", &importable)
+                .filter("Picture", crate::import::PICTURE)
                 .filter("Animate document", &["fla", "xfl"])
                 .filter("Flash movie", &["swf"])
                 .filter("PDF or Illustrator artwork", &["pdf", "ai"])
@@ -13585,14 +15277,21 @@ impl App {
 
     /// Merge a chosen file into the open document.
     fn import_file(&mut self, target: buzz_scene::ImportTarget, path: std::path::PathBuf) {
-        // **A sound picked here is imported, not refused.** File > Import is
-        // what anyone reaches for with a dialogue track in hand; sending it to
-        // the scene importers only produced "BuzzAnimate cannot import .mp3
-        // files" from a program that has a sound library. Nothing else about
-        // the command changes: a sound goes to the library and onto the
-        // timeline, exactly as File > Import Sound puts it.
-        if crate::import::is_audio(&path) {
-            self.import_sound_from(path);
+        // **A sound or a picture picked here is imported, not refused.**
+        // File > Import is what anyone reaches for with a dialogue track or a
+        // drawing in hand; sending it to the scene importers only produced
+        // "BuzzAnimate cannot import .mp3 files" from a program that has a
+        // sound library. To the stage a sound goes to the library and onto the
+        // timeline and a picture becomes artwork on the active layer; to the
+        // library each only goes into the library (M1).
+        let sound = crate::import::is_audio(&path);
+        if sound || crate::import::is_picture(&path) {
+            let library = matches!(target, buzz_scene::ImportTarget::Library);
+            match (sound, library) {
+                (true, false) => self.import_sound_from(path),
+                (true, true) => self.import_sound_to_library_from(path),
+                (false, library) => self.import_picture_file(library, path),
+            }
             // Synchronous — no read-and-merge task follows it, so nothing
             // else here would ever move a batch (D3) on to the next file.
             if self.import_batch.is_some() {
@@ -13631,6 +15330,33 @@ impl App {
         });
     }
 
+    /// A picture chosen in Import to Stage (`library` false) or Import to
+    /// Library (M1). A lone picture on the stage lands exactly as File ▸ Import
+    /// Image always put it; in a batch (D3) the ones for the stage land
+    /// staggered, and a failure is recorded for the batch's one status line.
+    fn import_picture_file(&mut self, library: bool, path: std::path::PathBuf) {
+        let name = file_name(&path);
+        let result = match (library, &mut self.import_batch) {
+            (false, None) => return self.import_image_from(path),
+            (false, Some(batch)) => {
+                batch.pictures += 1;
+                let offset = Self::stagger_offset(batch.pictures - 1);
+                self.editor.import_image_at(&path, offset)
+            }
+            (true, _) => self.editor.import_image_to_library(&path),
+        };
+        match (result, &mut self.import_batch) {
+            (Ok(_), Some(_)) => {}
+            (Ok(imported), None) => {
+                self.editor.status = Some(format!("Imported {imported} into the library"))
+            }
+            (Err(e), Some(batch)) => batch.failed.push((name, format!("{e:#}"))),
+            (Err(e), None) => {
+                self.editor.status = Some(format!("Could not import that image: {e:#}"))
+            }
+        }
+    }
+
     /// D3: one or more files chosen at once for Import to Stage or Import to
     /// Library. A single file behaves exactly as it always did — no batch, no
     /// summary line beyond the one `finish_merge` already writes. More than
@@ -13652,6 +15378,7 @@ impl App {
         self.import_batch = Some(ImportBatch {
             total: paths.len(),
             failed: Vec::new(),
+            pictures: 0,
         });
         self.import_queue = paths.into_iter().map(|p| (target, p)).collect();
         self.advance_import_queue();
@@ -14412,6 +16139,7 @@ impl App {
         self.stage_bands = 0;
         self.band_frames_since_ladder = 0;
         self.banded_on_target = None;
+        self.rendered_on_target = None;
     }
 
     /// **D2.** Start `path` reading, as our own format or a foreign one —
@@ -15286,6 +17014,7 @@ impl App {
         {
             let scene = self.editor.doc.scene().clone();
             self.editor.sound.install_decoded(results, &scene);
+            self.editor.forget_waveforms();
             self.sound_decode = None;
             active.window.request_redraw();
         }
@@ -15338,7 +17067,11 @@ impl App {
                 buzz_render::lighting::INLINE_BUDGET
             });
             self.lights.lights.set_queue(!building && settled);
+            // T14: while a light is being dragged a heavy frame leaves its
+            // crescents out (`DrawCache::set_draft`); they return on release.
+            self.lights.set_draft(self.editor.light_gesture.is_some());
         }
+        let drafting = self.lights.drafting();
 
         self.profiler.enter(crate::profile::Section::Encode);
 
@@ -15383,7 +17116,9 @@ impl App {
             ),
             edit_multiple: self.editor.edit_multiple,
             lights_generation: self.lights_generation,
-            lights: rig,
+            // A drafted encoding is not the finished one: the bit keeps the
+            // frame after release from reusing it.
+            lights: rig ^ u64::from(drafting) ^ (u64::from(self.lights.draft_on()) << 1),
             painted_preview: paints_into_scene,
         };
         // **Only a preview that is painted into the scene invalidates it.**
@@ -15819,6 +17554,7 @@ impl App {
             }
             // Half-written until it returns, so not reusable if it fails.
             self.banded_on_target = None;
+            self.rendered_on_target = None;
             let render_started_bands = Instant::now();
             self.stage_bands = render_stage_bands(
                 active,
@@ -15868,6 +17604,7 @@ impl App {
             // sized them pays that here, with an empty scene, so no frame of a
             // playback does.
             if std::mem::take(&mut self.warm.prealloc) {
+                self.rendered_on_target = None;
                 active.gpu.render(
                     &VelloScene::new(),
                     target,
@@ -15876,11 +17613,24 @@ impl App {
                     pasteboard(&self.editor.workspace),
                 )?;
             }
-            let render_call_started = Instant::now();
-            active
-                .gpu
-                .render(&active.vello, target, w, h, pasteboard(&self.editor.workspace))?;
-            render_call_ms = render_call_started.elapsed().as_secs_f64() * 1e3;
+            // **T14b: the retained lit stage.** The encoding was reused (the
+            // stamp is the one it was built for) and the target still holds
+            // the render of it, so the 40 ms of GPU a lit traced street costs
+            // is not paid again for a redraw a hover or a panel asked for.
+            let background = pasteboard(&self.editor.workspace);
+            let retained = self.retain_stage
+                && reuse
+                && !pipelined
+                && self.rendered_on_target == Some((w, h, background));
+            if !retained {
+                self.rendered_on_target = None;
+                let render_call_started = Instant::now();
+                active
+                    .gpu
+                    .render(&active.vello, target, w, h, background)?;
+                render_call_ms = render_call_started.elapsed().as_secs_f64() * 1e3;
+                self.rendered_on_target = Some((w, h, background));
+            }
         }
         // Read back out once either path above has finished writing into it —
         // the ordinary single pass rendered straight into it, banded mode
@@ -19546,13 +21296,11 @@ mod idle_tests {
         assert!(app.editor.ai_character.open);
     }
 
-    /// F7.0: every AI command lands in the AI panel — the three that open a
-    /// dialog body (Models, Character from Image, Identify & Rename) and the
-    /// three the shell runs itself (Direct Story, Auto-Rig, Scene from
-    /// Image, whose file picker is not opened here) — and the panel then
-    /// draws inside the real window, every section title on screen.
+    /// Q1: no AI command reveals the AI panel (the settings ones open their own
+    /// window), and the panel, opened by hand, still draws inside the real
+    /// window with its section titles on screen.
     #[test]
-    fn every_ai_command_reveals_the_ai_panel_and_it_draws_through_the_ui() {
+    fn ai_commands_never_reveal_the_ai_panel_and_it_draws_through_the_ui() {
         for command in [
             buzz_ui::Command::AiModels,
             buzz_ui::Command::AiCharacterFromImage,
@@ -19565,10 +21313,18 @@ mod idle_tests {
             assert!(!app.editor.workspace.is_open(buzz_ui::PanelId::Ai), "hidden by default");
             app.dispatch(command);
             assert!(
-                app.editor.workspace.is_open(buzz_ui::PanelId::Ai),
-                "{command:?} did not reveal the AI panel"
+                !app.editor.workspace.is_open(buzz_ui::PanelId::Ai),
+                "{command:?} revealed the AI panel"
             );
         }
+        // The settings commands open their own window instead.
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.dispatch(buzz_ui::Command::AiModels);
+        app.dispatch(buzz_ui::Command::AiCharacterFromImage);
+        app.dispatch(buzz_ui::Command::AiIdentifyAssets);
+        assert!(app.editor.ai_models.open && app.editor.ai_character.open && app.editor.ai_rename.open);
+        assert!(!app.editor.workspace.is_open(buzz_ui::PanelId::Ai));
 
         let mut app = App::new(GpuPreference::Automatic);
         app.recovery.found.clear();
@@ -19601,6 +21357,179 @@ mod idle_tests {
             assert!(all.contains(want), "{want} not on screen");
         }
         assert!(!all.contains("sk-local-d"), "a stored key reached the screen");
+    }
+
+    /// Q1: a running AI task shows the small card and a waiting review gets its
+    /// own window — with the AI panel closed all the while.
+    #[test]
+    fn quiet_ai_actions_show_a_card_and_review_windows_not_the_panel() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let (hold, wait) = crossbeam_channel::bounded::<()>(1);
+        let _ = app.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "AI: Split Picture", move |_| {
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(20));
+            crate::tasks::TaskOutcome::Finished(String::new())
+        });
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut screen = |app: &mut App| {
+            let mut all = String::new();
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(input, |ui| {
+                    app.build_ui(ui);
+                });
+                all = out
+                    .shapes
+                    .iter()
+                    .filter_map(|s| match &s.shape {
+                        egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            all
+        };
+        let all = screen(&mut app);
+        assert!(all.contains("AI: Split Picture"), "the progress card is not drawn");
+        assert!(!all.contains("quietpic.png"));
+        assert!(!app.editor.workspace.is_open(buzz_ui::PanelId::Ai));
+
+        app.ai_panel.scene = Some(buzz_ui::ai_panel::SceneReview {
+            image_name: "quietpic.png".into(),
+            rows: Vec::new(),
+            secs: 1.0,
+            note: String::new(),
+        });
+        app.ai_panel.story = Some(buzz_ui::ai_panel::StoryReview {
+            beats: vec!["quietbeat".into()],
+            cues: Vec::new(),
+            cast: Vec::new(),
+            secs: 1.0,
+            model: "m".into(),
+        });
+        app.ai_panel.rig = Some(buzz_ui::ai_panel::RigReview {
+            symbol: "quietrig".into(),
+            mapping: Vec::new(),
+            secs: 0.0,
+        });
+        app.ai_panel.transcript = Some(buzz_ui::ai_panel::TranscriptReview {
+            sound: "quietsound.wav".into(),
+            lines: vec![(0.0, 1.0, "hello".into())],
+            secs: 1.0,
+            provider: "cpu".into(),
+        });
+        let all = screen(&mut app);
+        for want in ["quietpic.png", "quietbeat", "quietrig", "quietsound.wav"] {
+            assert!(all.contains(want), "{want}: its review window is not drawn");
+        }
+        assert!(!app.editor.workspace.is_open(buzz_ui::PanelId::Ai));
+        let _ = hold.send(());
+    }
+
+    /// Q2: the progress window for every long operation: centred on the stage
+    /// the first time, draggable and remembered, a row per task, hide/restore.
+    #[test]
+    fn the_progress_window_is_centred_draggable_remembered_and_one_row_per_task() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.editor.workspace.progress_window_pos = None;
+        let stage = egui::Rect::from_min_size(egui::pos2(200.0, 100.0), egui::vec2(900.0, 700.0));
+        app.last_stage_area = Some(stage);
+        let (hold, wait) = crossbeam_channel::bounded::<()>(2);
+        let wait2 = wait.clone();
+        let hold_for = |w: crossbeam_channel::Receiver<()>| {
+            move |_: crate::tasks::TaskCtx| {
+                let _ = w.recv_timeout(std::time::Duration::from_secs(20));
+                crate::tasks::TaskOutcome::Finished(String::new())
+            }
+        };
+        let _ = app.tasks.spawn_thread(crate::tasks::TaskKind::Trace, "Trace Bitmap", hold_for(wait));
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0));
+        let frame = |app: &mut App, events: Vec<egui::Event>| -> String {
+            let mut all = String::new();
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let out = ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            });
+            all.push_str(
+                &out.shapes
+                    .iter()
+                    .filter_map(|s| match &s.shape {
+                        egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            all
+        };
+        let area = || ctx.memory(|m| m.area_rect(egui::Id::new(buzz_ui::ai_panel::PROGRESS_WINDOW_ID)));
+        for _ in 0..3 {
+            frame(&mut app, Vec::new());
+        }
+        let rect = area().expect("the progress window is drawn while a trace runs");
+        assert!((rect.center() - stage.center()).length() < 60.0, "not centred on the stage: {rect:?}");
+
+        // Drag the title bar 150 points left and 80 down.
+        let grab = rect.min + egui::vec2(40.0, 10.0);
+        let to = grab + egui::vec2(-150.0, 80.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(grab)]);
+        frame(&mut app, vec![button(grab, true)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(grab + egui::vec2(-70.0, 40.0))]);
+        frame(&mut app, vec![egui::Event::PointerMoved(to)]);
+        frame(&mut app, vec![button(to, false)]);
+        frame(&mut app, Vec::new());
+        let moved = area().unwrap();
+        assert!((moved.min - (rect.min + egui::vec2(-150.0, 80.0))).length() < 6.0, "not dragged: {moved:?} from {rect:?}");
+        let saved = app.editor.workspace.progress_window_pos.expect("the drop is remembered");
+        assert!((egui::pos2(saved[0], saved[1]) - moved.min).length() < 6.0);
+
+        // Two tasks: two rows. A kind that is background noise is not one.
+        let _ = app.tasks.spawn_thread(crate::tasks::TaskKind::Export, "Export clip", hold_for(wait2));
+        let _ = app.tasks.spawn_thread(crate::tasks::TaskKind::Thumbnails, "pictures", |_| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            crate::tasks::TaskOutcome::Finished(String::new())
+        });
+        assert_eq!(app.progress_rows(true).len(), 2);
+        let text = frame(&mut app, Vec::new());
+        assert!(text.contains("Trace Bitmap") && text.contains("Export clip"), "{text}");
+        assert!(!text.contains("pictures"));
+        assert_eq!(area().unwrap().min.x.round(), moved.min.x.round(), "the window jumped");
+
+        // Hide to a slim bar, then restore.
+        app.progress_hidden = true;
+        let text = frame(&mut app, Vec::new());
+        assert!(text.contains("2 tasks running") && !text.contains("Export clip"), "{text}");
+        app.progress_hidden = false;
+        assert!(frame(&mut app, Vec::new()).contains("Export clip"));
+
+        // A fresh session opens where the user left it.
+        let ctx2 = egui::Context::default();
+        buzz_ui::theme::apply(&ctx2);
+        let mut hidden = false;
+        let row = app.progress_rows(true);
+        for _ in 0..3 {
+            ctx2.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                buzz_ui::ai_panel::progress_window(ui.ctx(), &row, stage, Some(saved), &mut hidden);
+            });
+        }
+        let reopened = ctx2.memory(|m| m.area_rect(egui::Id::new(buzz_ui::ai_panel::PROGRESS_WINDOW_ID))).unwrap();
+        assert!((reopened.min - egui::pos2(saved[0], saved[1])).length() < 2.0);
+        let _ = hold.send(());
+        let _ = hold.send(());
     }
 
     /// F7.0/F7.9: a finished transcription waits in the panel, and Apply
@@ -19636,7 +21565,7 @@ mod idle_tests {
         app.collect_ai_result(id);
         let t = app.ai_panel.transcript.as_ref().expect("the transcript waits in the panel");
         assert_eq!(t.lines.len(), 2);
-        assert!(app.editor.workspace.is_open(buzz_ui::PanelId::Ai));
+        assert!(!app.editor.workspace.is_open(buzz_ui::PanelId::Ai), "a transcript does not open the panel");
         app.ai_panel.transcribe_speaker = "Ramu".into();
         app.ai_panel_action(buzz_ui::ai_panel::AiPanelAction::TranscriptApply);
         let captions = app
@@ -24692,6 +26621,260 @@ mod layer_rig_ui_tests {
         assert!(text.iter().any(|t| t == "layers"), "no layers label: {text:?}");
     }
 
+    /// **CAST_FRESH F1**: the Cast panel's "Start Fresh" button opens a
+    /// confirm, Cancel leaves the file alone, OK backs the file up under
+    /// `_cast_backup/` and saves it with one keyframe per layer; the header's
+    /// "Start Fresh: all…" does every character. Driven by egui events through a
+    /// full `build_ui` (the buttons are found in the accesskit tree), no real
+    /// mouse.
+    #[test]
+    fn start_fresh_button_confirms_backs_up_and_clears_the_character() {
+        use egui::accesskit::{Action, Role};
+
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = buzz_doc::AssetLibrary::at(dir.path());
+        for name in ["Ana", "Ben"] {
+            let mut scene = buzz_scene::Scene::default();
+            let layer = scene.add_layer("Body", buzz_scene::LayerKind::Normal);
+            scene.update_layer(layer, |l| {
+                while l.frames.length() < 12 {
+                    l.frames.insert_frame(l.frames.length());
+                }
+                l.frames.insert_keyframe(4);
+                l.frames.insert_keyframe(8);
+            });
+            library.save(name, "Cast", &scene).expect("saved");
+        }
+        let keys_of = |path: &std::path::Path| -> (usize, u32) {
+            let scene = buzz_doc::format::load(path).expect("loads");
+            let layer = scene.stage_layers().iter().next().expect("a layer");
+            (layer.keyframe_count(), layer.frames.length())
+        };
+        let ana = dir.path().join("Cast").join("Ana.buzz");
+        let ben = dir.path().join("Cast").join("Ben.buzz");
+        assert_eq!(keys_of(&ana), (3, 12));
+
+        let mut app = App::new(GpuPreference::Automatic);
+        app.editor.assets = buzz_doc::AssetLibrary::at(dir.path());
+        app.editor.workspace.reveal(buzz_ui::PanelId::Cast);
+
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            })
+        };
+        // Every button with this label, top to bottom, by centre.
+        let buttons = |output: &egui::FullOutput, label: &str| -> Vec<egui::Pos2> {
+            let update = output.platform_output.accesskit_update.as_ref().expect("accesskit is on");
+            let mut found: Vec<egui::Pos2> = update
+                .nodes
+                .iter()
+                .filter(|(_, n)| n.role() == Role::Button && n.supports_action(Action::Click) && n.label() == Some(label))
+                .filter_map(|(_, n)| n.bounds())
+                .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+                .collect();
+            found.sort_by(|a, b| a.y.total_cmp(&b.y));
+            found
+        };
+        let click = |app: &mut App, at: egui::Pos2| {
+            let mods = egui::Modifiers::default();
+            let _ = frame(app, vec![egui::Event::PointerMoved(at)]);
+            let _ = frame(
+                app,
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: mods,
+                }],
+            );
+            let _ = frame(
+                app,
+                vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: mods,
+                }],
+            );
+        };
+
+        let _ = frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let rows = buttons(&output, "Start Fresh");
+        assert_eq!(rows.len(), 2, "one Start Fresh per character");
+        assert_eq!(buttons(&output, "Start Fresh: all\u{2026}").len(), 1, "the header button");
+
+        // Cancel: the confirm opens, nothing is written.
+        click(&mut app, rows[0]);
+        let output = frame(&mut app, vec![]);
+        let cancel = buttons(&output, "Cancel");
+        assert_eq!(cancel.len(), 1, "the confirm is open");
+        click(&mut app, cancel[0]);
+        let output = frame(&mut app, vec![]);
+        assert!(buttons(&output, "Cancel").is_empty(), "Cancel closed the confirm");
+        assert_eq!(keys_of(&ana), (3, 12), "Cancel wrote nothing");
+        assert!(!dir.path().join("_cast_backup").exists(), "Cancel made no backup");
+
+        // OK on the first character only.
+        click(&mut app, rows[0]);
+        let output = frame(&mut app, vec![]);
+        let ok = buttons(&output, "OK");
+        assert_eq!(ok.len(), 1);
+        click(&mut app, ok[0]);
+        assert_eq!(keys_of(&ana), (1, 1), "Ana is fresh");
+        assert_eq!(keys_of(&ben), (3, 12), "Ben is untouched");
+        let backups: Vec<_> = std::fs::read_dir(dir.path().join("_cast_backup"))
+            .expect("a backup folder")
+            .flatten()
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let backed_up = backups[0].path().join("Cast").join("Ana.buzz");
+        assert_eq!(keys_of(&backed_up), (3, 12), "the backup is the original");
+        assert!(
+            app.editor.status.as_deref().is_some_and(|s| s.contains("_cast_backup")),
+            "status names the backup: {:?}",
+            app.editor.status
+        );
+
+        // The header button does the rest.
+        let output = frame(&mut app, vec![]);
+        let all = buttons(&output, "Start Fresh: all\u{2026}");
+        click(&mut app, all[0]);
+        let output = frame(&mut app, vec![]);
+        let ok = buttons(&output, "OK");
+        assert_eq!(ok.len(), 1);
+        click(&mut app, ok[0]);
+        assert_eq!(keys_of(&ben), (1, 1), "Ben is fresh");
+    }
+
+    /// **CAST_POSES C1**: with a search filter on, "Select all" selects only
+    /// what is listed, "Delete (n)…" confirms (naming the ones a casting.json
+    /// uses) and OK MOVES the files to `_cast_backup/<stamp>_deleted/`; the
+    /// others stay and the backup folder is not itself listed. Headless.
+    #[test]
+    fn cast_select_all_with_a_filter_deletes_to_the_backup_folder() {
+        use egui::accesskit::{Action, Role};
+
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = buzz_doc::AssetLibrary::at(dir.path());
+        for name in ["Ana", "Anil", "Ben", "Cy"] {
+            let mut scene = buzz_scene::Scene::default();
+            scene.add_layer("Body", buzz_scene::LayerKind::Normal);
+            library.save(name, "Cast", &scene).expect("saved");
+        }
+        std::fs::create_dir_all(dir.path().join("Cast").join("Series")).unwrap();
+        std::fs::write(
+            dir.path().join("Cast").join("Series").join("casting.json"),
+            r#"{"version":1,"series":"Series","choices":{"a":{"asset":"Cast/Ana.buzz","name":"Ana","locked":true}}}"#,
+        )
+        .unwrap();
+
+        let mut app = App::new(GpuPreference::Automatic);
+        app.editor.assets = buzz_doc::AssetLibrary::at(dir.path());
+        app.editor.workspace.reveal(buzz_ui::PanelId::Cast);
+        app.editor.cast_panel.search = "an".into();
+
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0));
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            })
+        };
+        let buttons = |output: &egui::FullOutput, label: &str| -> Vec<egui::Pos2> {
+            let update = output.platform_output.accesskit_update.as_ref().expect("accesskit is on");
+            update
+                .nodes
+                .iter()
+                .filter(|(_, n)| n.role() == Role::Button && n.supports_action(Action::Click) && n.label() == Some(label))
+                .filter_map(|(_, n)| n.bounds())
+                .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+                .collect()
+        };
+        let click = |app: &mut App, at: egui::Pos2| {
+            let mods = egui::Modifiers::default();
+            let _ = frame(app, vec![egui::Event::PointerMoved(at)]);
+            for pressed in [true, false] {
+                let _ = frame(
+                    app,
+                    vec![egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: mods,
+                    }],
+                );
+            }
+        };
+
+        let _ = frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let select_all = buttons(&output, "Select all");
+        assert_eq!(select_all.len(), 1, "a Select all button");
+        click(&mut app, select_all[0]);
+        assert_eq!(app.editor.cast_panel.selected.len(), 2, "only Ana and Anil are listed, so only they are selected");
+
+        let output = frame(&mut app, vec![]);
+        let delete = buttons(&output, "Delete (2)\u{2026}");
+        assert_eq!(delete.len(), 1, "Delete (2)\u{2026} appears");
+        click(&mut app, delete[0]);
+        let ask = app.editor.cast_panel.delete_ask.clone().expect("the confirm is open");
+        assert_eq!(ask.assets.len(), 2);
+        assert_eq!(ask.cast_in_series, vec!["Ana".to_string()], "the casting.json user is named");
+        assert!(dir.path().join("Cast").join("Ana.buzz").exists(), "nothing moves before OK");
+
+        let _ = frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let ok = buttons(&output, "Move to backup");
+        assert_eq!(ok.len(), 1);
+        click(&mut app, ok[0]);
+
+        assert!(!dir.path().join("Cast").join("Ana.buzz").exists(), "status: {:?}", app.editor.status);
+        assert!(!dir.path().join("Cast").join("Anil.buzz").exists());
+        assert!(dir.path().join("Cast").join("Ben.buzz").exists(), "unlisted characters stay");
+        assert!(dir.path().join("Cast").join("Cy.buzz").exists());
+        let deleted: Vec<_> = std::fs::read_dir(dir.path().join("_cast_backup"))
+            .expect("a backup folder")
+            .flatten()
+            .collect();
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted[0].file_name().to_string_lossy().ends_with("_deleted"));
+        assert!(deleted[0].path().join("Cast").join("Ana.buzz").exists());
+        assert!(deleted[0].path().join("Cast").join("Anil.buzz").exists());
+        assert!(app.editor.cast_panel.selected.is_empty());
+        let listed: Vec<String> = app
+            .editor
+            .assets
+            .assets()
+            .iter()
+            .filter(|a| is_cast(&a.folder))
+            .map(|a| a.name.clone())
+            .collect();
+        assert_eq!(listed, vec!["Ben".to_string(), "Cy".to_string()], "the backup folder is not listed");
+        assert!(
+            app.editor.status.as_deref().is_some_and(|s| s.contains("_cast_backup") && s.contains("Ana")),
+            "status names the backup and the casting.json user: {:?}",
+            app.editor.status
+        );
+    }
+
     /// LR2 changed only what *new* characters get: a bone rig saved to Cast
     /// before is still a bone rig when an app with the Layers default scans
     /// and loads it.
@@ -25245,5 +27428,145 @@ mod frame_move_drag_tests {
         let selection = drive.app.editor.selection.timeline().unwrap();
         assert!(selection.layers.contains(&below));
         assert_eq!(selection.first_frame, 4);
+    }
+}
+
+/// E1 (`docs/SIMPLE_EPISODE_FLOW_PLAN.md`): AI > Generate Background. ComfyUI is
+/// not needed here: the drawn pictures are stand-in PNGs handed to the same
+/// commit the drawing task ends in.
+#[cfg(test)]
+mod gen_background_tests {
+    use super::*;
+
+    /// A flat-colour "village": sky, ground, a brown house with a dark roof.
+    fn stub_picture(name: &str, w: u32, h: u32) -> std::path::PathBuf {
+        let mut img = image::RgbaImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let (fx, fy) = (x as f32 / w as f32, y as f32 / h as f32);
+            *px = if fy < 0.55 {
+                image::Rgba([150, 175, 200, 255])
+            } else {
+                image::Rgba([110, 130, 90, 255])
+            };
+            if (0.3..0.6).contains(&fx) && (0.35..0.75).contains(&fy) {
+                *px = if fy < 0.45 { image::Rgba([60, 40, 40, 255]) } else { image::Rgba([160, 120, 80, 255]) };
+            }
+        }
+        let dir = std::env::temp_dir().join("buzzanimate_gen_background_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        img.save(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn generate_background_places_the_pick_on_a_new_bottom_layer_named_background() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let before = app.editor.doc.scene().layers().len();
+        let a = stub_picture("a.png", 480, 270);
+        let b = stub_picture("b.png", 480, 270);
+        let v = app.commit_backgrounds(vec![(a, 11), (b, 12)], None, false);
+        assert_eq!(v["pictures"].as_array().map(Vec::len), Some(2));
+        assert_eq!(app.gen_bg.results.len(), 2, "the tries wait as thumbnails");
+        assert_eq!(app.editor.doc.scene().layers().len(), before, "nothing is placed until one is picked");
+
+        let placed = app.use_generated_background(1, false, false);
+        assert_eq!(placed["placed"], true, "{placed}");
+        let scene = app.editor.doc.scene();
+        assert_eq!(scene.layers().len(), before + 1);
+        let bottom = scene.layers().iter().last().unwrap();
+        assert_eq!(bottom.name, "Background", "it sits at the bottom of the stack");
+        let objects = bottom.objects_at(app.editor.current_frame);
+        assert_eq!(objects.len(), 1);
+        assert!(matches!(&objects[0].kind, buzz_scene::ObjectKind::Shape(s) if matches!(s.fill.as_ref().map(|f| &f.paint), Some(buzz_scene::Paint::Image(_)))));
+        // Centred on the stage, selected.
+        let stage = scene.stage().size;
+        let bounds = scene.resolved_bounds(&objects[0]);
+        assert!(((bounds.x0 + bounds.x1) / 2.0 - stage.width / 2.0).abs() < 1.0, "{bounds:?}");
+        assert!(((bounds.y0 + bounds.y1) / 2.0 - stage.height / 2.0).abs() < 1.0, "{bounds:?}");
+        assert!(app.editor.selection.ids().contains(&objects[0].id));
+        assert!(!app.gen_bg.open, "the dialog closes once the pick is placed");
+    }
+
+    #[test]
+    fn generate_background_dialog_opens_from_the_command_and_shows_thumbnails() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.dispatch(Command::AiGenerateBackground);
+        assert!(app.gen_bg.open);
+        let pics = vec![(stub_picture("t1.png", 320, 180), 1), (stub_picture("t2.png", 320, 180), 2)];
+        app.commit_backgrounds(pics, None, false);
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0));
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            });
+        }
+        assert!(app.gen_bg.results.iter().all(|t| t.has_thumbnail()), "both tries are drawn as thumbnails");
+        assert!(app.gen_bg.open);
+    }
+
+    #[test]
+    fn generate_background_agent_pick_is_placed_and_a_bad_pick_is_refused() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let a = stub_picture("c.png", 320, 180);
+        let v = app.commit_backgrounds(vec![(a, 5)], Some((0, false)), true);
+        assert_eq!(v["placed"], true, "{v}");
+        assert_eq!(v["layer"], "Background");
+        let bad = app.use_generated_background(3, false, true);
+        assert_eq!(bad["placed"], false);
+        // No prompt, no task.
+        app.gen_bg.prompt.clear();
+        assert!(!app.start_gen_background(None));
+        assert!(!app.gen_bg.busy);
+    }
+
+    #[test]
+    fn generate_background_bold_split_traces_with_bold_outlines() {
+        let plain = crate::backdrop::BackdropOptions::default().trace_options();
+        let bold = crate::backdrop::BackdropOptions { bold_outlines: true, ..Default::default() }.trace_options();
+        assert!(!plain.bold_outlines);
+        assert!(bold.bold_outlines && !bold.drop_background);
+        let (w, h) = crate::gen_background::draw_size((1920.0, 1080.0));
+        assert_eq!((w, h), (1920, 1080));
+    }
+
+    /// The whole one-go path on a stand-in picture, run for real (VLM + SAM 2
+    /// for the objects, so it is slow and needs those models):
+    /// `cargo test -p buzz-app --lib generate_background_one_go -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs the VLM and SAM 2; slow"]
+    fn generate_background_one_go_traces_and_splits() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let src = std::env::var("BUZZ_E1_PICTURE").map(std::path::PathBuf::from).unwrap_or_else(|_| stub_picture("one_go.png", 960, 540));
+        let v = app.commit_backgrounds(vec![(src, 1)], Some((0, true)), false);
+        assert_eq!(v["placed"], true, "{v}");
+        let began = std::time::Instant::now();
+        loop {
+            app.poll_tasks();
+            if app.tasks.running().next().is_none() && app.ai_results.is_empty() {
+                break;
+            }
+            assert!(began.elapsed() < Duration::from_secs(900), "the split did not finish");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let scene = app.editor.doc.scene();
+        let names: Vec<String> = scene.layers().iter().map(|l| l.name.clone()).collect();
+        println!("layers after Trace + Split: {names:?}; status: {:?}", app.editor.status);
+        for want in ["Sky", "Far", "Mid", "Ground", "Source picture"] {
+            assert!(names.iter().any(|n| n == want), "no {want} layer in {names:?}");
+        }
+        let bold_strokes = scene
+            .layers()
+            .iter()
+            .filter(|l| l.name == "Ground" || l.name == "Mid")
+            .flat_map(|l| l.objects_at(app.editor.current_frame).to_vec())
+            .filter(|o| matches!(&o.kind, buzz_scene::ObjectKind::Shape(s) if s.stroke.as_ref().is_some_and(|st| st.width >= 1.5)))
+            .count();
+        println!("bold-stroked shapes on Mid/Ground: {bold_strokes}");
+        assert!(bold_strokes > 0, "the plates carry no bold outlines");
     }
 }

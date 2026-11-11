@@ -899,6 +899,34 @@ fn place_layer_rig(
     Some(LayerRig { layers, root })
 }
 
+/// One ready-made part for [`rig_parts_as_layers`].
+pub struct PartSpec {
+    /// Index into the pattern: which slot's layer this part's layer follows from.
+    pub slot: usize,
+    /// The layer's name (the slot's name, so the rig is read back by it).
+    pub name: String,
+    /// The artwork as it should stand, in the layer's coordinates.
+    pub artwork: Object,
+    /// The joint it turns about, in the layer's coordinates.
+    pub joint: Point,
+}
+
+/// **A layer rig from parts the caller has already cut and placed** (the part
+/// order is paint order, back to front): one layer per part, named as given, the
+/// transformation point on its joint, each layer following the layer of its
+/// nearest filled ancestor slot, as [`rig_character_layers`] does. Built on the
+/// first layer of the stage, whose (empty) place in the stack it takes. The
+/// caller wraps this in one `Document::edit`.
+pub fn rig_parts_as_layers(scene: &mut Scene, frame: u32, pattern: &RigPattern, parts: Vec<PartSpec>) -> Option<LayerRig> {
+    let home = scene.layers().iter().next()?.id;
+    let parents: Vec<Option<usize>> = pattern.slots.iter().map(|s| s.parent).collect();
+    let parts: Vec<LayerPart> = parts
+        .into_iter()
+        .map(|p| LayerPart { slot: p.slot, name: p.name, artwork: p.artwork, joint: p.joint, from: None, lead: false })
+        .collect();
+    place_layer_rig(scene, RigHome::Active, frame, home, parts, &parents, true)
+}
+
 /// [`rig_character`], but rigged by **layer parenting** instead of bones.
 ///
 /// One layer per filled slot, named after the slot, with the part alone on
@@ -2666,6 +2694,10 @@ pub use even_lines::{
     EvenLinesPlan, EvenLinesReport, EvenLinesScope, EvenLinesSettings, EvenLinesTrace, apply_even_lines,
     default_solid_above, nested_symbols, plan_even_lines, retrace_even_lines, trace_even_lines,
 };
+
+/// T13: Optimize Shapes, `docs/TRACE_PICTURE_PLAN.md`.
+mod optimize_shapes;
+pub use optimize_shapes::{OptimizeSettings, Optimized, Piece, optimize_shapes, segment_count};
 
 /// A6b: Remove Background Specks, `docs/TRACE_SPILL_AND_OUTPAINT_PLAN.md`.
 mod background_specks;

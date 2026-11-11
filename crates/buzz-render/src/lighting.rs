@@ -523,6 +523,22 @@ impl LightCache {
             .map(Arc::clone)
     }
 
+    /// The last bands built for a figure, whatever direction they were built
+    /// for, when it has any. What a traced surface shows during a light drag
+    /// (T14b) instead of gathering its whole silhouette again for every
+    /// pointer move.
+    pub fn last_figure(
+        &mut self,
+        owner: Option<&Arc<Object>>,
+        content: u64,
+        doc: Affine,
+    ) -> Option<Arc<ShadeGeometry>> {
+        let place = Self::place(owner?, Self::FIGURE, content, doc);
+        let slot = self.places.get_mut(&place)?;
+        slot.used = self.frame;
+        (!slot.last.is_empty()).then(|| Arc::clone(&slot.last))
+    }
+
     /// The key one piece of artwork is cached under.
     fn place(owner: &Arc<Object>, shape_index: u16, content: u64, doc: Affine) -> Place {
         Place {

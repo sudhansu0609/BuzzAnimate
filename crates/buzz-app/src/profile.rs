@@ -10,7 +10,61 @@
 //! nothing next to what they measure, and a warning that only appears when it is
 //! deserved is worth far more than the nanoseconds it costs.
 
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// When the running frame began, in ms since [`epoch`] plus one; 0 between
+/// frames. Atomics only, so the UI thread never waits on the stall watchdog.
+static FRAME_START: AtomicU64 = AtomicU64::new(0);
+/// Index of the section the running frame is in; [`NO_SECTION`] before the first.
+static CURRENT_SECTION: AtomicU8 = AtomicU8::new(NO_SECTION);
+const NO_SECTION: u8 = u8::MAX;
+/// A frame running longer than this is a stall worth a log line.
+const STALL_AFTER: Duration = Duration::from_secs(5);
+/// A stall that goes on is repeated this often, not every second.
+const STALL_REPEAT: Duration = Duration::from_secs(30);
+
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// **Say where the UI thread is stuck.** The per-section warning above only
+/// fires when a section *ends*, so a frame that never ends (a driver wait, a
+/// deadlock) logs nothing at all. This thread reads the published section and
+/// frame start once a second and warns while a frame overruns.
+fn start_stall_watchdog() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let spawned = std::thread::Builder::new().name("ui-stall-watchdog".into()).spawn(|| {
+            let mut warned_frame = 0u64;
+            let mut last_warned = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let start = FRAME_START.load(Ordering::Relaxed);
+                if start == 0 {
+                    continue;
+                }
+                let running = epoch().elapsed().saturating_sub(Duration::from_millis(start - 1));
+                if running <= STALL_AFTER {
+                    continue;
+                }
+                if start != warned_frame || last_warned.elapsed() >= STALL_REPEAT {
+                    let label = Section::ALL
+                        .get(CURRENT_SECTION.load(Ordering::Relaxed) as usize)
+                        .map_or("before the first section", |s| s.label());
+                    tracing::warn!("UI stalled {} s in section '{}'", running.as_secs(), label);
+                    warned_frame = start;
+                    last_warned = Instant::now();
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("could not start the UI stall watchdog: {e}");
+        }
+    });
+}
 
 /// The ~4 ms a UI-thread frame section is allowed, from `ARCHITECTURE.md` §0.
 pub const BUDGET: Duration = Duration::from_millis(4);
@@ -99,6 +153,9 @@ impl Default for FrameProfiler {
 impl FrameProfiler {
     /// Begin a frame. Closes any section left open by a panic-free early return.
     pub fn begin_frame(&mut self) {
+        start_stall_watchdog();
+        CURRENT_SECTION.store(NO_SECTION, Ordering::Relaxed);
+        FRAME_START.store(epoch().elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
         self.open = None;
         self.current = Frame::default();
     }
@@ -110,11 +167,13 @@ impl FrameProfiler {
             self.current.sections[prev.index()] += now.duration_since(started);
         }
         self.open = Some((section, now));
+        CURRENT_SECTION.store(section.index() as u8, Ordering::Relaxed);
     }
 
     /// Close the frame: charge the last open section, store the frame, and warn
     /// if any section ran over budget.
     pub fn end_frame(&mut self) {
+        FRAME_START.store(0, Ordering::Relaxed);
         let now = Instant::now();
         if let Some((prev, started)) = self.open.take() {
             self.current.sections[prev.index()] += now.duration_since(started);

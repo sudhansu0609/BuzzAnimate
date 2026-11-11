@@ -51,13 +51,19 @@ pub fn args_hint(command: Command) -> Option<&'static str> {
         AiRigVectorCharacter => "{symbol: library symbol name|id, element?: instance id on stage} -> {started:true, job}; detects a skeleton on the GPU and rigs it as one undo step when done; call wait_for_jobs for the result",
         AiRigLayers => "{symbol?: library symbol name|id, element?: instance id on stage (its symbol; one of the two is required), frame?: symbol frame the pieces are read at (default 0), overrides?: [{layer: the layer's name now, slot?: slot or display name (Hips, Torso, Head, Upper Arm L, Forearm R, Hand L, Thigh R, Shin L, Foot R, Brow L...) | Extra (stays on its slot, never its lead), name?: new layer name}], apply?: bool (default true), profile?: naming profile name (default My Animate convention: head, body, leftArm, leftWrist = forearm, leftPalm = hand, midCloth, leftThigh, leftShin, leftFoot, screen sides, body/midCloth/thighs are roots, legs folder; Descriptive: Upper Arm R, Forearm R, Hand R, Torso, everything follows the hips; rig_naming.json beside the workspace can override), split_merged?: bool (default: on when a merged drawing is found, i.e. one vector piece covering more than one body part; cuts its fills and strokes along the skeleton into pieces, each child part overlapping its parent across the joint so bends show no gap; off: pieces as drawn)} -> {started:true, job}; AI > Rig Character as Layers: finds the body parts (DWPose when installed, else fitted to the drawings, lower confidence), puts every piece on its own layer inside the symbol named after its body part and rigs them by layer parenting, nothing moving on any frame; an override that moves a piece works the leads and names out again before its own name is used. Call wait_for_jobs: apply:false gives {applied:false, plan:{symbol, frame, source, confidence, low_confidence, pieces:[{layer, new_name, slot, lead, score}], symbol_renames, notes, side_calls, merged_found, split_merged:{drawings, parts, joint_overlaps, unsplit_keys}|null}} and changes nothing; otherwise one undo step and {applied:true, parts, slots, layers_before, layers_after, keys_rebaked, renamed_symbols, undo_steps_added, pieces}",
         AiDirectStory => "{brief: text} -> {started:true, job}; an LLM parses the brief and the result is applied as one undo step when done; call wait_for_jobs for the result",
+        AiSplitPictureIntoLayers => "{element?: id of a picture on stage (else the selection), redetect?: bool (default false: a picture the VLM already listed objects for reuses that saved list, so the same picture gives the same layers; true asks the VLM again and saves the new list over the old one)} -> {started:true, job}; AI > Split Picture into Layers: cuts the picture into Sky/Far/Mid/Ground plates and the objects a vision model finds in it (house, tree, lamp...; people and animals are left in the plates), each object a library symbol on its own layer above its plate, all as one undo step when done; the picture itself is kept on a hidden, locked \"Source picture\" layer. Needs the VLM and SAM 2 for objects (without them: plates only, said in the result). Call wait_for_jobs for {split, objects, layers_added, notes}",
+        TraceBoldSplit => "{element?: id of a picture on stage (else the selection)} -> {started:true, job}; Modify > Bitmap > Trace Bold + Split into Layers: Bold trace (thick black outlines, Keep textures: skies/glows/ground keep their pixels) now, then the traced artwork is cut into Sky/Far/Land plates and objects as one undo step when the job is done. Call wait_for_jobs for {split, objects, layers_added, notes}",
+        AiGenerateBackground => "{prompt: what the background shows, series?: series whose look to draw in (default Khayal3Baje: its ComfyUI profile, LoRA and style text, the Producer's plate path), seed?: whole number (random), tries?: 1..4 (default 1; seeds seed, seed+1..), pick?: 1..tries, the picture to keep (default 1), trace_split?: bool (default true)} -> {started:true, job}; AI > Generate Background: draws the pictures at the stage's size off the UI thread (ComfyUI is started when it is not running), puts picture `pick` on a new bottom layer named Background (selected), then with trace_split runs Trace with bold outlines + Split Picture into Layers on it (a second job). Call wait_for_jobs: the first result has {pictures, seeds, placed, element, split_job?}; wait again for the split job's {split, objects, layers_added, notes}",
+        AiRemoveObject => "{point?: {x, y} in stage units, points?: [{x, y, positive?: bool (default true; false excludes)}] (SAM 2 prompts on the picture of the traced layer), ids?: [shape ids] (removed whole), element?: an id on the layer (else the selection/active layer)} -> {started:true, job}; AI > Remove Object (remove_from_picture): the thing under the point is found with SAM 2, the shapes mostly inside it are deleted, shapes partly inside are cut along its outline, and the hole is patched with LaMa (traced, behind the rest) as one undo step when done. Call wait_for_jobs for {removed, shapes, lama}",
+        DeleteAndFill => "{ids?: [shape ids] (else the selection)} -> {started:true, job}; Edit > Delete and Fill: the selected shapes of a traced layer are deleted and the hole patched with LaMa, one undo step when done; call wait_for_jobs for {removed, shapes, lama}",
         AiCharacterFromImage => "{path: image file (PNG/JPG of one character, full body), character_name?: text (default the file name), rig?: layers|bones (default layers)} -> {started:true, job}; the Character from Image wizard with its default choices (pose and skeleton, parts, hidden parts completed, vector trace, biped rig) as one undo step, rigged by layer parenting (one followed layer per part) or, with rig:bones, as an armature; takes a minute or two, so call wait_for_jobs for {character, symbols, elements, rig_kind: layers|bones, rig_root_element, armature_element}. rig_root_element is the id to pass as `element` to perform / ai_direct_story (the root part of a layer rig, the armature of a bone rig); armature_element is null for a layer rig. A rig whose artwork is skinned stays bones, and rig_kind says so. The rigged character is then on stage and in Cast",
         AiMouthChart => "{element: id of the character's rig on stage | character: name (finds the library symbol `<name>_mouth`), path: image file of a labelled mouth chart (mouths in rows on a plain page, coloured mouths with grey/black labels under them), labels?: [text] in reading order (default Raju's 19: Neutral Closed, Small Smile, Broad Smile, Frown, A, E, I, O, U, M/B/P, F/V, L, TH, CH/J, S/Z, Open Laugh, Angry Tight Mouth, Confused Half-Open, Skeptical Side-Mouth)} -> replaces the character's mouth-symbol frames, as one undo step: frames 0..9 are the ten lip-sync visemes (Rest, Ai, E, O, U, L, WQ, MBP, FV, Etc) so lip_sync keeps working, then every other mouth as an extra named frame (10.. : Small Smile, Broad Smile, Frown, I, TH, CH/J, Open Laugh...) to key by hand (an instance's first_frame, or the keyframe label). Sized to the current Rest mouth and drawn in its line weight. Takes a few seconds",
         ClearAllKeyframes => "{symbol: library symbol name|id, keep?: first|playhead (first; playhead = the inner frame a selected instance of it shows, else the open frame when that symbol is being edited, else first), nested?: bool (default true for a character: tag character or folder Cast)} -> Clear All Keyframes: every layer keeps one keyframe at frame 0 holding the kept pose, the rest become normal frames, lengths unchanged, audio-guide layers untouched; one undo step; returns {keyframes_cleared, layers, symbols}",
         CleanUpLayers => "{scope?: timeline|whole_scene (timeline = the timeline being edited; whole_scene = the stage and every library symbol), empty?: bool (true: delete layers with no artwork and no sound), trim?: bool (true: trim blank keyframes after each layer's last content, never below the longest content end), folders?: bool (true: remove folders with no children, including ones this run empties)} -> Clean Up Layers: never deletes a folder with children, a layer something files under or follows, a mask/guide with its run, an audio-guide layer, or the last layer; one undo step; returns {layers_deleted, frames_trimmed, folders_removed, symbols_touched}",
         ArrangeLayers => "{} -> Arrange Layers on the timeline being edited: deletes empty layers, then files top-level layers into folders (one per character with its layer-parenting chain, Background, FX, Props, Audio at the bottom), reusing same-named folders; a layer whose artwork overlaps a layer it would have to pass stays where it is, so the picture never changes; one undo step (none when already tidy); returns {folders_made, layers_moved, layers_left_in_place, emptied}",
         RepairLayerRigs => "{scope?: timeline|whole_scene (timeline = the timeline being edited; whole_scene = the stage and every library symbol)} -> Repair Layer Rigs: rewires layer-parenting rigs built with the old Bones -> Layers wiring (each part's front-most layer leads, the slot's other pieces and its child parts follow it), rebaking every keyframe so no frame changes; an already-correct rig is left alone; one undo step (none when nothing changes); returns {rigs, links_changed, keys_rebaked}",
-        EvenLines => "{element?: id of a shape or instance (its symbol, recursively; default the selection, else the symbol being edited, else the whole stage), face_width?: 0.25..12 px, body_width?: 0.25..12 px (defaults: the measured median width of the face / body ink), keep_weight?: bool (true: each line keeps its measured weight relative to the median, 0.5-2x the width), straighten?: 0..1 (0), solid_above?: 0.5..40 px (ink deeper than this radius stays a filled area; default 1.25x the measured width)} -> Even Out Lines (Modify > Shape): filled ink shapes on \"Ink\" layers (and dark filled shapes that come out as line) on every keyframe of every layer become strokes of one width along each line, face lines (eyes, brows, lids, mouth, nose, moustache, head/face layers or symbols) and body lines each at their own width; solid areas stay fills; one undo step; returns {face_lines, body_lines, solids, face_width, body_width}",
+        OptimizeShapes => "{element?: id of a shape (default the selection, else the active layer's frame), smoothing?: 0..4 px curve-fit tolerance (default 0.75; 0 leaves curves), merge_same_colour?: bool (default true: touching shapes of one colour become one), remove_tiny?: 0..50 sq px (default 1: smaller solid shapes take their largest neighbour's colour; 0 keeps them)} -> Optimize Shapes: fewer curve segments and shapes in one undo step; returns shapes and segments before/after",
+        EvenLines => "{element?: id of a shape or instance (its symbol, recursively; default the selection, else the symbol being edited, else the whole stage), face_width?: 0.25..12 px, body_width?: 0.25..12 px (defaults: the measured median width of the face / body ink), keep_weight?: bool (true: each line keeps its measured weight relative to the median, 0.5-2x the width), straighten?: 0..1 (0), solid_above?: 0.5..40 px (ink deeper than this radius stays a filled area; default 1.25x the measured width), bold?: bool (bold outlines like the user's FLA files: every ink line black at the picture's bold width, 3 px per 1920 px, detail half of it, plus an outline between colour regions that differ; widths default to that)} -> Even Out Lines (Modify > Shape): filled ink shapes on \"Ink\" layers (and dark filled shapes that come out as line) on every keyframe of every layer become strokes of one width along each line, face lines (eyes, brows, lids, mouth, nose, moustache, head/face layers or symbols) and body lines each at their own width; solid areas stay fills; one undo step; returns {face_lines, body_lines, solids, face_width, body_width}",
         RemoveBackgroundSpecks => "{element?: id of a shape or instance (its symbol and every symbol inside; default the selection, else the symbol being edited, else the whole stage), colour?: \"#rrggbb\" (the sheet's paper colour; default: guessed from the light grey fills that touch the outside), reach?: 0..200 units (12: a speck lies wholly within this of the outline, or touches the outside), max_area?: 0..100000 square units (600: larger light fills are kept)} -> Remove Background Specks (Modify > Shape): fills of the paper colour (mean within dE 10) trapped between hair curls and body-hair strands near the character's outline are deleted (or cut out of a shape with other pieces) on every keyframe of every layer, in the symbols inside too; eyes, eyelids and mouths (by layer, symbol or object name) and larger light areas (a white shirt, a vest) are kept; one undo step; returns {shapes_removed, shapes_clipped, area, keyframes, colour, keyframes_not_judged}",
         RigHead => "{symbol?: head symbol name|id (or a character symbol: the head inside it), element?: instance id on stage (its symbol, same rule); default the selected instance, else the symbol being edited, else the head on the stage} -> Rig Head (Modify > Timeline): a head symbol whose face parts are separate layers or named objects is rebuilt like the user's heads, top first: eyeLid (7-frame blink symbol, resting open on frame 0, single frame), eyeMask (mask: the eye whites' fill without outline), eyeBall (masked: both irises/pupils, a cut iris completed as a circle; gaze = move this instance), eyeWhite (whites + outlines), rightEyebrow, leftEyebrow, extras, mouth (a symbol; an existing mouth-shape symbol is kept), Nose, hair, base; no layer parenting; rest picture unchanged; one undo step; an already rigged head is left alone; returns {head, view, layers, eyes, irises_completed, eye_white, eye_mask, eye_ball, eye_lid, mouth, skin, ink, already_rigged, notes}",
         PasteMotion | PasteMotionSpecial => "{relative?: bool (default true: each key is the change from the copied motion's first key, applied about the target's own transformation point, so it keeps its starting place; false writes the copied transforms as they are), parts?: [position|scale|rotation|colour|timing] (default all; rotation includes skew, colour is the colour effect and alpha, timing an instance's first frame and looping), stretch?: 0.25..4 (1; key offsets scaled and rounded, keys landing on one frame merged)} -> Paste Motion: the motion taken by copy_motion onto every selected object, each on its own layer, starting at the playhead, keyframes at the copied offsets with the copied tweens; frames outside the pasted span keep what they showed; works inside a symbol being edited; one undo step; returns {pasted, relative, parts, stretch}",
@@ -197,6 +203,10 @@ pub fn run(app: &mut App, command: Command, a: &Value) -> AgentResult {
         Command::AiRigVectorCharacter => rig_vector_character(app, a),
         Command::AiRigLayers => rig_layers(app, a),
         Command::AiDirectStory => direct_story(app, a),
+        Command::AiSplitPictureIntoLayers => split_picture(app, a),
+        Command::TraceBoldSplit => trace_bold_split(app, a),
+        Command::AiGenerateBackground => generate_background(app, a),
+        Command::AiRemoveObject | Command::DeleteAndFill => remove_from_picture(app, command, a),
         Command::AiCharacterFromImage => character_from_image(app, a),
         Command::AiMouthChart => mouth_chart(app, a),
         Command::ClearAllKeyframes => clear_symbol_keyframes(app, a),
@@ -205,6 +215,7 @@ pub fn run(app: &mut App, command: Command, a: &Value) -> AgentResult {
         Command::RepairLayerRigs => repair_layer_rigs(app, a),
         Command::RigHead => rig_head(app, a),
         Command::EvenLines => even_lines(app, a),
+        Command::OptimizeShapes => optimize_shapes(app, a),
         Command::RemoveBackgroundSpecks => remove_background_specks(app, a),
         Command::PasteMotion | Command::PasteMotionSpecial => paste_motion(app, id, a),
         Command::PastePose => paste_pose(app, id, a),
@@ -569,9 +580,50 @@ fn rig_head(app: &mut App, a: &Value) -> AgentResult {
     finish(app, "rig_head", before, value)
 }
 
+/// Optimize Shapes dialog -> `Editor::optimize_shapes_now` (`docs/TRACE_PICTURE_PLAN.md` T13).
+fn optimize_shapes(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["element", "smoothing", "merge_same_colour", "remove_tiny"]) {
+        return AgentResult::err(e);
+    }
+    let defaults = crate::rigging::OptimizeSettings::default();
+    let parsed = (|| -> Result<crate::rigging::OptimizeSettings, String> {
+        Ok(crate::rigging::OptimizeSettings {
+            smoothing: num(a, "smoothing", 0.0, 4.0)?.unwrap_or(defaults.smoothing),
+            merge_same_colour: flag(a, "merge_same_colour")?.unwrap_or(defaults.merge_same_colour),
+            remove_tiny: num(a, "remove_tiny", 0.0, 50.0)?.unwrap_or(defaults.remove_tiny),
+        })
+    })();
+    let settings = match parsed {
+        Ok(s) => s,
+        Err(e) => return AgentResult::err(e),
+    };
+    let element = match given(a, "element") {
+        Some(v) => {
+            let Some(id) = v.as_u64() else { return AgentResult::err("'element' needs an element id") };
+            if app.agent_editor().doc.scene().find_object(ObjectId(id)).is_none() {
+                return AgentResult::err(format!("no element {id} in this scene"));
+            }
+            Some(ObjectId(id))
+        }
+        None => None,
+    };
+    let before = depth(app);
+    let report = match app.agent_editor_mut().optimize_shapes_now(element, settings) {
+        Ok(report) => report,
+        Err(e) => return AgentResult::err(e),
+    };
+    let value = json!({
+        "shapes_before": report.shapes_before,
+        "shapes_after": report.shapes_after,
+        "segments_before": report.segments_before,
+        "segments_after": report.segments_after,
+    });
+    finish(app, "optimize_shapes", before, value)
+}
+
 /// Even Out Lines dialog -> `Editor::even_out_lines` (`docs/EVEN_LINES_PLAN.md` E2).
 fn even_lines(app: &mut App, a: &Value) -> AgentResult {
-    if let Err(e) = check_keys(a, &["element", "face_width", "body_width", "keep_weight", "straighten", "solid_above"]) {
+    if let Err(e) = check_keys(a, &["element", "face_width", "body_width", "keep_weight", "straighten", "solid_above", "bold"]) {
         return AgentResult::err(e);
     }
     let parsed = (|| -> Result<crate::editor::EvenLinesRequest, String> {
@@ -581,6 +633,7 @@ fn even_lines(app: &mut App, a: &Value) -> AgentResult {
             keep_weight: flag(a, "keep_weight")?,
             straighten: num(a, "straighten", 0.0, 1.0)?,
             solid_above: num(a, "solid_above", 0.5, 40.0)?,
+            bold: flag(a, "bold")?,
         })
     })();
     let request = match parsed {
@@ -895,6 +948,7 @@ fn trace_options(app: &mut App, a: &Value) -> AgentResult {
     editor.doc.end_gesture();
     editor.status = None;
     editor.confirm_trace_options(o);
+    editor.finish_pending_trace_now();
     editor.doc.end_gesture();
     finish(app, "trace_bitmap_options", before, json!({}))
 }
@@ -1708,6 +1762,88 @@ fn rig_layers(app: &mut App, a: &Value) -> AgentResult {
     ))
 }
 
+/// Split Picture into Layers -> `App::ai_split_picture_async`; the finished
+/// job lands as one undo step (`App::commit_split_picture`).
+fn split_picture(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["element", "redetect"]) {
+        return AgentResult::err(e);
+    }
+    let redetect = match flag(a, "redetect") {
+        Ok(v) => v.unwrap_or(false),
+        Err(e) => return AgentResult::err(e),
+    };
+    if let Err(e) = select_element(app, a) {
+        return AgentResult::err(e);
+    }
+    app.agent_editor_mut().status = None;
+    app.agent_forget_last_task();
+    app.split_redetect = redetect;
+    app.ai_split_picture_with(false);
+    let Some(job) = app.agent_track_last_job("ai_split_picture_into_layers") else {
+        let why = app.agent_editor().status.clone().unwrap_or_else(|| "the split task did not start".into());
+        return AgentResult::err(why);
+    };
+    AgentResult::ok(super::jobs::started(
+        "ai_split_picture_into_layers",
+        job,
+        "the picture is being cut into depth plates and objects off the UI thread; the layers are added as one undo step when done",
+    ))
+}
+
+/// Trace Bold + Split into Layers -> `App::agent_trace_bold_split`: the Bold
+/// trace (Keep textures) runs now, the split as a job.
+fn trace_bold_split(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["element"]) {
+        return AgentResult::err(e);
+    }
+    if let Err(e) = select_element(app, a) {
+        return AgentResult::err(e);
+    }
+    app.agent_editor_mut().status = None;
+    match app.agent_trace_bold_split() {
+        Ok(job) => AgentResult::ok(super::jobs::started(
+            "ai_split_picture_into_layers",
+            job,
+            "the picture is traced (Bold, Keep textures); the traced artwork is being cut into layers off the UI thread, added as one undo step when done",
+        )),
+        Err(why) => AgentResult::err(why),
+    }
+}
+
+/// Generate Background -> `App::agent_generate_background`; the finished job
+/// places the pick and (with `trace_split`) starts the bold-outline split.
+fn generate_background(app: &mut App, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["prompt", "series", "seed", "tries", "pick", "trace_split"]) {
+        return AgentResult::err(e);
+    }
+    let prompt = match text(a, "prompt") {
+        Ok(Some(p)) if !p.trim().is_empty() => p.to_string(),
+        Ok(_) => return missing(&["prompt"]),
+        Err(e) => return AgentResult::err(e),
+    };
+    let series = match text(a, "series") {
+        Ok(s) => s.map(str::to_string),
+        Err(e) => return AgentResult::err(e),
+    };
+    let (seed, tries, pick, split) = match (int(a, "seed", 0, u32::MAX), int(a, "tries", 1, 4), int(a, "pick", 1, 4), flag(a, "trace_split")) {
+        (Ok(s), Ok(t), Ok(p), Ok(f)) => (s, t.unwrap_or(1), p.unwrap_or(1), f.unwrap_or(true)),
+        (Err(e), ..) | (_, Err(e), ..) | (_, _, Err(e), _) | (_, _, _, Err(e)) => return AgentResult::err(e),
+    };
+    if pick > tries {
+        return AgentResult::err("'pick' is beyond 'tries'");
+    }
+    app.agent_editor_mut().status = None;
+    app.agent_forget_last_task();
+    match app.agent_generate_background(prompt, series, seed.map(u64::from), tries as usize, pick as usize, split) {
+        Ok(job) => AgentResult::ok(super::jobs::started(
+            "ai_generate_background",
+            job,
+            "the pictures are drawn off the UI thread; the pick lands on a new bottom layer named Background when done",
+        )),
+        Err(e) => AgentResult::err(e),
+    }
+}
+
 /// Direct Story with LLM -> `App::ai_direct_story_from`.
 fn direct_story(app: &mut App, a: &Value) -> AgentResult {
     if let Err(e) = check_keys(a, &["brief"]) {
@@ -2360,4 +2496,69 @@ fn storyboard_export(app: &mut App, a: &Value) -> AgentResult {
         })),
         None => AgentResult::err("storyboard_export: no sheets were written"),
     }
+}
+
+/// Remove Object / Delete and Fill -> `App::remove_from_picture_async`; the
+/// finished job lands as one undo step (`App::commit_remove_artwork`).
+fn remove_from_picture(app: &mut App, command: Command, a: &Value) -> AgentResult {
+    if let Err(e) = check_keys(a, &["point", "points", "ids", "element"]) {
+        return AgentResult::err(e);
+    }
+    if let Err(e) = select_element(app, a) {
+        return AgentResult::err(e);
+    }
+    let mut ids: Option<Vec<ObjectId>> = None;
+    if let Some(v) = given(a, "ids") {
+        let Some(list) = v.as_array() else { return AgentResult::err("'ids' needs a list of element ids") };
+        let mut out = Vec::new();
+        for x in list {
+            match x.as_u64() {
+                Some(n) => out.push(ObjectId(n)),
+                None => return AgentResult::err("'ids' needs element ids"),
+            }
+        }
+        if let Some(first) = out.first() {
+            if app.agent_editor().doc.scene().find_object(*first).is_none() {
+                return AgentResult::err(format!("no element {} in this scene", first.0));
+            }
+            app.agent_editor_mut().selection.select_one(*first);
+        }
+        ids = Some(out);
+    }
+    let mut points: Vec<(buzz_geom::Point, bool)> = Vec::new();
+    let xy = |v: &Value| Some(buzz_geom::Point::new(v.get("x")?.as_f64()?, v.get("y")?.as_f64()?));
+    if let Some(p) = given(a, "point") {
+        match xy(p) {
+            Some(p) => points.push((p, true)),
+            None => return AgentResult::err("'point' needs {x, y}"),
+        }
+    }
+    if let Some(list) = given(a, "points").and_then(|v| v.as_array()) {
+        for v in list {
+            match xy(v) {
+                Some(p) => points.push((p, v.get("positive").and_then(|b| b.as_bool()).unwrap_or(true))),
+                None => return AgentResult::err("each of 'points' needs {x, y}"),
+            }
+        }
+    }
+    let what = if !points.is_empty() && ids.is_none() {
+        crate::app::RemoveWhat::Points(points)
+    } else if let Some(ids) = ids.or_else(|| (command == Command::DeleteAndFill).then(|| app.agent_editor().selection.ids())).filter(|i| !i.is_empty()) {
+        crate::app::RemoveWhat::Shapes(ids)
+    } else {
+        return missing(&["point|points|ids"]);
+    };
+    let Some(layer) = app.remove_layer() else {
+        return AgentResult::err("select the traced artwork (or pass element) first");
+    };
+    let frame = app.agent_editor().frame();
+    app.agent_editor_mut().status = None;
+    app.agent_forget_last_task();
+    app.remove_from_picture_async(layer, frame, what);
+    let kind = if command == Command::DeleteAndFill { "delete_and_fill" } else { "ai_remove_object" };
+    let Some(job) = app.agent_track_last_job(kind) else {
+        let why = app.agent_editor().status.clone().unwrap_or_else(|| "the removal task did not start".into());
+        return AgentResult::err(why);
+    };
+    AgentResult::ok(super::jobs::started(kind, job, "the shapes are removed and the hole patched off the UI thread; one undo step when done"))
 }

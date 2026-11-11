@@ -380,11 +380,12 @@ fn base_of(name: &str) -> &str {
 }
 
 /// A name that is a part of a character or a numbered copy, not a character.
-fn not_a_character(name: &str) -> bool {
+fn not_a_character(name: &str, folder: &str) -> bool {
     let lower = name.to_lowercase();
     let toks = tokens(name);
     let part = toks.iter().any(|t| ["mouth", "eye", "eyes", "eyeopening", "palm", "hand", "body", "shape"].contains(&t.as_str()));
-    let numbered = lower.rsplit_once(' ').is_some_and(|(b, n)| !b.is_empty() && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    // A series folder (`Cast/<Series>`, the cast FLA import) names its roles `PADOSI 1`: a number there is the name.
+    let numbered = !folder.to_lowercase().starts_with("cast/") && lower.rsplit_once(' ').is_some_and(|(b, n)| !b.is_empty() && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
     part || numbered || crate::cast_build::pose_of_rig(name).is_some()
 }
 
@@ -426,7 +427,7 @@ fn in_sources(sources: Option<&CastSources>, folder: &str, name: &str) -> bool {
 fn catalogue_with(root: &Path, sources: Option<&CastSources>) -> Vec<Entry> {
     let library = AssetLibrary::at(root);
     let index = AssetIndex::load(root);
-    let wanted = |a: &&Asset| in_sources(sources, &a.folder, &a.name) && !not_a_character(&a.name) && base_of(&a.name) == a.name;
+    let wanted = |a: &&Asset| in_sources(sources, &a.folder, &a.name) && !not_a_character(&a.name, &a.folder) && base_of(&a.name) == a.name;
     let mut assets: Vec<&Asset> = library.assets().iter().filter(wanted).collect();
     assets.sort_by_key(|a| pick_order(a));
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -928,7 +929,7 @@ pub fn readiness(library: &AssetLibrary, asset: &Asset) -> Readiness {
         }
         if let Some(view) = buzz_act::layer_rig::rig_of_layer(&scene, layer.id) {
             let arms = view.parts.iter().any(|(slot, _, _)| view.pattern.slots.get(*slot).is_some_and(|s| arm_word(&s.name)));
-            let mouth = buzz_act::textsync::find_layer_rig_mouth(&scene, &view).is_some();
+            let mouth = buzz_act::textsync::find_layer_rig_mouth(&scene, &view).is_some() || buzz_act::face::face_of(&scene, &view).is_some_and(|f| f.mouth.is_some());
             return Readiness { name: asset.name.clone(), mouth, arms, rig: "layers", loose_mouth: loose };
         }
     }

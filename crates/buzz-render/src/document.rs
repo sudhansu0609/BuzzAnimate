@@ -283,6 +283,12 @@ pub struct DrawCache {
     /// The encoded segments of the same passes as [`Self::measured_lines`], so
     /// a level refused by the *segment* ceiling is refused too.
     measured_segments: [Option<u32>; 4],
+    /// **T14 (`docs/TRACE_PICTURE_PLAN.md`): is a light being dragged?** Set by
+    /// the window for the length of the gesture. See [`Self::set_draft`].
+    draft: bool,
+    /// Did the last undrafted [`LightDetail::Full`] pass encode more than
+    /// [`DRAFT_SEGMENTS`]? Only such a frame is drafted.
+    full_heavy: bool,
     /// Per level, the measured `lines(level.up()) / lines(level)`, kept across
     /// frames. See [`RatioMemo`].
     step_ratio: [RatioMemo; 4],
@@ -454,6 +460,11 @@ pub enum LightDetail {
     /// or a test.
     Unsealed,
 }
+
+/// The encoded segments above which a `Full` frame is drafted while a light is
+/// dragged ([`DrawCache::set_draft`]). The traced street is 3.2 M; a lit
+/// character scene is a small fraction of this.
+pub const DRAFT_SEGMENTS: u32 = 1_000_000;
 
 impl LightDetail {
     /// May a shape draw its terminator and highlight?
@@ -697,6 +708,38 @@ impl DrawCache {
         self.detail
     }
 
+    /// **Draft the modelling while a light is being dragged** (T14).
+    ///
+    /// A terminator and a highlight are about 4.7x the geometry of the shape
+    /// they model, and a lamp moving re-encodes every shape on every pointer
+    /// move: measured on a 4 800-shape traced street, 200 ms of encode and
+    /// 250 ms of GPU a frame at `Full` against 55 ms without them. So on a
+    /// frame whose last full pass came to more than [`DRAFT_SEGMENTS`], the
+    /// crescents are left out for as long as `draft` is on. The tint, the pool
+    /// and the cast shadows stay, so the light still follows the pointer
+    /// exactly; the crescents come back on the frame after release. A light
+    /// rig on an ordinary document is far under the threshold and is never
+    /// drafted.
+    pub fn set_draft(&mut self, draft: bool) {
+        self.draft = draft;
+    }
+
+    /// Is a light being dragged? See [`Self::set_draft`].
+    pub fn draft_on(&self) -> bool {
+        self.draft
+    }
+
+    /// Is the modelling being left out right now? See [`Self::set_draft`].
+    pub fn drafting(&self) -> bool {
+        self.draft && self.full_heavy && self.detail == LightDetail::Full
+    }
+
+    /// May a shape draw its terminator and highlight on this frame? The
+    /// [`LightDetail`] ladder's answer, less the drag draft.
+    pub fn models(&self) -> bool {
+        self.detail.models() && !self.drafting()
+    }
+
     /// The encoded path segments of the last frame judged, in the units
     /// [`segment_ceiling`] is expressed in.
     pub fn last_encode(&self) -> u32 {
@@ -768,6 +811,17 @@ impl DrawCache {
     pub fn reconsider(&mut self, segments: u32, output_pixels: f64) -> bool {
         self.encode = segments;
         self.ceiling = segment_ceiling_at(output_pixels, self.scale.0);
+        // A drafted pass is smaller than the full one it stands in for, so it
+        // says nothing about whether `Full` fits: it neither moves the ladder
+        // nor is remembered as a measurement of it.
+        if self.drafting() {
+            self.last_pass_over = false;
+            self.last_pass_detail = self.detail;
+            return false;
+        }
+        if self.detail == LightDetail::Full {
+            self.full_heavy = segments > DRAFT_SEGMENTS;
+        }
         // L7: remember what this level cost, and which level it was encoded at
         // (`self.detail` is about to move on).
         self.last_pass_over = false;
@@ -3087,7 +3141,12 @@ impl DrawCache {
     }
 
     pub fn end(&mut self) {
-        self.lights.end();
+        // A drafted frame asks for no crescents, so nothing it holds was
+        // "not drawn": ageing them out would throw the whole street's shading
+        // away three frames into the drag.
+        if !self.drafting() {
+            self.lights.end();
+        }
         self.filters.end();
         self.bounds.end();
         self.layer_fx.end();
@@ -3434,6 +3493,8 @@ pub fn draw_frame_lit(
         lines: 0,
         measured_lines: [None; 4],
         measured_segments: [None; 4],
+        draft: false,
+        full_heavy: false,
         step_ratio: [RatioMemo::default(); 4],
         last_pass_over: false,
         last_pass_detail: LightDetail::default(),
@@ -4597,7 +4658,27 @@ fn draw_layer(
                 cache,
             );
         }
+        // **A traced picture throws no shadow while a light is dragged** (T14b):
+        // it is thousands of casters moved every pointer step, the least
+        // visible shadow on the stage, and the stage stamp carries the draft so
+        // the frame after release draws it. Characters keep theirs.
+        let draft_traced = cache.draft_on()
+            && matches!(role, ShadowRole::Own)
+            && shadow.is_some()
+            && {
+                let mut count = 0usize;
+                let mut all_shapes = true;
+                for (object, _) in resolved.iter_owned() {
+                    count += 1;
+                    if !matches!(object.kind, ObjectKind::Shape(_)) {
+                        all_shapes = false;
+                        break;
+                    }
+                }
+                all_shapes && count > TRACED_SHAPES
+            };
         if rig_parts.is_empty()
+            && !draft_traced
             && let Some(shadow) = shadow
             && let Some(key) = rig.key()
         {
@@ -4734,7 +4815,7 @@ fn draw_layer(
         // Trimmed away with the crescents at `LightDetail::Fill`: a rim is
         // modelling, it costs a silhouette and a stack of strokes, and a frame
         // that will not fit the rasteriser has to give something up.
-        let rim = (lit && cache.detail().models())
+        let rim = (lit && cache.models())
             .then(|| rig.key())
             .flatten()
             .and_then(|key| {
@@ -4970,6 +5051,9 @@ fn draw_layer(
                 // Only the figure mode has any grouping to do; the others read
                 // each object on its own and must not pay to find out that they
                 // overlap.
+                buzz_scene::EdgeMode::Figure if is_traced_surface(&placed) => {
+                    vec![(0..placed.len()).collect()]
+                }
                 buzz_scene::EdgeMode::Figure => figure_groups(&placed, &layer_ctx),
                 _ => (0..placed.len()).map(|i| vec![i]).collect(),
             };
@@ -5505,6 +5589,9 @@ struct FigurePass<'a> {
     key_built: Option<Arc<buzz_light::ShadeGeometry>>,
     gloom_built: Option<Arc<buzz_light::ShadeGeometry>>,
     modelling: f32,
+    /// The stage rectangle, for a traced surface that covers it: its silhouette
+    /// is continued past the frame so the picture has no edge there (T14b).
+    frame_edge: Option<buzz_geom::Rect>,
 }
 
 /// One top-level object of a layer, placed and measured, waiting to be drawn.
@@ -5653,6 +5740,23 @@ fn figure_groups(placed: &[Placed<'_>], ctx: &DrawCtx<'_>) -> Vec<Vec<usize>> {
     groups
 }
 
+/// **A layer of this many plain shapes is a traced picture** (T14b,
+/// `docs/TRACE_PICTURE_PLAN.md`): Trace Bitmap and Split into Layers make a
+/// layer of thousands of flat fills that read as one painted surface.
+const TRACED_SHAPES: usize = 500;
+
+/// Is this layer a traced picture: more than [`TRACED_SHAPES`] objects, every
+/// one a plain shape? Such a layer is lit as **one surface** — one silhouette,
+/// one pair of bands — instead of a shade and a highlight per shape, which was
+/// 4.7x the geometry of the artwork. A character is a few dozen pieces and
+/// groups, an instance or a rig, so it never comes here.
+fn is_traced_surface(placed: &[Placed<'_>]) -> bool {
+    placed.len() > TRACED_SHAPES
+        && placed
+            .iter()
+            .all(|p| matches!(p.object().kind, ObjectKind::Shape(_)))
+}
+
 /// **How many overlapping objects still read as one body.**
 ///
 /// A figure is gathered and rebuilt as a unit: move one of its pieces and the
@@ -5694,7 +5798,7 @@ impl<'a> FigurePass<'a> {
         let modelling = ctx.lights.figure_edges();
         let lead = *members.first()?;
         if modelling <= 0.01
-            || !cache.detail().models()
+            || !cache.models()
             || !members.iter().any(|m| m.object().visible)
         {
             return None;
@@ -5756,6 +5860,14 @@ impl<'a> FigurePass<'a> {
             for coefficient in member.doc().as_coeffs() {
                 hash = hash.rotate_left(7) ^ (coefficient.to_bits() as u64);
             }
+            // A traced surface is hundreds of plain shapes keyed on the first:
+            // each one's own address says which edit of it this is, or
+            // reshaping a later piece would keep the old bands.
+            if members.len() > MOST_PIECES_IN_A_FIGURE
+                && let Some(owner) = member.owner
+            {
+                hash = hash.rotate_left(5) ^ (Arc::as_ptr(owner) as usize as u64);
+            }
             // A breath deforms the artwork frame by frame without moving the
             // object, its `Arc` or its placement. With `elapsed` no longer
             // folded in for artwork that holds still, the breath has to be.
@@ -5792,6 +5904,20 @@ impl<'a> FigurePass<'a> {
                 light.softness,
             )
         });
+        // **A traced surface keeps its last bands while a light is dragged**
+        // (T14b): gathering its silhouette is a copy of every path in the
+        // layer, and each pointer move would ask for it. The exact bands are
+        // built on the frame after release (the stage stamp carries the draft).
+        let stale_ok = cache.draft_on() && members.len() > MOST_PIECES_IN_A_FIGURE;
+        let key_built = key_built.or_else(|| {
+            key.filter(|_| stale_ok)
+                .and_then(|_| cache.lights.last_figure(owner, content, doc))
+        });
+        let gloom_built = gloom_built.or_else(|| {
+            gloom
+                .filter(|_| stale_ok)
+                .and_then(|_| cache.lights.last_figure(owner, content, doc))
+        });
         if key.is_some() && key_built.is_none()
             || gloom.is_some() && gloom_built.is_none()
             // Tweened and posed artwork has no identity to cache against, so it
@@ -5812,11 +5938,34 @@ impl<'a> FigurePass<'a> {
             key_built,
             gloom_built,
             modelling,
+            frame_edge: (backdrop && members.len() > MOST_PIECES_IN_A_FIGURE).then_some(stage),
         })
     }
 
     /// Lay the bands over the figure that has just been drawn.
     fn close(self, builder: &mut SceneBuilder<'_>, ctx: &DrawCtx<'_>, cache: &mut DrawCache) {
+        // A traced picture that covers the stage has no edge in shot: a ring
+        // round the frame joins its silhouette to the outside, so the bands
+        // go round the gaps in the picture and not along its border.
+        if let Some(stage) = self.frame_edge {
+            let out = stage.inflate(4096.0, 4096.0);
+            let mut ring = buzz_geom::BezPath::new();
+            for (rect, clockwise) in [(out, true), (stage, false)] {
+                let corners = [
+                    (rect.x0, rect.y0),
+                    (rect.x1, rect.y0),
+                    (rect.x1, rect.y1),
+                    (rect.x0, rect.y1),
+                ];
+                let order: [usize; 4] = if clockwise { [0, 1, 2, 3] } else { [0, 3, 2, 1] };
+                for (n, i) in order.iter().enumerate() {
+                    let p = buzz_geom::Point::new(corners[*i].0, corners[*i].1);
+                    if n == 0 { ring.move_to(p) } else { ring.line_to(p) }
+                }
+                ring.close_path();
+            }
+            cache.lights.add_silhouette(&ring);
+        }
         let silhouette = cache.lights.take_silhouette();
 
         // Whatever was cached, else built from the silhouette this draw
@@ -6044,7 +6193,7 @@ fn draw_gloom_edge(
 
     // A gloom's edge is a crescent by another name — the same cache, the same
     // boolean — so it is given up with the rest of the modelling.
-    if !cache.detail().models() {
+    if !cache.models() {
         return;
     }
     let modelling = ctx.shape_edges;
@@ -8042,7 +8191,7 @@ fn draw_shape(
             // `Full` the crescents are neither built nor drawn, so a frame that
             // cannot afford them does not pay the booleans either. See
             // [`LightDetail`].
-            if cache.detail().models()
+            if cache.models()
                 && let Some(light) = &light
                 && let Some(key) = ctx.lights.key()
                 && let Some((towards, lz)) = match ctx.lights.model {

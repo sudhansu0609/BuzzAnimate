@@ -53,9 +53,12 @@ pub mod texture;
 pub mod time;
 pub mod timeline;
 pub mod trace;
+pub mod trace_bold;
 mod trace_colour;
+mod trace_even;
 mod trace_ink;
 mod trace_lines;
+mod trace_soft;
 pub mod trace_metrics;
 pub mod trace_tuning;
 pub mod tween;
@@ -119,8 +122,9 @@ pub use symbol::{
     ColorEffect, ColorTransform, Library, LoopMode, Symbol, SymbolId, SymbolInstance, SymbolKind,
 };
 pub use timeline::{FrameKind, FrameSegment, Keyframe, LayerTimeline, ResolvedFrame, TweenSpan};
-pub use trace::{LineStyle, TraceMode, TraceOptions, TraceReport, quantise, trace};
+pub use trace::{LineStyle, TraceMode, TraceOptions, TraceReport, adopt_texture_images, is_trace_texture, quantise, trace};
 pub use trace_tuning::{ColourTuning, InkTuning, TraceTuning};
+pub use trace_lines::is_ink_drawing;
 pub use tween::{EaseForm, Easing, EasingSet, Tween, TweenKind, eval_bezier_ease};
 pub use wand::{WandOptions, region_at as wand_region};
 pub use wave::{WaveKind, WaveSettings, WaveStroke, wave_artwork, wave_bounds, wave_loop};
@@ -409,6 +413,25 @@ pub struct ClearReport {
     pub layers: usize,
     /// Nested symbols visited besides the one asked for.
     pub symbols: usize,
+}
+
+/// What [`Scene::start_fresh`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FreshReport {
+    /// Symbols visited (roots and nested), picker symbols excluded.
+    pub symbols: usize,
+    /// Keyframes turned back into normal frames inside symbols.
+    pub keyframes_cleared: usize,
+    /// Symbol layers that changed.
+    pub layers: usize,
+    /// Stage layers cut to one frame.
+    pub stage_layers: usize,
+    /// Stage keyframes dropped.
+    pub stage_keyframes_cleared: usize,
+    /// Audio guide layers removed from the stage.
+    pub guides_removed: usize,
+    /// Frame-picker symbols left alone.
+    pub skipped: usize,
 }
 
 /// **The instance a symbol on the edit path was opened from**: the object
@@ -1354,6 +1377,50 @@ impl Scene {
         cues
     }
 
+    /// Bitmaps drawn anywhere — the stage, symbols, groups, rigs — counted as
+    /// the shapes whose fill or stroke is the bitmap. What Delete in the
+    /// Library checks before it lets a picture go.
+    pub fn image_usage(&self) -> std::collections::BTreeMap<ImageId, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+
+        fn shape(data: &ShapeData, counts: &mut std::collections::BTreeMap<ImageId, usize>) {
+            let fill = data.fill.as_ref().map(|f| &f.paint);
+            let stroke = data.stroke.as_ref().map(|s| &s.paint);
+            for paint in fill.into_iter().chain(stroke) {
+                if let Some(image) = paint.image() {
+                    *counts.entry(image.asset.id).or_insert(0) += 1;
+                }
+            }
+        }
+
+        fn walk(object: &Object, counts: &mut std::collections::BTreeMap<ImageId, usize>) {
+            match &object.kind {
+                ObjectKind::Shape(data) => shape(data, counts),
+                ObjectKind::Warp(warp) => shape(&warp.shape, counts),
+                ObjectKind::Group(children) => {
+                    for c in children {
+                        walk(c, counts);
+                    }
+                }
+                ObjectKind::Armature(rig) => {
+                    for part in &rig.parts {
+                        walk(&part.artwork, counts);
+                    }
+                }
+                ObjectKind::Instance(_) => {}
+            }
+        }
+
+        let stage = self.stage_layers().iter();
+        let nested = self.library.iter().flat_map(|s| s.layers.iter());
+        for layer in stage.chain(nested) {
+            for object in layer.all_objects() {
+                walk(object, &mut counts);
+            }
+        }
+        counts
+    }
+
     /// Sounds placed anywhere, including inside symbols, for the Library
     /// panel's use count.
     pub fn sound_usage(&self) -> std::collections::BTreeMap<SoundId, usize> {
@@ -1726,11 +1793,23 @@ impl Scene {
     /// With `nested`, every symbol reachable through instances in the kept
     /// pose gets the same treatment from its first frame, each once.
     pub fn clear_symbol_keyframes(&mut self, id: SymbolId, keep: KeepPose, nested: bool) -> ClearReport {
+        self.clear_symbol_keyframes_skipping(id, keep, nested, &std::collections::BTreeSet::new())
+    }
+
+    /// [`Self::clear_symbol_keyframes`], leaving the symbols in `skip` (and
+    /// whatever is only reachable through them) exactly as they are.
+    pub fn clear_symbol_keyframes_skipping(
+        &mut self,
+        id: SymbolId,
+        keep: KeepPose,
+        nested: bool,
+        skip: &std::collections::BTreeSet<SymbolId>,
+    ) -> ClearReport {
         let mut report = ClearReport::default();
         let mut seen = std::collections::BTreeSet::new();
         let mut queue = vec![(id, keep)];
         while let Some((sid, pose)) = queue.pop() {
-            if !seen.insert(sid) {
+            if skip.contains(&sid) || !seen.insert(sid) {
                 continue;
             }
             let Some(symbol) = self.library.get(sid) else {
@@ -1789,6 +1868,125 @@ impl Scene {
                 }
             }
         }
+        report
+    }
+
+    /// **Frame pickers**: symbols whose own timeline is a set of drawings that
+    /// instances choose between (a mouth chart, an eyelid, a hand set) rather
+    /// than an animation. Start Fresh leaves them alone. A symbol is one when
+    /// any instance in the document shows it as a single frame or from a frame
+    /// other than the first, or when it is a multi-frame symbol named for a
+    /// mouth, lid, hand or viseme.
+    pub fn picker_symbols(&self) -> std::collections::BTreeSet<SymbolId> {
+        fn visit(object: &Object, out: &mut std::collections::BTreeSet<SymbolId>) {
+            match &object.kind {
+                ObjectKind::Instance(i) => {
+                    if i.loop_mode == LoopMode::SingleFrame || i.first_frame != 0 {
+                        out.insert(i.symbol);
+                    }
+                }
+                ObjectKind::Group(children) => {
+                    for child in children {
+                        visit(child, out);
+                    }
+                }
+                ObjectKind::Armature(rig) => {
+                    for part in &rig.parts {
+                        visit(&part.artwork, out);
+                    }
+                }
+                ObjectKind::Shape(_) | ObjectKind::Warp(_) => {}
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        let stage = self.layers.iter();
+        let nested = self.library.iter().flat_map(|s| s.layers.iter());
+        for layer in stage.chain(nested) {
+            for object in layer.all_objects() {
+                visit(object, &mut out);
+            }
+        }
+        for symbol in self.library.iter() {
+            let name = symbol.name.to_lowercase();
+            if symbol.length() >= 2 && ["mouth", "lid", "hand", "viseme"].iter().any(|w| name.contains(w)) {
+                out.insert(symbol.id);
+            }
+        }
+        out
+    }
+
+    /// **Start Fresh** for a saved character: every symbol reachable from the
+    /// stage in the kept pose is cleared ([`Self::clear_symbol_keyframes_skipping`],
+    /// nested, leaving [`Self::picker_symbols`]), every stage layer is cut to one
+    /// keyframe at frame 0 holding the kept pose and one frame long, and audio
+    /// guide layers are removed.
+    pub fn start_fresh(&mut self, keep: KeepPose) -> FreshReport {
+        let mut report = FreshReport::default();
+        let skip = self.picker_symbols();
+        report.skipped = skip.len();
+
+        // Stage layers first, remembering which symbols the kept pose shows.
+        let mut roots: Vec<SymbolId> = Vec::new();
+        let mut guides: Vec<LayerId> = Vec::new();
+        let mut changes: Vec<(LayerId, LayerTimeline)> = Vec::new();
+        for layer in self.layers.iter() {
+            if layer.audio_guide {
+                guides.push(layer.id);
+                continue;
+            }
+            let length = layer.frames.length();
+            let frame = match keep {
+                KeepPose::First => 0,
+                KeepPose::Frame(f) => f.min(length.saturating_sub(1)),
+            };
+            let keyframes = layer.frames.keyframes();
+            let first = &keyframes[0];
+            let objects = layer
+                .frames
+                .keyframe_at(frame)
+                .map(|k| k.objects.clone())
+                .unwrap_or_else(|| first.objects.clone());
+            for object in objects.iter() {
+                collect_symbols(object, &mut roots);
+            }
+            let unchanged = keyframes.len() == 1
+                && length == 1
+                && first.tween == crate::tween::Tween::default()
+                && first.ease_curve.is_none();
+            if unchanged {
+                continue;
+            }
+            let mut kept = Keyframe::new(0);
+            kept.objects = objects;
+            kept.label = first.label.clone();
+            kept.sound = first.sound.clone();
+            report.stage_keyframes_cleared += keyframes.len().saturating_sub(1);
+            report.stage_layers += 1;
+            changes.push((layer.id, LayerTimeline::from_parts(vec![kept], 1)));
+        }
+        if !changes.is_empty() || !guides.is_empty() {
+            let stack = self.edit_stage_layers();
+            for (layer, timeline) in changes {
+                stack.update(layer, |l| l.frames = timeline);
+            }
+            for guide in guides {
+                if stack.remove(guide).is_some() {
+                    report.guides_removed += 1;
+                }
+            }
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        for root in roots {
+            if !seen.insert(root) {
+                continue;
+            }
+            let cleared = self.clear_symbol_keyframes_skipping(root, KeepPose::First, true, &skip);
+            report.keyframes_cleared += cleared.keyframes_cleared;
+            report.layers += cleared.layers;
+            report.symbols += cleared.symbols + 1;
+        }
+        self.bump();
         report
     }
 
@@ -4756,5 +4954,64 @@ mod tests {
         assert!(!scene.pick_from_set(6, id, idle, SetStart::SameFrame));
         assert_eq!(scene.revision(), revision);
         assert_eq!(scene.layers().get(layer).unwrap().keyframe_count(), 1);
+    }
+
+    /// **Start Fresh** (CAST_FRESH F1): a character's stage layers and the
+    /// symbols behind them lose every extra keyframe, a frame-picker symbol
+    /// (a mouth chart shown as a single frame) keeps all of its own, and an
+    /// audio guide layer is dropped.
+    #[test]
+    fn start_fresh_clears_keys_but_leaves_frame_pickers_alone() {
+        fn widen(layer: &mut Layer, frames: u32) {
+            while layer.frames.length() < frames {
+                layer.frames.insert_frame(layer.frames.length());
+            }
+            for f in 1..frames {
+                layer.frames.insert_keyframe(f);
+            }
+        }
+        let mut scene = Scene::default();
+
+        // A body symbol with three keys on its layer, and a mouth chart of 6 frames.
+        let mut body = Symbol::new(SymbolId(1), "body", SymbolKind::Graphic);
+        let mut bl = Layer::new(LayerId(10), "art", LayerKind::Normal);
+        widen(&mut bl, 3);
+        body.layers.push_front(bl);
+        scene.library_mut().insert(body);
+        let mut mouth = Symbol::new(SymbolId(2), "mouth chart", SymbolKind::Graphic);
+        let mut ml = Layer::new(LayerId(20), "shapes", LayerKind::Normal);
+        widen(&mut ml, 6);
+        mouth.layers.push_front(ml);
+        scene.library_mut().insert(mouth);
+
+        // The stage: one layer keyed 5 times showing both, plus an audio guide.
+        let layer = scene.add_stage_layer("Character", LayerKind::Normal);
+        scene.update_layer(layer, |l| widen(l, 5));
+        let mut single = Object::instance_of(ObjectId(31), SymbolId(2));
+        if let ObjectKind::Instance(i) = &mut single.kind {
+            i.loop_mode = LoopMode::SingleFrame;
+            i.first_frame = 3;
+        }
+        scene.add_object(layer, Object::instance_of(ObjectId(30), SymbolId(1)));
+        scene.add_object(layer, single);
+        let guide = scene.add_stage_layer("Voice", LayerKind::Normal);
+        scene.update_layer(guide, |l| l.audio_guide = true);
+
+        let report = scene.start_fresh(KeepPose::First);
+        assert_eq!(report.stage_layers, 1);
+        assert_eq!(report.guides_removed, 1);
+        assert!(scene.stage_layers().iter().all(|l| !l.audio_guide));
+        let stage = scene.stage_layers().get(layer).expect("the layer stays");
+        assert_eq!((stage.keyframe_count(), stage.frames.length()), (1, 1));
+        let keys = |id: u64, layer: u64| {
+            scene
+                .library()
+                .get(SymbolId(id))
+                .and_then(|s| s.layers.get(LayerId(layer)))
+                .map(|l| (l.keyframe_count(), l.frames.length()))
+        };
+        assert_eq!(keys(1, 10), Some((1, 3)), "the body is one key, same length");
+        assert_eq!(keys(2, 20), Some((6, 6)), "the mouth chart is untouched");
+        assert!(report.skipped >= 1);
     }
 }

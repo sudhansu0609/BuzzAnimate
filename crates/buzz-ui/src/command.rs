@@ -20,9 +20,11 @@ pub enum Command {
     SaveAs,
     Close,
     Quit,
-    /// Import an Animate document's symbols into the library.
+    /// Import an Animate document's symbols, a picture or a sound into the
+    /// library only (no stage instance, no timeline layer).
     ImportToLibrary,
-    /// Import an Animate document onto the stage as well as the library.
+    /// Import an Animate document, a picture or a sound onto the stage as
+    /// well as the library.
     ImportToStage,
     /// Write the document back out as an Adobe Animate `.fla`.
     ///
@@ -40,9 +42,11 @@ pub enum Command {
     ExportGif,
     /// Render the film as an animated WebP. CP-6.3.
     ExportWebp,
-    /// Bring a sound file into the library.
+    /// Bring a sound file into the library. In no menu: it opens the Import
+    /// to Stage dialog (shortcuts, the Sound panel and the agent keep it).
     ImportSound,
-    /// Bring a bitmap onto the stage, already broken apart into artwork.
+    /// Bring a bitmap onto the stage, already broken apart into artwork. In
+    /// no menu: it opens the Import to Stage dialog.
     ImportImage,
     /// Put the library's selected sound on the current keyframe.
     AttachSound,
@@ -113,6 +117,8 @@ pub enum Command {
     /// spot on another frame or another layer.
     PasteInPlace,
     Delete,
+    /// Delete the selected shapes of a traced layer and patch the hole (LaMa), one undo step.
+    DeleteAndFill,
     SelectAll,
     Deselect,
     DuplicateSelection,
@@ -191,8 +197,14 @@ pub enum Command {
     /// paper thrown away, so what is left is outlines you can paint inside.
     TraceLineArt,
     /// Trace Bitmap with the options dialog open first, rather than the
-    /// built-in defaults straight away.
+    /// built-in defaults straight away. In the AI menu as **Trace Picture…**;
+    /// `TraceLineArt` and `TraceBoldSplit` are in no menu (the dialog has the
+    /// Line art preset, Split Picture into Layers the rest).
     TraceBitmapOptions,
+    /// **Trace Bold + Split into Layers** (T16b): the selected picture is traced with
+    /// the Bold preset (Keep textures on), then the artwork it became is cut into
+    /// Sky / Far / Land and objects (AI > Split Picture into Layers), in one go.
+    TraceBoldSplit,
     ConvertLinesToFills,
     ExpandFill,
     SmoothSelection,
@@ -201,6 +213,9 @@ pub enum Command {
     /// even-width strokes, face lines and body lines each at their own width
     /// (`docs/EVEN_LINES_PLAN.md` E2).
     EvenLines,
+    /// **Optimize Shapes…** (Modify ▸ Shape): fewer curve segments, same-colour
+    /// neighbours merged, tiny specks absorbed, on the selection or the layer.
+    OptimizeShapes,
     /// **Remove Background Specks** (Modify ▸ Shape): the sheet's paper traced
     /// as small white or cream fills between hair curls and body-hair strands
     /// near a character's outline, deleted on every keyframe of the selection
@@ -316,6 +331,14 @@ pub enum Command {
     AiRigLayers,
     /// Build and stage a scene from a reference image using local VLM and library assets.
     AiSceneFromImage,
+    /// Cut the selected picture into depth plates plus its objects, each on its
+    /// own layer, so they can be animated.
+    AiSplitPictureIntoLayers,
+    /// Draw a background from a prompt in the series look (1-4 tries), put the
+    /// pick on a new bottom layer `Background`, optionally trace + split it.
+    AiGenerateBackground,
+    /// Pick a thing on traced artwork (SAM 2) and remove it, patching the hole (LaMa).
+    AiRemoveObject,
     /// Direct a sequence from natural language brief using local LLM verbs.
     AiDirectStory,
     /// Import a labelled mouth chart as a character's swappable mouth frames.
@@ -432,6 +455,13 @@ pub enum Command {
     /// **Sequence \u{25b8} Re-apply Master Audio**: enforce Master Audio mode
     /// again, for example after new characters are placed.
     ReapplyMasterAudio,
+    /// **Sequence \u{25b8} Lip Sync All Characters**: transcribe the scene's dialogue, match its lines to the
+    /// script's speakers, and give every character on the stage the mouth and the talking on their own
+    /// lines (SIMPLE_EPISODE_FLOW_PLAN E3).
+    LipSyncAllCharacters,
+    /// **Modify \u{25b8} Add Life to All Characters**: breath and blinks for every Cast character on the
+    /// stage, from the playhead to the scene's end (E2).
+    AddLifeToAllCharacters,
     /// **Sequence \u{25b8} Make Setup from This Scene**: mark the active scene a
     /// reusable Setup — a source to stamp shots from, never itself in the
     /// exported film.
@@ -732,6 +762,7 @@ command_table! {
             Paste => "paste",
             PasteInPlace => "paste_in_place",
             Delete => "delete",
+            DeleteAndFill => "delete_and_fill",
             SelectAll => "select_all",
             Deselect => "deselect",
             DuplicateSelection => "duplicate_selection",
@@ -769,11 +800,13 @@ command_table! {
             TraceBitmap => "trace_bitmap",
             TraceLineArt => "trace_line_art",
             TraceBitmapOptions => "trace_bitmap_options",
+            TraceBoldSplit => "trace_bold_split",
             ConvertLinesToFills => "convert_lines_to_fills",
             ExpandFill => "expand_fill",
             SmoothSelection => "smooth_selection",
             StraightenSelection => "straighten_selection",
             EvenLines => "even_lines",
+            OptimizeShapes => "optimize_shapes",
             RemoveBackgroundSpecks => "remove_background_specks",
             RecogniseShape => "recognise_shape",
             FlipHorizontal => "flip_horizontal",
@@ -818,6 +851,9 @@ command_table! {
             AiRigVectorCharacter => "ai_rig_vector_character",
             AiRigLayers => "ai_rig_layers",
             AiSceneFromImage => "ai_scene_from_image",
+            AiSplitPictureIntoLayers => "ai_split_picture_into_layers",
+            AiGenerateBackground => "ai_generate_background",
+            AiRemoveObject => "ai_remove_object",
             AiDirectStory => "ai_direct_story",
             AiMouthChart => "ai_mouth_chart",
             AddSun => "add_sun",
@@ -853,6 +889,8 @@ command_table! {
             SetMasterAudio => "set_master_audio",
             ToggleMasterAudioMode => "toggle_master_audio_mode",
             ReapplyMasterAudio => "reapply_master_audio",
+            LipSyncAllCharacters => "lip_sync_all_characters",
+            AddLifeToAllCharacters => "add_life_to_all_characters",
             MakeSetupFromScene => "make_setup_from_scene",
             SplitAtPlayhead => "split_at_playhead",
             FlattenToMasterScene => "flatten_to_master_scene",
@@ -1182,6 +1220,7 @@ impl Command {
             Paste => "Paste",
             PasteInPlace => "Paste in Place",
             Delete => "Delete",
+            DeleteAndFill => "Delete and Fill",
             SelectAll => "Select All",
             Deselect => "Deselect All",
             DuplicateSelection => "Duplicate",
@@ -1220,12 +1259,14 @@ impl Command {
             ThinStroke => "Thin Lines",
             TraceBitmap => "Trace Bitmap",
             TraceLineArt => "Trace as Line Art",
-            TraceBitmapOptions => "Trace Bitmap\u{2026}",
+            TraceBitmapOptions => "Trace Picture\u{2026}",
+            TraceBoldSplit => "Trace Bold + Split into Layers",
             ConvertLinesToFills => "Convert Lines to Fills",
             ExpandFill => "Expand Fill…",
             SmoothSelection => "Smooth",
             StraightenSelection => "Straighten",
             EvenLines => "Even Out Lines\u{2026}",
+            OptimizeShapes => "Optimize Shapes\u{2026}",
             RemoveBackgroundSpecks => "Remove Background Specks",
             RecogniseShape => "Recognise Shape",
             FlipHorizontal => "Flip Horizontal",
@@ -1278,6 +1319,9 @@ impl Command {
             AiRigVectorCharacter => "Auto-Rig Vector Character\u{2026}",
             AiRigLayers => "Rig Character as Layers\u{2026}",
             AiSceneFromImage => "Scene from Image\u{2026}",
+            AiSplitPictureIntoLayers => "Split Picture into Layers\u{2026}",
+            AiGenerateBackground => "Generate Background\u{2026}",
+            AiRemoveObject => "Remove Object",
             AiDirectStory => "Direct Story with LLM\u{2026}",
             AiMouthChart => "Mouth Chart\u{2026}",
 
@@ -1317,6 +1361,8 @@ impl Command {
             SetMasterAudioFromLayer(_) => "Set Master Audio",
             ToggleMasterAudioMode => "Master Audio Mode",
             ReapplyMasterAudio => "Re-apply Master Audio",
+            LipSyncAllCharacters => "Lip Sync All Characters",
+            AddLifeToAllCharacters => "Add Life to All Characters",
             MakeSetupFromScene => "Make Setup from This Scene",
             NewShotFromSetup(_) => "New Shot from Setup",
             SplitAtPlayhead => "Split at Playhead",
@@ -1438,6 +1484,7 @@ impl Command {
             Paste => sc(ctrl, Key::V),
             PasteInPlace => sc(ctrl_shift, Key::V),
             Delete => sc(Modifiers::NONE, Key::Delete),
+            DeleteAndFill => sc(Modifiers::SHIFT, Key::Delete),
             SelectAll => sc(ctrl, Key::A),
             Deselect => sc(ctrl_shift, Key::A),
             DuplicateSelection => sc(ctrl, Key::D),
@@ -1474,12 +1521,13 @@ impl Command {
             // the rest of the picture. Animate binds neither.
             ThickenStroke => sc(Modifiers::NONE, Key::CloseBracket),
             ThinStroke => sc(Modifiers::NONE, Key::OpenBracket),
-            TraceBitmap | TraceLineArt | TraceBitmapOptions => None,
+            TraceBitmap | TraceLineArt | TraceBitmapOptions | TraceBoldSplit => None,
             ConvertLinesToFills => None,
             SmoothSelection => None,
             RecogniseShape => None,
             StraightenSelection => None,
             EvenLines => None,
+            OptimizeShapes => None,
             RemoveBackgroundSpecks => None,
             // Animate's own: Ctrl+Shift+9 and Ctrl+Shift+7 rotate; the flips
             // have no default there, and none is invented here.
@@ -1547,6 +1595,8 @@ impl Command {
             | SetMasterAudioFromLayer(_)
             | ToggleMasterAudioMode
             | ReapplyMasterAudio
+            | LipSyncAllCharacters
+            | AddLifeToAllCharacters
             | MakeSetupFromScene
             | NewShotFromSetup(_)
             | SplitAtPlayhead
@@ -1660,7 +1710,8 @@ impl Command {
             // The Storyboard panel's buttons.
             StoryboardMake | StoryboardEdit | StoryboardExport => None,
             AiModels | AiGenerateImage | AiCharacterFromImage | AiIdentifyAssets
-            | AiRigVectorCharacter | AiRigLayers | AiSceneFromImage | AiDirectStory
+            | AiRigVectorCharacter | AiRigLayers | AiSceneFromImage | AiSplitPictureIntoLayers
+            | AiGenerateBackground | AiRemoveObject | AiDirectStory
             | AiMouthChart => None,
         }
     }
@@ -1675,6 +1726,7 @@ impl Command {
             self,
             Cut | Copy
                 | Delete
+                | DeleteAndFill
                 | DuplicateSelection
                 | GroupSelection
                 | UngroupSelection
@@ -1738,6 +1790,7 @@ pub fn palette_commands() -> Vec<Command> {
         Paste,
         PasteInPlace,
         Delete,
+        DeleteAndFill,
         SelectAll,
         Deselect,
         DuplicateSelection,
@@ -1768,11 +1821,13 @@ pub fn palette_commands() -> Vec<Command> {
         ThinStroke,
         TraceLineArt,
         TraceBitmapOptions,
+        TraceBoldSplit,
         ConvertLinesToFills,
         ExpandFill,
         SmoothSelection,
         StraightenSelection,
         EvenLines,
+        OptimizeShapes,
         RemoveBackgroundSpecks,
         RecogniseShape,
         FlipHorizontal,
@@ -1874,6 +1929,8 @@ pub fn palette_commands() -> Vec<Command> {
         SetMasterAudio,
         ToggleMasterAudioMode,
         ReapplyMasterAudio,
+        LipSyncAllCharacters,
+        AddLifeToAllCharacters,
         MakeSetupFromScene,
         SplitAtPlayhead,
         FlattenToMasterScene,
@@ -1924,6 +1981,9 @@ pub fn palette_commands() -> Vec<Command> {
         AiRigVectorCharacter,
         AiRigLayers,
         AiSceneFromImage,
+        AiGenerateBackground,
+        AiSplitPictureIntoLayers,
+        AiRemoveObject,
         AiDirectStory,
     ]
 }
@@ -1987,6 +2047,7 @@ mod tests {
             Paste,
             PasteInPlace,
             Delete,
+            DeleteAndFill,
             SelectAll,
             Deselect,
             DuplicateSelection,
@@ -2018,11 +2079,13 @@ mod tests {
             TraceBitmap,
             TraceLineArt,
             TraceBitmapOptions,
+            TraceBoldSplit,
             ConvertLinesToFills,
             ExpandFill,
             SmoothSelection,
             StraightenSelection,
             EvenLines,
+            OptimizeShapes,
             RemoveBackgroundSpecks,
             RecogniseShape,
             FlipHorizontal,
@@ -2246,7 +2309,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            238
+            246
         );
     }
 

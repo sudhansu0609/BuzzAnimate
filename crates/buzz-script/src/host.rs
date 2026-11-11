@@ -111,6 +111,21 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         state,
         "prompt",
         |state, question: String, default: String| {
+            // A host that can ask a person does (J6): the answer is theirs, and
+            // closing the dialog is a cancel, which a script sees as `null`.
+            if let Some(answer) = crate::symtl::ask(
+                state,
+                crate::Question::Prompt { message: question.clone(), default: default.clone() },
+            ) {
+                let reply = match answer {
+                    crate::Answer::Text(t) => Some(t),
+                    _ => None,
+                };
+                let mut s = state.borrow_mut();
+                s.prompts.push((question.clone(), default));
+                s.alerts.push(format!("{question} - answered {reply:?}"));
+                return Ok(reply);
+            }
             let mut s = state.borrow_mut();
             let index = s.prompt_index;
             s.prompt_index += 1;
@@ -122,7 +137,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 .unwrap_or_else(|| default.clone());
             s.prompts.push((question.clone(), default));
             s.alerts.push(format!("{question} - answered {answer:?}"));
-            Ok(answer)
+            Ok(Some(answer))
         }
     );
 
@@ -161,7 +176,22 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 "{uri} is outside the script folder, which scripts may not read past"
             )));
         }
-        std::fs::read_to_string(&real).map_err(|e| throw(&format!("could not read {uri}: {e}")))
+        let text = std::fs::read_to_string(&real)
+            .map_err(|e| throw(&format!("could not read {uri}: {e}")))?;
+        // The user's changed settings for an included file (J5).
+        let stem = real
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mine: Vec<(String, String)> = state
+            .borrow()
+            .context
+            .overrides
+            .iter()
+            .filter(|(s, _, _)| s.eq_ignore_ascii_case(&stem))
+            .map(|(_, n, l)| (n.clone(), l.clone()))
+            .collect();
+        Ok(crate::tunables::apply(&text, &mine))
     });
 
     // -- document properties ------------------------------------------------
@@ -696,7 +726,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         host,
         state,
         "convertToSymbol",
-        |state, kind: String, name: String| {
+        |state, kind: String, name: String, registration: String| {
             let kind = match kind.to_ascii_lowercase().as_str() {
                 "graphic" => SymbolKind::Graphic,
                 "button" => SymbolKind::Button,
@@ -714,8 +744,25 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 return Err(throw("select something before converting it to a symbol"));
             }
 
-            let (layer, frame) = target(&state.borrow())?;
+            let (target_layer, frame) = target(&state.borrow())?;
             let mut s = state.borrow_mut();
+            // The instance goes back where the artwork came from, on that layer.
+            let layer = ids
+                .iter()
+                .find_map(|id| s.scene().find_object(*id).map(|(l, _)| l))
+                .unwrap_or(target_layer);
+            // **Registration point** (the third argument, "bottom center" and
+            // the like): the symbol's own origin sits there on the artwork, and
+            // the instance is placed so nothing moves on the stage. Left off,
+            // the symbol keeps the stage's own origin.
+            let registration_at = (!registration.trim().is_empty())
+                .then(|| {
+                    ids.iter()
+                        .filter_map(|id| s.scene().find_object(*id).map(|(_, o)| s.scene().resolved_bounds(o)))
+                        .reduce(|a, b| a.union(b))
+                })
+                .flatten()
+                .and_then(|bounds| crate::symtl::registration_point(&registration, bounds));
 
             let name = if name.is_empty() {
                 "Symbol".to_string()
@@ -735,7 +782,11 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
 
             let mut lifted = Vec::new();
             for id in &ids {
-                if let Some(object) = s.scene_mut().remove_object(*id) {
+                if let Some(mut object) = s.scene_mut().remove_object(*id) {
+                    if let Some(p) = registration_at {
+                        let o = Arc::make_mut(&mut object);
+                        o.transform = Affine::translate((-p.x, -p.y)) * o.transform;
+                    }
                     lifted.push(object);
                 }
             }
@@ -745,9 +796,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 });
             });
 
-            let placed = s
-                .scene_mut()
-                .add_instance_at(layer, frame, symbol, Affine::IDENTITY);
+            let place = registration_at
+                .map(|p| Affine::translate((p.x, p.y)))
+                .unwrap_or(Affine::IDENTITY);
+            let placed = s.scene_mut().add_instance_at(layer, frame, symbol, place);
             s.context.selection = placed.into_iter().collect();
             Ok(())
         }
@@ -900,6 +952,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 .get(id)
                 .ok_or_else(|| throw("that layer is gone"))?;
             let ids: Vec<u64> = l.frames.objects_at(frame).iter().map(|o| o.id.0).collect();
+            let mut hint = s.layer_hint.borrow_mut();
+            for i in &ids {
+                hint.insert(*i, id);
+            }
             Ok(serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string()))
         }
     );
@@ -1053,7 +1109,8 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             let mut s = state.borrow_mut();
             let layer = s.selected_layer.unwrap_or(0);
             let lo = start.min(end).max(0) as u32;
-            let hi = start.max(end).max(0) as u32;
+            // `setSelectedFrames(5, 5)` is the one frame 5, as in Animate.
+            let hi = (start.max(end).max(0) as u32).max(lo + 1);
             s.selected_ranges = vec![(layer, lo, hi)];
             Ok(())
         }
@@ -1068,7 +1125,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 .map_err(|_| throw("expected [layer, start, end, ...]"))?;
             let ranges: Vec<(i32, u32, u32)> = flat
                 .chunks_exact(3)
-                .map(|c| (c[0], c[1].max(0) as u32, c[2].max(0) as u32))
+                .map(|c| {
+                    let lo = c[1].max(0) as u32;
+                    (c[0], lo, (c[2].max(0) as u32).max(lo + 1))
+                })
                 .collect();
             state.borrow_mut().selected_ranges = ranges;
             Ok(())
@@ -1093,11 +1153,16 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             let f = if frame >= 0 {
                 frame as u32
             } else {
-                s.context.current_frame
+                selected_start(&s)
             };
             (id, f)
         };
         state.borrow_mut().scene_mut().update_layer(id, |l| {
+            // Past the layer's last frame, the layer is extended first, so the
+            // new keyframe carries the last drawing on (F6 there does).
+            if f >= l.frames.length() {
+                l.frames.insert_frame(f);
+            }
             l.frames.insert_keyframe(f);
         });
         Ok(())
@@ -1114,7 +1179,7 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 let f = if frame >= 0 {
                     frame as u32
                 } else {
-                    s.context.current_frame
+                    selected_start(&s)
                 };
                 (id, f)
             };
@@ -1155,7 +1220,14 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             for id in layer_ids {
                 for _ in 0..count.max(0) {
                     s.scene_mut().update_layer(id, |l| {
-                        l.frames.insert_frame(frame);
+                        // F5 on a keyframe extends that keyframe's span: the
+                        // keyframe stays, whatever follows moves along.
+                        let at = if l.frames.is_keyframe(frame) && frame < l.frames.length() {
+                            frame + 1
+                        } else {
+                            frame
+                        };
+                        l.frames.insert_frame(at);
                     });
                 }
             }
@@ -1287,10 +1359,22 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         if !entered {
             return Err(throw("that symbol is not in the library"));
         }
+        // A different timeline: its layers and frames are not selected yet.
+        s.selected_layer = None;
+        s.selected_ranges.clear();
+        let here = s.context.current_frame;
+        s.frame_stack.push(here);
         Ok(())
     });
     host_fn!(ctx, host, state, "exitEditMode", |state| {
-        state.borrow_mut().scene_mut().exit_symbol();
+        let mut s = state.borrow_mut();
+        s.scene_mut().exit_symbol();
+        s.selected_layer = None;
+        s.selected_ranges.clear();
+        // The playhead of the timeline we come back to is the one we left.
+        if let Some(frame) = s.frame_stack.pop() {
+            s.context.current_frame = frame;
+        }
         Ok(())
     });
 
@@ -1342,9 +1426,24 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
     // The film-making half: scenes, staging, casting, rigging, dialogue and the
     // camera. See `crate::film`.
     crate::film::install(ctx, &host, state)?;
+    // The rest of the command shelf: layer parenting, element transform parts,
+    // library items, layer effects and FLfile.
+    crate::shelf::install(ctx, &host, state)?;
+    // Library-item timelines, Break Apart, Trace Bitmap, Import and the dialogs.
+    crate::symtl::install(ctx, &host, state)?;
 
     ctx.globals().set("__host", host)?;
     Ok(())
+}
+
+/// Where `insertKeyframe()` / `insertBlankKeyframe()` act when given no frame:
+/// the first selected frame, else the playhead.
+fn selected_start(state: &State) -> u32 {
+    state
+        .selected_ranges
+        .first()
+        .map(|(_, start, _)| *start)
+        .unwrap_or(state.context.current_frame)
 }
 
 /// The layer `setSelectedLayers` last named, falling back to
@@ -1362,8 +1461,15 @@ fn selection_layer(state: &State) -> JsResult<LayerId> {
 /// id, then read back from the keyframe that actually governs `frame` — not
 /// necessarily the same stored copy `find_object` would meet first, once an
 /// `insertKeyframe` has cloned it onto a second span with its own edits.
-fn locate_element(state: &State, id: u64, frame: u32) -> JsResult<Arc<SceneObject>> {
+pub(crate) fn locate_element(state: &State, id: u64, frame: u32) -> JsResult<Arc<SceneObject>> {
     let object_id = ObjectId(id);
+    // Where it was last seen: one layer's frame, not the whole document.
+    if let Some(layer_id) = state.layer_hint.borrow().get(&id).copied()
+        && let Some(layer) = state.scene().layers().get(layer_id)
+        && let Some(found) = layer.frames.objects_at(frame).iter().find(|o| o.id == object_id)
+    {
+        return Ok(found.clone());
+    }
     let (layer_id, _) = state
         .scene()
         .find_object(object_id)
@@ -1383,7 +1489,7 @@ fn locate_element(state: &State, id: u64, frame: u32) -> JsResult<Arc<SceneObjec
 }
 
 /// JSFL's `symbolType`/`libraryItem.itemType` spelling of a [`SymbolKind`].
-fn symbol_kind_str(kind: SymbolKind) -> &'static str {
+pub(crate) fn symbol_kind_str(kind: SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Graphic => "graphic",
         SymbolKind::MovieClip => "movie clip",
@@ -1394,7 +1500,7 @@ fn symbol_kind_str(kind: SymbolKind) -> &'static str {
 /// JSFL's `layerType` spelling of a [`LayerKind`]. Animate has no inverse
 /// mask, so it reads as an ordinary mask — the nearest thing it has a name
 /// for.
-fn layer_kind_str(kind: LayerKind) -> &'static str {
+pub(crate) fn layer_kind_str(kind: LayerKind) -> &'static str {
     match kind {
         LayerKind::Normal => "normal",
         LayerKind::Folder => "folder",
@@ -1406,7 +1512,7 @@ fn layer_kind_str(kind: LayerKind) -> &'static str {
 }
 
 /// JSFL's `tweenType` spelling of a [`buzz_scene::TweenKind`].
-fn tween_kind_str(kind: buzz_scene::TweenKind) -> &'static str {
+pub(crate) fn tween_kind_str(kind: buzz_scene::TweenKind) -> &'static str {
     match kind {
         buzz_scene::TweenKind::None => "none",
         buzz_scene::TweenKind::Classic => "classic",
@@ -1479,7 +1585,7 @@ fn add_shape(
 /// Animate's own spelling, drive letter and all — the pipe rather than a colon
 /// is a genuine quirk of the format and scripts concatenate onto it, so it has
 /// to come back out the same way it went in.
-fn path_to_uri(path: &std::path::Path) -> String {
+pub(crate) fn path_to_uri(path: &std::path::Path) -> String {
     let text = path.to_string_lossy().replace('\\', "/");
     let text = match text.as_bytes() {
         [drive, b':', ..] => format!("{}|{}", *drive as char, &text[2..]),
@@ -1490,7 +1596,7 @@ fn path_to_uri(path: &std::path::Path) -> String {
 }
 
 /// The reverse, accepting the plain path a script might also pass.
-fn uri_to_path(uri: &str) -> JsResult<std::path::PathBuf> {
+pub(crate) fn uri_to_path(uri: &str) -> JsResult<std::path::PathBuf> {
     let text = uri.trim();
     let text = text
         .strip_prefix("file:///")
@@ -1560,10 +1666,15 @@ pub(crate) fn layer_id(state: &State, index: i32) -> JsResult<LayerId> {
 /// Where a drawing or frame operation lands: the active layer, or the front
 /// one if the editor has not nominated a layer.
 pub(crate) fn target(state: &State) -> JsResult<(LayerId, u32)> {
+    // The layer `setSelectedLayers` / `addNewLayer` made current wins: that is
+    // the layer Animate draws on and inserts frames into.
     let layer = state
-        .context
-        .active_layer
-        .filter(|id| state.scene().layers().get(*id).is_some())
+        .selected_layer
+        .and_then(|i| layer_id(state, i).ok())
+        .or(state
+            .context
+            .active_layer
+            .filter(|id| state.scene().layers().get(*id).is_some()))
         .or_else(|| state.scene().layers().iter().next().map(|l| l.id))
         .ok_or_else(|| throw("the document has no layer to work on"))?;
     Ok((layer, state.context.current_frame))

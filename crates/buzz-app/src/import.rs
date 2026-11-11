@@ -85,6 +85,20 @@ pub fn is_audio(path: &Path) -> bool {
         .is_some_and(|e| AUDIBLE.contains(&e.as_str()))
 }
 
+/// Pictures, which File > Import to Stage / Import to Library also accept
+/// (they used to need File > Import Image). Like a sound, a picture is not
+/// read by the importers above: `Editor::import_image` puts it on the stage,
+/// `Editor::import_image_to_library` only in the library.
+pub const PICTURE: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif"];
+
+/// Is this a picture, and so bound for `Editor::import_image*` rather than the
+/// scene importers?
+pub fn is_picture(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .is_some_and(|e| PICTURE.contains(&e.as_str()))
+}
+
 /// Read a file into a scene.
 ///
 /// Errors are already phrased for a person: each importer explains what it
@@ -110,11 +124,12 @@ pub fn read(path: &Path) -> Result<Imported, String> {
         // saying so is more use than the general refusal below.
         other if AUDIBLE.contains(&other) => Err(format!(
             ".{other} is a sound rather than artwork. Bring it in with \
-             File > Import Sound."
+             File > Import to Stage or Import to Library."
         )),
         other => Err(format!(
             "BuzzAnimate cannot import .{other} files. It reads .fla and .xfl \
-             from Animate, .swf movies, .pdf or .ai artwork, and sound as \
+             from Animate, .swf movies, .pdf or .ai artwork, pictures as \
+             .png, .jpg, .webp, .bmp or .gif, and sound as \
              .wav, .mp3, .ogg, .flac, .m4a or .aac."
         )),
     }

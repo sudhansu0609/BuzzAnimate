@@ -61,6 +61,8 @@ pub enum CastingAction {
     Save,
     /// The chosen character has no mouth: run the AI Layer Rig action on it.
     FixRig,
+    /// Import the cast FLA (`CastingDialogState::fla`) as locked Cast assets (ALAXMI plan B1a).
+    ImportFla,
     Close,
 }
 
@@ -70,6 +72,8 @@ pub struct CastingDialogState {
     pub series: String,
     /// The episode's output folder, where the story converter put `cast.json`.
     pub out: String,
+    /// The cast FLA to import (`Import cast FLA...`); empty: the episode folder's `cast.fla`.
+    pub fla: String,
     pub rows: Vec<CastingRow>,
     pub status: Option<String>,
     /// The rows were changed since they were loaded or saved.
@@ -159,10 +163,18 @@ fn body(ui: &mut Ui, ctx: &Context, state: &mut CastingDialogState, action: &mut
         ui.label("Episode folder");
         ui.add(egui::TextEdit::singleline(&mut state.out).desired_width(300.0)).on_hover_text("Where cast.json is (the story converter's cast); empty: the series' remembered cast");
         ui.end_row();
+        ui.label("Cast FLA");
+        ui.add(egui::TextEdit::singleline(&mut state.fla).desired_width(300.0)).on_hover_text("Your cast file (one wrapper symbol per role); empty: cast.fla beside the episode folder");
+        ui.end_row();
     });
-    if ui.button("Load cast").clicked() {
-        *action = CastingAction::Load;
-    }
+    ui.horizontal(|ui| {
+        if ui.button("Load cast").clicked() {
+            *action = CastingAction::Load;
+        }
+        if ui.button("Import cast FLA\u{2026}").on_hover_text("Files each role's views and walks of the FLA as locked Cast assets under Cast/<Series>/ (the Cast folder is backed up first) and writes casting.json").clicked() {
+            *action = CastingAction::ImportFla;
+        }
+    });
     if let Some(status) = &state.status {
         ui.label(status.as_str());
     }

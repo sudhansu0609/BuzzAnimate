@@ -146,12 +146,21 @@ pub fn rig_of_layer(scene: &Scene, layer: LayerId) -> Option<LayerRigView> {
         let Some(slot) = pattern.slot_for(&l.name) else {
             continue;
         };
-        let Some(object) = l.frames.keyframes().first().and_then(|k| k.objects.first()) else {
+        let Some(object) = l.frames.keyframes().iter().find_map(|k| k.objects.first()) else {
             continue;
         };
         parts.push((slot, id, object.id));
     }
-    let (_, root, body) = *parts.first()?;
+    let (_, mut root, mut body) = *parts.first()?;
+    // The rest follow the top of the follow tree, even when that layer is not named
+    // after a slot (a shirt layer the parts hang on): it is the root, or the
+    // performance would be written on a follower, ignoring what it inherits.
+    if root != top
+        && let Some(object) = layers.get(top).and_then(|l| l.frames.keyframes().iter().find_map(|k| k.objects.first()))
+    {
+        root = top;
+        body = object.id;
+    }
     Some(LayerRigView {
         root,
         body,
@@ -175,8 +184,8 @@ fn rest_of(scene: &Scene, layer: LayerId) -> Option<Affine> {
     l.rest_pose.or_else(|| {
         l.frames
             .keyframes()
-            .first()
-            .and_then(|k| k.objects.first())
+            .iter()
+            .find_map(|k| k.objects.first())
             .map(|o| o.transform)
     })
 }

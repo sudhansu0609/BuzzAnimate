@@ -369,7 +369,7 @@ fn draw_master_waveform(
 ) {
     let middle = area.center().y;
     let half = (area.height() * 0.5 - 2.0).max(1.0);
-    let colour = Color32::from_rgba_unmultiplied(120, 215, 255, 90);
+    let colour = Color32::from_rgb(220, 30, 30);
     let last_level = wave.level_end.unwrap_or(wave.levels.len()).min(wave.levels.len());
 
     // Downsampled to one bar per pixel column rather than one per frame —

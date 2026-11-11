@@ -121,7 +121,7 @@ pub fn tasks_panel(ui: &mut Ui, view: &TasksView) -> Option<TaskAction> {
     action
 }
 
-fn running_row(ui: &mut Ui, row: &TaskRow) -> Option<TaskAction> {
+pub(crate) fn running_row(ui: &mut Ui, row: &TaskRow) -> Option<TaskAction> {
     let mut action = None;
 
     ui.horizontal(|ui| {

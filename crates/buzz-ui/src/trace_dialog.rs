@@ -27,7 +27,7 @@ pub enum TraceDialogAction {
 /// Draw the dialog, editing `options` in place.
 pub fn trace_dialog(ctx: &egui::Context, options: &mut TraceOptions) -> TraceDialogAction {
     let mut action = TraceDialogAction::None;
-    egui::Window::new("Trace Bitmap")
+    egui::Window::new("Trace Picture")
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -39,6 +39,22 @@ fn body(ui: &mut Ui, options: &mut TraceOptions, action: &mut TraceDialogAction)
     ui.set_min_width(320.0);
 
     recommended_row(ui, || *options = TraceOptions::ink_colour());
+    // T15: the preset for thick black outlines like the user's FLA files.
+    if ui
+        .button("Bold outlines (like the FLAs)")
+        .on_hover_text("Colour regions with the ink and every object edge as thick black lines (3 px per 1920 px); small detail stays thin")
+        .clicked()
+    {
+        *options = TraceOptions { tuning: options.tuning, ..TraceOptions::bold() };
+    }
+    // Trace as Line Art is in no menu now: this is how the dialog reaches it.
+    if ui
+        .button("Line art (ink and paper)")
+        .on_hover_text("A scan of a drawing: two colours, the paper dropped, ink as brush lines to paint inside")
+        .clicked()
+    {
+        *options = TraceOptions { tuning: options.tuning, ..TraceOptions::line_art() };
+    }
     ui.separator();
 
     ui.label("Mode");
@@ -58,6 +74,13 @@ fn body(ui: &mut Ui, options: &mut TraceOptions, action: &mut TraceDialogAction)
         .spacing([12.0, 6.0])
         .show(ui, |ui| {
             let ink_mode = matches!(options.mode, TraceMode::Ink | TraceMode::InkAndColour);
+            if matches!(options.mode, TraceMode::Outline | TraceMode::ColourLines | TraceMode::Auto) {
+                ui.label("");
+                ui.checkbox(&mut options.bold_outlines, "Bold outlines").on_hover_text(
+                    "Thick black outlines like the FLA files: the ink and every edge between colours that differ, 3 px per 1920 px of the picture (Outline width sets it); beads and small loops get none, thin things a thinner line",
+                );
+                ui.end_row();
+            }
             if ink_mode {
                 ui.label("Bold");
                 ui.add(egui::Slider::new(&mut options.ink_bold, -1.0..=3.0).step_by(0.05).suffix(" px"))
@@ -160,6 +183,41 @@ fn body(ui: &mut Ui, options: &mut TraceOptions, action: &mut TraceDialogAction)
                 ui.checkbox(&mut options.drop_background, "")
                     .on_hover_text("Throw away the colour that covers the most of the picture");
                 ui.end_row();
+
+                ui.label("Optimize after trace");
+                ui.checkbox(&mut options.optimize_after, "")
+                    .on_hover_text("Fewer curve segments, touching shapes of one colour merged, tiny specks absorbed (Modify > Shape > Optimize Shapes, mild)");
+                ui.end_row();
+
+                if matches!(options.mode, TraceMode::Outline | TraceMode::ColourLines) {
+                    ui.label("Smooth soft tones");
+                    ui.checkbox(&mut options.soft_tones, "")
+                        .on_hover_text("A haze or glow becomes one shape with a gradient instead of flat bands");
+                    ui.end_row();
+
+                    ui.label("Keep textures");
+                    ui.checkbox(&mut options.keep_textures, "")
+                        .on_hover_text("A sky, wall or ground that is textured or graded keeps the picture's own pixels, clipped by the traced outline, instead of one flat colour");
+                    ui.end_row();
+
+                    ui.label("Even lines");
+                    ui.horizontal(|ui| {
+                        let mut on = options.even_lines.is_some();
+                        if ui
+                            .checkbox(&mut on, "")
+                            .on_hover_text("Draw the picture's ink as strokes of one width, like the Line tool")
+                            .changed()
+                        {
+                            options.even_lines = on.then_some(0.0);
+                        }
+                        if let Some(width) = options.even_lines.as_mut() {
+                            let suffix = if *width <= 0.0 { " (Auto)" } else { " px" };
+                            ui.add(egui::Slider::new(width, 0.0..=12.0).suffix(suffix))
+                                .on_hover_text("Line width. 0 means the width measured off the picture");
+                        }
+                    });
+                    ui.end_row();
+                }
             }
 
             ui.label("Speck size");

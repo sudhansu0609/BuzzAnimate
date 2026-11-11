@@ -37,3 +37,6 @@ pollster.workspace = true
 # for a full GPU read-back on every render, and a normal build must not carry
 # that cost. See Phase 4b in `docs/FLA_IMPORT_BLANK_AND_LAG_PLAN.md`.
 gpu-truth = ["vello/debug_layers"]
+
+[dev-dependencies]
+image.workspace = true

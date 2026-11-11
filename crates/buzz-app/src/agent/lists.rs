@@ -401,7 +401,7 @@ fn filters_apply(app: &mut App, target: &Target, req: &Req) -> Result<Value, Str
 // -- modifiers --------------------------------------------------------------------------
 
 const MODIFIER_KINDS: &[&str] =
-    &["wiggle", "spring", "look_at", "squash_stretch", "breathe", "blink", "turn", "sway", "drift", "pendulum", "hair"];
+    &["wiggle", "spring", "look_at", "squash_stretch", "breathe", "blink", "turn", "sway", "hair_flow", "drift", "pendulum", "hair"];
 
 fn modifier_fields(m: &Modifier) -> (&'static str, Vec<(&'static str, f64)>) {
     match *m {
@@ -418,6 +418,17 @@ fn modifier_fields(m: &Modifier) -> (&'static str, Vec<(&'static str, f64)>) {
         Modifier::Blink { rate, duration } => ("blink", vec![("rate", rate), ("duration", duration)]),
         Modifier::Turn { round } => ("turn", vec![("round", round)]),
         Modifier::Sway { amount, rate } => ("sway", vec![("amount", amount), ("rate", rate)]),
+        Modifier::HairFlow { strength, rate, wavelength, wind, lag, root } => (
+            "hair_flow",
+            vec![
+                ("strength", strength),
+                ("rate", rate),
+                ("wavelength", wavelength),
+                ("wind", wind),
+                ("lag", lag),
+                ("root", root),
+            ],
+        ),
         Modifier::Drift { dx, dy, span, phase } => {
             ("drift", vec![("dx", dx), ("dy", dy), ("span", span), ("phase", phase)])
         }
@@ -461,6 +472,14 @@ fn modifier_default(kind: &str) -> Option<Modifier> {
         "blink" => Modifier::Blink { rate: 12.0, duration: 0.16 },
         "turn" => Modifier::Turn { round: 1.0 },
         "sway" => Modifier::Sway { amount: 0.12, rate: 0.2 },
+        "hairflow" => Modifier::HairFlow {
+            strength: 0.08,
+            rate: 0.2,
+            wavelength: 0.6,
+            wind: 0.0,
+            lag: 0.18,
+            root: 0.0,
+        },
         "drift" => Modifier::Drift { dx: 12.0, dy: 0.0, span: 0.0, phase: 0.0 },
         "pendulum" => Modifier::pendulum(),
         "hair" | "cloth" | "haircloth" => Modifier::hair(),
@@ -575,6 +594,14 @@ fn build_modifier(item: &Map<String, Value>, base: Option<&Modifier>) -> Result<
                 lag: f("lag").clamp(0.0, 4.0),
             }
         }
+        "hair_flow" => Modifier::HairFlow {
+            strength: f("strength"),
+            rate: f("rate"),
+            wavelength: f("wavelength"),
+            wind: f("wind"),
+            lag: f("lag"),
+            root: f("root").round().clamp(0.0, 4.0),
+        },
         _ => Modifier::Drift { dx: f("dx"), dy: f("dy"), span: f("span"), phase: f("phase") },
     })
 }

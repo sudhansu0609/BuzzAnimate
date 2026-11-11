@@ -872,6 +872,7 @@ dependencies = [
  "buzz-geom",
  "buzz-light",
  "buzz-scene",
+ "image",
  "kurbo",
  "peniko",
  "pollster 1.0.1",
@@ -924,6 +925,7 @@ dependencies = [
  "buzz-act",
  "buzz-audio",
  "buzz-doc",
+ "buzz-fx",
  "buzz-geom",
  "buzz-scene",
  "buzz-text",
@@ -949,6 +951,7 @@ dependencies = [
 name = "buzz-ui"
 version = "0.1.0"
 dependencies = [
+ "buzz-act",
  "buzz-ai",
  "buzz-doc",
  "buzz-export",

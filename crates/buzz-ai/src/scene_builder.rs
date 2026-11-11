@@ -173,6 +173,81 @@ Respond strictly in JSON according to the schema.";
     Ok(layout)
 }
 
+/// Like `decompose_scene_image`, for **cutting a background into movable
+/// objects** (Split Picture): whole things with tight, full-extent boxes.
+pub fn decompose_background_objects(
+    llm: &impl Llm,
+    model: &str,
+    png_bytes: &[u8],
+) -> Result<DetectedSceneLayout, LlmError> {
+    decompose_background_objects_with(llm, model, png_bytes, false)
+}
+
+/// As `decompose_background_objects`; `every_far_building` also asks for each small, far
+/// building of a receding row as its own object (split artwork).
+pub fn decompose_background_objects_with(
+    llm: &impl Llm,
+    model: &str,
+    png_bytes: &[u8],
+    every_far_building: bool,
+) -> Result<DetectedSceneLayout, LlmError> {
+    decompose_background_objects_opts(llm, model, png_bytes, every_far_building, crate::llm::ChatOpts::default())
+}
+
+/// Version of the two Split Picture prompts below. Bump it whenever their text
+/// changes: a saved object list (the detection cache) is only reused for the
+/// version it was made with. 2: asked without hidden reasoning (a list made while the
+/// model was thinking can be empty).
+pub const BACKGROUND_OBJECTS_PROMPT_VERSION: u32 = 2;
+
+/// As [`decompose_background_objects_with`], with sampling options for the model call
+/// (Split Picture asks at temperature 0 and a fixed seed so a picture lists the same
+/// objects every run).
+pub fn decompose_background_objects_opts(
+    llm: &impl Llm,
+    model: &str,
+    png_bytes: &[u8],
+    every_far_building: bool,
+    opts: crate::llm::ChatOpts,
+) -> Result<DetectedSceneLayout, LlmError> {
+    let mut system_prompt = String::from("You are a 2D animation layout artist cutting a background picture into separately movable \
+objects. List every WHOLE object an animator could move on its own: each building or shop front (the whole building \
+from roof to base, never just a part of it), each awning together with its garland and lights, each platform or \
+step, each pole, lamp, cart, tree, wall, gate, sign. Do not list tiny details (single bulbs, pots, firecrackers), \
+sky, road, ground, or people and animals. Give each object a short label and a TIGHT bounding box \
+[x0, y0, x1, y1] (normalised 0.0 to 1.0) that covers the object's FULL extent, including the part hidden behind \
+other things only if it is visible. Boxes of different objects may overlap. kind is prop, vehicle or other; facing \
+is na. Also give ground_y (horizon, 0.0 to 1.0) and camera (wide, medium, close). Respond strictly in JSON \
+according to the schema.");
+    if every_far_building {
+        // Artwork split: a building is one object with everything attached to it.
+        system_prompt = String::from("You are a 2D animation layout artist cutting a street picture into separately movable \
+objects. Each building, house or shop is ONE object from roof to base, INCLUDING everything attached to it: its \
+awnings, garlands, platform or steps, roof, signboards, doors and posts. NEVER list an awning, garland, platform, \
+sign or other attached part as its own object, and never list the upper floor and the shop front of one building \
+separately. A building's box runs from its roof (or the top edge of the picture when the building is cut off there) \
+down to the ground, and sideways to the picture edge when it is cut off there; one box never holds two buildings, and \
+a near building and the building behind it are two objects. On EACH side of the street list the nearest \nbuilding, then the large building directly behind it (even when the nearest one hides part of it, as long as its roof and \nwalls show), then the next ones further away. Free-standing things (lamp post, pole, cart, tree, wall, gate) are listed separately. Label each building \
+House, Shop or Building. In a row of buildings that recedes into the distance, list EACH building separately, \
+including the small, far ones, each with its own tight box; never one box for the whole row. Do not list tiny \
+details (single bulbs, pots, firecrackers), sky, road, ground, or people and animals. Give each object a TIGHT \
+bounding box [x0, y0, x1, y1] (normalised 0.0 to 1.0) that covers its FULL extent. Boxes of different objects may \
+overlap. kind is prop, vehicle or other; facing is na. Also give ground_y (horizon, 0.0 to 1.0) and camera (wide, \
+medium, close). Respond strictly in JSON according to the schema.");
+    }
+    let user_prompt = "List the whole, separately movable objects of this background with full-extent boxes.";
+    let mut layout: DetectedSceneLayout =
+        llm.chat_json_opts(model, &system_prompt, user_prompt, &[png_bytes], scene_decomposition_schema(), opts)?;
+    if let Ok((w, h)) = image::ImageReader::new(std::io::Cursor::new(png_bytes))
+        .with_guessed_format()
+        .map_err(|_| ())
+        .and_then(|r| r.into_dimensions().map_err(|_| ()))
+    {
+        normalise_boxes(&mut layout, w, h);
+    }
+    Ok(layout)
+}
+
 /// Candidate asset from the library to match against.
 #[derive(Debug, Clone)]
 pub struct LibraryAssetCandidate {

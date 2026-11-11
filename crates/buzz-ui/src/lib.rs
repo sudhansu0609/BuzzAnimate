@@ -23,8 +23,10 @@ pub mod clear_keys_dialog;
 pub mod cleanup_dialog;
 pub mod command;
 pub mod command_palette;
+pub mod jsfl_menu;
 pub mod depth_panel;
 pub mod even_lines_dialog;
+pub mod optimize_dialog;
 pub mod export_panel;
 pub mod filter_panel;
 pub mod font_preview;
@@ -74,6 +76,7 @@ pub use ai_models_dialog::{AiModelsState, ai_models_dialog, ModelDownloadProgres
 pub use ai_rename_dialog::{AiRenameAction, AiRenameState};
 pub use align::{Align, Distribute, MatchSize};
 pub use even_lines_dialog::{EvenLinesAction, EvenLinesDialogState, even_lines_dialog};
+pub use optimize_dialog::{OptimizeAction, OptimizeDialogState, optimize_dialog};
 pub use arrange_dialog::{ArrangeAction, ArrangeDialogState, arrange_dialog};
 pub use clear_keys_dialog::{ClearKeysState, clear_keys_dialog};
 pub use cleanup_dialog::{CleanupState, cleanup_dialog};
@@ -81,7 +84,7 @@ pub use assets_panel::{AssetAction, AssetPanelState, ThumbnailSize, assets_panel
 pub use brush::{BrushKind, BrushSettings, BrushTips, PatternShape};
 pub use camera_panel::{CameraPanelState, CameraResponse, camera_hud, camera_panel};
 pub use character_panel::{
-    CAST_FOLDER, CastAction, CastPanelState, CastThumbnailSource, cast_panel,
+    CAST_FOLDER, AddPoseAsk, CastAction, DeleteAsk, CastPanelState, PoseSource, FreshAsk, CastThumbnailSource, cast_panel,
 };
 pub use command::Command;
 pub use command_palette::{CommandPaletteState, command_palette};

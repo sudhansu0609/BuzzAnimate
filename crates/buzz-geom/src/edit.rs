@@ -11,7 +11,7 @@
 //! unlike [`crate::clip`]. They are never applied to render-space geometry.
 
 use kurbo::{
-    BezPath, Cap, Join, Line, ParamCurve, ParamCurveArclen, PathEl, PathSeg, Point, Shape, Stroke,
+    BezPath, Cap, Join, Line, ParamCurve, ParamCurveArclen, PathEl, PathSeg, Point, Shape, Stroke, Vec2,
     StrokeOpts,
 };
 
@@ -133,6 +133,166 @@ pub fn smooth(path: &BezPath, strength: f64) -> BezPath {
     // diverge wildly. A looser area allowance than boolean refitting, because
     // changing the shape is the whole point here.
     crate::boolean::refit_checked(path, accuracy, 0.6, 0.10)
+}
+
+/// **Optimize**: the same shape in fewer curve segments, within `accuracy`
+/// document units (Animate: Modify > Shape > Optimize).
+///
+/// The outline is flattened finely, thinned with Douglas-Peucker (a tolerance
+/// of `accuracy`, so a corner survives by itself) and rebuilt as cubics that
+/// run smoothly through the surviving points, with a hard corner wherever the
+/// outline turns by more than about 35 degrees. (Not `kurbo`'s simplifier:
+/// it does not come back from the pixel staircase of a traced edge.) The fit
+/// is refused, returning the path as it was, if it moves the outline's bounds
+/// or drifts the area by more than 1 %.
+pub fn optimize_path(path: &BezPath, accuracy: f64) -> BezPath {
+    if path.elements().is_empty() {
+        return path.clone();
+    }
+    let accuracy = sane_tolerance(accuracy, path);
+    let mut subs: Vec<(Vec<Point>, bool)> = Vec::new();
+    let mut cur: Vec<Point> = Vec::new();
+    let flush = |cur: &mut Vec<Point>, closed: bool, subs: &mut Vec<(Vec<Point>, bool)>| {
+        if cur.len() > 1 {
+            subs.push((std::mem::take(cur), closed));
+        } else {
+            cur.clear();
+        }
+    };
+    kurbo::flatten(path.iter(), accuracy * 0.2, |el| match el {
+        PathEl::MoveTo(p) => {
+            flush(&mut cur, false, &mut subs);
+            cur.push(p);
+        }
+        PathEl::LineTo(p) => {
+            if cur.last() != Some(&p) {
+                cur.push(p);
+            }
+        }
+        PathEl::ClosePath => flush(&mut cur, true, &mut subs),
+        _ => {}
+    });
+    flush(&mut cur, false, &mut subs);
+    for ring in &mut subs {
+        if ring.1 && ring.0.len() > 1 && ring.0.first() == ring.0.last() {
+            ring.0.pop();
+        }
+    }
+    let source_bb = path.bounding_box();
+    let source_area = path.area().abs();
+    // The coarsest tolerance that keeps the outline (a small shape refuses
+    // the full one): `accuracy`, then half, then a quarter.
+    for eps in [accuracy, accuracy * 0.5, accuracy * 0.25] {
+        let mut out = BezPath::new();
+        for (points, closed) in &subs {
+            let kept = douglas_peucker(points, *closed, eps);
+            rebuild_smooth(&mut out, &kept, *closed);
+        }
+        if out.elements().is_empty() {
+            return path.clone();
+        }
+        let slack = (eps * 4.0).max(source_bb.width().hypot(source_bb.height()) * 1e-4);
+        let in_bounds = source_bb.inflate(slack, slack).contains_rect(out.bounding_box());
+        let area_ok = source_area <= 0.0 || (out.area().abs() - source_area).abs() / source_area <= 0.01;
+        if in_bounds && area_ok {
+            return out;
+        }
+    }
+    path.clone()
+}
+
+/// Douglas-Peucker over `points` (an open run, or a closed ring split at its
+/// farthest point from the first).
+fn douglas_peucker(points: &[Point], closed: bool, eps: f64) -> Vec<Point> {
+    let n = points.len();
+    if n < 3 {
+        return points.to_vec();
+    }
+    let mut keep = vec![false; n];
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    if closed {
+        let far = (1..n)
+            .max_by(|&a, &b| points[a].distance(points[0]).total_cmp(&points[b].distance(points[0])))
+            .unwrap_or(1);
+        keep[0] = true;
+        keep[far] = true;
+        stack.push((0, far));
+        stack.push((far, n));
+    } else {
+        keep[0] = true;
+        keep[n - 1] = true;
+        stack.push((0, n - 1));
+    }
+    while let Some((lo, hi)) = stack.pop() {
+        let a = points[lo];
+        let b = points[hi % n];
+        let (mut worst, mut at) = (0.0, lo);
+        for i in lo + 1..hi {
+            let d = dist_to_segment(points[i], a, b);
+            if d > worst {
+                worst = d;
+                at = i;
+            }
+        }
+        if worst > eps && at > lo {
+            keep[at] = true;
+            stack.push((lo, at));
+            stack.push((at, hi));
+        }
+    }
+    points.iter().zip(keep).filter(|(_, k)| *k).map(|(p, _)| *p).collect()
+}
+
+fn dist_to_segment(p: Point, a: Point, b: Point) -> f64 {
+    let ab = b - a;
+    let len2 = ab.hypot2();
+    if len2 < 1e-18 {
+        return p.distance(a);
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
+}
+
+/// Cubics through `pts`, smooth at every point but where the outline turns
+/// sharply (and at the ends of an open run).
+fn rebuild_smooth(out: &mut BezPath, pts: &[Point], closed: bool) {
+    let n = pts.len();
+    if n < 2 {
+        return;
+    }
+    let at = |i: isize| pts[i.rem_euclid(n as isize) as usize];
+    let tangent = |i: usize| -> Vec2 {
+        if !closed && (i == 0 || i == n - 1) {
+            return Vec2::ZERO;
+        }
+        let (prev, here, next) = (at(i as isize - 1), pts[i], at(i as isize + 1));
+        let (d0, d1) = (here - prev, next - here);
+        let (l0, l1) = (d0.hypot(), d1.hypot());
+        if l0 < 1e-12 || l1 < 1e-12 {
+            return Vec2::ZERO;
+        }
+        let turn = (d0.dot(d1) / (l0 * l1)).clamp(-1.0, 1.0).acos();
+        if turn > 0.6 {
+            return Vec2::ZERO;
+        }
+        // The chord's direction, as long as the shorter side (no overshoot).
+        let dir = (d0 / l0 + d1 / l1).normalize();
+        dir * l0.min(l1)
+    };
+    out.move_to(pts[0]);
+    let segments = if closed { n } else { n - 1 };
+    for i in 0..segments {
+        let j = (i + 1) % n;
+        let (ti, tj) = (tangent(i), tangent(j));
+        if ti == Vec2::ZERO && tj == Vec2::ZERO {
+            out.line_to(pts[j]);
+        } else {
+            out.curve_to(pts[i] + ti / 3.0, pts[j] - tj / 3.0, pts[j]);
+        }
+    }
+    if closed {
+        out.close_path();
+    }
 }
 
 /// Replace curves that are already nearly straight with actual line segments.

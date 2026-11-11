@@ -41,12 +41,14 @@
 pub mod audio_align;
 pub mod autorig;
 pub mod direct;
+pub mod face;
 pub mod figure;
 pub mod layer_rig;
 pub mod lipsync;
 pub mod motion_path;
 pub mod perform;
 pub mod physics;
+pub mod pose;
 pub mod puppet;
 pub mod scenery;
 pub mod screenplay;

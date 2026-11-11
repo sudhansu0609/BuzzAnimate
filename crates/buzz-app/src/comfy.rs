@@ -3,7 +3,7 @@
 //! fetch its pictures.
 //!
 //! Mirrors BuzzEdit's Python client (`backend/comfyui_bridge/client.py`):
-//! probe `/system_stats`; scan 8188..8208 at 0.5 s per port; `POST /prompt`
+//! probe `/system_stats`; scan 8188..8208 and 8000 (ComfyUI Desktop) at 0.5 s per port; `POST /prompt`
 //! `{prompt, client_id}` with a generous timeout (ComfyUI blocks its HTTP
 //! server while loading a model); poll `/history/{id}`; read every output
 //! entry; fetch through `GET /view`. A job that sees "connection refused" for
@@ -27,6 +27,19 @@ const QUEUE: Duration = Duration::from_secs(120);
 const REFUSED_GIVE_UP: Duration = Duration::from_secs(20);
 /// The portable install, unless `COMFYUI_DIR` says otherwise.
 pub const DEFAULT_COMFYUI_DIR: &str = r"B:\ComfyUI_windows_portable_nvidia_cu118_or_cpu\ComfyUI_windows_portable";
+
+/// The folder to start ComfyUI from when `COMFYUI_DIR` is not set: the portable
+/// install on Windows, `~/ComfyUI` elsewhere.
+fn default_comfyui_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(DEFAULT_COMFYUI_DIR)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("ComfyUI")).unwrap_or_else(|| PathBuf::from("ComfyUI"))
+    }
+}
 const CLIENT_ID: &str = "buzzanimate_client";
 
 /// Where one finished picture is, as ComfyUI's history lists it.
@@ -725,7 +738,26 @@ fn start_detached(bat: &std::path::Path) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err(format!("ComfyUI cannot be started from here: {} is a Windows script", bat.display()))
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        // `bat` is `<dir>/main.py` here: run it with the folder's own Python
+        // environment when it has one.
+        let dir = bat.parent().unwrap_or(std::path::Path::new("."));
+        let python = ["venv/bin/python", ".venv/bin/python"]
+            .iter()
+            .map(|p| dir.join(p))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| PathBuf::from("python3"));
+        std::process::Command::new(python)
+            .arg("main.py")
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("could not start ComfyUI ({}): {e}", bat.display()))
     }
 }
 

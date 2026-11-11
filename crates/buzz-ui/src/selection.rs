@@ -378,6 +378,26 @@ impl Selection {
     }
 
     pub fn bounds_at(&self, scene: &Scene, frame: u32) -> Option<Rect> {
+        // A big selection (a traced picture is thousands of shapes) is found in
+        // one walk of the scene; `find_object` per id is quadratic. The same
+        // object `find_object` would give: first layer, first copy.
+        if self.objects.len() > 16 {
+            let mut seen = std::collections::HashSet::new();
+            let mut union: Option<Rect> = None;
+            for layer in scene.layers().iter() {
+                let mut follows = None;
+                for object in layer.all_objects() {
+                    if !self.objects.contains(&object.id) || !seen.insert(object.id) {
+                        continue;
+                    }
+                    let follows = *follows
+                        .get_or_insert_with(|| scene.layers().inherited_transform(layer.id, frame));
+                    let r = buzz_scene::object::transform_rect(follows, scene.resolved_bounds(object));
+                    union = Some(union.map_or(r, |u| u.union(r)));
+                }
+            }
+            return union;
+        }
         self.objects
             .iter()
             .filter_map(|id| {

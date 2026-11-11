@@ -57,11 +57,74 @@ pub const BONE_MOVE_ON_ARTWORK: &str = "Move mode \u{2014} switch to Create to a
 
 /// The Even Out Lines dialog's preview (`docs/EVEN_LINES_PLAN.md` E2).
 pub struct EvenLinesSession {
-    plan: crate::rigging::EvenLinesPlan,
+    plan: std::sync::Arc<crate::rigging::EvenLinesPlan>,
     trace: crate::rigging::EvenLinesTrace,
     /// History when the dialog opened: Apply folds every preview into one
     /// step from here, Cancel puts it back exactly (no undo step, no redo).
     checkpoint: buzz_doc::RunCheckpoint,
+}
+
+/// Even Out Lines work for a task thread (T12): finding and tracing the ink
+/// of a whole picture takes seconds and must not freeze the UI.
+pub enum EvenLinesWork {
+    /// Find and measure the ink of `scope` in `scene`, then trace it.
+    Open { scene: Scene, scope: crate::rigging::EvenLinesScope },
+    /// Trace a session's plan again for new options.
+    Retrace {
+        plan: std::sync::Arc<crate::rigging::EvenLinesPlan>,
+        previous: crate::rigging::EvenLinesTrace,
+        straighten: f64,
+        solid_above: f64,
+        draft: bool,
+    },
+}
+
+/// What [`EvenLinesWork`] came to.
+pub enum EvenLinesDone {
+    Opened { plan: crate::rigging::EvenLinesPlan, trace: crate::rigging::EvenLinesTrace },
+    Retraced(crate::rigging::EvenLinesTrace),
+}
+
+/// Run Even Out Lines work on the calling thread. `progress` hears the phase.
+pub fn run_even_lines_work(work: EvenLinesWork, progress: &dyn Fn(&str)) -> EvenLinesDone {
+    match work {
+        EvenLinesWork::Open { scene, scope } => {
+            progress("Finding the ink\u{2026}");
+            let plan = crate::rigging::plan_even_lines(&scene, &scope);
+            if plan.is_empty() {
+                return EvenLinesDone::Opened { plan, trace: Default::default() };
+            }
+            progress("Tracing the lines\u{2026}");
+            let d = EvenLinesDialogDefaults::of(&plan);
+            let trace = crate::rigging::trace_even_lines(&plan, 0.0, d.solid_above, false);
+            EvenLinesDone::Opened { plan, trace }
+        }
+        EvenLinesWork::Retrace { plan, previous, straighten, solid_above, draft } => {
+            progress("Tracing the lines\u{2026}");
+            EvenLinesDone::Retraced(crate::rigging::retrace_even_lines(&plan, previous, straighten, solid_above, draft))
+        }
+    }
+}
+
+/// The dialog's starting settings for a plan.
+struct EvenLinesDialogDefaults {
+    face_width: f64,
+    body_width: f64,
+    solid_above: f64,
+    /// T15: the bold outlines weight for the plan's picture.
+    bold_width: f64,
+}
+
+impl EvenLinesDialogDefaults {
+    fn of(plan: &crate::rigging::EvenLinesPlan) -> Self {
+        let quarter = |v: f64, lo: f64, hi: f64| ((v * 4.0).round() / 4.0).clamp(lo, hi);
+        Self {
+            face_width: quarter(plan.face_measured.or(plan.ink_measured).unwrap_or(1.5), 0.25, 12.0),
+            body_width: quarter(plan.body_measured.or(plan.ink_measured).unwrap_or(2.0), 0.25, 12.0),
+            solid_above: quarter(crate::rigging::default_solid_above(plan), 0.5, 40.0),
+            bold_width: quarter(plan.bold_width, 0.25, 12.0),
+        }
+    }
 }
 
 /// Even Out Lines settings asked for without the dialog; `None` is the
@@ -73,6 +136,8 @@ pub struct EvenLinesRequest {
     pub keep_weight: Option<bool>,
     pub straighten: Option<f64>,
     pub solid_above: Option<f64>,
+    /// T15: bold outlines (black lines of the picture's bold width unless widths are given).
+    pub bold: Option<bool>,
 }
 
 /// Remove Background Specks settings (A6b); `None` is the default
@@ -263,11 +328,27 @@ pub struct Editor {
     /// `Some` only while the dialog itself is open — see
     /// `Command::TraceBitmapOptions` and `Workspace::trace`.
     pub trace_dialog: Option<buzz_scene::TraceOptions>,
+    /// A Trace Bitmap waiting for the app to run it on a task thread
+    /// (`trace_in_background`); the agent runs it at once instead.
+    pub pending_trace: Option<TraceJob>,
     /// The Even Out Lines dialog (`docs/EVEN_LINES_PLAN.md` E2).
     pub even_lines_dialog: buzz_ui::EvenLinesDialogState,
     /// Its preview: the ink found, its centrelines, and where history stood
     /// when it opened. `Some` only while the dialog is open.
     pub even_lines: Option<EvenLinesSession>,
+    /// Optimize Shapes (T13): its dialog, preview and queued work.
+    pub optimize: crate::optimize::OptimizeState,
+    /// Even Out Lines work waiting for the app to run it on a task thread,
+    /// tagged with the generation it answers (T12).
+    pub even_lines_work: Option<(u64, EvenLinesWork)>,
+    /// Bumped by every request and by Cancel: a result of an older one is
+    /// dropped, and the app stops the task that makes it.
+    pub even_lines_gen: u64,
+    /// A retrace asked for while one runs: the next one, `draft` or full.
+    even_lines_queued: Option<bool>,
+    /// The scene revision the open started from; a result over a changed
+    /// document is refused.
+    even_lines_rev: u64,
     /// A rigging drag in progress: building a bone, posing one, or moving a
     /// warp handle. Held here rather than in the tool machine because it began
     /// with a question about the document.
@@ -391,6 +472,40 @@ pub struct Editor {
     /// rather than re-walking the library per object — the difference between a
     /// snappy click and a second's pause on a rig-heavy import.
     bounds_cache: std::cell::RefCell<Option<(u64, SymbolBounds)>>,
+    /// Where each object on screen is drawn — frame, layer, and its place in
+    /// that frame's list — for [`Self::drawn_at`]. Chrome asks per selected
+    /// object every frame; scanning every layer for each of 2,600 selected
+    /// shapes (a big trace) cost ~100 ms a frame. Keyed on the scene revision,
+    /// the playhead and the Edit Multiple frames; every hit is re-checked.
+    drawn_index: std::cell::RefCell<Option<DrawnIndex>>,
+    /// What the selection's chrome measures every frame — each selected
+    /// object's focal-plane frame, and its flattened outline for the hatch —
+    /// kept while the document, playhead, selection (and zoom, for the
+    /// outlines) are the same. Asked several times a frame by the box, the
+    /// pivot, the tool context and the hatch; for 2,600 selected shapes that
+    /// was ~150 ms a frame.
+    selection_cache: std::cell::RefCell<Option<SelectionCache>>,
+}
+
+/// See [`Editor::selection_cache`].
+struct SelectionCache {
+    revision: u64,
+    frame: u32,
+    /// The frames Edit Multiple Frames is showing: switching it on draws the
+    /// selection on other frames' terms, with no edit and no frame change.
+    multi: Vec<u32>,
+    ids: Vec<ObjectId>,
+    zoom: u64,
+    frames: Option<Arc<Vec<(Rect, [Point; 4])>>>,
+    shapes: Option<Arc<Vec<DrawnShape>>>,
+}
+
+/// See [`Editor::drawn_index`].
+struct DrawnIndex {
+    revision: u64,
+    frame: u32,
+    multi: Vec<u32>,
+    at: std::collections::HashMap<ObjectId, (u32, LayerId, usize)>,
 }
 
 /// Every symbol's resolved extent, keyed by id. See [`Editor::symbol_bounds`].
@@ -707,14 +822,22 @@ impl Editor {
             pending_motion_path: None,
             import_summary: None,
             trace_dialog: None,
+            pending_trace: None,
             even_lines_dialog: buzz_ui::EvenLinesDialogState::default(),
             even_lines: None,
+            optimize: Default::default(),
+            even_lines_work: None,
+            even_lines_gen: 0,
+            even_lines_queued: None,
+            even_lines_rev: 0,
             should_quit: false,
             status: None,
             waveform_cache: WaveformCache::default(),
             master_waveform_cache: None,
             sequence_scrub: None,
             bounds_cache: std::cell::RefCell::new(None),
+            drawn_index: std::cell::RefCell::new(None),
+            selection_cache: std::cell::RefCell::new(None),
         };
         editor.auto_keyframe = editor.workspace.auto_keyframe;
         // K2: a saved Protect Other Keyframes is on from the start.
@@ -1097,6 +1220,8 @@ impl Editor {
         // follow the selection into another that happens to reuse the id.
         self.anchor_selection = None;
         self.bounds_cache = std::cell::RefCell::new(None);
+        self.drawn_index = std::cell::RefCell::new(None);
+        self.selection_cache = std::cell::RefCell::new(None);
         self.waveform_cache = WaveformCache::default();
         self.master_waveform_cache = None;
         (old_doc, old_view)
@@ -1763,6 +1888,75 @@ impl Editor {
             ),
         });
         Ok(written)
+    }
+
+    /// **Modify > Add Life to All Characters** (E2): breath and blinks for every Cast character on the
+    /// stage from the playhead to the scene's end, one undo step. Running it again replaces them.
+    pub fn add_life_to_all(&mut self) {
+        let from = self.current_frame;
+        let mut report = crate::scene_life::LifeReport::default();
+        self.doc.edit("Add Life to All Characters", |scene| {
+            let to = scene.frame_count();
+            report = crate::scene_life::add_life(scene, from, to);
+        });
+        self.doc.end_gesture();
+        self.status = Some(if report.characters.is_empty() {
+            "No Cast character on the stage to give life to (put one in with Cast into the shot)".to_string()
+        } else {
+            format!("Breath and blinks from frame {from} for {}", report.characters.join(", "))
+        });
+    }
+
+    /// The caption layer Lip Sync All Characters writes, replaced on every run.
+    pub const LIP_SYNC_ALL_LAYER: &'static str = "Dialogue (Lip Sync All)";
+
+    /// **Sequence > Lip Sync All Characters**, the writing half (E3): `lines` are the recording's lines (who
+    /// says what, when), `track` the mouth shapes heard in it from its start at `sound_start`. Captions
+    /// carrying the speaker go on a layer of their own, every character on the stage gets the mouth and the
+    /// talking on their own lines. One undo step; running it again replaces both.
+    pub fn lip_sync_all_apply(
+        &mut self,
+        lines: &[crate::scene_life::SpokenLine],
+        track: &buzz_audio::VisemeTrack,
+        sound_start: u32,
+    ) -> anyhow::Result<crate::scene_life::LipSyncAllReport> {
+        if crate::scene_life::stage_characters(self.doc.scene()).is_empty() {
+            anyhow::bail!("there is no Cast character on the stage (put them in with Cast into the shot)");
+        }
+        let fps = self.doc.scene().stage().frame_rate.max(1.0);
+        let checkpoint = self.doc.run_checkpoint();
+        self.doc.edit("Lip Sync All Characters", |scene| {
+            let old: Vec<LayerId> = scene.layers().iter().filter(|l| l.name == Self::LIP_SYNC_ALL_LAYER).map(|l| l.id).collect();
+            for id in old {
+                scene.remove_layer(id);
+            }
+        });
+        let captions: Vec<(std::ops::Range<u32>, String, Option<String>)> = lines
+            .iter()
+            .map(|l| {
+                let a = sound_start + (l.start * fps).round() as u32;
+                let b = sound_start + (l.end * fps).round() as u32;
+                (a..b.max(a + 2), l.text.clone(), l.speaker.clone())
+            })
+            .collect();
+        let layer = if captions.is_empty() { None } else { self.draw_captions_layer(&captions).ok() };
+        let mut report = crate::scene_life::LipSyncAllReport::default();
+        self.doc.edit("Lip Sync All Characters", |scene| {
+            if let Some(layer) = layer {
+                scene.update_layer(layer, |l| l.name = Self::LIP_SYNC_ALL_LAYER.to_string());
+            }
+            report = crate::scene_life::lip_sync_all(scene, track, sound_start, lines);
+        });
+        self.doc.end_gesture();
+        self.doc.collapse_run(checkpoint, "Lip Sync All Characters");
+        self.status = Some(format!(
+            "Lip sync: {} of {} lines to {}{}",
+            report.matched,
+            report.lines,
+            if report.mouths.is_empty() { "nobody".to_string() } else { report.mouths.join(", ") },
+            if report.unmatched.is_empty() { String::new() } else { format!(" ({} line(s) with no character on the stage)", report.unmatched.len()) }
+        ));
+        Ok(report)
     }
 
     /// **Write the active layer's captions back out as `.srt`.**
@@ -4089,6 +4283,69 @@ impl Editor {
     }
 
     /// Every selected raw shape, as it is drawn — what the stage hatches.
+    pub fn selected_drawn_shapes_cached(&self) -> Arc<Vec<DrawnShape>> {
+        if let Some(shapes) = self.selection_cache_get(|c| c.shapes.clone()) {
+            return shapes;
+        }
+        let shapes = Arc::new(self.selected_drawn_shapes());
+        self.selection_cache_set(|c| c.shapes = Some(Arc::clone(&shapes)));
+        shapes
+    }
+
+    /// Run `read` on the selection cache if it still describes this document,
+    /// playhead, selection and zoom; `None` when it does not (or `read` finds
+    /// nothing in it).
+    fn selection_cache_get<T>(&self, read: impl FnOnce(&SelectionCache) -> Option<T>) -> Option<T> {
+        let cache = self.selection_cache.borrow();
+        let c = cache.as_ref()?;
+        if c.revision != self.doc.scene().revision()
+            || c.frame != self.current_frame
+            || c.multi != self.multi_frames()
+            || c.zoom != self.camera.zoom.to_bits()
+            || !self.selection.ids().iter().eq(c.ids.iter())
+        {
+            return None;
+        }
+        read(c)
+    }
+
+    /// Store into the selection cache, starting a fresh one when the old one
+    /// describes something else.
+    fn selection_cache_set(&self, write: impl FnOnce(&mut SelectionCache)) {
+        let fresh = self.selection_cache_get(|_| Some(())).is_none();
+        let mut cache = self.selection_cache.borrow_mut();
+        if fresh {
+            *cache = Some(SelectionCache {
+                revision: self.doc.scene().revision(),
+                frame: self.current_frame,
+                multi: self.multi_frames(),
+                ids: self.selection.ids(),
+                zoom: self.camera.zoom.to_bits(),
+                frames: None,
+                shapes: None,
+            });
+        }
+        if let Some(c) = cache.as_mut() {
+            write(c);
+        }
+    }
+
+    /// Each selected object's own bounds and focal-plane quad, in selection
+    /// order, for those that are drawn. Memoised: see [`Self::selection_cache`].
+    fn selection_focal_frames(&self) -> Arc<Vec<(Rect, [Point; 4])>> {
+        if let Some(frames) = self.selection_cache_get(|c| c.frames.clone()) {
+            return frames;
+        }
+        let frames: Arc<Vec<(Rect, [Point; 4])>> = Arc::new(
+            self.selection
+                .iter()
+                .filter_map(|id| self.focal_local_and_quad(id))
+                .collect(),
+        );
+        self.selection_cache_set(|c| c.frames = Some(Arc::clone(&frames)));
+        frames
+    }
+
     pub fn selected_drawn_shapes(&self) -> Vec<DrawnShape> {
         self.selection
             .iter()
@@ -4147,13 +4404,11 @@ impl Editor {
         // `None` when the object is on no frame currently drawn — a selection
         // that has outlived its span. There is nothing on screen to put a
         // handle on, and drawing one anyway put a box over empty stage.
-        let (frame, layer) = self.drawn_at(id)?;
-        let object = scene
-            .layers()
-            .get(layer)?
-            .objects_at(frame)
-            .iter()
-            .find(|o| o.id == id)?;
+        let (frame, layer, n) = self.drawn_at_index(id)?;
+        let object = scene.layers().get(layer)?.objects_at(frame).get(n)?;
+        if object.id != id {
+            return None;
+        }
         let depth = scene.layers().get(layer).map(|l| l.depth).unwrap_or(0.0);
 
         let table = self.symbol_bounds();
@@ -4231,21 +4486,18 @@ impl Editor {
     ///
     /// `None` when nothing in the selection is on a frame currently drawn.
     pub fn selection_bounds_drawn(&self) -> Option<Rect> {
-        self.selection
+        self.selection_focal_frames()
             .iter()
-            .filter_map(|id| {
+            .map(|(_, quad)| {
                 // **Measured once.** `object_quad` is where the artwork is
                 // drawn — through the object's own turn in space, its layer's
                 // depth and parenting, the place a symbol was opened at, and
                 // the shot. Deriving the bounds from it rather than
                 // re-measuring means the handle box and the outline cannot
                 // drift apart, which is how they drifted before.
-                let (_, quad) = self.focal_local_and_quad(id)?;
-                Some(
-                    quad[1..]
-                        .iter()
-                        .fold(Rect::from_points(quad[0], quad[0]), |r, p| r.union_pt(*p)),
-                )
+                quad[1..]
+                    .iter()
+                    .fold(Rect::from_points(quad[0], quad[0]), |r, p| r.union_pt(*p))
             })
             .reduce(|a, b| a.union(b))
     }
@@ -4355,17 +4607,12 @@ impl Editor {
     fn natural_selection_box(&self) -> Option<TransformBox> {
         let aligned = || self.selection_bounds_drawn().map(TransformBox::axis_aligned);
 
-        let mut frames: Vec<(Rect, [Point; 4])> = Vec::new();
-        for id in self.selection.iter() {
-            if let Some(found) = self.focal_local_and_quad(id) {
-                frames.push(found);
-            }
-        }
+        let frames = self.selection_focal_frames();
         let &(first_local, _) = frames.first()?;
 
         // Every object needs a frame of its own, or none of them has one.
         let mut maps = Vec::with_capacity(frames.len());
-        for (local, quad) in &frames {
+        for (local, quad) in frames.iter() {
             match affine_frame_of(*local, *quad) {
                 Some(map) => maps.push(map),
                 None => return aligned(),
@@ -4395,7 +4642,7 @@ impl Editor {
         } else {
             let back = to_doc.inverse();
             let mut union: Option<Rect> = None;
-            for (_, quad) in &frames {
+            for (_, quad) in frames.iter() {
                 for corner in quad {
                     let at = back * *corner;
                     union = Some(match union {
@@ -4418,15 +4665,44 @@ impl Editor {
     /// case and the cheap one. Otherwise whichever keyframe Edit Multiple
     /// Frames is showing it on. `None` when it is on neither.
     fn drawn_at(&self, id: ObjectId) -> Option<(u32, LayerId)> {
+        self.drawn_at_index(id).map(|(frame, layer, _)| (frame, layer))
+    }
+
+    /// [`Self::drawn_at`], and the object's place in that frame's list on its
+    /// layer. Answered from [`Self::drawn_index`], built once per revision.
+    fn drawn_at_index(&self, id: ObjectId) -> Option<(u32, LayerId, usize)> {
         let scene = self.doc.scene();
-        let on = |frame: u32| {
-            scene
-                .layers()
-                .iter()
-                .find(|l| l.objects_at(frame).iter().any(|o| o.id == id))
-                .map(|l| (frame, l.id))
-        };
-        on(self.current_frame).or_else(|| self.multi_frames().into_iter().find_map(on))
+        let revision = scene.revision();
+        let stale = self.drawn_index.borrow().as_ref().is_none_or(|i| {
+            i.revision != revision || i.frame != self.current_frame
+        });
+        let multi = if stale { Vec::new() } else { self.multi_frames() };
+        let stale = stale
+            || self
+                .drawn_index
+                .borrow()
+                .as_ref()
+                .is_none_or(|i| i.multi != multi);
+        if stale {
+            let multi = self.multi_frames();
+            let mut at = std::collections::HashMap::new();
+            // The playhead's frame wins over the others, as it always did.
+            for frame in std::iter::once(self.current_frame).chain(multi.iter().copied()).rev() {
+                for layer in scene.layers().iter() {
+                    for (n, o) in layer.objects_at(frame).iter().enumerate() {
+                        at.insert(o.id, (frame, layer.id, n));
+                    }
+                }
+            }
+            *self.drawn_index.borrow_mut() = Some(DrawnIndex {
+                revision,
+                frame: self.current_frame,
+                multi,
+                at,
+            });
+        }
+        let hit = self.drawn_index.borrow().as_ref()?.at.get(&id).copied()?;
+        Some(hit)
     }
 
     /// What a **double-click** on a raw shape takes, besides the shape itself —
@@ -5499,11 +5775,19 @@ impl Editor {
             ExpandFill => self.expand_selection(2.0),
             ThickenStroke => self.scale_selected_strokes(1.25),
             ThinStroke => self.scale_selected_strokes(0.8),
-            TraceBitmap => self.trace_with(buzz_scene::TraceOptions {
+            // As many colours as the picture has (the palette stops on its
+            // own once a colour is no longer distinct): the six of the
+            // defaults merged a night street into black and white.
+            TraceBitmap => self.trace_in_background(buzz_scene::TraceOptions {
                 mode: buzz_scene::TraceMode::Outline,
+                colours: QUICK_TRACE_COLOURS,
+                keep_alpha: true,
+                soft_tones: true,
+                optimize_after: true,
+                even_lines: Some(0.0),
                 ..buzz_scene::TraceOptions::default()
             }),
-            TraceLineArt => self.trace_with(buzz_scene::TraceOptions::line_art()),
+            TraceLineArt => self.trace_in_background(buzz_scene::TraceOptions::line_art()),
             TraceBitmapOptions => match self.picture_selection_status() {
                 None => self.trace_dialog = Some(self.workspace.trace.with_saved_tuning()),
                 Some(status) => self.status = Some(status),
@@ -5511,6 +5795,7 @@ impl Editor {
             SmoothSelection => self.reshape_selection(Reshape::Smooth),
             StraightenSelection => self.reshape_selection(Reshape::Straighten),
             EvenLines => self.open_even_lines(),
+            OptimizeShapes => self.open_optimize_shapes(),
             RemoveBackgroundSpecks => {
                 let _ = self.remove_background_specks(None, SpecksRequest::default());
             }
@@ -5534,7 +5819,7 @@ impl Editor {
                 let id = self.doc_add_layer("Reference", LayerKind::Guide);
                 self.selection.set_active_layer(Some(id));
                 self.status =
-                    Some("Reference layer added — Import Image onto it to trace over".into());
+                    Some("Reference layer added — File > Import to Stage puts a picture on it to trace over".into());
             }
             MoveLayerUp => {
                 self.move_active_layer(true);
@@ -5763,6 +6048,10 @@ impl Editor {
             // Asks first (and may open the Set Master Audio dialog); the
             // shell intercepts this too (see `App::toggle_master_audio_mode`).
             ToggleMasterAudioMode => {}
+            // Needs the recording heard first (a background job): the shell starts it
+            // (see `App::lip_sync_all_start`) and calls `lip_sync_all_apply` with the result.
+            LipSyncAllCharacters => {}
+            AddLifeToAllCharacters => self.add_life_to_all(),
             ReapplyMasterAudio => {
                 if self.doc.master_audio_mode() {
                     self.enforce_master_audio_now();
@@ -5946,29 +6235,26 @@ impl Editor {
                 );
             }
             About => self.about.open = true,
-            // Every AI command lands in the AI panel (F7.0); the dialog flag
-            // is kept for a shell that draws the old window instead.
+            // AI commands never reveal the AI panel (Q1): the dialog flag opens
+            // the command's own window, drawn by the shell.
             // Handled by `App` (it owns the microphone service).
             VoicePushToTalk | VoiceMute => {}
             AiModels => {
                 self.ai_models.open = true;
-                self.workspace.reveal(buzz_ui::PanelId::Ai);
             }
             AiCharacterFromImage => {
                 self.preload_ai_character_from_selection();
                 self.ai_character.open = true;
-                self.workspace.reveal(buzz_ui::PanelId::Ai);
             }
             AiIdentifyAssets => {
                 self.open_ai_rename();
-                self.workspace.reveal(buzz_ui::PanelId::Ai);
             }
             // AiRigVectorCharacter, AiSceneFromImage and AiDirectStory are
             // intercepted in `App::dispatch`, before a command reaches here —
             // all three need a background thread (rigging also a GPU render
             // and pose detection; the scene-from-image one, a non-blocking
             // file dialog too) that `Editor` has no way to start on its own.
-            AiRigVectorCharacter | AiRigLayers | AiSceneFromImage | AiDirectStory => {}
+            AiRigVectorCharacter | AiRigLayers | AiSceneFromImage | AiSplitPictureIntoLayers | TraceBoldSplit | AiGenerateBackground | AiDirectStory | DeleteAndFill | AiRemoveObject => {}
             // Handled by `App` (`crate::estate`): they talk to BuzzEdit and
             // Buzzcaf Studio over HTTP, which `Editor` has no thread for.
             SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => {}
@@ -6555,6 +6841,16 @@ impl Editor {
     /// answering the one question its callers ask it — folding "and it went on
     /// a layer" into the returned name would make the name unusable as a name.
     pub fn import_sound(&mut self, path: &std::path::Path) -> anyhow::Result<String> {
+        self.import_sound_as(path, true)
+    }
+
+    /// File ▸ Import to Library for a sound: [`Self::import_sound`] without
+    /// the layer — the clip is in the library, and the timeline is untouched.
+    pub fn import_sound_to_library(&mut self, path: &std::path::Path) -> anyhow::Result<String> {
+        self.import_sound_as(path, false)
+    }
+
+    fn import_sound_as(&mut self, path: &std::path::Path, place: bool) -> anyhow::Result<String> {
         if let Some(refusal) = self.master_audio_import_refusal() {
             anyhow::bail!(refusal);
         }
@@ -6576,7 +6872,7 @@ impl Editor {
         self.doc.edit("Import Sound", |scene| {
             let id = scene.add_sound(&name, bytes, &format, rate, channels, length);
             imported = Some(id);
-            placed = place_sound_on_stage(scene, id, fps);
+            placed = place && place_sound_on_stage(scene, id, fps);
         });
         self.doc.end_gesture();
 
@@ -6728,6 +7024,210 @@ impl Editor {
         Ok(name)
     }
 
+    /// File ▸ Import to Library for a picture: the bitmap goes into the
+    /// document's image library (`Scene::add_image`) and nowhere else — no
+    /// object, no layer, no selection. Returns the name it took there.
+    pub fn import_image_to_library(&mut self, path: &std::path::Path) -> anyhow::Result<String> {
+        // Decoded inside `add_image`, before the document is touched, so a
+        // file that is not really a picture leaves no library entry behind.
+        let bytes = std::fs::read(path)?;
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Bitmap".to_string());
+
+        let revision_before = self.doc.scene().revision();
+        let mut added: Option<Result<String, String>> = None;
+        self.doc.edit("Import Image to Library", |scene| {
+            added = Some(
+                scene
+                    .add_image(&name, &bytes)
+                    .map(|asset| asset.name.clone())
+                    .map_err(|e| e.to_string()),
+            );
+        });
+        match added {
+            Some(Ok(name)) => {
+                self.doc.end_gesture();
+                Ok(name)
+            }
+            failed => {
+                // As in `import_image_at`: a decode failure bumps no revision,
+                // so there is no undo step of ours to take back.
+                if self.doc.scene().revision() != revision_before {
+                    self.doc.undo();
+                }
+                anyhow::bail!(failed
+                    .and_then(|r| r.err())
+                    .unwrap_or_else(|| "could not add it to the library".into()))
+            }
+        }
+    }
+
+    /// Carry out what the Library panel left on `LibraryState::media_request`
+    /// for a picture or sound.
+    pub fn run_library_media(&mut self, request: buzz_ui::library_panel::MediaRequest) {
+        use buzz_ui::library_panel::{LibraryMedia, MediaRequest};
+        match request {
+            MediaRequest::Place(LibraryMedia::Picture(id)) => self.place_library_image(id, None),
+            MediaRequest::Place(LibraryMedia::Sound(id)) => self.place_library_sound(id),
+            MediaRequest::Delete(media) => self.delete_library_media(media),
+        }
+    }
+
+    /// A picture or sound dragged out of the Library and dropped on the stage
+    /// at `screen` (screen coordinates, like [`Self::place_symbol_at`]). A
+    /// sound has no position; it goes on a layer of its own.
+    pub fn drop_library_media(&mut self, media: buzz_ui::library_panel::LibraryMedia, screen: Point) {
+        match media {
+            buzz_ui::library_panel::LibraryMedia::Picture(id) => {
+                let at = self.camera.screen_to_doc(screen);
+                self.place_library_image(id, Some(at));
+            }
+            buzz_ui::library_panel::LibraryMedia::Sound(id) => self.place_library_sound(id),
+        }
+    }
+
+    /// Put a library bitmap on the stage the way Import to Stage puts a file
+    /// there ([`Self::import_image_at`]): as artwork on the active layer, scaled
+    /// down (never up) to fit the stage, selected. Centred on `at` in document
+    /// coordinates, or on the camera centre without one.
+    pub fn place_library_image(&mut self, id: buzz_scene::ImageId, at: Option<Point>) {
+        let Some(asset) = self.doc.scene().images().get(id).cloned() else {
+            self.status = Some("That picture is no longer in the Library".into());
+            return;
+        };
+        let Some(layer) = self.active_layer() else {
+            self.status = Some("No layer available to place it on".into());
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+
+        let stage = self.doc.scene().stage().size;
+        let centre = at.unwrap_or(self.camera.center);
+        let frame = self.current_frame;
+        let (w, h) = (asset.width as f64, asset.height as f64);
+        let fit = (stage.width / w).min(stage.height / h).min(1.0);
+        let (w, h) = (w * fit, h * fit);
+        let rect = buzz_geom::Rect::new(
+            centre.x - w / 2.0,
+            centre.y - h / 2.0,
+            centre.x + w / 2.0,
+            centre.y + h / 2.0,
+        );
+        let name = asset.name.clone();
+        let mut placed = None;
+        self.doc.edit("Place Picture", |scene| {
+            placed = scene.place_image_in(layer, frame, asset, rect);
+        });
+        self.doc.end_gesture();
+        match placed {
+            Some(object) => {
+                self.selection.set([object]);
+                self.status = Some(format!("Placed {name} on the stage"));
+            }
+            None => self.status = Some("Could not place it on this frame".into()),
+        }
+    }
+
+    /// Put a library sound on the timeline the way Import to Stage does: on a
+    /// layer of its own from frame 1 ([`place_sound_on_stage`]).
+    pub fn place_library_sound(&mut self, id: buzz_scene::SoundId) {
+        if let Some(refusal) = self.master_audio_refusal(Some(id)) {
+            self.status = Some(refusal);
+            return;
+        }
+        let Some(name) = self.doc.scene().sounds().get(id).map(|s| s.name.clone()) else {
+            self.status = Some("That sound is no longer in the Library".into());
+            return;
+        };
+        let fps = self.doc.scene().stage().frame_rate.max(1.0);
+        let mut placed = false;
+        self.doc.edit("Place Sound", |scene| {
+            placed = place_sound_on_stage(scene, id, fps);
+        });
+        self.doc.end_gesture();
+        let scene = self.doc.scene().clone();
+        self.sound.refresh(&scene);
+        self.status = Some(if placed {
+            format!("Placed {name} on a layer of its own from frame 1")
+        } else {
+            format!("{name} has no length to place")
+        });
+    }
+
+    /// Delete a library picture or sound in one undo step, refusing — with a
+    /// status message — while the document still uses it.
+    pub fn delete_library_media(&mut self, media: buzz_ui::library_panel::LibraryMedia) {
+        use buzz_ui::library_panel::LibraryMedia;
+        match media {
+            LibraryMedia::Picture(id) => {
+                let Some(name) = self.doc.scene().images().get(id).map(|a| a.name.clone()) else {
+                    return;
+                };
+                let uses = self.doc.scene().image_usage().get(&id).copied().unwrap_or(0);
+                if uses > 0 {
+                    self.status = Some(format!(
+                        "{name} is still used {uses} time(s) in the document; delete those first"
+                    ));
+                    return;
+                }
+                self.doc.edit("Delete Picture", |scene| {
+                    scene.images_mut().remove(id);
+                });
+                self.doc.end_gesture();
+                self.status = Some(format!("Deleted {name} from the Library"));
+            }
+            LibraryMedia::Sound(id) => {
+                let Some(name) = self.doc.scene().sounds().get(id).map(|s| s.name.clone()) else {
+                    return;
+                };
+                let uses = self.doc.scene().sound_usage().get(&id).copied().unwrap_or(0);
+                if uses > 0 {
+                    self.status = Some(format!(
+                        "{name} is still on a timeline {uses} time(s); take it off first"
+                    ));
+                    return;
+                }
+                self.doc.edit("Delete Sound", |scene| {
+                    scene.sounds_mut().remove(id);
+                });
+                self.doc.end_gesture();
+                let scene = self.doc.scene().clone();
+                self.sound.refresh(&scene);
+                self.status = Some(format!("Deleted {name} from the Library"));
+            }
+        }
+        self.library.selected_media = None;
+    }
+
+    /// **Generate Background's landing** (E1): a new layer `Background` at the
+    /// bottom of the timeline being edited, active, with the picture on it
+    /// centred on the stage and selected. Two undo steps (the layer, then the
+    /// import). Returns the picture's object.
+    pub fn place_background(&mut self, path: &std::path::Path) -> anyhow::Result<ObjectId> {
+        let stage = self.doc.scene().stage().size;
+        let mut layer = None;
+        self.doc.edit("Add Background Layer", |scene| {
+            let id = scene.add_layer("Background", buzz_scene::LayerKind::Normal);
+            let last = scene.layers().len().saturating_sub(1);
+            scene.reorder_layer(id, last);
+            layer = Some(id);
+        });
+        self.doc.end_gesture();
+        self.selection.set_active_layer(layer);
+        let offset = (stage.width / 2.0 - self.camera.center.x, stage.height / 2.0 - self.camera.center.y);
+        self.import_image_at(path, offset)?;
+        self.selection
+            .ids()
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("the picture was not placed"))
+    }
+
     /// Put the most recently imported sound on the current keyframe.
     ///
     /// Put the newest import on the keyframe the playhead is on.
@@ -6743,7 +7243,7 @@ impl Editor {
             return;
         };
         let Some(sound) = self.doc.scene().sounds().iter().last().map(|s| s.id) else {
-            self.status = Some("Import a sound first: File > Import Sound".into());
+            self.status = Some("Import a sound first: File > Import to Stage".into());
             return;
         };
         if let Some(refusal) = self.master_audio_refusal(Some(sound)) {
@@ -6868,6 +7368,14 @@ impl Editor {
         self.waveform_cache.revision = Some(revision);
         self.waveform_cache.map = map.clone();
         map
+    }
+
+    /// Drop the revision gate on [`Self::waveforms`] so the next call reassembles
+    /// the map. Needed when clips land off-thread: the document revision does
+    /// not move when a decode finishes, so a map built before it would
+    /// otherwise stay without that layer's waveform.
+    pub fn forget_waveforms(&mut self) {
+        self.waveform_cache.revision = None;
     }
 
     /// Make a mouth symbol with a frame per shape.
@@ -8150,6 +8658,8 @@ impl Editor {
                 .root()
                 .map(|p| p.to_path_buf()),
             prompt_answers: answers,
+            hooks: Default::default(),
+            overrides: Vec::new(),
         };
 
         let mut working = self.doc.scene().clone();
@@ -9065,6 +9575,47 @@ impl Editor {
 
     /// Set the tween on every distinct keyframe span touched by the timeline selection.
     fn set_tween(&mut self, tween: Tween) {
+        if self.camera_selected {
+            // The camera's keys always interpolate; a tween on its row is the
+            // governing key's pacing. Classic = even, Motion = ease in and out,
+            // as a deliberate camera move gets. Needs a later key to move to.
+            let frame = self.current_frame;
+            let camera = self.doc.scene().camera();
+            if camera.locked {
+                self.status = Some("The camera is locked".into());
+                return;
+            }
+            let Some(start) = camera.keys().iter().rev().find(|k| k.frame <= frame).copied()
+            else {
+                self.status = Some("Tween: key the camera first (F6)".into());
+                return;
+            };
+            if !tween.is_active() {
+                self.status = Some(
+                    "Camera keys always interpolate - remove a key or match its neighbour to hold"
+                        .into(),
+                );
+                return;
+            }
+            if tween.kind == buzz_scene::TweenKind::Shape {
+                self.status = Some("A shape tween needs artwork - the camera has none".into());
+                return;
+            }
+            if !camera.keys().iter().any(|k| k.frame > start.frame) {
+                self.status = Some("Tween: add a later camera keyframe to move to (F6)".into());
+                return;
+            }
+            let ease = if tween.kind == buzz_scene::TweenKind::Motion {
+                buzz_scene::camera_track::SMOOTH
+            } else {
+                buzz_scene::Easing::Linear
+            };
+            self.doc.edit("Camera Tween", |scene| {
+                scene.camera_mut().set_key(buzz_scene::CameraKey { ease, ..start });
+            });
+            self.status = Some("Camera tween set".into());
+            return;
+        }
         let targets = self.timeline_targets();
         if targets.is_empty() {
             return;
@@ -10014,41 +10565,89 @@ impl Editor {
             keep_weight: d.keep_weight,
             straighten: d.straighten,
             solid_above: d.solid_above,
+            bold: d.bold,
         }
     }
 
-    /// **Even Out Lines…**: find and measure the ink of the scope, open the
-    /// dialog on its measured widths, and preview the result on the stage.
+    /// **Even Out Lines…**: open the dialog and have the ink of the scope
+    /// found, measured and traced off the UI thread (T12; the app runs
+    /// [`Self::even_lines_work`] on a task thread); [`Self::finish_even_lines`]
+    /// then previews it on the stage.
     pub fn open_even_lines(&mut self) {
-        if self.even_lines.is_some() {
+        if self.even_lines.is_some() || self.even_lines_dialog.open {
             return;
         }
         let scope = self.even_lines_scope(None);
-        let plan = crate::rigging::plan_even_lines(self.doc.scene(), &scope);
-        if plan.is_empty() {
-            self.status = Some(
-                "Even Out Lines: no traced ink here (filled shapes on an \"Ink\" layer, or dark filled shapes)".into(),
-            );
+        self.even_lines_gen += 1;
+        self.even_lines_rev = self.doc.scene().revision();
+        self.even_lines_queued = None;
+        self.even_lines_work = Some((self.even_lines_gen, EvenLinesWork::Open { scene: self.doc.scene().clone(), scope }));
+        let d = &mut self.even_lines_dialog;
+        d.open = true;
+        d.working = true;
+        d.has_face = false;
+        d.has_body = false;
+        (d.face_lines, d.body_lines, d.solids) = (0, 0, 0);
+    }
+
+    /// Run the queued Even Out Lines work now, on the calling thread (tests
+    /// and probes; the app runs it on a task thread).
+    pub fn finish_even_lines_now(&mut self) {
+        while let Some((generation, work)) = self.even_lines_work.take() {
+            let done = run_even_lines_work(work, &|_| {});
+            self.finish_even_lines(generation, done);
+        }
+    }
+
+    /// An Even Out Lines task came to `done`: open the session and preview it,
+    /// or take the new trace in; then start whatever was asked meanwhile.
+    pub fn finish_even_lines(&mut self, generation: u64, done: EvenLinesDone) {
+        if generation != self.even_lines_gen || !self.even_lines_dialog.open {
             return;
         }
-        let quarter = |v: f64, lo: f64, hi: f64| ((v * 4.0).round() / 4.0).clamp(lo, hi);
-        let d = &mut self.even_lines_dialog;
-        d.face_width = quarter(plan.face_measured.or(plan.ink_measured).unwrap_or(1.5), 0.25, 12.0);
-        d.body_width = quarter(plan.body_measured.or(plan.ink_measured).unwrap_or(2.0), 0.25, 12.0);
-        d.keep_weight = true;
-        d.straighten = 0.0;
-        d.solid_above = quarter(crate::rigging::default_solid_above(&plan), 0.5, 40.0);
-        d.has_face = plan.has_face();
-        d.has_body = plan.has_body();
-        d.open = true;
-        let trace = crate::rigging::trace_even_lines(&plan, d.straighten, d.solid_above, false);
-        self.doc.end_gesture();
-        self.even_lines = Some(EvenLinesSession {
-            plan,
-            trace,
-            checkpoint: self.doc.run_checkpoint(),
-        });
+        self.even_lines_dialog.working = false;
+        match done {
+            EvenLinesDone::Opened { plan, trace } => {
+                if self.doc.scene().revision() != self.even_lines_rev {
+                    self.even_lines_dialog.open = false;
+                    self.status = Some("Even Out Lines: the document changed meanwhile, run it again".into());
+                    return;
+                }
+                if plan.is_empty() {
+                    self.even_lines_dialog.open = false;
+                    self.status = Some(
+                        "Even Out Lines: no traced ink here (filled shapes on an \"Ink\" layer, or dark filled shapes)"
+                            .into(),
+                    );
+                    return;
+                }
+                let defaults = EvenLinesDialogDefaults::of(&plan);
+                let d = &mut self.even_lines_dialog;
+                d.face_width = defaults.face_width;
+                d.body_width = defaults.body_width;
+                d.keep_weight = true;
+                d.straighten = 0.0;
+                d.solid_above = defaults.solid_above;
+                d.bold = false;
+                d.bold_width = defaults.bold_width;
+                d.has_face = plan.has_face();
+                d.has_body = plan.has_body();
+                self.doc.end_gesture();
+                self.even_lines = Some(EvenLinesSession {
+                    plan: Arc::new(plan),
+                    trace,
+                    checkpoint: self.doc.run_checkpoint(),
+                });
+            }
+            EvenLinesDone::Retraced(trace) => {
+                let Some(session) = self.even_lines.as_mut() else { return };
+                session.trace = trace;
+            }
+        }
         self.even_lines_preview();
+        if let Some(draft) = self.even_lines_queued.take() {
+            self.even_lines_retrace(draft);
+        }
     }
 
     /// Write the dialog's result over the scope's original ink — exactly what
@@ -10056,10 +10655,14 @@ impl Editor {
     /// one, Cancel takes them back.
     fn even_lines_preview(&mut self) {
         let settings = self.even_lines_settings();
+        if self.even_lines_dialog.working {
+            return;
+        }
         let Some(session) = self.even_lines.as_mut() else { return };
         let mut report = crate::rigging::EvenLinesReport::default();
+        let plan = session.plan.clone();
         self.doc.edit("Even Out Lines", |scene| {
-            report = crate::rigging::apply_even_lines(scene, &session.plan, &mut session.trace, &settings);
+            report = crate::rigging::apply_even_lines(scene, &plan, &mut session.trace, &settings);
         });
         let d = &mut self.even_lines_dialog;
         d.face_lines = report.face_lines;
@@ -10068,20 +10671,29 @@ impl Editor {
     }
 
     /// Trace the open session's ink again for the dialog's straighten and
-    /// solid-above (`draft`: at the lower scale, while a slider drags).
+    /// solid-above (`draft`: at the lower scale, while a slider drags), on a
+    /// task thread; one asked for while another runs waits its turn.
     fn even_lines_retrace(&mut self, draft: bool) {
-        let settings = self.even_lines_settings();
-        if let Some(session) = self.even_lines.as_mut() {
-            // Only the sets whose result can change are traced again (E1b).
-            let previous = std::mem::take(&mut session.trace);
-            session.trace = crate::rigging::retrace_even_lines(
-                &session.plan,
-                previous,
-                settings.straighten,
-                settings.solid_above,
-                draft,
-            );
+        if self.even_lines_dialog.working {
+            self.even_lines_queued = Some(self.even_lines_queued.map_or(draft, |q| q && draft));
+            return;
         }
+        let settings = self.even_lines_settings();
+        let Some(session) = self.even_lines.as_mut() else { return };
+        // Only the sets whose result can change are traced again (E1b).
+        let previous = std::mem::take(&mut session.trace);
+        self.even_lines_gen += 1;
+        self.even_lines_work = Some((
+            self.even_lines_gen,
+            EvenLinesWork::Retrace {
+                plan: session.plan.clone(),
+                previous,
+                straighten: settings.straighten,
+                solid_above: settings.solid_above,
+                draft,
+            },
+        ));
+        self.even_lines_dialog.working = true;
     }
 
     /// What the Even Out Lines dialog asked for.
@@ -10090,17 +10702,20 @@ impl Editor {
         match action {
             A::None => {}
             A::Widths => self.even_lines_preview(),
-            A::Retrace { draft } => {
-                self.even_lines_retrace(draft);
-                self.even_lines_preview();
-            }
+            A::Retrace { draft } => self.even_lines_retrace(draft),
             A::Apply => {
+                if self.even_lines_dialog.working {
+                    return;
+                }
                 let settings = self.even_lines_settings();
                 let stale = self.even_lines.as_ref().is_some_and(|s| {
                     s.trace.draft || s.trace.straighten != settings.straighten || s.trace.solid_above != settings.solid_above
                 });
                 if stale {
+                    // A full trace first (a slider's release asks for one;
+                    // this is only for a draft left behind).
                     self.even_lines_retrace(false);
+                    self.finish_even_lines_now();
                 }
                 self.even_lines_preview();
                 self.even_lines_dialog.open = false;
@@ -10116,6 +10731,11 @@ impl Editor {
             }
             A::Cancel => {
                 self.even_lines_dialog.open = false;
+                self.even_lines_dialog.working = false;
+                // The task in flight (if any) answers a generation nobody waits for.
+                self.even_lines_gen += 1;
+                self.even_lines_work = None;
+                self.even_lines_queued = None;
                 let Some(session) = self.even_lines.take() else { return };
                 // Back to the checkpoint: no undo step and no redo entry (E1b).
                 self.doc.restore_checkpoint(session.checkpoint);
@@ -10143,18 +10763,20 @@ impl Editor {
             return Err(message);
         }
         let quarter = |v: f64, lo: f64, hi: f64| ((v * 4.0).round() / 4.0).clamp(lo, hi);
+        let bold = request.bold.unwrap_or(false);
         let settings = crate::rigging::EvenLinesSettings {
-            face_width: request
-                .face_width
-                .unwrap_or_else(|| quarter(plan.face_measured.or(plan.ink_measured).unwrap_or(1.5), 0.25, 12.0)),
-            body_width: request
-                .body_width
-                .unwrap_or_else(|| quarter(plan.body_measured.or(plan.ink_measured).unwrap_or(2.0), 0.25, 12.0)),
+            face_width: request.face_width.unwrap_or_else(|| {
+                if bold { quarter(plan.bold_width, 0.25, 12.0) } else { quarter(plan.face_measured.or(plan.ink_measured).unwrap_or(1.5), 0.25, 12.0) }
+            }),
+            body_width: request.body_width.unwrap_or_else(|| {
+                if bold { quarter(plan.bold_width, 0.25, 12.0) } else { quarter(plan.body_measured.or(plan.ink_measured).unwrap_or(2.0), 0.25, 12.0) }
+            }),
             keep_weight: request.keep_weight.unwrap_or(true),
             straighten: request.straighten.unwrap_or(0.0),
             solid_above: request
                 .solid_above
                 .unwrap_or_else(|| quarter(crate::rigging::default_solid_above(&plan), 0.5, 40.0)),
+            bold,
         };
         let mut trace = crate::rigging::trace_even_lines(&plan, settings.straighten, settings.solid_above, false);
         let mut report = crate::rigging::EvenLinesReport::default();
@@ -11070,8 +11692,60 @@ impl Editor {
             .unwrap_or_default()
     }
 
+    /// **The frame commands on the camera row.** The camera is not a layer, so
+    /// F5/F6/F7 and the frame menu act on its own keys at the playhead: Insert
+    /// Keyframe keys the camera as it is now, Insert Blank Keyframe keys it
+    /// reset (centred, 1x, level), Insert/Remove Frame open or close a span
+    /// by moving the later keys, Clear Keyframe removes the key. Returns
+    /// `false` for ops the camera has no meaning for, so they fall through.
+    fn camera_frame_op(&mut self, op: FrameOp) -> bool {
+        if !matches!(
+            op,
+            FrameOp::InsertFrame
+                | FrameOp::RemoveFrame
+                | FrameOp::InsertKeyframe
+                | FrameOp::InsertBlankKeyframe
+                | FrameOp::ClearKeyframe
+        ) {
+            return false;
+        }
+        if self.doc.scene().camera().locked {
+            self.status = Some("The camera is locked".into());
+            return true;
+        }
+        let frame = self.current_frame;
+        match op {
+            FrameOp::InsertKeyframe => self.add_camera_key(),
+            FrameOp::InsertBlankKeyframe => {
+                let centre = self.doc.scene().stage().stage_rect().center();
+                self.doc.edit(op.label(), |scene| {
+                    scene.camera_mut().enabled = true;
+                    scene
+                        .camera_mut()
+                        .set_key(buzz_scene::CameraKey::new(frame, centre));
+                });
+            }
+            FrameOp::ClearKeyframe => {
+                self.doc.edit(op.label(), |scene| {
+                    scene.camera_mut().remove_key(frame);
+                });
+            }
+            FrameOp::InsertFrame | FrameOp::RemoveFrame => {
+                let delta = if matches!(op, FrameOp::InsertFrame) { 1 } else { -1 };
+                self.doc.edit(op.label(), |scene| {
+                    scene.camera_mut().shift_after(frame, delta);
+                });
+            }
+            _ => {}
+        }
+        true
+    }
+
     /// Apply a frame operation to all selected cells in one undo transaction.
     fn frame_op(&mut self, op: FrameOp) {
+        if self.camera_selected && self.camera_frame_op(op) {
+            return;
+        }
         let mut targets = self.timeline_targets();
         if targets.is_empty() {
             return;
@@ -12444,7 +13118,7 @@ impl Editor {
 
         // Phase 1: read the modified state at each frame, with the modifiers
         // still active. Collected before mutating so the borrow is done.
-        let mut baked: Vec<(u32, Affine, Option<Vec<f64>>)> = Vec::new();
+        let mut baked: Vec<(u32, Affine, Option<Vec<f64>>, Option<ObjectKind>)> = Vec::new();
         {
             let scene = self.doc.scene();
             let Some(l) = scene.layers().get(layer) else {
@@ -12464,7 +13138,15 @@ impl Editor {
                     ObjectKind::Armature(rig) => Some(rig.armature.pose()),
                     _ => None,
                 };
-                baked.push((frame, transform, pose));
+                // **Hair Flow bends the outline**, so its keys carry the flowed
+                // artwork itself, not only a placement.
+                let flowed = obj
+                    .modifiers
+                    .iter()
+                    .any(|m| matches!(m, buzz_scene::Modifier::HairFlow { .. }))
+                    .then(|| base.kind.clone())
+                    .filter(|k| matches!(k, ObjectKind::Shape(_) | ObjectKind::Group(_)));
+                baked.push((frame, transform, pose, flowed));
             }
         }
         if baked.is_empty() {
@@ -12499,17 +13181,27 @@ impl Editor {
                     l.frames.insert_frame(last);
                 }
             });
-            for (frame, transform, pose) in &baked {
+            for (frame, transform, pose, flowed) in &baked {
                 scene.ensure_keyframe(layer, *frame);
                 scene.update_object_at(*frame, id, |o| {
                     o.transform = *transform;
                     if let (Some(p), ObjectKind::Armature(rig)) = (pose.as_ref(), &mut o.kind) {
                         rig.armature.set_pose(p);
                     }
+                    if let Some(kind) = flowed {
+                        o.kind = kind.clone();
+                    }
                 });
                 if *frame != last {
+                    // Flowed artwork morphs between its keys (same outline, the
+                    // points moved); a group of shapes holds on twos instead.
+                    let tween = match flowed {
+                        Some(ObjectKind::Shape(_)) => buzz_scene::Tween::shape(),
+                        Some(_) => buzz_scene::Tween::default(),
+                        None => buzz_scene::Tween::motion(),
+                    };
                     scene.update_layer(layer, |l| {
-                        l.frames.set_tween(*frame, buzz_scene::Tween::motion());
+                        l.frames.set_tween(*frame, tween);
                     });
                 }
             }
@@ -13456,17 +14148,46 @@ impl Editor {
         }
     }
 
+    /// Trace the selected pictures now, on the calling thread. The agent/API
+    /// and tests use this; UI clicks use [`Self::trace_in_background`].
     pub fn trace_with(&mut self, options: buzz_scene::TraceOptions) {
+        let Some(job) = self.prepare_trace(options) else { return };
+        match run_trace_job(&job, &|| false) {
+            Ok(result) => self.apply_trace(job, result),
+            Err(message) => self.status = Some(message),
+        }
+    }
+
+    /// Queue a trace for the app's task thread (`App::poll_trace`): a 5120 px
+    /// picture takes seconds to trace and must not freeze the UI meanwhile.
+    pub fn trace_in_background(&mut self, options: buzz_scene::TraceOptions) {
+        if let Some(job) = self.prepare_trace(options) {
+            self.pending_trace = Some(job);
+            self.status = Some("Tracing\u{2026} (Tasks panel)".into());
+        }
+    }
+
+    /// Run a queued trace synchronously. For callers that read the result
+    /// straight after the command (agent, API, probes).
+    pub fn finish_pending_trace_now(&mut self) {
+        let Some(job) = self.pending_trace.take() else { return };
+        match run_trace_job(&job, &|| false) {
+            Ok(result) => self.apply_trace(job, result),
+            Err(message) => self.status = Some(message),
+        }
+    }
+
+    /// Everything a trace needs from the document, read up front so the pixel
+    /// work can run without the editor and a refusal leaves no half-edit.
+    fn prepare_trace(&mut self, options: buzz_scene::TraceOptions) -> Option<TraceJob> {
         if let Some(status) = self.picture_selection_status() {
             self.status = Some(status);
-            return;
+            return None;
         }
         let ids = self.selection.ids();
         let at = self.edit_at();
 
-        // Everything needed is read before the document is touched, so a
-        // picture that turns out not to be traceable leaves no half-edit.
-        let mut jobs: Vec<(LayerId, ObjectId, Affine, buzz_scene::TraceReport)> = Vec::new();
+        let mut items: Vec<TraceJobItem> = Vec::new();
         let mut not_pictures = 0usize;
         for id in &ids {
             let Some((layer, object)) = self.doc.scene().find_object(*id) else {
@@ -13485,19 +14206,16 @@ impl Editor {
                 not_pictures += 1;
                 continue;
             }
-            let report = buzz_scene::trace(asset.width, asset.height, &asset.pixels, &options);
-            if report.shapes.is_empty() {
-                self.status = Some(report.message);
-                return;
-            }
-            // Pixels → the unit square → the image's own space → the layer.
-            let place = object.transform
-                * fill.transform
-                * Affine::scale_non_uniform(1.0 / asset.width as f64, 1.0 / asset.height as f64);
-            jobs.push((layer, *id, place, report));
+            items.push(TraceJobItem {
+                layer,
+                id: *id,
+                object_transform: object.transform,
+                fill_transform: fill.transform,
+                asset: asset.clone(),
+            });
         }
 
-        if jobs.is_empty() {
+        if items.is_empty() {
             self.status = Some(if not_pictures > 0 {
                 "Nothing selected is a picture \u{2014} tracing turns an imported bitmap \
                  into shapes"
@@ -13505,9 +14223,35 @@ impl Editor {
             } else {
                 "Nothing there to trace".to_string()
             });
+            return None;
+        }
+        Some(TraceJob { items, frame: at.frame, options })
+    }
+
+    /// Put a finished trace into the document. The document may have changed
+    /// (or been replaced) while it ran, so a picture that is gone, or is no
+    /// longer the same bitmap, is skipped rather than edited blind.
+    pub fn apply_trace(&mut self, job: TraceJob, result: TraceResult) {
+        let kept_background = result.kept_background;
+        let mut jobs: Vec<(LayerId, ObjectId, Affine, buzz_scene::TraceReport)> = Vec::new();
+        for (item, (place, report)) in job.items.iter().zip(result.items) {
+            let still_there = self.doc.scene().find_object(item.id).is_some_and(|(_, object)| {
+                let ObjectKind::Shape(shape) = &object.kind else { return false };
+                matches!(
+                    shape.fill.as_ref().map(|f| &f.paint),
+                    Some(buzz_scene::Paint::Image(fill)) if std::sync::Arc::ptr_eq(&fill.asset, &item.asset)
+                )
+            });
+            if still_there {
+                jobs.push((item.layer, item.id, place, report));
+            }
+        }
+        if jobs.is_empty() {
+            self.status = Some("The picture changed while tracing \u{2014} nothing traced".into());
             return;
         }
 
+        let at = EditAt { frame: job.frame, ..self.edit_at() };
         let mut made = 0usize;
         let mut specks = 0usize;
         let mut strokes = 0usize;
@@ -13520,9 +14264,18 @@ impl Editor {
                 strokes += report.strokes;
                 fills += report.fills;
                 colours_note = report.message.clone();
-                for shape in &report.shapes {
+                // Keep-textures fills carry a placeholder image: into the library.
+                let mut adopted = report.shapes.clone();
+                buzz_scene::adopt_texture_images(&mut adopted, scene);
+                for (shape_index, shape) in adopted.iter().enumerate() {
                     let mut shape = shape.clone();
                     shape.path = *place * shape.path.clone();
+                    // An image fill rides the same placement as the path.
+                    if let Some(fill) = shape.fill.as_mut()
+                        && let buzz_scene::Paint::Image(image) = &mut fill.paint
+                    {
+                        image.transform = *place * image.transform;
+                    }
                     // A stroke's width is a scalar in the picture's own
                     // pixels; `place` can scale the picture unevenly onto the
                     // stage, so the width has to follow the same area scale
@@ -13531,6 +14284,11 @@ impl Editor {
                         s.width *= place.determinant().abs().sqrt();
                     }
                     if let Some(new) = scene.add_shape_at(*layer, at.frame, shape) {
+                        // A soft edge (`soft_tones`) is a Blur filter on its shape.
+                        if let Some(&(_, radius)) = report.blurs.iter().find(|(i, _)| *i == shape_index) {
+                            let radius = radius * place.determinant().abs().sqrt();
+                            scene.update_object_at(at.frame, new, |o| o.filters.push(buzz_scene::TraceReport::blur_filter(radius)));
+                        }
                         fresh.push(new);
                         made += 1;
                     }
@@ -13553,6 +14311,11 @@ impl Editor {
             ),
             (false, false) => format!("Traced {made} shapes"),
         });
+        if kept_background {
+            if let Some(status) = self.status.as_mut() {
+                status.push_str(" \u{2014} background kept: the picture is not on paper");
+            }
+        }
     }
 
     /// **Extend Part Under Neighbours** — continue each selected part symbol's
@@ -16845,6 +17608,258 @@ fn interior_point(path: &buzz_geom::BezPath) -> Option<Point> {
 /// worse than not having it.
 fn same_colour(a: Color, b: Color) -> bool {
     a.to_rgba8().to_u8_array() == b.to_rgba8().to_u8_array()
+}
+
+/// Colours asked of the quick Trace Bitmap: the dialog's ceiling. The palette
+/// stops on its own once a colour is no longer distinct (a night street comes
+/// out at ~28), so this is "every colour the picture has", not 64 shades.
+const QUICK_TRACE_COLOURS: usize = 64;
+
+/// Picture pixels traced per stage unit, at most.
+///
+/// A photo imported at 5120 × 2880 and shown at 1920 × 1080 carries 2.7
+/// pixels per stage unit; tracing all of them took 150 s on the UI thread
+/// (Auto → colour lines) for detail no zoom short of 270 % shows. Two per unit
+/// keeps edges within a stage pixel at 200 % and measured (night street,
+/// 48 colours, vs the source) p99 colour error 22.6 at 2× against 18.8 at the
+/// full 2.7×, in 5 s instead of 10.
+const TRACE_PX_PER_STAGE_UNIT: f64 = 2.0;
+
+/// One picture to trace, as read from the document.
+#[derive(Clone)]
+pub struct TraceJobItem {
+    layer: LayerId,
+    id: ObjectId,
+    object_transform: Affine,
+    fill_transform: Affine,
+    asset: std::sync::Arc<buzz_scene::ImageAsset>,
+}
+
+/// A trace ready to run off the editor: see [`run_trace_job`].
+#[derive(Clone)]
+pub struct TraceJob {
+    items: Vec<TraceJobItem>,
+    frame: u32,
+    options: buzz_scene::TraceOptions,
+}
+
+/// What [`run_trace_job`] made: per job item, the placement and the report.
+pub struct TraceResult {
+    items: Vec<(Affine, buzz_scene::TraceReport)>,
+    kept_background: bool,
+}
+
+/// All the pixel work of Trace Bitmap, with no editor access so it can run on
+/// a task thread. `Err` carries the status message for a picture that traced
+/// to nothing (or for a cancel).
+pub fn run_trace_job(job: &TraceJob, cancelled: &dyn Fn() -> bool) -> Result<TraceResult, String> {
+    let mut items = Vec::new();
+    let mut kept_background = false;
+    for item in &job.items {
+        if cancelled() {
+            return Err("Trace cancelled".into());
+        }
+        let asset = &item.asset;
+        // Pixels → the unit square → the image's own space → the layer.
+        let full_place = item.object_transform
+            * item.fill_transform
+            * Affine::scale_non_uniform(1.0 / asset.width as f64, 1.0 / asset.height as f64);
+        let (w, h, pixels) = trace_pixels(asset, full_place);
+        let mut options = resolve_auto_mode(w, h, &pixels, job.options);
+        // Trace Bitmap keeps translucency, whichever route (quick or dialog).
+        options.keep_alpha = true;
+        if options.drop_background && !border_is_paper(w, h, &pixels) {
+            options.drop_background = false;
+            kept_background = true;
+        }
+        if cancelled() {
+            return Err("Trace cancelled".into());
+        }
+        let mut report = buzz_scene::trace(w, h, &pixels, &options);
+        if report.shapes.is_empty() {
+            return Err(report.message);
+        }
+        let place = item.object_transform
+            * item.fill_transform
+            * Affine::scale_non_uniform(1.0 / w as f64, 1.0 / h as f64);
+        if options.optimize_after && !cancelled() {
+            optimize_trace_report(&mut report, place);
+        }
+        items.push((place, report));
+    }
+    Ok(TraceResult { items, kept_background })
+}
+
+/// **Trace Bitmap on a bare scene** (JSFL `document.traceBitmap`, JSFL_COMMANDS_PLAN
+/// J6): the pictures `ids` on the open timeline become shapes at `frame`, exactly
+/// as [`Editor::trace_with`] makes them (same job, same placement, soft edges as
+/// blurs), and the new shapes' ids come back. The picture goes last.
+pub fn trace_pictures_in_scene(
+    scene: &mut buzz_scene::Scene,
+    frame: u32,
+    ids: &[ObjectId],
+    options: buzz_scene::TraceOptions,
+) -> Result<Vec<ObjectId>, String> {
+    let mut items: Vec<TraceJobItem> = Vec::new();
+    for id in ids {
+        let Some((layer, object)) = scene.find_object(*id) else { continue };
+        let ObjectKind::Shape(shape) = &object.kind else { continue };
+        let Some(buzz_scene::Paint::Image(fill)) = shape.fill.as_ref().map(|f| &f.paint) else {
+            continue;
+        };
+        if fill.asset.width == 0 || fill.asset.height == 0 {
+            continue;
+        }
+        items.push(TraceJobItem {
+            layer,
+            id: *id,
+            object_transform: object.transform,
+            fill_transform: fill.transform,
+            asset: fill.asset.clone(),
+        });
+    }
+    if items.is_empty() {
+        return Err("Nothing selected is a picture \u{2014} tracing turns an imported bitmap into shapes".into());
+    }
+    let job = TraceJob { items, frame, options };
+    let result = run_trace_job(&job, &|| false)?;
+    let mut fresh: Vec<ObjectId> = Vec::new();
+    for (item, (place, report)) in job.items.iter().zip(result.items) {
+        let mut adopted = report.shapes.clone();
+        buzz_scene::adopt_texture_images(&mut adopted, scene);
+        for (shape_index, shape) in adopted.iter().enumerate() {
+            let mut shape = shape.clone();
+            shape.path = place * shape.path.clone();
+            if let Some(fill) = shape.fill.as_mut()
+                && let buzz_scene::Paint::Image(image) = &mut fill.paint
+            {
+                image.transform = place * image.transform;
+            }
+            if let Some(s) = shape.stroke.as_mut() {
+                s.width *= place.determinant().abs().sqrt();
+            }
+            if let Some(new) = scene.add_shape_at(item.layer, frame, shape) {
+                if let Some(&(_, radius)) = report.blurs.iter().find(|(i, _)| *i == shape_index) {
+                    let radius = radius * place.determinant().abs().sqrt();
+                    scene.update_object_at(frame, new, |o| o.filters.push(buzz_scene::TraceReport::blur_filter(radius)));
+                }
+                fresh.push(new);
+            }
+        }
+        scene.remove_object(item.id);
+    }
+    Ok(fresh)
+}
+
+/// **Optimize after trace** (T13): the mild [`OptimizeSettings`] over a
+/// report's shapes (`place` maps the picture's pixels to the stage, which the
+/// tolerance and the tiny-shape area are measured in). Soft-edged shapes
+/// (`blurs`) are indexed by position, so with any of them the shapes keep
+/// their places: curves are refitted and nothing merged or dropped.
+fn optimize_trace_report(report: &mut buzz_scene::TraceReport, place: Affine) {
+    let mut settings = crate::rigging::OptimizeSettings::default();
+    if !report.blurs.is_empty() {
+        settings.merge_same_colour = false;
+        settings.remove_tiny = 0.0;
+    }
+    let input: Vec<(Affine, buzz_scene::ShapeData)> = report.shapes.drain(..).map(|s| (place, s)).collect();
+    let optimized = crate::rigging::optimize_shapes(&input, &settings, &|| false);
+    report.shapes = optimized.pieces.into_iter().map(|p| p.shape).collect();
+}
+
+/// The longest side traced, whatever the stage size.
+const TRACE_MAX_SIDE: u32 = 4096;
+
+/// The picture's pixels at the resolution [`Editor::trace_with`] traces:
+/// its own when it is shown at no more than [`TRACE_PX_PER_STAGE_UNIT`],
+/// else resampled down to that (and to [`TRACE_MAX_SIDE`]). `place` maps the
+/// picture's own pixels onto the layer.
+fn trace_pixels(
+    asset: &buzz_scene::ImageAsset,
+    place: Affine,
+) -> (u32, u32, std::borrow::Cow<'_, [u8]>) {
+    let (w, h) = (asset.width, asset.height);
+    let stage_per_px = place.determinant().abs().sqrt();
+    let by_stage = if stage_per_px > 0.0 { TRACE_PX_PER_STAGE_UNIT * stage_per_px } else { 1.0 };
+    let by_side = TRACE_MAX_SIDE as f64 / w.max(h) as f64;
+    let scale = by_stage.min(by_side);
+    if scale >= 0.95 {
+        return (w, h, std::borrow::Cow::Borrowed(asset.pixels.as_slice()));
+    }
+    let (nw, nh) = (((w as f64 * scale).round() as u32).max(1), ((h as f64 * scale).round() as u32).max(1));
+    let Some(mut img) = image::RgbaImage::from_raw(w, h, asset.pixels.as_ref().clone()) else {
+        return (w, h, std::borrow::Cow::Borrowed(asset.pixels.as_slice()));
+    };
+    // Straight alpha averaged as is darkens a cut-out's rim toward the
+    // transparent pixels' (usually black) RGB, so resample premultiplied.
+    let translucent = img.pixels().any(|p| p[3] < 255);
+    if translucent {
+        for p in img.pixels_mut() {
+            let a = p[3] as u32;
+            for c in 0..3 {
+                p[c] = ((p[c] as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
+    let mut small = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3);
+    if translucent {
+        for p in small.pixels_mut() {
+            let a = p[3] as u32;
+            if a > 0 {
+                for c in 0..3 {
+                    p[c] = ((p[c] as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
+    }
+    (nw, nh, std::borrow::Cow::Owned(small.into_raw()))
+}
+
+/// Whether the picture sits on paper: most of its opaque border is light and
+/// nearly colourless (luma ≥ 200, channel spread ≤ 30), or it has no opaque
+/// border at all (a cut-out).
+///
+/// Drop Background throws away the colour covering the most of the picture.
+/// On a drawing on paper that is the paper; on a painted scene it is the
+/// street or the sky — a remembered dialog choice from tracing characters
+/// emptied a night street to white. Only the Trace command asks this; the
+/// character and extend-part pipelines drop their own known backgrounds.
+fn border_is_paper(w: u32, h: u32, pixels: &[u8]) -> bool {
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || pixels.len() < w * h * 4 {
+        return true;
+    }
+    let ring = (0..w).flat_map(|x| [(x, 0), (x, h - 1)]).chain((0..h).flat_map(|y| [(0, y), (w - 1, y)]));
+    let (mut opaque, mut paper) = (0usize, 0usize);
+    for (x, y) in ring {
+        let p = &pixels[(y * w + x) * 4..(y * w + x) * 4 + 4];
+        if p[3] < 128 {
+            continue;
+        }
+        opaque += 1;
+        let (lo, hi) = (p[0].min(p[1]).min(p[2]), p[0].max(p[1]).max(p[2]));
+        let luma = (299 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32) / 1000;
+        if luma >= 200 && hi - lo <= 30 {
+            paper += 1;
+        }
+    }
+    opaque == 0 || paper * 2 >= opaque
+}
+
+/// `Auto` decided here rather than in the tracer: ink line art still goes to
+/// the line tracer, but a colour picture is traced as flat colour regions
+/// (`Outline`) — the tracer's own Auto picks colour *lines* for it, which drew
+/// dark strokes over a painted scene (twice the colour error) and is the path
+/// that took 150 s.
+fn resolve_auto_mode(w: u32, h: u32, pixels: &[u8], options: buzz_scene::TraceOptions) -> buzz_scene::TraceOptions {
+    if options.mode != buzz_scene::TraceMode::Auto {
+        return options;
+    }
+    let ink = buzz_scene::is_ink_drawing(w as usize, h as usize, pixels, &options);
+    buzz_scene::TraceOptions {
+        mode: if ink { buzz_scene::TraceMode::LineArt } else { buzz_scene::TraceMode::Outline },
+        ..options
+    }
 }
 
 #[cfg(test)]
@@ -25150,6 +26165,51 @@ mod tests {
             started.elapsed()
         );
         assert!(e.current_frame < e.scene().frame_count());
+    }
+
+    /// F5/F6/F7 and the frame menu act on the camera's keys while the camera
+    /// row is selected, and Create Tween paces the span between two keys.
+    #[test]
+    fn frame_commands_and_tweens_work_on_the_camera_row() {
+        let mut e = editor();
+        e.camera_selected = true;
+        e.set_frame(0);
+        e.run(Command::InsertKeyframe);
+        assert!(e.scene().camera().enabled);
+        assert!(e.scene().camera().has_key_at(0));
+        // A tween with nothing to move to is refused, not a silent no-op.
+        e.run(Command::CreateClassicTween);
+        assert!(e.status.as_deref().unwrap_or("").contains("later camera keyframe"));
+
+        e.set_frame(12);
+        e.run(Command::InsertBlankKeyframe);
+        assert!(e.scene().camera().has_key_at(12));
+        e.doc.edit("Move", |s| {
+            let mut k = s.camera().keys()[1];
+            k.zoom = 2.0;
+            k.rotation = 0.5;
+            s.camera_mut().set_key(k);
+        });
+        e.set_frame(0);
+        e.run(Command::CreateMotionTween);
+        assert_eq!(e.scene().camera().keys()[0].ease, buzz_scene::camera_track::SMOOTH);
+        e.run(Command::CreateClassicTween);
+        assert_eq!(e.scene().camera().keys()[0].ease, buzz_scene::Easing::Linear);
+
+        let mid = e.scene().camera().state_at(6u32).expect("camera on");
+        assert!(mid.zoom > 1.0 && mid.zoom < 2.0, "zoom interpolates: {}", mid.zoom);
+        assert!(mid.rotation > 0.0 && mid.rotation < 0.5, "rotation: {}", mid.rotation);
+
+        // Insert Frame opens a span: the later key moves out by one.
+        e.set_frame(5);
+        e.run(Command::InsertFrame);
+        assert!(e.scene().camera().has_key_at(13));
+        e.run(Command::RemoveFrame);
+        assert!(e.scene().camera().has_key_at(12));
+        // Clear Keyframe removes the key at the playhead.
+        e.set_frame(12);
+        e.run(Command::ClearKeyframe);
+        assert!(!e.scene().camera().has_key_at(12));
     }
 
     #[test]

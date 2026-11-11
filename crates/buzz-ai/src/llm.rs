@@ -5,6 +5,18 @@ use base64::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
+/// Per-call options for [`Llm::chat_json_opts`]. `None` / `false` leaves the
+/// server's own default (what `chat_json` always does).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ChatOpts {
+    pub temperature: Option<f64>,
+    pub seed: Option<u64>,
+    /// Ask for no hidden reasoning on this call whatever the process-wide switch
+    /// ([`low_reasoning`]) says: LM Studio gets `reasoning_effort: "none"`, Ollama
+    /// `think: false`, the Claude proxy nothing.
+    pub no_thinking: bool,
+}
+
 /// Trait for interacting with a local language and vision model.
 pub trait Llm: Send + Sync {
     /// Generates structured JSON matching `schema`, validated and deserialized into `T`.
@@ -18,6 +30,22 @@ pub trait Llm: Send + Sync {
         images: &[&[u8]],
         schema: serde_json::Value,
     ) -> Result<T, LlmError>;
+
+    /// [`Llm::chat_json`] with sampling options (`temperature`, `seed`). The
+    /// default ignores them and calls `chat_json`; a backend that can send
+    /// them overrides this.
+    fn chat_json_opts<T: DeserializeOwned>(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        images: &[&[u8]],
+        schema: serde_json::Value,
+        opts: ChatOpts,
+    ) -> Result<T, LlmError> {
+        let _ = opts;
+        self.chat_json(model, system, user, images, schema)
+    }
 
     /// [`Llm::chat_json`] that gives up when `cancel` says so (P8-C2): a
     /// backend that can runs the call on a worker and polls `cancel` every
@@ -459,6 +487,18 @@ impl Llm for Backend {
         images: &[&[u8]],
         schema: serde_json::Value,
     ) -> Result<T, LlmError> {
+        self.chat_json_opts(model, system, user, images, schema, ChatOpts::default())
+    }
+
+    fn chat_json_opts<T: DeserializeOwned>(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        images: &[&[u8]],
+        schema: serde_json::Value,
+        opts: ChatOpts,
+    ) -> Result<T, LlmError> {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(LLM_CONNECT_TIMEOUT)
             .timeout(LLM_REQUEST_TIMEOUT)
@@ -524,10 +564,20 @@ impl Llm for Backend {
                             }
                         }
                     });
+                    if !is_claude {
+                        // LM Studio / OpenAI shape. (Not sent to the Claude proxy: newer
+                        // Claude models refuse a sampling temperature.)
+                        if let Some(t) = opts.temperature {
+                            payload["temperature"] = serde_json::json!(t);
+                        }
+                        if let Some(s) = opts.seed {
+                            payload["seed"] = serde_json::json!(s);
+                        }
+                    }
                     if is_claude {
                         // The proxy defaults to "low"; ask for the user's choice.
                         payload["reasoning_effort"] = serde_json::json!(crate::ai_config::CLAUDE_DEFAULT_EFFORT);
-                    } else if low_reasoning() {
+                    } else if low_reasoning() || opts.no_thinking {
                         // Measured on LM Studio + qwen3.8-27b (2026-09-26):
                         // "none" gives 0 reasoning tokens; "low", `/no_think`
                         // and `chat_template_kwargs.enable_thinking=false`
@@ -585,8 +635,18 @@ impl Llm for Backend {
                         ],
                         "format": schema,
                     });
-                    if low_reasoning() {
+                    if low_reasoning() || opts.no_thinking {
                         payload["think"] = serde_json::json!(false);
+                    }
+                    let mut options = serde_json::Map::new();
+                    if let Some(t) = opts.temperature {
+                        options.insert("temperature".into(), serde_json::json!(t));
+                    }
+                    if let Some(s) = opts.seed {
+                        options.insert("seed".into(), serde_json::json!(s));
+                    }
+                    if !options.is_empty() {
+                        payload["options"] = serde_json::Value::Object(options);
                     }
 
                     let resp = agent.post(&url)

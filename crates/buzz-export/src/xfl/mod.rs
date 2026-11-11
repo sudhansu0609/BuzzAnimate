@@ -778,17 +778,35 @@ fn frame_xml(
 
     let mut out = format!("{pad}<DOMFrame {attrs}>\n{tweens_xml}{envelope_xml}{pad}  <elements>\n");
     let separate = keeps_shapes_apart(&keyframe.objects);
-    for object in keyframe.objects.iter() {
+    for object in keyframe.objects.iter().map(|o| synced_start(scene, o, at)) {
         if relative == Affine::IDENTITY {
-            out.push_str(&object_xml(scene, paths, object, separate, report, indent + 4));
+            out.push_str(&object_xml(scene, paths, &object, separate, report, indent + 4));
         } else {
-            let mut moved: Object = (**object).clone();
+            let mut moved: Object = (*object).clone();
             moved.transform = relative * moved.transform;
             out.push_str(&object_xml(scene, paths, &moved, separate, report, indent + 4));
         }
     }
     out.push_str(&format!("{pad}  </elements>\n{pad}</DOMFrame>\n"));
     out
+}
+
+/// **An instance locked to the stage's frame, written for Animate**, which has no such lock: a
+/// looping graphic on a key that starts at `at` plays from its `firstFrame` there, so to show
+/// the symbol's frame `at` (what the lock shows) it starts on `first_frame + at`, looped into
+/// the symbol's length. A head symbol placed this way keeps its mouth and eyelid keys in step
+/// with the scene, wherever the head's own layer is keyed.
+fn synced_start(scene: &Scene, object: &std::sync::Arc<Object>, at: u32) -> std::sync::Arc<Object> {
+    let ObjectKind::Instance(instance) = &object.kind else { return object.clone() };
+    if !instance.sync_to_root || instance.loop_mode != buzz_scene::LoopMode::Loop {
+        return object.clone();
+    }
+    let length = scene.library().get(instance.symbol).map_or(1, |s| s.length()).max(1);
+    let mut moved: Object = (**object).clone();
+    if let ObjectKind::Instance(i) = &mut moved.kind {
+        i.first_frame = (i.first_frame + at) % length;
+    }
+    std::sync::Arc::new(moved)
 }
 
 /// A tween's attributes onto a frame's, and its `<tweens>` element (custom
@@ -1044,7 +1062,7 @@ fn object_xml(
                 String::new()
             };
             format!(
-                "{pad}<DOMSymbolInstance libraryItemName=\"{}\" symbolType=\"{kind}\"{playing}>\n{}{}{pad}</DOMSymbolInstance>\n",
+                "{pad}<DOMSymbolInstance libraryItemName=\"{}\" symbolType=\"{kind}\"{playing}>\n{}{}{}{pad}</DOMSymbolInstance>\n",
                 escape(paths.of(symbol.id)),
                 matrix_xml(object.transform, indent + 2),
                 // **The joint goes back out too.** On a rigged character the
@@ -1052,6 +1070,7 @@ fn object_xml(
                 // leaving it out would hand Animate a character whose joints
                 // had all been reset to the middle of their artwork.
                 pivot_xml(object.pivot, indent + 2),
+                color_xml(&instance.color, indent + 2),
             )
         }
         // Rigged and warped artwork has no equivalent in a `.fla`: Animate's
@@ -1253,6 +1272,39 @@ fn pivot_xml(pivot: Option<buzz_geom::Point>, indent: usize) -> String {
         number(at.x),
         number(at.y),
     )
+}
+
+/// An instance's colour effect as Animate's `<color><Color .../></color>`.
+/// Named effects go out as Animate writes them (tint, brightness, alpha);
+/// anything else as per-channel multipliers and 0..255 offsets.
+fn color_xml(color: &buzz_scene::ColorTransform, indent: usize) -> String {
+    use buzz_scene::ColorEffect;
+    if color.is_identity() {
+        return String::new();
+    }
+    let attrs = match ColorEffect::from_transform(color) {
+        ColorEffect::Brightness(a) => format!("brightness=\"{}\"", number(a as f64)),
+        ColorEffect::Alpha(a) => format!("alphaMultiplier=\"{}\"", number(a as f64)),
+        ColorEffect::Tint { color: c, amount } => format!(
+            "tintColor=\"{}\" tintMultiplier=\"{}\"",
+            hex(c),
+            number(amount as f64)
+        ),
+        _ => {
+            let mut s = Vec::new();
+            for (i, ch) in ["red", "green", "blue", "alpha"].into_iter().enumerate() {
+                if (color.multiply[i] - 1.0).abs() > 1e-6 {
+                    s.push(format!("{ch}Multiplier=\"{}\"", number(color.multiply[i] as f64)));
+                }
+                if color.add[i].abs() > 1e-6 {
+                    s.push(format!("{ch}Offset=\"{}\"", number((color.add[i] * 255.0) as f64)));
+                }
+            }
+            s.join(" ")
+        }
+    };
+    let pad = " ".repeat(indent);
+    format!("{pad}<color>\n{pad}  <Color {attrs}/>\n{pad}</color>\n")
 }
 
 fn matrix_xml(transform: Affine, indent: usize) -> String {

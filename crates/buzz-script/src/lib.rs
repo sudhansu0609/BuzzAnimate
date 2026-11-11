@@ -39,6 +39,10 @@
 mod film;
 mod host;
 mod samples;
+mod shelf;
+mod symtl;
+pub mod tunables;
+pub mod xmlui;
 
 pub use samples::{Sample, samples};
 
@@ -120,6 +124,85 @@ pub struct ScriptContext {
     /// document changes rather than committing them, since that run was only
     /// ever a rehearsal to find out what to ask.
     pub prompt_answers: Vec<String>,
+
+    /// **Settings the user changed for a command** (J5): `(file stem, name,
+    /// literal)`. When the script pulls in `commonVariables.jsfl` through
+    /// `fl.runScript`, the overrides filed under that stem are written into the
+    /// text it loads, so a value edited once applies to every command that
+    /// includes the file. The command's own overrides are applied to its text
+    /// by the caller, with [`tunables::apply`]. Never written to disk.
+    pub overrides: Vec<(String, String, String)>,
+
+    /// **What the host does for the script that a script cannot do for itself**
+    /// (J6): ask a person a question, trace a bitmap. Empty, a run is
+    /// unattended -- `prompt` answers its default, `confirm` says yes, a
+    /// file picker is cancelled, and `traceBitmap` says it is unavailable.
+    pub hooks: Hooks,
+}
+
+/// A question a script puts to a person (JSFL's `prompt`, `confirm`,
+/// `fl.xmlPanel`, `fl.browseForFileURL`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Question {
+    Prompt { message: String, default: String },
+    Confirm { message: String },
+    /// An XMLUI dialog, already read into its controls.
+    Form(xmlui::Form),
+    PickFile { title: String, save: bool },
+}
+
+/// What the person answered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Answer {
+    Text(String),
+    Yes(bool),
+    /// `(control id, value)` of every control, for an accepted XMLUI dialog.
+    Form(Vec<(String, String)>),
+    File(std::path::PathBuf),
+    /// Closed without answering (Cancel, Esc, or the script was stopped).
+    Cancelled,
+}
+
+/// Asks a person. Called on the script's thread and **blocks until answered**;
+/// the time spent waiting does not count against the script's time limit.
+pub type AskFn = Arc<dyn Fn(Question) -> Answer + Send + Sync>;
+
+/// Trace the bitmaps `ids` on `layer` at `frame` of the open timeline into
+/// shapes (Trace Bitmap, the Bold trace); returns the new shapes' ids.
+pub type TraceFn = Arc<
+    dyn Fn(&mut Scene, LayerId, u32, &[ObjectId]) -> Result<Vec<ObjectId>, String> + Send + Sync,
+>;
+
+/// The host's side of the J6 dialogs and Trace Bitmap. See
+/// [`ScriptContext::hooks`].
+#[derive(Clone, Default)]
+pub struct Hooks {
+    pub ask: Option<AskFn>,
+    pub trace: Option<TraceFn>,
+}
+
+impl std::fmt::Debug for Hooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hooks")
+            .field("ask", &self.ask.is_some())
+            .field("trace", &self.trace.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for Hooks {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.ask, &other.ask) {
+            (None, None) => {}
+            (Some(a), Some(b)) if Arc::ptr_eq(a, b) => {}
+            _ => return false,
+        }
+        match (&self.trace, &other.trace) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 /// Where a shelf of JSFL commands lives on this machine.
@@ -263,6 +346,10 @@ pub struct ScriptOutcome {
     /// True when the host asked it to stop, rather than it finishing or
     /// failing on its own.
     pub stopped: bool,
+    /// The script called `document.save()` (or `fl.saveDocumentAs`). A script
+    /// works on a copy of the scene, so the save is the host's to do, after it
+    /// has committed the run.
+    pub save_requested: bool,
     pub elapsed: Duration,
 }
 
@@ -348,6 +435,26 @@ pub(crate) struct State {
     /// entry per copied range, each the keyframes inside it with their start
     /// made relative to the range's own start.
     pub frame_clip: Vec<(LayerId, Vec<(u32, buzz_scene::timeline::Keyframe)>)>,
+    /// Set by `document.save()`; see [`ScriptOutcome::save_requested`].
+    pub save_requested: bool,
+    /// Which layer an element id was last seen on (filled by `frame.elements`),
+    /// so reading a property of one of thousands of elements does not search
+    /// the whole document for it every time.
+    pub layer_hint: RefCell<std::collections::HashMap<u64, LayerId>>,
+    /// Files the person picked in a file dialog during this run (J6): the only
+    /// paths outside the script folders that `document.importFile` may read.
+    pub granted_files: Vec<std::path::PathBuf>,
+    /// The playhead of each timeline the script left to enter a symbol, so
+    /// leaving it puts the outer timeline's playhead back (Animate keeps one per
+    /// timeline).
+    pub frame_stack: Vec<u32>,
+    /// The colour an instance had before a layer colour transform was set on it,
+    /// by `(object id, keyframe start)`, so setting the transform twice replaces
+    /// it instead of stacking (J6).
+    pub layer_fx_base: std::collections::HashMap<(u64, u32), buzz_scene::ColorTransform>,
+    /// Nanoseconds the script spent waiting for a person, which the time limit
+    /// does not count.
+    pub waited: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl State {
@@ -464,6 +571,12 @@ pub fn run_film(
         selected_layer: None,
         selected_ranges: Vec::new(),
         frame_clip: Vec::new(),
+        save_requested: false,
+        layer_hint: RefCell::new(std::collections::HashMap::new()),
+        granted_files: Vec::new(),
+        frame_stack: Vec::new(),
+        layer_fx_base: std::collections::HashMap::new(),
+        waited: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }));
 
     let (error, stopped) = evaluate(&state, source, limits, stop);
@@ -488,6 +601,7 @@ pub fn run_film(
         context: finished.context,
         changed,
         stopped,
+        save_requested: finished.save_requested,
         elapsed: started.elapsed(),
     }
 }
@@ -508,6 +622,12 @@ impl State {
             selected_layer: self.selected_layer,
             selected_ranges: self.selected_ranges.clone(),
             frame_clip: self.frame_clip.clone(),
+            save_requested: self.save_requested,
+            layer_hint: RefCell::new(self.layer_hint.borrow().clone()),
+            granted_files: self.granted_files.clone(),
+            frame_stack: self.frame_stack.clone(),
+            layer_fx_base: self.layer_fx_base.clone(),
+            waited: Arc::clone(&self.waited),
         }
     }
 }
@@ -546,6 +666,7 @@ fn evaluate(
     let fired = Arc::clone(&timed_out);
     let asked = Arc::clone(&asked_to_stop);
     let deadline = Instant::now() + limits.time;
+    let waited = Arc::clone(&state.borrow().waited);
     runtime.set_interrupt_handler(Some(Box::new(move || {
         // The host first: a person who pressed Stop is owed an answer sooner
         // than a clock is.
@@ -555,7 +676,8 @@ fn evaluate(
             asked.store(true, Ordering::Relaxed);
             return true;
         }
-        if Instant::now() >= deadline {
+        // The time a person took to answer a dialog is not the script's.
+        if Instant::now() >= deadline + Duration::from_nanos(waited.load(Ordering::Relaxed)) {
             fired.store(true, Ordering::Relaxed);
             return true;
         }
@@ -593,7 +715,14 @@ fn evaluate(
             ));
         }
 
-        match ctx.eval::<rquickjs::Value, _>(source) {
+        // **Sloppy mode, like Animate's.** rquickjs evaluates strict by default,
+        // and a shelf of JSFL written over years assigns to undeclared
+        // variables (`startFrame = 0;`) and nobody noticed because Animate's
+        // engine lets it. A strict run threw `startFrame is not defined` on a
+        // script that works in Animate.
+        let mut options = rquickjs::context::EvalOptions::default();
+        options.strict = false;
+        match ctx.eval_with_options::<rquickjs::Value, _>(source, options) {
             Ok(_) => None,
             Err(e) => {
                 // `describe` also clears the pending exception, so it runs

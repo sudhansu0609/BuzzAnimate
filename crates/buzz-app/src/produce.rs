@@ -471,6 +471,11 @@ fn view_rank(rig: &str) -> u8 {
     }
 }
 
+/// A Cast rig of the producer: in `Cast/`, or in the series' own `Cast/<Series>/` (the cast FLA import files its rigs there).
+fn in_cast(a: &buzz_doc::Asset, series: &str) -> bool {
+    a.folder == "Cast" || a.folder.eq_ignore_ascii_case(&format!("Cast/{series}"))
+}
+
 fn base_name(rig: &str) -> &str {
     for suffix in [" 3-4", " Back", " Side"] {
         if let Some(b) = rig.strip_suffix(suffix) {
@@ -586,7 +591,11 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
         }
         None => {
             let hints = BreakdownHints {
-                style: format!("{}, light humour", req.style.name),
+                style: format!(
+                    "{}, {}",
+                    req.style.name,
+                    crate::comfy_profile::profile_for(&series).map(|p| p.tone).filter(|t| !t.is_empty()).unwrap_or_else(|| "light humour".into())
+                ),
                 known_characters: art.iter().map(|a| a.name.clone()).collect(),
                 series: series.clone(),
                 world: req.world.clone(),
@@ -731,7 +740,7 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
                 let mut rigs: Vec<String> = library
                     .assets()
                     .iter()
-                    .filter(|a| a.folder == "Cast" && keys.contains(&norm(base_name(&a.name))))
+                    .filter(|a| in_cast(a, &series) && keys.contains(&norm(base_name(&a.name))))
                     .map(|a| a.name.clone())
                     .collect();
                 let mut why = "already in Cast (kept)".to_string();
@@ -743,7 +752,7 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
                             progress(Step::Cast, &format!("character {}/{}: {} \u{2014} your {} ({reason})", i + 1, wanted.len(), brief.name, entry.name));
                             // A Cast rig brings its other views; any other asset stands as it is.
                             let base = base_name(&entry.name).to_string();
-                            rigs = library.assets().iter().filter(|a| a.folder == "Cast" && base_name(&a.name) == base).map(|a| a.name.clone()).collect();
+                            rigs = library.assets().iter().filter(|a| in_cast(a, &series) && base_name(&a.name) == base).map(|a| a.name.clone()).collect();
                             if rigs.is_empty() {
                                 rigs.push(entry.name.clone());
                             }
@@ -767,7 +776,7 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
                     .iter()
                     .filter(|a| keys.contains(&norm(&a.name)))
                     .flat_map(cast_build::pose_rigs_of)
-                    .any(|(_, rig)| !library.assets().iter().any(|a| a.folder == "Cast" && a.name == rig));
+                    .any(|(_, rig)| !library.assets().iter().any(|a| a.folder == "Cast" && a.name == rig) && !crate::cast_combine::has_pose(&library, &rig));
                 if rigs.is_empty() || pose_missing {
                     let has_art = art.iter().any(|a| keys.contains(&norm(&a.name)));
                     let client = if !has_art && brief.importance <= 2 { comfy.get(progress, Step::Cast) } else { None };
@@ -817,7 +826,7 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
                     let by_pose: BTreeMap<String, String> = AssetLibrary::at(&assets_root)
                         .assets()
                         .iter()
-                        .filter(|a| a.folder == "Cast")
+                        .filter(|a| in_cast(a, &series))
                         .filter_map(|a| {
                             cast_build::pose_of_rig(&a.name).filter(|(b, _)| *b == base).map(|(_, p)| (p.to_string(), a.name.clone()))
                         })
@@ -881,6 +890,12 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
     // F1/F4: only reverse, low/high angle and over-the-shoulder get an angle picture,
     // re-angled from the location's wide (4th field: wide key, camera).
     let mut keys: Vec<(String, String, Option<u64>, Option<(String, String)>)> = Vec::new();
+    // `plates.json` (optional, in the output folder): `{"<background key>": "<finished prompt>"}`, the
+    // creator's own plate prompts. A key listed there is drawn from that prompt as it stands (not
+    // re-angled from the wide, no framing words added); the key `<location>__<camera>` names an angle.
+    let plate_prompts: BTreeMap<String, String> = read_json(&out.join("plates.json"))
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
     for s in &briefs {
         let key = s.location_key.trim().to_string();
         if key.is_empty() || keys.iter().any(|(k, _, _, _)| *k == key) {
@@ -892,13 +907,18 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
         for cam in backdrop::plan_angles(here().map(|sh| sh.camera.as_str())).into_iter().skip(1).filter(|_| req.angle_pictures) {
             if let Some(shot) = here().find(|sh| sh.camera == cam) {
                 let seed = (shot.seed_family != 0).then_some(shot.seed_family);
-                keys.push((backdrop::angle_key(&key, &cam), String::new(), seed, Some((key.clone(), cam.clone()))));
+                let angle_key = backdrop::angle_key(&key, &cam);
+                match plate_prompts.get(&angle_key) {
+                    Some(p) => keys.push((angle_key, p.clone(), seed, None)),
+                    None => keys.push((angle_key, String::new(), seed, Some((key.clone(), cam.clone())))),
+                }
             }
         }
     }
     // B4: a seed or prompt the creator set in the Producer panel wins over the breakdown's.
     crate::copilot::apply_to_keys(out, &mut keys);
     let objects_on = crate::bg_objects::enabled(req.objects, &series);
+    let plates_hash = if plate_prompts.is_empty() { String::new() } else { hash_file(&out.join("plates.json")) };
     let bg_hash = hash_parts(&[
         bd_hash.as_bytes(),
         req.style.suffix.as_bytes(),
@@ -907,6 +927,7 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
         if req.backgrounds { b"generate" } else { b"assets" },
         assets_root.to_string_lossy().as_bytes(),
         if objects_on { b"objects" } else { b"" },
+        plates_hash.as_bytes(),
     ]);
     let bg_path = out.join("backgrounds.json");
     let asset_of = |key: &str| format!("Backgrounds/{series}/{key}");
@@ -952,7 +973,10 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
                 }
                 let full = match &angle {
                     Some((_, p)) => p.to_string(),
-                    None => backdrop::background_prompt(prompt, &req.style),
+                    None => match plate_prompts.get(key) {
+                        Some(p) => p.clone(),
+                        None => backdrop::background_prompt(prompt, &req.style),
+                    },
                 };
                 // The prompt's hash in the name: a changed prompt draws anew.
                 let wide_hash = angle.as_ref().map(|(w, _)| hash_file(w)).unwrap_or_default();
@@ -1226,6 +1250,9 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
     let t = Instant::now();
     let mut casting_v = casting_base.clone();
     casting_v["title_cards"] = json!(true);
+    // `inserts.json` (optional, in the output folder): `["<background key>", ...]`, plates that are
+    // inserts (close-up / still-life): the cast is out of frame while they show. No file = none.
+    let insert_keys: Vec<String> = read_json(&out.join("inserts.json")).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     if let Some(scenes) = casting_v["scenes"].as_object_mut() {
         for s in &briefs {
             if let Some(set) = scenes.get_mut(&s.number.to_string()) {
@@ -1248,7 +1275,8 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
                     .iter()
                     .filter_map(|sh| {
                         crate::backdrop::background_for(&bg_value, loc, &sh.camera).map(|a| {
-                            json!({"at_line": sh.at_line, "camera": sh.camera, "background": a, "horizon_row": horizon_of(&sh.camera)})
+                            let insert = insert_keys.contains(&crate::backdrop::angle_key(loc, &sh.camera));
+                            json!({"at_line": sh.at_line, "camera": sh.camera, "background": a, "horizon_row": horizon_of(&sh.camera), "insert": insert})
                         })
                     })
                     .collect();
@@ -1321,7 +1349,7 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
         }
         None => {
             let assets = AssetLibrary::at(&assets_root);
-            let mut opts = BuildOptions { width: req.size.0, height: req.size.1, fps: req.fps, captions: captions_on, ..BuildOptions::default() };
+            let mut opts = BuildOptions { width: req.size.0, height: req.size.1, fps: req.fps, captions: captions_on, audio_cues: crate::comfy_profile::profile_for(&series).is_some_and(|p| p.audio_layers), ..BuildOptions::default() };
             if let Some(path) = &req.index {
                 match crate::asset_sets::load_index_file(path) {
                     Some(index) => opts.index = Some(Arc::new(index)),

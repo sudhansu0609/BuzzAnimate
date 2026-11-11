@@ -210,6 +210,7 @@ fn main() {
         keep_weight: true,
         straighten: 0.0,
         solid_above: quarter(buzz_app::rigging::default_solid_above(&plan), 0.5, 40.0),
+        bold: false,
     };
     let t1 = Instant::now();
     let mut trace = buzz_app::rigging::trace_even_lines(&plan, settings.straighten, settings.solid_above, false);

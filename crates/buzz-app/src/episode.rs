@@ -190,6 +190,8 @@ pub struct ShotBackground {
     pub background: String,
     /// Where that picture's horizon is, `0..1` down the frame.
     pub horizon_row: Option<f64>,
+    /// An insert (close-up / still-life picture): the cast is off the frame while it shows.
+    pub insert: bool,
 }
 
 /// A prop on the set.
@@ -443,6 +445,9 @@ pub struct BuildOptions {
     pub tidy_layers: bool,
     /// AN13: write the caption layer. Off for story channels (no captions or cards).
     pub captions: bool,
+    /// Empty `Voice` and `SFX` layers with a labelled keyframe on every spoken line and `(SFX: ...)` cue, for a
+    /// recording to be dropped in on its marker. Off by default.
+    pub audio_cues: bool,
 }
 
 impl Default for BuildOptions {
@@ -458,6 +463,7 @@ impl Default for BuildOptions {
             audio: None,
             tidy_layers: true,
             captions: true,
+            audio_cues: false,
         }
     }
 }
@@ -1331,6 +1337,26 @@ fn place_asset(scene: &mut Scene, assets: &AssetLibrary, asset: &Asset) -> Resul
     Ok(arrived_since(scene, &before))
 }
 
+/// **Place a Cast asset for the producer.** A combined character (one symbol
+/// owning a set of poses, CAST_POSES_PLAN C2) is unpacked onto the stage as a
+/// layer rig, its Front pose, in a layer folder named after it; its other poses
+/// are switched to per shot. The folder is returned. Any other asset is placed as
+/// it is.
+pub(crate) fn place_cast(scene: &mut Scene, assets: &AssetLibrary, asset: &Asset) -> Result<(Placed, Option<LayerId>), String> {
+    let before: HashSet<LayerId> = scene.layers().iter().map(|l| l.id).collect();
+    let incoming = assets
+        .load(asset)
+        .map_err(|e| format!("could not place {:?}: {e}", asset.name))?;
+    if let Some(main) = crate::cast_combine::main_symbol(&incoming) {
+        let key = format!("{}/{}", asset.folder, asset.name);
+        let lifted = buzz_act::pose::lift_character(scene, &incoming, main, main, &key)
+            .map_err(|e| format!("could not place {:?}: {e}", asset.name))?;
+        return Ok((arrived_since(scene, &before), Some(lifted.folder)));
+    }
+    scene.merge(&incoming, buzz_scene::ImportTarget::Stage);
+    Ok((arrived_since(scene, &before), None))
+}
+
 /// **Place a scene that is already loaded** (one symbol or one part of an
 /// asset, AS4) exactly as [`place_asset`] places a whole asset.
 pub(crate) fn place_scene(scene: &mut Scene, incoming: &Scene) -> Placed {
@@ -1357,6 +1383,15 @@ fn arrived_since(scene: &Scene, before: &HashSet<LayerId>) -> Placed {
             continue;
         };
         if layer.follows.is_some_and(|f| arrived_set.contains(&f)) {
+            // A follower (a shin, a sandal) is part of the figure's box too, carrying
+            // what it inherits, even when it is no named part of the rig.
+            let inherited = scene.layers().inherited_transform(*id, 0u32);
+            for object in layer.objects_at(0) {
+                let b = buzz_scene::object::transform_rect(inherited, scene.resolved_bounds(object));
+                if object.visible && !(b.width() <= 0.0 && b.height() <= 0.0) {
+                    bounds = Some(bounds.map_or(b, |u| u.union(b)));
+                }
+            }
             continue;
         }
         top.push(*id);
@@ -1383,8 +1418,10 @@ fn arrived_since(scene: &Scene, before: &HashSet<LayerId>) -> Placed {
                 let Some(layer) = scene.layers().get(part) else {
                     continue;
                 };
+                // A part carries what it inherits from the layers it follows.
+                let inherited = scene.layers().inherited_transform(part, 0u32);
                 for object in layer.objects_at(0) {
-                    let b = scene.resolved_bounds(object);
+                    let b = buzz_scene::object::transform_rect(inherited, scene.resolved_bounds(object));
                     if !object.visible || (b.width() <= 0.0 && b.height() <= 0.0) {
                         continue;
                     }
@@ -1474,6 +1511,8 @@ enum Mouth {
     Rig(ObjectId),
     /// A part of a layer rig, on a layer of its own.
     RigLayer(ObjectId),
+    /// The `Mouth` layer inside the head symbol of a layer rig (the Animate way).
+    Nested(buzz_act::face::Face),
     /// A layer of its own, with the symbol to show and where.
     Layer {
         layer: LayerId,
@@ -1503,6 +1542,8 @@ struct Actor {
     eyes: Vec<(usize, [buzz_scene::SymbolId; 3])>,
     /// The eye parts of a layer rig, by object: the same, on their own layers.
     layer_eyes: Vec<(ObjectId, [buzz_scene::SymbolId; 3])>,
+    /// The head of a layer rig whose `Eyelid` layer is inside it: the blinks are keyed there.
+    nested_lid: Option<buzz_act::face::Face>,
     /// Blinking comes with the character (a puppet's eyes carry the modifier).
     blinks: bool,
     /// AN11: the layers to move and scale (empty for a puppet), and every layer
@@ -1513,6 +1554,9 @@ struct Actor {
     /// base instance of the same character is hidden.
     variant: bool,
     pose_spans: Vec<(u32, u32)>,
+    /// CAST_POSES_PLAN C2: the layer folder of a combined Cast character unpacked
+    /// onto the stage (its other poses are switched to per shot).
+    folder: Option<LayerId>,
 }
 
 impl Actor {
@@ -2181,6 +2225,9 @@ pub fn build_scene(
         if actor.body.is_some() && !actor.layer_eyes.is_empty() {
             blink_layer_rig(scene, actor, total, fps);
         }
+        if actor.body.is_some() && actor.nested_lid.is_some() {
+            blink_nested_lid(scene, actor, total, fps);
+        }
     }
     for actor in &mut actors {
         sync_mouth(scene, actor, total, fps, audio.as_ref(), &mut report);
@@ -2256,6 +2303,7 @@ pub fn build_scene(
     for (layers, hidden) in &angle_gates {
         hide_during(scene, layers, hidden, total);
     }
+    switch_poses_per_shot(scene, &segments, &mut actors, src, casting, &schedule, timing.frames(timing.line_gap), total, &mut report);
     restage_angles(scene, &segments, &actors, &variants, &feet, src, casting, stage, set.wide_horizon, total, &mut report);
     for v in &variants {
         if let Some(base) = actors.iter().find(|a| a.member.key == v.member.key) {
@@ -2304,6 +2352,8 @@ struct AngleSeg {
     /// The background asset shown: the angle's own picture, else the scene's wide one.
     background: String,
     horizon: Option<f64>,
+    /// An insert: no cast in frame.
+    insert: bool,
 }
 
 /// The scene's angles in frames. wide / medium / close keep the wide
@@ -2338,10 +2388,11 @@ fn angle_segments(set: &SceneSet, line_starts: &[u32], total: u32) -> Vec<AngleS
             camera: if camera.is_empty() { "wide".into() } else { camera },
             background,
             horizon: if own { s.horizon_row } else { None },
+            insert: own && s.insert,
         });
     }
     if segs.first().is_none_or(|s| s.start > 0) {
-        segs.insert(0, AngleSeg { start: 0, end: total, at_line: 0, camera: "wide".into(), background: base, horizon: None });
+        segs.insert(0, AngleSeg { start: 0, end: total, at_line: 0, camera: "wide".into(), background: base, horizon: None, insert: false });
     }
     for i in 0..segs.len() {
         segs[i].end = segs.get(i + 1).map_or(total, |n| n.start);
@@ -2415,7 +2466,14 @@ fn place_cover(scene: &mut Scene, assets: &AssetLibrary, name: &str, stage: Rect
     };
     let asset = found.ok_or_else(|| format!("background {name:?}: no such asset in the library"))?;
     let placed = place_asset(scene, assets, asset)?;
-    if let Some(b) = placed.bounds {
+    if let Some(mut b) = placed.bounds {
+        // A traced plate fills the picture (`backdrop::STAGE`); a soft glow or smoke disc that spills past
+        // its edge must not widen the box, or the cover scale shrinks the picture and the stage shows.
+        let picture = Rect::new(0.0, 0.0, crate::backdrop::STAGE.0, crate::backdrop::STAGE.1);
+        let inside = b.intersect(picture);
+        if inside.width() >= 0.9 * picture.width() && inside.height() >= 0.9 * picture.height() {
+            b = inside;
+        }
         transform_layers(scene, &placed.top, cover(b, stage));
     }
     Ok(placed.all)
@@ -2506,6 +2564,157 @@ fn angle_restage(camera: &str, role: Role, side: f64, stage: Rect, mark_x: f64, 
     }
 }
 
+/// Who speaks each dialogue line (`None` for a voice-over), in script order.
+fn speakers_of(src: &ScriptScene, casting: &Casting) -> Vec<Option<String>> {
+    src.items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Dialogue(Dialogue { speaker, voice, .. }) => {
+                Some(if *voice == Voice::VoiceOver { None } else { casting.character(speaker).map(|(k, _)| k) })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The speaker of an angle's line and the staged character who listens to it.
+fn speaker_and_listener(seg: &AngleSeg, speakers: &[Option<String>], actors: &[Actor]) -> (Option<String>, Option<String>) {
+    let staged = |k: &str| actors.iter().any(|a| a.member.key == k && !a.top.is_empty());
+    let speaker = speakers.get(seg.at_line).cloned().flatten();
+    let differs = |k: &&String| Some(k.as_str()) != speaker.as_deref() && staged(k);
+    let listener = speakers
+        .iter()
+        .take(seg.at_line + 1)
+        .rev()
+        .flatten()
+        .find(differs)
+        .or_else(|| speakers.iter().skip(seg.at_line + 1).flatten().find(differs))
+        .cloned()
+        .or_else(|| {
+            actors
+                .iter()
+                .find(|a| Some(a.member.key.as_str()) != speaker.as_deref() && !a.top.is_empty())
+                .map(|a| a.member.key.clone())
+        });
+    (speaker, listener)
+}
+
+/// The views of a combined Cast character that suit an angle, best first
+/// (CAST_POSES_PLAN C2): a camera that leaves the wide axis sees speaker and
+/// listener from the side or three-quarters, the listener of an
+/// over-the-shoulder from behind; wide, medium and close stay on the Front.
+fn view_words(camera: &str, role: Role) -> &'static [&'static str] {
+    match (camera, role) {
+        ("over_shoulder", Role::Listener) => &["Back", "3-4", "Side"],
+        ("over_shoulder", Role::Speaker) => &["3-4", "Side"],
+        ("reverse" | "low_angle" | "high_angle", Role::Speaker | Role::Listener) => &["3-4", "Side"],
+        _ => &["Front"],
+    }
+}
+
+/// **Each angle's pose** for the characters unpacked from a combined Cast asset:
+/// at the start of every angle the character is turned to the view that suits it
+/// (`buzz_act::pose::switch_lifted_pose`, mouth and blinks carried across). A
+/// character who is walking keeps their pose (a switch does not carry a walk).
+/// Afterwards `top` and `layers` hold every pose's layers, so the angle re-staging
+/// moves them all.
+#[allow(clippy::too_many_arguments)]
+fn switch_poses_per_shot(scene: &mut Scene, segments: &[AngleSeg], actors: &mut [Actor], src: &ScriptScene, casting: &Casting, schedule: &Schedule, gap: u32, total: u32, report: &mut SceneReport) {
+    let speakers = speakers_of(src, casting);
+    // Every layer of a lifted character reaches the end first, so a pose can be read at any frame.
+    for a in actors.iter() {
+        if let Some(folder) = a.folder {
+            for id in buzz_act::pose::character_layers(scene, folder) {
+                scene.update_layer(id, |l| {
+                    if total > 0 && l.frames.length() < total {
+                        l.frames.insert_frame(total - 1);
+                    }
+                });
+            }
+        }
+    }
+    for seg in segments {
+        if seg.insert {
+            continue;
+        }
+        let (speaker, listener) = speaker_and_listener(seg, &speakers, actors);
+        for a in actors.iter() {
+            let Some(folder) = a.folder else { continue };
+            let role = if Some(a.member.key.as_str()) == speaker.as_deref() {
+                Role::Speaker
+            } else if Some(&a.member.key) == listener.as_ref() {
+                Role::Listener
+            } else {
+                Role::Other
+            };
+            let Some(want) = view_words(&seg.camera, role).iter().find_map(|w| buzz_act::pose::pose_for_view(scene, folder, w)) else {
+                continue;
+            };
+            let name = scene.library().get(want).map(|s| s.name.clone()).unwrap_or_default();
+            if buzz_act::pose::shown_pose(scene, folder, seg.start).is_none_or(|shown| shown == name) {
+                continue;
+            }
+            if buzz_act::pose::moves_after(scene, folder, seg.start) {
+                report.notes.push(format!("{}: moving at frame {}, so the {} pose is not switched to", a.member.key, seg.start, name));
+                continue;
+            }
+            match buzz_act::pose::switch_lifted_pose(scene, folder, seg.start, want) {
+                Ok(r) if r.changed => report.notes.push(format!("{}: {} -> {} from frame {} ({} angle)", a.member.key, r.from, r.to, seg.start, seg.camera)),
+                Ok(_) => {}
+                Err(e) => report.warnings.push(format!("{}: pose switch failed: {e}", a.member.key)),
+            }
+        }
+    }
+    // AN11: the action poses (`DEEPAK Sitting`) are members of the same set: an action line
+    // that gives the character one shows it from the line to the end of the next spoken line.
+    for a in actors.iter() {
+        let Some(folder) = a.folder else { continue };
+        let role = scene.layers().get(folder).map(|l| l.name.clone()).unwrap_or_default();
+        let members: Vec<(String, String)> = buzz_act::pose::poses_of(scene, folder)
+            .into_iter()
+            .skip(1)
+            .filter_map(|(_, name)| {
+                let rest = name.strip_prefix(role.as_str())?.trim().to_lowercase();
+                let view = ["front", "side", "back", "3-4"].contains(&rest.as_str()) || rest.starts_with("walk");
+                (!rest.is_empty() && !view).then(|| (rest.replace(' ', "_"), name.clone()))
+            })
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        for (pose_name, spans) in pose_beats(src, schedule, &casting.stage_names(), &a.member.key, &members, total, gap) {
+            let Some(want) = buzz_act::pose::poses_of(scene, folder).into_iter().find(|(_, n)| *n == pose_name).map(|(id, _)| id) else {
+                continue;
+            };
+            for (start, end) in spans {
+                let back = (end < total).then(|| buzz_act::pose::shown_pose(scene, folder, end)).flatten();
+                if buzz_act::pose::moves_after(scene, folder, start) {
+                    report.notes.push(format!("{}: moving at frame {start}, so the {pose_name} pose is not switched to", a.member.key));
+                    continue;
+                }
+                match buzz_act::pose::switch_lifted_pose(scene, folder, start, want) {
+                    Ok(r) if r.changed => report.notes.push(format!("{}: {} -> {} from frame {start} (action)", a.member.key, r.from, r.to)),
+                    Ok(_) => {}
+                    Err(e) => report.warnings.push(format!("{}: pose switch failed: {e}", a.member.key)),
+                }
+                if let Some(back) = back.filter(|b| *b != pose_name)
+                    && let Some(id) = buzz_act::pose::poses_of(scene, folder).into_iter().find(|(_, n)| *n == back).map(|(id, _)| id)
+                {
+                    let _ = buzz_act::pose::switch_lifted_pose(scene, folder, end, id);
+                }
+            }
+        }
+    }
+    for a in actors.iter_mut() {
+        if let Some(folder) = a.folder {
+            let mut top = vec![folder];
+            top.extend(buzz_act::pose::character_tops(scene, folder));
+            a.top = top;
+            a.layers = buzz_act::pose::character_layers(scene, folder);
+        }
+    }
+}
+
 /// Re-stage the cast in each angle's span and write the angles to the report.
 #[allow(clippy::too_many_arguments)]
 fn restage_angles(
@@ -2521,35 +2730,10 @@ fn restage_angles(
     total: u32,
     report: &mut SceneReport,
 ) {
-    let speakers: Vec<Option<String>> = src
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Dialogue(Dialogue { speaker, voice, .. }) => {
-                Some(if *voice == Voice::VoiceOver { None } else { casting.character(speaker).map(|(k, _)| k) })
-            }
-            _ => None,
-        })
-        .collect();
-    let staged = |k: &str| actors.iter().any(|a| a.member.key == k && !a.top.is_empty());
+    let speakers = speakers_of(src, casting);
     for seg in segments {
         let mut how: Vec<String> = Vec::new();
-        let speaker = speakers.get(seg.at_line).cloned().flatten();
-        let differs = |k: &&String| Some(k.as_str()) != speaker.as_deref() && staged(k);
-        let listener = speakers
-            .iter()
-            .take(seg.at_line + 1)
-            .rev()
-            .flatten()
-            .find(differs)
-            .or_else(|| speakers.iter().skip(seg.at_line + 1).flatten().find(differs))
-            .cloned()
-            .or_else(|| {
-                actors
-                    .iter()
-                    .find(|a| Some(a.member.key.as_str()) != speaker.as_deref() && !a.top.is_empty())
-                    .map(|a| a.member.key.clone())
-            });
+        let (speaker, listener) = speaker_and_listener(seg, &speakers, actors);
         let side = listener
             .as_ref()
             .and_then(|k| actors.iter().find(|a| &a.member.key == k))
@@ -2566,6 +2750,14 @@ fn restage_angles(
             } else {
                 Role::Other
             };
+            if seg.insert {
+                // An insert shows the object alone: the cast is carried off the frame.
+                transform_during(scene, &a.top, seg.start, seg.end, Affine::translate((0.0, 4.0 * stage.height())), total);
+                if !a.variant {
+                    how.push(a.member.key.clone());
+                }
+                continue;
+            }
             let Some(&(_, feet)) = feet.iter().find(|(k, _)| *k == a.member.key) else { continue };
             let Some(t) = angle_restage(&seg.camera, role, side, stage, a.mark_x, feet, dy) else {
                 continue;
@@ -2584,6 +2776,7 @@ fn restage_angles(
         let verb = match seg.camera.as_str() {
             "reverse" => "mirrored",
             "over_shoulder" => "over the shoulder",
+            "low_angle" | "high_angle" if seg.insert => "insert, cast out of frame",
             "low_angle" | "high_angle" => "ground line moved",
             _ => "",
         };
@@ -3413,11 +3606,13 @@ fn stage_actor(
                 offstage: false,
                 eyes: Vec::new(),
                 layer_eyes: Vec::new(),
+                nested_lid: None,
                 blinks: spec.blink_rate > 0.0,
                 top: Vec::new(),
                 layers: Vec::new(),
                 variant: false,
                 pose_spans: Vec::new(),
+                folder: None,
                 member,
             })
         }
@@ -3430,7 +3625,7 @@ fn stage_actor(
                 ));
                 return None;
             };
-            let placed = match place_asset(scene, assets, asset) {
+            let (placed, folder) = match place_cast(scene, assets, asset) {
                 Ok(p) => p,
                 Err(e) => {
                     report.skipped.push(format!("{}: {e}", member.key));
@@ -3466,7 +3661,12 @@ fn stage_actor(
                 Some(CharacterRig::Layers(view)) => (Vec::new(), layer_eye_variants(scene, view, &member.key)),
                 None => (Vec::new(), Vec::new()),
             };
-            let blinks = separate_eyes > 0 || !eyes.is_empty() || !layer_eyes.is_empty();
+            let face = match &rig {
+                Some(CharacterRig::Layers(view)) => buzz_act::face::face_of(scene, view),
+                _ => None,
+            };
+            let nested_lid = face.filter(|f| f.lid.is_some());
+            let blinks = separate_eyes > 0 || !eyes.is_empty() || !layer_eyes.is_empty() || nested_lid.is_some();
             if !blinks {
                 report.warnings.push(format!(
                     "{}: no separate eyes and no eye parts with eyelids found, so no blink",
@@ -3490,11 +3690,13 @@ fn stage_actor(
                 offstage: false,
                 eyes,
                 layer_eyes,
+                nested_lid,
                 blinks,
                 top: placed.top.clone(),
                 layers: placed.all.clone(),
                 variant: false,
                 pose_spans: Vec::new(),
+                folder,
                 member,
             };
             if let Some(body) = placed.body {
@@ -3502,6 +3704,8 @@ fn stage_actor(
                     Some(CharacterRig::Layers(view)) => {
                         if let Some(mouth) = textsync::find_layer_rig_mouth(scene, view) {
                             actor.mouth = Mouth::RigLayer(mouth);
+                        } else if let Some(face) = face.filter(|f| f.mouth.is_some()) {
+                            actor.mouth = Mouth::Nested(face);
                         }
                     }
                     _ => {
@@ -3634,7 +3838,7 @@ fn eye_variants(scene: &mut Scene, body: ObjectId, label: &str) -> Vec<(usize, [
             continue;
         };
         let name = symbol.name.to_lowercase();
-        let has_lid = symbol.layers.iter().any(|l| l.name == "Eyelid");
+        let has_lid = symbol.layers.iter().any(|l| buzz_act::pose::is_lid_layer_name(&l.name));
         if name.contains("eye") && has_lid && !name.contains("brow") {
             found.push((index, instance.symbol));
         }
@@ -3646,9 +3850,12 @@ fn eye_variants(scene: &mut Scene, body: ObjectId, label: &str) -> Vec<(usize, [
             continue;
         };
         let mut shut_ids = [open; 3];
-        for (slot, frame) in [(1usize, 1u32), (2, 2)] {
+        // The chart's own half-shut and shut frames (1 and 2 for a chart that does not tell).
+        let chart = original.layers.iter().find(|l| buzz_act::pose::is_lid_layer_name(&l.name)).and_then(|l| l.frames.objects_at(0).first().and_then(|o| o.instance().map(|i| i.symbol)));
+        let [_, half, shut] = chart.and_then(|c| buzz_act::pose::lid_chart_frames(scene, c)).unwrap_or([0, 1, 2]);
+        for (slot, frame) in [(1usize, half), (2, shut)] {
             let id = scene.add_symbol(
-                format!("{label} eye {}", if frame == 1 { "half" } else { "shut" }),
+                format!("{label} eye {}", if slot == 1 { "half" } else { "shut" }),
                 buzz_scene::SymbolKind::Graphic,
                 Some("Cast parts"),
             );
@@ -3661,7 +3868,7 @@ fn eye_variants(scene: &mut Scene, body: ObjectId, label: &str) -> Vec<(usize, [
                 .unwrap_or_else(|| copy.name.clone());
             copy.folder = Some("Cast parts".to_string());
             // The lid on its half-shut or shut frame.
-            let lid = copy.layers.iter().find(|l| l.name == "Eyelid").map(|l| l.id);
+            let lid = copy.layers.iter().find(|l| buzz_act::pose::is_lid_layer_name(&l.name)).map(|l| l.id);
             if let Some(lid) = lid {
                 copy.layers.update(lid, |l| {
                     if let Some(first) = l.frames.objects_at(0).first() {
@@ -3742,7 +3949,7 @@ fn layer_eye_variants(scene: &mut Scene, rig: &LayerRigView, label: &str) -> Vec
             continue;
         };
         let name = symbol.name.to_lowercase();
-        let has_lid = symbol.layers.iter().any(|l| l.name == "Eyelid");
+        let has_lid = symbol.layers.iter().any(|l| buzz_act::pose::is_lid_layer_name(&l.name));
         if name.contains("eye") && has_lid && !name.contains("brow") {
             found.push((id, instance.symbol));
         }
@@ -3754,9 +3961,12 @@ fn layer_eye_variants(scene: &mut Scene, rig: &LayerRigView, label: &str) -> Vec
             continue;
         };
         let mut shut_ids = [open; 3];
-        for (slot, frame) in [(1usize, 1u32), (2, 2)] {
+        // The chart's own half-shut and shut frames (1 and 2 for a chart that does not tell).
+        let chart = original.layers.iter().find(|l| buzz_act::pose::is_lid_layer_name(&l.name)).and_then(|l| l.frames.objects_at(0).first().and_then(|o| o.instance().map(|i| i.symbol)));
+        let [_, half, shut] = chart.and_then(|c| buzz_act::pose::lid_chart_frames(scene, c)).unwrap_or([0, 1, 2]);
+        for (slot, frame) in [(1usize, half), (2, shut)] {
             let copy_id = scene.add_symbol(
-                format!("{label} eye {}", if frame == 1 { "half" } else { "shut" }),
+                format!("{label} eye {}", if slot == 1 { "half" } else { "shut" }),
                 buzz_scene::SymbolKind::Graphic,
                 Some("Cast parts"),
             );
@@ -3768,7 +3978,7 @@ fn layer_eye_variants(scene: &mut Scene, rig: &LayerRigView, label: &str) -> Vec
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| copy.name.clone());
             copy.folder = Some("Cast parts".to_string());
-            let lid = copy.layers.iter().find(|l| l.name == "Eyelid").map(|l| l.id);
+            let lid = copy.layers.iter().find(|l| buzz_act::pose::is_lid_layer_name(&l.name)).map(|l| l.id);
             if let Some(lid) = lid {
                 copy.layers.update(lid, |l| {
                     if let Some(first) = l.frames.objects_at(0).first() {
@@ -3793,7 +4003,7 @@ fn layer_eye_variants(scene: &mut Scene, rig: &LayerRigView, label: &str) -> Vec
 /// after one to three, each on an even frame so it lands on a key of a
 /// performance written on twos. Seeded by the character, so a cast does not
 /// blink together.
-fn blink_starts(seed: &str, total: u32, fps: f64) -> Vec<u32> {
+pub(crate) fn blink_starts(seed: &str, total: u32, fps: f64) -> Vec<u32> {
     let mut state: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in seed.bytes() {
         state = (state ^ byte as u64).wrapping_mul(0x0100_0000_01b3);
@@ -3817,7 +4027,7 @@ fn blink_starts(seed: &str, total: u32, fps: f64) -> Vec<u32> {
 
 /// How shut the eye is at `frame`: 0 open, 1 half, 2 shut. A blink is half,
 /// shut, half over six frames.
-fn eye_state(starts: &[u32], frame: u32) -> usize {
+pub(crate) fn eye_state(starts: &[u32], frame: u32) -> usize {
     for &b in starts {
         if frame < b {
             break;
@@ -3921,6 +4131,29 @@ fn blink_layer_rig(scene: &mut Scene, actor: &Actor, total: u32, fps: f64) {
             });
         }
     }
+}
+
+/// [`blink_layer_rig`] for a lid chart inside the head symbol (`Eyelid` layer): a key
+/// through each blink on that layer, showing the chart's half-shut and shut frames.
+fn blink_nested_lid(scene: &mut Scene, actor: &Actor, total: u32, fps: f64) {
+    let Some(face) = actor.nested_lid else {
+        return;
+    };
+    let Some((spot, frames)) = face.lid else {
+        return;
+    };
+    let starts = blink_starts(&actor.member.key, total, fps);
+    let mut keys: Vec<(u32, u32)> = Vec::new();
+    for b in &starts {
+        for step in [0u32, 2, 4, 6] {
+            if b + step < total {
+                keys.push((b + step, frames[eye_state(&starts, b + step)]));
+            }
+        }
+    }
+    keys.sort_by_key(|k| k.0);
+    keys.dedup_by_key(|k| k.0);
+    buzz_act::face::put_chart_keys(scene, &face, spot, &keys);
 }
 
 /// Add a Blink to the separate eye objects among `layers`, if there are any.
@@ -4502,6 +4735,15 @@ fn sync_mouth(
                     .push(format!("{}: lip sync failed: {e}", actor.member.key));
             }
         }
+        Mouth::Nested(face) => {
+            if actor.body.is_none() {
+                return;
+            }
+            if let Some(spot) = face.mouth {
+                let keys = buzz_act::face::mouth_keys(scene, face, &track.runs());
+                buzz_act::face::put_chart_keys(scene, face, spot, &keys);
+            }
+        }
         Mouth::Layer {
             layer,
             symbol,
@@ -4568,12 +4810,66 @@ pub fn build_episode(
             if opts.tidy_layers {
                 scene.arrange_layers(buzz_scene::ArrangeOptions::default());
             }
+            // After the tidy: it would remove the (deliberately) empty layers.
+            if opts.audio_cues {
+                write_audio_cue_layers(scene, src, opts);
+            }
         });
         doc.end_gesture();
         doc.rename_scene(index, format!("Scene {number} \u{2014} {}", src.title));
         reports.push(report);
     }
     (doc, reports)
+}
+
+/// **Places for the recording.** Two empty layers, `Voice` and `SFX`, each with a labelled keyframe where a
+/// spoken line (`Voice`: `3 DEEPAK: first words`) or an `(SFX: ...)` cue (`SFX`) starts, timed as the scene
+/// was built, so the creator's audio goes in on its marker.
+fn write_audio_cue_layers(scene: &mut Scene, src: &ScriptScene, opts: &BuildOptions) {
+    let timing = Timing { fps: opts.fps, ..opts.timing };
+    let mut notes: Vec<String> = Vec::new();
+    let from_audio = opts.audio.as_deref().and_then(|plan| scene_audio(plan, &timing, src, &mut notes));
+    let schedule = match &from_audio {
+        Some(a) => a.timed.schedule.clone(),
+        None => timing.schedule(src),
+    };
+    let total = schedule.total_frames.max(1);
+    let short = |text: &str| -> String {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let head = words.iter().take(8).copied().collect::<Vec<_>>().join(" ");
+        if words.len() > 8 { format!("{head}\u{2026}") } else { head }
+    };
+    let mut voice: Vec<(u32, String)> = Vec::new();
+    let mut sfx: Vec<(u32, String)> = Vec::new();
+    let mut line = 0usize;
+    for (index, item) in src.items.iter().enumerate() {
+        let Some(slot) = schedule.slots.get(index) else { continue };
+        match item {
+            Item::Dialogue(Dialogue { speaker, text, .. }) => {
+                line += 1;
+                voice.push((slot.start.min(total - 1), format!("{line} {}: {}", norm(speaker), short(text))));
+            }
+            Item::Action(text) if text.trim_start().to_uppercase().starts_with("(SFX") => {
+                sfx.push((slot.start.min(total - 1), short(text.trim().trim_start_matches('(').trim_end_matches(')'))));
+            }
+            _ => {}
+        }
+    }
+    for (name, marks) in [("SFX", sfx), ("Voice", voice)] {
+        let layer = scene.add_stage_layer(name, buzz_scene::LayerKind::Normal);
+        scene.update_layer(layer, |l| {
+            l.unlit = true;
+            while l.frames.length() < total {
+                l.frames.insert_frame(l.frames.length());
+            }
+            for (frame, label) in &marks {
+                if !l.frames.is_keyframe(*frame) {
+                    l.frames.insert_blank_keyframe(*frame);
+                }
+                l.frames.set_label(*frame, Some(label.clone()));
+            }
+        });
+    }
 }
 
 /// Just the name of a scene's file-safe label, for a preview's file name.
@@ -4813,8 +5109,8 @@ mod tests {
             Shot { start: 30, kind: "medium".into(), on: Some("AMMA".into()), center: Point::new(400.0, 500.0), zoom: 2.16, push: true },
         ];
         let segs = vec![
-            AngleSeg { start: 0, end: 30, at_line: 0, camera: "wide".into(), background: "W".into(), horizon: None },
-            AngleSeg { start: 30, end: 90, at_line: 1, camera: "over_shoulder".into(), background: "O".into(), horizon: None },
+            AngleSeg { start: 0, end: 30, at_line: 0, camera: "wide".into(), background: "W".into(), horizon: None, insert: false },
+            AngleSeg { start: 30, end: 90, at_line: 1, camera: "over_shoulder".into(), background: "O".into(), horizon: None, insert: false },
         ];
         apply_angle_framing(&mut plan, &segs, stage, 90);
         let inside: Vec<&Shot> = plan.iter().filter(|s| s.start >= 30).collect();
@@ -4827,8 +5123,8 @@ mod tests {
         let mut set = SceneSet::default();
         set.background = vec!["Wide".into()];
         set.shot_backgrounds = vec![
-            ShotBackground { at_line: 0, camera: "wide".into(), background: "Wide".into(), horizon_row: None },
-            ShotBackground { at_line: 1, camera: "low_angle".into(), background: "Low".into(), horizon_row: None },
+            ShotBackground { at_line: 0, camera: "wide".into(), background: "Wide".into(), horizon_row: None, insert: false },
+            ShotBackground { at_line: 1, camera: "low_angle".into(), background: "Low".into(), horizon_row: None, insert: false },
         ];
         let segs = angle_segments(&set, &[0, 12], 24);
         assert_eq!(segs.len(), 2);
@@ -4901,11 +5197,13 @@ mod tests {
             offstage: false,
             eyes: Vec::new(),
             layer_eyes: Vec::new(),
+            nested_lid: None,
             blinks: false,
             top: Vec::new(),
             layers: Vec::new(),
             variant: false,
             pose_spans: Vec::new(),
+            folder: None,
         };
         let stage = Rect::new(0.0, 0.0, 1920.0, 1080.0);
         let total = schedule.total_frames;

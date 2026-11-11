@@ -15,9 +15,10 @@
 //! cheap — a library with thousands of symbols is a handful of string
 //! comparisons per row, and only visible rows are built.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
-use buzz_scene::{Scene, SymbolId, SymbolKind};
+use buzz_scene::{ImageAsset, ImageId, Scene, SoundId, SymbolId, SymbolKind};
 use egui::{RichText, Ui};
 
 use crate::command::Command;
@@ -31,6 +32,55 @@ const THUMBNAIL: f32 = 20.0;
 
 /// Room kept on the right of a symbol row for its use count.
 const USE_COUNT: f32 = 26.0;
+
+/// Room kept on the right of a sound row for its length.
+const DURATION: f32 = 48.0;
+
+/// Longest side of a bitmap's thumbnail texture, in pixels. Drawn at
+/// [`THUMBNAIL`] points, so this is generous even on a dense display.
+const PICTURE_THUMB: usize = 64;
+
+/// A bitmap or a sound in the document's own libraries — the two things that
+/// are listed beside the symbols (Animate's Library shows them too).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryMedia {
+    Picture(ImageId),
+    Sound(SoundId),
+}
+
+/// What the user asked of a picture or sound, left on
+/// [`LibraryState::media_request`] for the shell to carry out. The panel
+/// cannot do it itself: placing needs the camera and the active layer, and a
+/// deletion has to check what the stage still uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaRequest {
+    /// Put it on the stage (double-click, the Place button, the menu).
+    Place(LibraryMedia),
+    /// Take it out of the library (the bin button, the menu).
+    Delete(LibraryMedia),
+}
+
+/// A picture or sound being dragged out of the Library, on its way to the
+/// stage. A type of its own for the same reason as [`DraggedSymbol`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DraggedMedia(pub LibraryMedia);
+
+/// A bitmap's small picture, kept with the allocation it was made from so an
+/// edited bitmap (a different allocation) gets a fresh one.
+#[derive(Clone)]
+struct PictureThumb {
+    asset: Arc<ImageAsset>,
+    texture: egui::TextureHandle,
+}
+
+// By hand: the derived `Debug` would print the bitmap's pixels.
+impl std::fmt::Debug for PictureThumb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PictureThumb")
+            .field("image", &self.asset.id)
+            .finish()
+    }
+}
 
 /// A symbol being dragged out of the Library, on its way to the stage.
 ///
@@ -117,10 +167,20 @@ pub struct LibraryState {
     /// Clear All Keyframes was raised from this panel's menu, so it targets
     /// `selected` rather than a selected stage instance. Taken by the editor.
     pub clear_keys_from_library: bool,
+    /// The picture or sound highlighted in the list. Exclusive with `selected`
+    /// and `selected_folder`: the strip along the bottom acts on one thing.
+    pub selected_media: Option<LibraryMedia>,
+    /// Place or Delete asked of a picture or sound. Taken by the editor.
+    pub media_request: Option<MediaRequest>,
     /// Folder paths the user has opened.
     expanded: BTreeSet<String>,
     /// Rename buffer, live only while a rename is in progress.
     renaming: Option<(SymbolId, String)>,
+    /// The same for a picture or sound.
+    renaming_media: Option<(LibraryMedia, String)>,
+    /// Small pictures of the document's bitmaps. Made here, from the pixels,
+    /// rather than by the shell's GPU thumbnails, which draw symbols.
+    picture_thumbs: HashMap<ImageId, PictureThumb>,
     /// The search string, lower-cased, recomputed only when `search` changes.
     ///
     /// `matches` is called once per symbol; lower-casing the needle inside it
@@ -160,6 +220,72 @@ impl LibraryState {
     fn matches(&self, name: &str) -> bool {
         self.search_lower.is_empty() || name.to_lowercase().contains(&self.search_lower)
     }
+
+    /// The small picture of a bitmap, made on first sight and again whenever
+    /// the bitmap is replaced.
+    fn picture_thumbnail(&mut self, ctx: &egui::Context, asset: &Arc<ImageAsset>) -> egui::TextureHandle {
+        if let Some(thumb) = self.picture_thumbs.get(&asset.id)
+            && Arc::ptr_eq(&thumb.asset, asset)
+        {
+            return thumb.texture.clone();
+        }
+        let texture = ctx.load_texture(
+            format!("library-picture-{}", asset.id.0),
+            picture_thumbnail_image(asset),
+            egui::TextureOptions::LINEAR,
+        );
+        self.picture_thumbs.insert(
+            asset.id,
+            PictureThumb {
+                asset: Arc::clone(asset),
+                texture: texture.clone(),
+            },
+        );
+        texture
+    }
+}
+
+/// A bitmap shrunk to at most [`PICTURE_THUMB`] pixels a side, each pixel the
+/// average of up to nine samples of the block it stands for. Averaged with
+/// the alpha as a weight, so a transparent edge does not darken the colour.
+fn picture_thumbnail_image(asset: &ImageAsset) -> egui::ColorImage {
+    let (w, h) = (asset.width as usize, asset.height as usize);
+    if w == 0 || h == 0 || asset.pixels.len() < w * h * 4 {
+        return egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT);
+    }
+    let scale = (PICTURE_THUMB as f32 / w.max(h) as f32).min(1.0);
+    let tw = ((w as f32 * scale).round() as usize).max(1);
+    let th = ((h as f32 * scale).round() as usize).max(1);
+    let mut rgba = Vec::with_capacity(tw * th * 4);
+    for ty in 0..th {
+        let y0 = ty * h / th;
+        let y1 = ((ty + 1) * h / th).clamp(y0 + 1, h);
+        for tx in 0..tw {
+            let x0 = tx * w / tw;
+            let x1 = ((tx + 1) * w / tw).clamp(x0 + 1, w);
+            let (nx, ny) = ((x1 - x0).min(3), (y1 - y0).min(3));
+            let (mut r, mut g, mut b, mut a) = (0u32, 0u32, 0u32, 0u32);
+            for sy in 0..ny {
+                let y = y0 + sy * (y1 - y0) / ny;
+                for sx in 0..nx {
+                    let x = x0 + sx * (x1 - x0) / nx;
+                    let p = &asset.pixels[(y * w + x) * 4..(y * w + x) * 4 + 4];
+                    let weight = u32::from(p[3]);
+                    r += u32::from(p[0]) * weight;
+                    g += u32::from(p[1]) * weight;
+                    b += u32::from(p[2]) * weight;
+                    a += weight;
+                }
+            }
+            let samples = (nx * ny) as u32;
+            if a == 0 {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            } else {
+                rgba.extend_from_slice(&[(r / a) as u8, (g / a) as u8, (b / a) as u8, (a / samples) as u8]);
+            }
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([tw, th], &rgba)
 }
 
 /// Looks up the picture for a symbol, and remembers that it was asked for.
@@ -208,14 +334,20 @@ pub fn library_panel(
     let mut command = None;
     // Lower-case the search needle once, not once per symbol in `matches`.
     state.sync_search();
+    // A symbol or folder chosen from outside (Place, New Folder) takes the
+    // highlight from a picture or sound; pictures that are gone lose their
+    // small image.
+    if state.selected.is_some() || state.selected_folder.is_some() {
+        state.selected_media = None;
+    }
+    state
+        .picture_thumbs
+        .retain(|id, _| scene.images().get(*id).is_some());
 
+    let items = scene.library().len() + scene.images().len() + scene.sounds().len();
     ui.horizontal(|ui| {
         ui.heading("Library");
-        ui.label(
-            RichText::new(format!("{} items", scene.library().len()))
-                .small()
-                .weak(),
-        );
+        ui.label(RichText::new(format!("{items} items")).small().weak());
     });
 
     // Search. Typing opens every folder, because a hit inside a closed folder
@@ -250,7 +382,7 @@ pub fn library_panel(
     //
     // So: a definite number of rows. Enough to browse in, and never enough to
     // hide what comes after it.
-    if scene.library().is_empty() {
+    if items == 0 {
         egui::ScrollArea::vertical()
             .id_salt("library-items")
             .auto_shrink([false, true])
@@ -261,7 +393,8 @@ pub fn library_panel(
                     RichText::new(
                         "No symbols yet.\n\n\
                          Select artwork and press F8 to convert it to a symbol, \
-                         or use File > Import to Library to bring in an Animate document.",
+                         or use File > Import to Library to bring in a picture, \
+                         a sound or an Animate document.",
                     )
                     .weak()
                     .italics(),
@@ -317,6 +450,12 @@ pub fn library_panel(
                                 thumbnail,
                                 &mut command,
                             );
+                        }
+                        Row::Picture { id, name } => {
+                            draw_picture_row(&mut row_ui, scene, state, *id, name);
+                        }
+                        Row::Sound { id, name } => {
+                            draw_sound_row(&mut row_ui, scene, state, *id, name);
                         }
                     }
                 }
@@ -452,6 +591,10 @@ enum Row {
         kind: SymbolKind,
         depth: usize,
     },
+    /// A bitmap, listed after the symbols under a "Pictures" heading.
+    Picture { id: ImageId, name: String },
+    /// A sound, listed after the pictures under a "Sounds" heading.
+    Sound { id: SoundId, name: String },
 }
 
 /// Flatten the visible tree — expanded folders and matching symbols — into a
@@ -514,6 +657,40 @@ fn flatten_rows(scene: &Scene, state: &LibraryState) -> Vec<Row> {
     }
     let mut rows = Vec::new();
     walk(scene, state, None, 0, &mut rows);
+
+    // Pictures and sounds are not filed in folders; they follow the tree. A
+    // picture is a still, so "Animated" hides it; a sound is neither, so only
+    // "All" shows it.
+    let pictures: Vec<_> = scene
+        .images()
+        .iter()
+        .filter(|i| state.motion.accepts(false) && state.matches(&i.name))
+        .collect();
+    if !pictures.is_empty() {
+        rows.push(Row::Group {
+            label: "Pictures",
+            depth: 0,
+        });
+        rows.extend(pictures.iter().map(|i| Row::Picture {
+            id: i.id,
+            name: i.name.clone(),
+        }));
+    }
+    let sounds: Vec<_> = scene
+        .sounds()
+        .iter()
+        .filter(|s| state.motion == MotionFilter::All && state.matches(&s.name))
+        .collect();
+    if !sounds.is_empty() {
+        rows.push(Row::Group {
+            label: "Sounds",
+            depth: 0,
+        });
+        rows.extend(sounds.iter().map(|s| Row::Sound {
+            id: s.id,
+            name: s.name.clone(),
+        }));
+    }
     rows
 }
 
@@ -547,6 +724,7 @@ fn draw_folder_row(ui: &mut Ui, state: &mut LibraryState, path: &str, leaf: &str
         if ui.selectable_label(selected, leaf).clicked() {
             state.selected_folder = Some(path.to_string());
             state.selected = None;
+            state.selected_media = None;
         }
     });
 }
@@ -671,6 +849,7 @@ fn draw_symbol_row(
         if label.clicked() {
             state.selected = Some(id);
             state.selected_folder = None;
+            state.selected_media = None;
         }
         if label.double_clicked() {
             // Double-click opens the symbol, exactly as in Animate.
@@ -724,6 +903,178 @@ fn draw_symbol_row(
     });
 }
 
+/// One bitmap row: its small picture (the drag handle, as a symbol's is), a
+/// "P" marker, and its name.
+fn draw_picture_row(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    state: &mut LibraryState,
+    id: ImageId,
+    name: &str,
+) {
+    let Some(asset) = scene.images().get(id).cloned() else {
+        return;
+    };
+    let texture = state.picture_thumbnail(ui.ctx(), &asset);
+    let drag_id = ui.id().with(("library-drag-picture", id.0));
+    ui.horizontal(|ui| {
+        ui.add_space(18.0);
+        let dragged = ui.dnd_drag_source(drag_id, DraggedMedia(LibraryMedia::Picture(id)), |ui| {
+            let (slot, _) =
+                ui.allocate_exact_size(egui::vec2(THUMBNAIL, THUMBNAIL), egui::Sense::hover());
+            // Fitted inside the square at its own proportions.
+            let [tw, th] = texture.size();
+            let scale = THUMBNAIL / tw.max(th).max(1) as f32;
+            let size = egui::vec2(tw as f32 * scale, th as f32 * scale);
+            egui::Image::new((texture.id(), size))
+                .paint_at(ui, egui::Rect::from_center_size(slot.center(), size));
+            ui.painter().rect_stroke(
+                slot,
+                2.0,
+                egui::Stroke::new(1.0, Palette::hairline()),
+                egui::StrokeKind::Inside,
+            );
+            slot
+        });
+        dragged
+            .response
+            .on_hover_text("Drag onto the stage to place it");
+        ui.label(RichText::new("P").small().weak())
+            .on_hover_text(format!("Picture, {} x {}", asset.width, asset.height));
+        draw_media_name(ui, scene, state, LibraryMedia::Picture(id), name, 0.0);
+    });
+}
+
+/// One sound row: a small bar icon (the drag handle), an "S" marker, its name
+/// and, on the right, its length.
+fn draw_sound_row(ui: &mut Ui, scene: &mut Scene, state: &mut LibraryState, id: SoundId, name: &str) {
+    let Some(seconds) = scene.sounds().get(id).map(|s| s.duration_seconds()) else {
+        return;
+    };
+    let drag_id = ui.id().with(("library-drag-sound", id.0));
+    ui.horizontal(|ui| {
+        ui.add_space(18.0);
+        let dragged = ui.dnd_drag_source(drag_id, DraggedMedia(LibraryMedia::Sound(id)), |ui| {
+            let (slot, _) =
+                ui.allocate_exact_size(egui::vec2(THUMBNAIL, THUMBNAIL), egui::Sense::hover());
+            // Five bars of different heights, as a sound is drawn everywhere.
+            let colour = ui.visuals().weak_text_color();
+            for (i, height) in [0.35, 0.7, 1.0, 0.6, 0.3].into_iter().enumerate() {
+                let x = slot.left() + THUMBNAIL * (0.15 + 0.175 * i as f32);
+                let half = THUMBNAIL * 0.4 * height;
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(x, slot.center().y - half),
+                        egui::pos2(x, slot.center().y + half),
+                    ],
+                    egui::Stroke::new(2.0, colour),
+                );
+            }
+            slot
+        });
+        dragged
+            .response
+            .on_hover_text("Drag onto the stage to put it on a layer");
+        ui.label(RichText::new("S").small().weak())
+            .on_hover_text("Sound");
+        draw_media_name(ui, scene, state, LibraryMedia::Sound(id), name, DURATION);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(format!("{seconds:.1} s")).small().weak());
+        });
+    });
+}
+
+/// The name of a picture or sound: a button that selects it, places it on a
+/// double-click, and opens its menu; a text field while it is being renamed.
+/// `reserve` is the room left on the right for what the caller draws there.
+fn draw_media_name(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    state: &mut LibraryState,
+    media: LibraryMedia,
+    name: &str,
+    reserve: f32,
+) {
+    if let Some((renaming, buffer)) = &mut state.renaming_media
+        && *renaming == media
+    {
+        let response = ui.text_edit_singleline(buffer);
+        let commit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if commit {
+            let new_name = buffer.trim().to_string();
+            if !new_name.is_empty() && new_name != name {
+                rename_media(scene, media, &new_name);
+            }
+            state.renaming_media = None;
+        } else if response.lost_focus() {
+            state.renaming_media = None;
+        } else {
+            response.request_focus();
+        }
+        return;
+    }
+
+    let room = (ui.available_width() - reserve).max(1.0);
+    let label = ui.add_sized(
+        egui::vec2(room, ui.spacing().interact_size.y),
+        egui::Button::selectable(state.selected_media == Some(media), name).truncate(),
+    );
+    // Highlighting a picture or sound lets go of any symbol or folder.
+    fn choose(state: &mut LibraryState, media: LibraryMedia) {
+        state.selected_media = Some(media);
+        state.selected = None;
+        state.selected_folder = None;
+    }
+    if label.clicked() {
+        choose(state, media);
+    }
+    if label.double_clicked() {
+        choose(state, media);
+        state.media_request = Some(MediaRequest::Place(media));
+    }
+    label.context_menu(|ui| {
+        if ui.button("Place on the stage").clicked() {
+            choose(state, media);
+            state.media_request = Some(MediaRequest::Place(media));
+            ui.close();
+        }
+        if ui.button("Delete").clicked() {
+            choose(state, media);
+            state.media_request = Some(MediaRequest::Delete(media));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Rename").clicked() {
+            state.renaming_media = Some((media, name.to_string()));
+            ui.close();
+        }
+    });
+}
+
+/// Rename a picture or sound, keeping its name unique among its own kind.
+/// The asset is replaced under the same id, so everything that refers to it by
+/// id is unaffected.
+fn rename_media(scene: &mut Scene, media: LibraryMedia, wanted: &str) {
+    match media {
+        LibraryMedia::Picture(id) => {
+            let Some(asset) = scene.images().get(id).cloned() else {
+                return;
+            };
+            let mut renamed = (*asset).clone();
+            renamed.name = scene.images().unique_name(wanted);
+            scene.images_mut().insert(renamed);
+        }
+        LibraryMedia::Sound(id) => {
+            let Some(asset) = scene.sounds().get(id).cloned() else {
+                return;
+            };
+            let mut renamed = (*asset).clone();
+            renamed.name = scene.sounds().unique_name(wanted);
+            scene.sounds_mut().insert(renamed);
+        }
+    }
+}
+
 /// The action strip and the "move to folder" control.
 fn draw_footer(
     ui: &mut Ui,
@@ -733,6 +1084,9 @@ fn draw_footer(
     command: &mut Option<Command>,
 ) {
     let selected = state.selected;
+    // A highlighted picture or sound, which Place and the bin act on when no
+    // symbol is selected.
+    let media = state.selected_media.filter(|_| selected.is_none());
 
     // **Wrapped, not one long row.**
     //
@@ -778,11 +1132,17 @@ fn draw_footer(
         }
         ui.separator();
         if ui
-            .add_enabled(selected.is_some(), egui::Button::new("Place"))
+            .add_enabled(
+                selected.is_some() || media.is_some(),
+                egui::Button::new("Place"),
+            )
             .on_hover_text("Place an instance on the stage")
             .clicked()
         {
-            *command = Some(Command::PlaceInstance);
+            match media {
+                Some(media) => state.media_request = Some(MediaRequest::Place(media)),
+                None => *command = Some(Command::PlaceInstance),
+            }
         }
         if ui
             .add_enabled(selected.is_some(), egui::Button::new("Dup"))
@@ -803,11 +1163,21 @@ fn draw_footer(
             *command = Some(Command::SymbolToAsset);
         }
         if ui
-            .add_enabled(selected.is_some(), egui::Button::new("🗑"))
-            .on_hover_text(Command::DeleteSymbol.label())
+            .add_enabled(
+                selected.is_some() || media.is_some(),
+                egui::Button::new("🗑"),
+            )
+            .on_hover_text(if media.is_some() {
+                "Delete the picture or sound from the library"
+            } else {
+                Command::DeleteSymbol.label()
+            })
             .clicked()
         {
-            *command = Some(Command::DeleteSymbol);
+            match media {
+                Some(media) => state.media_request = Some(MediaRequest::Delete(media)),
+                None => *command = Some(Command::DeleteSymbol),
+            }
         }
     });
 

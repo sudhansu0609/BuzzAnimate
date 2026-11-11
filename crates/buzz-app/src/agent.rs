@@ -125,10 +125,10 @@ pub fn route(command: Command) -> Route {
         // Open a dialog or panel that needs parameters: run from args.
         New | LipSync | TraceBitmapOptions | SetScene | DirectScene | SceneryFor | Perform
         | AddFollowThrough | AddWiggle | AddPendulum | AddHairMotion | AddTitleCard | AiIdentifyAssets | AiRigVectorCharacter | AiRigLayers
-        | AiDirectStory | AiCharacterFromImage | AiMouthChart | ClearAllKeyframes | CleanUpLayers
-        | ArrangeLayers | RepairLayerRigs | RigHead | EvenLines | RemoveBackgroundSpecks | PasteMotion | PasteMotionSpecial | PastePose | CopyPerformance
+        | AiDirectStory | AiSplitPictureIntoLayers | TraceBoldSplit | AiGenerateBackground | AiCharacterFromImage | AiMouthChart | ClearAllKeyframes | CleanUpLayers
+        | ArrangeLayers | RepairLayerRigs | RigHead | EvenLines | OptimizeShapes | RemoveBackgroundSpecks | PasteMotion | PasteMotionSpecial | PastePose | CopyPerformance
         | PastePerformance | PastePerformanceSpecial | StoryboardMake | StoryboardEdit
-        | StoryboardExport => Route::Args,
+        | StoryboardExport | DeleteAndFill | AiRemoveObject => Route::Args,
 
         // Needs the user, or has no document effect.
         Quit | Close | ShortcutEditor | Snapshots | About | AiModels | AiGenerateImage | NextDocument | PreviousDocument | PasteboardColour
@@ -162,7 +162,7 @@ pub fn route(command: Command) -> Route {
         | DuplicateScene | AddPerson | ClearModifiers | BakeModifiers | SetReverse
         | ClearReverse | AddProfileRight | AddProfileLeft | AddThreeQuarterRight
         | AddThreeQuarterLeft | MakeSetupFromScene | SplitAtPlayhead | FlattenToMasterScene
-        | ToggleMasterAudioMode | ReapplyMasterAudio
+        | ToggleMasterAudioMode | ReapplyMasterAudio | LipSyncAllCharacters | AddLifeToAllCharacters
         | ToggleActionsPanel | ClearScriptOutput | CreateClassicTween | CreateMotionTween
         | CreateShapeTween | RemoveTween | InsertFrame | RemoveFrame | InsertKeyframe
         | InsertBlankKeyframe | ClearKeyframe | PlayPause | NextFrame | PreviousFrame
@@ -197,6 +197,10 @@ pub fn execute(app: &mut App, call: &AgentCall) -> AgentResult {
         "wait_for_jobs" => jobs::wait_for_jobs(app, &call.args),
         "transcribe" => jobs::transcribe(app, &call.args),
         "arrange_assets" => assets::arrange_assets(app, &call.args),
+        "cast_start_fresh" => assets::cast_start_fresh(app, &call.args),
+        "cast_delete" => assets::cast_delete(app, &call.args),
+        "cast_combine_poses" => assets::cast_combine_poses(app, &call.args),
+        "import_cast_fla" => assets::import_cast_fla(app, &call.args),
         "dress_set_from_assets" => assets::dress_set_from_assets(app, &call.args),
         // BuzzEdit and Buzzcaf Studio (`crate::estate`, plan steps E2 and E3).
         "send_to_buzzedit" | "buzzedit_projects" | "transcribe_with_buzzedit" | "studio_projects"
@@ -275,7 +279,23 @@ fn run_command(app: &mut App, args: &Value) -> AgentResult {
             };
             app.agent_editor_mut().status = None;
             app.agent_forget_last_task();
+            // An export dialog that was never opened holds its default size
+            // (550x400): size it to the stage for this one export, as the
+            // API's export does, then put the user's settings back.
+            let saved_export = if let Pick::Export(kind) = &pick {
+                let saved = app.agent_editor().export.clone();
+                let editor = app.agent_editor_mut();
+                let size = editor.scene().stage().size;
+                let length = editor.doc.film_frames();
+                editor.export.open(*kind, (size.width.round().max(1.0) as u32, size.height.round().max(1.0) as u32), length);
+                Some(saved)
+            } else {
+                None
+            };
             app.apply_pick(pick, std::path::PathBuf::from(path));
+            if let Some(saved) = saved_export {
+                app.agent_editor_mut().export = saved;
+            }
             let mut value = report(app, id);
             // Scene from Image starts an AI task: hand the model its job id.
             if let Some(job) = app.agent_track_last_job(id) {
@@ -289,7 +309,29 @@ fn run_command(app: &mut App, args: &Value) -> AgentResult {
     }
 
     app.agent_editor_mut().status = None;
+    app.agent_forget_last_task();
     app.dispatch(command);
+    // Lip Sync All Characters hears the dialogue in a job: hand the model its job id.
+    if id == "lip_sync_all_characters"
+        && let Some(job) = app.agent_track_last_job(id)
+    {
+        let mut value = report(app, id);
+        value["started"] = json!(true);
+        value["job"] = json!(job);
+        value["note"] = json!(jobs::WAIT_NOTE);
+        return AgentResult::ok(value);
+    }
+    // The agent reads the result straight away, so a trace the UI would have
+    // handed to a task thread runs here instead.
+    if app.agent_editor().pending_trace.is_some() {
+        app.agent_editor_mut().finish_pending_trace_now();
+    }
+    if app.agent_editor().optimize.work.is_some() {
+        app.agent_editor_mut().finish_optimize_now();
+    }
+    if app.agent_editor().even_lines_work.is_some() {
+        app.agent_editor_mut().finish_even_lines_now();
+    }
     AgentResult::ok(report(app, id))
 }
 
@@ -771,6 +813,8 @@ fn script(app: &mut App, args: &Value) -> AgentResult {
         config_dir: buzz_script::default_config_dir(),
         asset_root: Some(buzz_doc::assets::default_root()),
         prompt_answers: Vec::new(),
+        hooks: Default::default(),
+            overrides: Vec::new(),
     };
     let mut working = editor.doc.scene().clone();
     // Stop reaches the interpreter between bytecodes, like the Script panel's.
@@ -880,7 +924,7 @@ pub const AGENT_TOOLS: &[(&str, &str)] = &[
     ("snapshot", "{frame?: 0-based frame} -> {png_base64, width, height}, longest side <= 768"),
     ("set_property", "{target: element:<id>|layer:<index|name> (index = inspect timeline \"index\", not \"id\")|frame:<layer>:<frame>|light:<id>|light:rig|camera|document|scene, field, value}; inspect {what:\"properties\", target} lists the fields, values and hints. {target:\"document\", field:\"playhead\", value:<0-based frame>} moves the playhead (frame 24 = 23)"),
     ("edit_list", "{target: element:<id>|layer:<index|name> (index = inspect timeline \"index\", not \"id\")|document, list: filters|modifiers|swatches|swatch_folders|poses|bones|rig, op: get|add|remove|move|set (rig list: set_rest_pose|mirror_pose|reset_pose), index?, to?, item?}; one undo step per op, returns the list. filters (element|layer): item {kind: blur|drop_shadow|glow|bevel|adjust|gradient_map, enabled?, <kind parameters>}, move uses to. modifiers (element): item {kind: wiggle|spring|look_at|squash_stretch|breathe|blink|turn|sway|drift|pendulum|hair (side 0 top|1 left|2 right|3 bottom, segments, stiffness, damping, wind, wind_rate, lag), <parameters>}. swatches (document): add {name, color, folder?}; set index {name?, color? (repaints linked fills), folder?|null}; remove; move index to folder. swatch_folders (document): add {name}; remove {name}|index. poses (armature element): add {name} saves the pose; set index applies (item {key:true} also keys it); remove index. bones (armature element): remove index deletes a bone; move index to parent bone|null reparents"),
-    ("wait_for_jobs", "{timeout_s?: 1..300 (default 120)} -> {jobs:[{id, kind, status: running|done|failed, result?, error?}], running, timed_out}; waits for every AI job started in this run (ai_rig_vector_character, ai_rig_layers, ai_direct_story, ai_character_from_image, ai_scene_from_image, transcribe) and returns as soon as none is running, or at the timeout with the ones still running; the BuzzEdit and Studio tools' jobs are waited for the same way. A finished job's result is given once"),
+    ("wait_for_jobs", "{timeout_s?: 1..300 (default 120)} -> {jobs:[{id, kind, status: running|done|failed, result?, error?}], running, timed_out}; waits for every AI job started in this run (ai_rig_vector_character, ai_rig_layers, ai_direct_story, ai_character_from_image, ai_scene_from_image, ai_split_picture_into_layers, ai_generate_background, transcribe) and returns as soon as none is running, or at the timeout with the ones still running; the BuzzEdit and Studio tools' jobs are waited for the same way. A finished job's result is given once"),
     ("transcribe", "{sound?: name of a sound in the library, path?: audio file} (exactly one) -> {started:true, job}; Whisper runs in the background (the multilingual model when installed, else base.en); call wait_for_jobs for {text, language, model, timing, speakers:\"not identified\", segments:[{start_s, end_s, text}]}. There is no speaker separation: infer who speaks from the content"),
     ("send_to_buzzedit", "{scope?: document|scene (default document: the whole film; scene: the scene being edited), project?: BuzzEdit project id from buzzedit_projects (default: a new BuzzEdit project), path?: .mp4 to write (must not exist; default beside the document), start?: bool (launch BuzzEdit if it is not running)} -> {started:true, job}; exports an MP4 on the export queue, then imports it into BuzzEdit; wait_for_jobs gives {project_id, project_name, new_project, video}. Needs ffmpeg"),
     ("buzzedit_projects", "{start?: bool} -> {started:true, job}; wait_for_jobs gives {projects:[{id, name, status}]} from BuzzEdit"),
@@ -888,6 +932,10 @@ pub const AGENT_TOOLS: &[(&str, &str)] = &[
     ("studio_projects", "{start?: bool} -> {started:true, job}; wait_for_jobs gives {projects:[{id, name, brand, status, current_step, has_script}]} from Buzzcaf Studio"),
     ("studio_build_episode", "{project: Studio project id, asset?: the project's script asset (default script), out_dir?: folder (default <the Studio project's folder>/animation), start?: bool} -> {started:true, job}; fetches the script and builds the episode (.buzz + report.md) as POST /api/episode does; wait_for_jobs gives {files, warnings, out_dir}. The script needs '## SCENE n — TITLE' headings"),
     ("dress_set_from_assets", "{query: the scene's words (slugline + what happens, e.g. \"EXT. CHHOTU'S TEA STALL - MORNING, a village lane\"; INT./room/inside -> a room; night/evening -> that sky), style?: name of an asset whose style to follow} -> dresses the open scene's set from the user's own assets (the asset index): a sky, trees and buildings along the horizon at three depths, bushes clear of the rigs on stage, or one room indoors; behind everything already there (in front of Set the scene's Sky/Ground layers; with none, a ground and a sky are staged first); one undo step. Returns {pieces:[{role, name, record, why}], notes, failed, interior, procedural_advised, layers}. Needs the index"),
+    ("cast_delete", "{names?: [Cast character names], all_listed?: true (every character the Cast panel lists, with its search filter)} -> MOVES those Cast assets (and thumbnails) to <assets>/_cast_backup/<date_time>_deleted/ (never erased). Returns {moved, backup, cast_in_series:[names still named by a casting.json]}"),
+    ("cast_combine_poses", "{names?: [role names, e.g. \"DEEPAK\"] (default: every role that has separate view/pose assets)} -> merges `<X>`, `<X> Side`, `<X> Back`, `<X> 3-4`, `<X> Pose <p>` into ONE Cast asset `<X>` whose symbol set holds every pose (Properties > Symbol Instance > Pose switches it per frame); the separate files are moved to <assets>/_cast_backup/<date_time>_combine/. Returns {combined:[{role, poses}], backup}"),
+    ("cast_start_fresh", "{name?: a Cast character's name, all?: true, keep_frame?: int (default 0)} -> Start Fresh: clears every keyframe of that saved Cast character (or every one with all:true), keeping one pose, so it starts clean in a new file; each file is backed up first to <assets>/_cast_backup/<date_time>/ . Returns {cleared, characters:[{name, backup, symbols, keyframes_cleared, picker_symbols_left}]}"),
+    ("import_cast_fla", "{fla: path of the cast FLA (one wrapper symbol per role: deepak, bhushan, mishra, radhe, padosi, padosi2), series: the series name, ai_rig?: bool (default true: try AI Layer Rig on a view whose mouth/arms are not found), roles?: [role names]} -> {started:true, job}; files each role's Front/Side/Back/3-4 poses (cut to one frame, layer-rigged) as Cast/<series>/<ROLE>, <ROLE> Side, <ROLE> Back, <ROLE> 3-4 and its walk cycles (every frame kept) as <ROLE> Pose walk_<view>, then writes the series' casting.json (locked); the Cast folder is backed up first to <assets>/_cast_backup/<stamp>/; the FLA is only read and no asset of yours is overwritten. wait_for_jobs gives {roles:[{role, source_symbol, assets, views, walks, readiness, missing}], backup, casting_json, choices, notes}"),
     ("arrange_assets", "{dry_run?: bool (default true)} -> Arrange by type & style from the asset index: dry run gives {moves, counts:{\"Type/Style\": n}, cast_kept, unindexed, first_moves:[{name, from, to, guessed}]} and moves nothing; dry_run:false moves the files (Cast/ never) and returns {moved, created_folders}; the Assets panel's Undo arrange reverses it. Needs the index (built by the Assets panel's Arrange by type & style…)"),
     ("produce_episode", "{script: screenplay file ('## SCENE n — TITLE' headings), out: output folder, audio?: the dialogue recording of the script's scenes in order, characters?: folder with one sub-folder of pictures per character, style?: comic|painterly|inked|free words (default comic), series?: the series name (names the .buzz and Backgrounds/<series>/), world?: where and when the story lives, ending every background prompt (default \"a semi-rural small town in North India, 2010s: smartphones, motorbikes, small shops and tea stalls of that decade\" for Chirailiya, else none)} -> {started:true, job}; the producer: script breakdown by the model, layer rigs for the cast (kept when Cast has them), one ComfyUI background per place traced into Backgrounds/<series>/, the recording's lines found, the episode built (<out>/<series>.buzz) with auto camera cuts, lights and title cards, a preview MP4 per scene joined into <series>.mp4, and <out>/report.md; resumable (a second call skips unchanged steps); takes minutes, so call wait_for_jobs for {buzz, mp4, report, cast, backgrounds, cuts, lines_from_audio, lines_from_text, warnings}"),
     ("redo_background", "{location: the background's key in backgrounds.json (the scene's location, e.g. courtyard), angle?: wide (default)|low_angle|high_angle|over_shoulder|reverse, out?: the producer's output folder (default: the Producer window's or the open produced .buzz's)} -> {started:true, job}; draws that background again with a new seed (an angle is re-angled from the wide by Qwen), traces and saves it, then rebuilds ONLY the scenes that use it; wait_for_jobs gives {changed, scenes_rebuilt, still}. The change is an override: it survives later full rebuilds"),

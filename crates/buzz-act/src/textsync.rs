@@ -513,12 +513,14 @@ fn rig_mouth(
 // -- a mouth that is a part of a layer rig ---------------------------------------------
 
 /// Which part of this **layer rig** is its mouth: the part, on its own layer,
-/// that is an instance of a symbol with a frame for every shape — preferring
-/// one whose symbol is called a mouth. [`find_rig_mouth`] for a rig made by
-/// layer parenting.
+/// that is an instance of a symbol with a frame for every shape **and is called a
+/// mouth** (the symbol's or the layer's name). Never a guess: a symbol that
+/// holds the face or head also has many frames, and taking it as the mouth
+/// turned its frames into lip-sync and left the character headless. A rig
+/// without a real mouth chart has none (it stays headful and silent).
+/// [`find_rig_mouth`] for a rig made by layer parenting.
 pub fn find_layer_rig_mouth(scene: &Scene, rig: &crate::layer_rig::LayerRigView) -> Option<ObjectId> {
-    let mut fallback = None;
-    for &(_, _, id) in &rig.parts {
+    for &(_, layer, id) in &rig.parts {
         let Some((_, object)) = scene.find_object(id) else {
             continue;
         };
@@ -531,12 +533,14 @@ pub fn find_layer_rig_mouth(scene: &Scene, rig: &crate::layer_rig::LayerRigView)
         if symbol.length() < Viseme::COUNT {
             continue;
         }
-        if symbol.name.to_lowercase().contains("mouth") {
+        let layer_name = scene.layers().get(layer).map(|l| l.name.to_lowercase()).unwrap_or_default();
+        let is_head = |n: &str| n.contains("head") || n.contains("face") || n.contains("base");
+        let sym_name = symbol.name.to_lowercase();
+        if (sym_name.contains("mouth") && !is_head(&sym_name)) || (layer_name.contains("mouth") && !is_head(&layer_name)) {
             return Some(id);
         }
-        fallback.get_or_insert(id);
     }
-    fallback
+    None
 }
 
 /// [`write_rig_mouth`] for a layer rig's mouth part (`object`,

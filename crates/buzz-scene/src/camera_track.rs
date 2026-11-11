@@ -496,6 +496,27 @@ impl CameraTrack {
         self.keys.len() != before
     }
 
+    /// Insert (`delta > 0`) or remove (`delta < 0`) frames at `frame`: every
+    /// camera and focus key *after* it moves by `delta`, so a span opens or
+    /// closes the way Insert Frame and Remove Frame do on a layer. A key at
+    /// `frame` itself stays unless the frames are being removed, then it goes
+    /// (the frame it sat on is gone). Returns whether anything changed.
+    pub fn shift_after(&mut self, frame: u32, delta: i32) -> bool {
+        let before = (self.keys.clone(), self.focus_keys.clone());
+        if delta < 0 {
+            self.keys.retain(|k| k.frame != frame);
+            self.focus_keys.retain(|k| k.frame != frame);
+        }
+        let shift = |f: u32| (f as i64 + delta as i64).max(0) as u32;
+        for k in self.keys.iter_mut().filter(|k| k.frame > frame) {
+            k.frame = shift(k.frame);
+        }
+        for k in self.focus_keys.iter_mut().filter(|k| k.frame > frame) {
+            k.frame = shift(k.frame);
+        }
+        (self.keys.clone(), self.focus_keys.clone()) != before
+    }
+
     pub fn clear(&mut self) {
         self.keys.clear();
     }

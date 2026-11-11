@@ -503,6 +503,14 @@ fn cast<'js>(ctx: &Ctx<'js>, host: &JsObject<'js>, state: &Rc<RefCell<State>>) -
                     amount: get("amount", 0.15),
                     rate: get("rate", 0.2),
                 },
+                "hairflow" => Modifier::HairFlow {
+                    strength: get("strength", 0.08),
+                    rate: get("rate", 0.2),
+                    wavelength: get("wavelength", 0.6),
+                    wind: get("wind", 0.0),
+                    lag: get("lag", 0.18),
+                    root: get("root", 0.0),
+                },
                 "drift" => Modifier::Drift {
                     dx: get("dx", 10.0),
                     dy: get("dy", 0.0),

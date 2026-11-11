@@ -5373,6 +5373,26 @@ impl Editor {
             MoveFrames { to, rows, copy } => self.move_frames(to, rows, copy),
             // Rotate Mode means the selection does not move, from the keys
             // either.
+            // Every frame of every layer — folders hold no frames of their
+            // own — and what is on the current frame, as in Animate.
+            SelectAllFrames => {
+                let scene = self.doc.scene();
+                let layers: Vec<LayerId> = scene
+                    .layers()
+                    .iter()
+                    .filter(|l| l.kind != buzz_scene::LayerKind::Folder)
+                    .map(|l| l.id)
+                    .collect();
+                let last = scene.frame_count().saturating_sub(1);
+                if let Some(&first) = layers.first() {
+                    self.selection.set_timeline(buzz_ui::TimelineSelection::new(
+                        layers, 0, last, first, 0,
+                    ));
+                    self.selection
+                        .select_timeline_contents(self.doc.scene(), self.current_frame);
+                    self.camera_selected = false;
+                }
+            }
             Nudge { .. } if self.machine.rotate_only() => {
                 self.status =
                     Some("Rotate Mode is on \u{2014} Shift+Q to move the selection".into());
@@ -5400,7 +5420,8 @@ impl Editor {
             Copy => {
                 self.copy_selection();
             }
-            Paste => self.paste_clipboard(),
+            Paste => self.paste_clipboard(false),
+            PasteInPlace => self.paste_clipboard(true),
 
             ZoomIn => self.zoom_by(2.0),
             ZoomOut => self.zoom_by(0.5),
@@ -12811,7 +12832,9 @@ impl Editor {
     ///
     /// The clipboard is **not** consumed: pasting the same character into four
     /// scenes is the thing this exists for.
-    fn paste_clipboard(&mut self) {
+    /// Paste the clipboard onto the active layer at the current frame —
+    /// nudged aside, or `in_place` exactly where it was copied from.
+    fn paste_clipboard(&mut self, in_place: bool) {
         let Some(lifted) = self.clipboard.clone() else {
             self.status = Some("There is nothing on the clipboard".into());
             return;
@@ -12825,7 +12848,13 @@ impl Editor {
 
         // Offset like Duplicate does, and for the same reason: a copy landing
         // exactly on its original is indistinguishable from nothing happening.
-        const OFFSET: (f64, f64) = (10.0, 10.0);
+        // Paste in Place is asked for precisely because it lands there.
+        let offset = if in_place {
+            buzz_geom::Vec2::ZERO
+        } else {
+            buzz_geom::Vec2::new(10.0, 10.0)
+        };
+        let label = if in_place { "Paste in Place" } else { "Paste" };
         let frame = self.current_frame;
         let before: Vec<buzz_scene::ObjectId> = scene
             .layers()
@@ -12853,13 +12882,13 @@ impl Editor {
         }
 
         let mut report = None;
-        self.doc.edit("Paste", |scene| {
+        self.doc.edit(label, |scene| {
             report = Some(scene.merge(
                 &lifted,
                 buzz_scene::ImportTarget::Onto {
                     layer,
                     frame,
-                    offset: buzz_geom::Vec2::new(OFFSET.0, OFFSET.1),
+                    offset,
                 },
             ));
         });
@@ -20947,6 +20976,30 @@ mod tests {
             "the point it was turned about moved to {now:?}, so the rotation \
              turned about something else"
         );
+    }
+
+    /// **Paste in Place lands where the copy came from**; Paste nudges it
+    /// aside so it can be seen.
+    #[test]
+    fn paste_in_place_lands_on_the_original() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 100.0, 100.0, 50.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        let original = e.scene().find_object(id).expect("there").1.bounds();
+        e.run(Command::Copy);
+
+        e.run(Command::PasteInPlace);
+        let pasted = e.selection.ids();
+        assert_eq!(pasted.len(), 1, "one copy");
+        assert_ne!(pasted[0], id, "a copy, not the original");
+        let at = e.scene().find_object(pasted[0]).expect("pasted").1.bounds();
+        assert!((at.origin() - original.origin()).hypot() < 1e-6, "moved to {at:?}");
+
+        e.run(Command::Paste);
+        let nudged = e.selection.ids();
+        let at = e.scene().find_object(nudged[0]).expect("pasted").1.bounds();
+        assert!((at.origin() - original.origin()).hypot() > 1.0, "Paste should nudge it aside");
     }
 
     /// Drag in document space through the screen, as the window would.

@@ -195,6 +195,28 @@ impl Selection {
         self.timeline = Some(selection);
     }
 
+    /// **Select what is on the selected frames**, as clicking a frame does in
+    /// Animate: every visible, unlocked object on the timeline selection's
+    /// layers, at `frame`. The frame selection is kept, so the frame commands
+    /// (Copy Frames and the rest) and the object commands (Copy, Delete, a
+    /// transform) both have something to act on.
+    pub fn select_timeline_contents(&mut self, scene: &Scene, frame: u32) {
+        self.objects.clear();
+        let Some(timeline) = &self.timeline else {
+            return;
+        };
+        for layer in scene.layers().selectable() {
+            if !timeline.layers.contains(&layer.id) {
+                continue;
+            }
+            for object in layer.objects_at(frame).iter() {
+                if object.visible && !object.locked {
+                    self.objects.insert(object.id);
+                }
+            }
+        }
+    }
+
     pub fn clear_timeline(&mut self) {
         self.timeline = None;
     }
@@ -748,6 +770,45 @@ mod tests {
 
         s.set(ids.iter().copied());
         assert_eq!(s.describe(&scene), "3 objects selected");
+    }
+
+    /// **Clicking a frame selects what is on it**, as in Animate, and keeps
+    /// the frame selected too — so the frame clipboard and the object
+    /// commands both have something to act on. Only the clicked layers, only
+    /// the clicked frame, and nothing locked or hidden.
+    #[test]
+    fn a_frame_selection_selects_the_artwork_on_that_frame() {
+        let mut scene = Scene::empty();
+        let l1 = scene.add_layer("L1", LayerKind::Normal);
+        let l2 = scene.add_layer("L2", LayerKind::Normal);
+        let square = |x: f64| {
+            ShapeData::filled(KRect::new(x, 0.0, x + 10.0, 10.0).to_path(1e-9), Color::WHITE)
+        };
+        let a = scene.add_shape(l1, square(0.0)).unwrap();
+        let b = scene.add_shape(l2, square(20.0)).unwrap();
+        scene.update_layer(l1, |l| {
+            l.frames.insert_blank_keyframe(10);
+        });
+        let later = scene.add_shape_at(l1, 10, square(40.0)).unwrap();
+
+        let mut s = Selection::new();
+        s.select_one(b);
+        s.set_timeline(TimelineSelection::cell(l1, 0));
+        s.select_timeline_contents(&scene, 0);
+        assert_eq!(s.ids(), vec![a], "only the clicked layer's artwork, and nothing left over");
+        assert!(s.timeline().is_some(), "the frame stays selected");
+
+        s.set_timeline(TimelineSelection::cell(l1, 10));
+        s.select_timeline_contents(&scene, 10);
+        assert_eq!(s.ids(), vec![later], "the artwork on the clicked frame");
+
+        s.set_timeline(TimelineSelection::new([l1, l2], 0, 0, l1, 0));
+        s.select_timeline_contents(&scene, 0);
+        assert_eq!(s.ids(), vec![a, b], "every selected layer");
+
+        scene.update_layer(l2, |l| l.locked = true);
+        s.select_timeline_contents(&scene, 0);
+        assert_eq!(s.ids(), vec![a], "a locked layer is left alone");
     }
 
     #[test]

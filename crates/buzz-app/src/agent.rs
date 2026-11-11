@@ -143,7 +143,7 @@ pub fn route(command: Command) -> Route {
 
         // Everything else runs as it does from the menu or the keyboard.
         SaveSnapshot | AttachSound | RemoveSound | NewMouthSymbol | DetectBeats | FitToNarration
-        | LipSyncFromCaptions | Undo | Redo | Cut | Copy | Paste | Delete | SelectAll | Deselect
+        | LipSyncFromCaptions | Undo | Redo | Cut | Copy | Paste | PasteInPlace | Delete | SelectAll | Deselect
         | DuplicateSelection | ZoomIn | ZoomOut | ZoomActual | ZoomFitInWindow | ZoomShowFrame
         | ZoomShowAll | ToggleRulers | ToggleAutoSave | ToggleGrid | ToggleGuides | ToggleSnapping
         | TogglePasteboard | ToggleNeighbours | GroupSelection | UngroupSelection | BreakApart | BringToFront
@@ -166,7 +166,7 @@ pub fn route(command: Command) -> Route {
         | ToggleActionsPanel | ClearScriptOutput | CreateClassicTween | CreateMotionTween
         | CreateShapeTween | RemoveTween | InsertFrame | RemoveFrame | InsertKeyframe
         | InsertBlankKeyframe | ClearKeyframe | PlayPause | NextFrame | PreviousFrame
-        | FirstFrame | LastFrame | CutFrames | CopyFrames | PasteFrames | CopyMotion | CopyPose | ClearFrames
+        | FirstFrame | LastFrame | CutFrames | CopyFrames | PasteFrames | SelectAllFrames | CopyMotion | CopyPose | ClearFrames
         | ReverseFrames | ToggleOnionSkin | ToggleAutoKeyframe | ToggleEditMultipleFrames
         | ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere
         | ToggleCamera | AddCameraKeyframe | RemoveCameraKeyframe | ResetCamera

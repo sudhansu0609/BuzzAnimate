@@ -227,8 +227,14 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::Undo, can_undo, &mut raised);
             item(ui, Command::Redo, can_redo, &mut raised);
             ui.separator();
-            for c in [Command::Cut, Command::Copy, Command::Paste, Command::Delete] {
-                let enabled = c == Command::Paste || has_selection;
+            for c in [
+                Command::Cut,
+                Command::Copy,
+                Command::Paste,
+                Command::PasteInPlace,
+                Command::Delete,
+            ] {
+                let enabled = matches!(c, Command::Paste | Command::PasteInPlace) || has_selection;
                 item(ui, c, enabled, &mut raised);
             }
             ui.separator();
@@ -607,6 +613,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 Command::CopyFrames,
                 Command::PasteFrames,
                 Command::ClearFrames,
+                Command::SelectAllFrames,
                 Command::ReverseFrames,
                 Command::ExposeOnTwos,
                 Command::ExposeOnThrees,

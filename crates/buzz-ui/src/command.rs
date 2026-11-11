@@ -108,6 +108,10 @@ pub enum Command {
     Cut,
     Copy,
     Paste,
+    /// **Paste in Place**: paste where the copied objects were, rather than
+    /// nudged aside — Animate's Ctrl+Shift+V. What carries a part to the same
+    /// spot on another frame or another layer.
+    PasteInPlace,
     Delete,
     SelectAll,
     Deselect,
@@ -504,6 +508,9 @@ pub enum Command {
     CopyFrames,
     /// Animate's Paste Frames.
     PasteFrames,
+    /// Animate's Select All Frames: every frame of every layer, and what is on
+    /// the current frame selected on the stage.
+    SelectAllFrames,
     /// **Copy Motion**: store the selected object's keyframed motion (pose,
     /// colour, timing, tweens) as a `MotionClip`
     /// (`docs/AI_LAYER_RIG_AND_MOTION_COPY_PLAN.md` C1).
@@ -723,6 +730,7 @@ command_table! {
             Cut => "cut",
             Copy => "copy",
             Paste => "paste",
+            PasteInPlace => "paste_in_place",
             Delete => "delete",
             SelectAll => "select_all",
             Deselect => "deselect",
@@ -869,6 +877,7 @@ command_table! {
             CutFrames => "cut_frames",
             CopyFrames => "copy_frames",
             PasteFrames => "paste_frames",
+            SelectAllFrames => "select_all_frames",
             CopyMotion => "copy_motion",
             PasteMotion => "paste_motion",
             PasteMotionSpecial => "paste_motion_special",
@@ -1171,6 +1180,7 @@ impl Command {
             Cut => "Cut",
             Copy => "Copy",
             Paste => "Paste",
+            PasteInPlace => "Paste in Place",
             Delete => "Delete",
             SelectAll => "Select All",
             Deselect => "Deselect All",
@@ -1341,6 +1351,7 @@ impl Command {
             CutFrames => "Cut Frames",
             CopyFrames => "Copy Frames",
             PasteFrames => "Paste Frames",
+            SelectAllFrames => "Select All Frames",
             CopyMotion => "Copy Motion",
             PasteMotion => "Paste Motion",
             PasteMotionSpecial => "Paste Motion Special\u{2026}",
@@ -1425,6 +1436,7 @@ impl Command {
             Cut => sc(ctrl, Key::X),
             Copy => sc(ctrl, Key::C),
             Paste => sc(ctrl, Key::V),
+            PasteInPlace => sc(ctrl_shift, Key::V),
             Delete => sc(Modifiers::NONE, Key::Delete),
             SelectAll => sc(ctrl, Key::A),
             Deselect => sc(ctrl_shift, Key::A),
@@ -1593,6 +1605,7 @@ impl Command {
             CutFrames => sc(ctrl_alt, Key::X),
             CopyFrames => sc(ctrl_alt, Key::C),
             PasteFrames => sc(ctrl_alt, Key::V),
+            SelectAllFrames => sc(ctrl_alt, Key::A),
             CopyMotion
             | PasteMotion
             | PasteMotionSpecial
@@ -1723,6 +1736,7 @@ pub fn palette_commands() -> Vec<Command> {
         Cut,
         Copy,
         Paste,
+        PasteInPlace,
         Delete,
         SelectAll,
         Deselect,
@@ -1786,6 +1800,7 @@ pub fn palette_commands() -> Vec<Command> {
         CutFrames,
         CopyFrames,
         PasteFrames,
+        SelectAllFrames,
         CopyMotion,
         PasteMotion,
         PasteMotionSpecial,
@@ -1970,6 +1985,7 @@ mod tests {
             Cut,
             Copy,
             Paste,
+            PasteInPlace,
             Delete,
             SelectAll,
             Deselect,
@@ -2032,6 +2048,7 @@ mod tests {
             CutFrames,
             CopyFrames,
             PasteFrames,
+            SelectAllFrames,
             CopyMotion,
             PasteMotion,
             PasteMotionSpecial,
@@ -2229,7 +2246,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            236
+            238
         );
     }
 

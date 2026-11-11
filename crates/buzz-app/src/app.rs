@@ -2802,6 +2802,65 @@ fn script_samples() -> Vec<buzz_ui::SampleEntry> {
         .collect()
 }
 
+/// **Give ⌘C, ⌘X and ⌘V back their key press.**
+///
+/// egui-winit turns every press of C, X or V with Command held into a bare
+/// `Copy`, `Cut` or `Paste` event and sends no key at all — whatever else is
+/// held, and for Paste only when the system clipboard has text in it. The
+/// shortcut map matches *keys*, so Copy, Cut, Paste, Paste in Place and the
+/// frame clipboard on ⌘⌥C / ⌘⌥X / ⌘⌥V were all listed against keys that could
+/// never arrive. The clipboard event is left where it is, for a focused text
+/// field; the key is added beside it, carrying the modifiers really held.
+///
+/// The letter is read the way egui-winit reads it — the logical key, falling
+/// back to the physical one — because ⌥C on a Mac types "ç", and it is the
+/// physical key that says C was pressed.
+fn restore_clipboard_key(state: &mut egui_winit::State, event: &WindowEvent) {
+    use winit::keyboard::{Key as WinitKey, KeyCode, PhysicalKey};
+    let WindowEvent::KeyboardInput { event, .. } = event else {
+        return;
+    };
+    if event.state != ElementState::Pressed {
+        return;
+    }
+    let modifiers = state.egui_input().modifiers;
+    if !modifiers.command {
+        return;
+    }
+    let logical = match &event.logical_key {
+        WinitKey::Character(c) => match c.to_lowercase().as_str() {
+            "c" => Some(egui::Key::C),
+            "x" => Some(egui::Key::X),
+            "v" => Some(egui::Key::V),
+            _ => None,
+        },
+        _ => None,
+    };
+    let physical = match event.physical_key {
+        PhysicalKey::Code(KeyCode::KeyC) => Some(egui::Key::C),
+        PhysicalKey::Code(KeyCode::KeyX) => Some(egui::Key::X),
+        PhysicalKey::Code(KeyCode::KeyV) => Some(egui::Key::V),
+        _ => None,
+    };
+    let Some(key) = logical.or(physical) else {
+        return;
+    };
+    let events = &mut state.egui_input_mut().events;
+    // Should a later egui-winit send the key itself, do not send it twice.
+    if events.iter().any(|e| {
+        matches!(e, egui::Event::Key { key: k, pressed: true, .. } if *k == key)
+    }) {
+        return;
+    }
+    events.push(egui::Event::Key {
+        key,
+        physical_key: physical,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    });
+}
+
 /// Commands the keyboard raises.
 ///
 /// **This list is what actually binds a key.** A command can have a
@@ -2830,6 +2889,7 @@ pub const KEYBOARD_COMMANDS: &[Command] = &[
     Command::Cut,
     Command::Copy,
     Command::Paste,
+    Command::PasteInPlace,
     Command::Delete,
     Command::SelectAll,
     Command::Deselect,
@@ -2887,6 +2947,7 @@ pub const KEYBOARD_COMMANDS: &[Command] = &[
     Command::CutFrames,
     Command::CopyFrames,
     Command::PasteFrames,
+    Command::SelectAllFrames,
     Command::ClearFrames,
     Command::ClearKeyframe,
     Command::CreateClassicTween,
@@ -7468,7 +7529,12 @@ impl App {
             });
         }
         if let Some(selection) = response.select_cells {
+            // The clicked frame, which the playhead is about to move to.
+            let frame = response.scrub_to.unwrap_or(self.editor.current_frame);
             self.editor.selection.set_timeline(selection);
+            self.editor
+                .selection
+                .select_timeline_contents(self.editor.doc.scene(), frame);
             self.editor.camera_selected = false;
         }
         if let Some(m) = response.move_frames {
@@ -8623,6 +8689,7 @@ impl App {
             item(ui, Command::Cut, has_selection);
             item(ui, Command::Copy, has_selection);
             item(ui, Command::Paste, true);
+            item(ui, Command::PasteInPlace, true);
             item(ui, Command::Delete, has_selection);
             ui.separator();
 
@@ -16047,6 +16114,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         let response = active.egui_state.on_window_event(&active.window, &event);
+        restore_clipboard_key(&mut active.egui_state, &event);
         // **Not for `RedrawRequested`:** egui-winit answers every one of those
         // with `repaint: true`, so asking for a redraw here made each frame
         // order the next one and an idle document re-rendered forever (Bimari5:
@@ -18618,6 +18686,41 @@ mod idle_tests {
         drive(&mut app, vec![]);
         assert!(app.editor.selection.contains(ids[0]), "the right-clicked square stays selected");
         assert!(!app.editor.selection.contains(ids[1]), "the square the pointer crossed is not selected");
+    }
+
+    /// **The clipboard keys reach their commands** once the key press is put
+    /// back beside egui-winit's clipboard event (`restore_clipboard_key`):
+    /// ⌘⌥C/X/V are the frame clipboard, as in Animate, and must not fall
+    /// through to the object clipboard on ⌘C/X/V — and those must still work.
+    /// ⌘⌥A is Select All Frames.
+    #[test]
+    fn the_clipboard_keys_reach_frame_and_object_commands() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let ctx = egui::Context::default();
+        let mut press = |key: egui::Key, modifiers: egui::Modifiers| {
+            let input = egui::RawInput {
+                events: vec![
+                    egui::Event::Copy,
+                    egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers },
+                ],
+                modifiers,
+                ..Default::default()
+            };
+            let mut got = Vec::new();
+            let _ = ctx.run_ui(input, |ui| got = keyboard_commands(ui.ctx(), &mut app.editor).0);
+            got
+        };
+        let cmd = egui::Modifiers::COMMAND;
+        let cmd_opt = egui::Modifiers::COMMAND | egui::Modifiers::ALT;
+        assert_eq!(press(egui::Key::C, cmd_opt), vec![Command::CopyFrames]);
+        assert_eq!(press(egui::Key::X, cmd_opt), vec![Command::CutFrames]);
+        assert_eq!(press(egui::Key::V, cmd_opt), vec![Command::PasteFrames]);
+        assert_eq!(press(egui::Key::C, cmd), vec![Command::Copy]);
+        assert_eq!(press(egui::Key::X, cmd), vec![Command::Cut]);
+        assert_eq!(press(egui::Key::V, cmd), vec![Command::Paste]);
+        assert_eq!(press(egui::Key::A, cmd_opt), vec![Command::SelectAllFrames]);
+        let cmd_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        assert_eq!(press(egui::Key::V, cmd_shift), vec![Command::PasteInPlace]);
     }
 
     /// **A keymap from Animate fires the most specific binding.** egui ignores

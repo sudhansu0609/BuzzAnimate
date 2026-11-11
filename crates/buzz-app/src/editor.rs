@@ -8960,6 +8960,13 @@ impl Editor {
     /// The artwork moves *into* the symbol rather than being copied, which is
     /// what makes F8 a conversion rather than a duplication.
     fn convert_selection_to_symbol(&mut self) {
+        self.convert_selection_to_symbol_as(None, self.library.new_symbol_kind);
+    }
+
+    /// Convert to Symbol with the name and type the Convert to Symbol dialog
+    /// asked for. `None` for the name keeps the default and offers it for
+    /// typing in the Library instead, which is what scripts and the agent get.
+    pub fn convert_selection_to_symbol_as(&mut self, name: Option<&str>, kind: buzz_scene::SymbolKind) {
         if self.selection.is_empty() {
             self.status = Some("Select artwork first, then Convert to Symbol".into());
             return;
@@ -8970,7 +8977,7 @@ impl Editor {
         let ids: Vec<ObjectId> = self.selection.iter().collect();
         let frame = self.current_frame;
         let folder = self.library.selected_folder.clone();
-        let kind = self.library.new_symbol_kind;
+        let asked = name.map(str::trim).filter(|n| !n.is_empty());
 
         // The instance's origin is the selection's top-left, so the artwork
         // does not jump when it is replaced.
@@ -8983,7 +8990,7 @@ impl Editor {
         let mut placed = None;
         let mut made = None;
         self.doc.edit("Convert to Symbol", |scene| {
-            let symbol = scene.add_symbol("Symbol", kind, folder.as_deref());
+            let symbol = scene.add_symbol(asked.unwrap_or("Symbol"), kind, folder.as_deref());
             made = Some(symbol);
             let Some(inner_layer) = scene
                 .library()
@@ -9037,6 +9044,11 @@ impl Editor {
                 // default.
                 if let Some(symbol) = made {
                     self.library.selected = Some(symbol);
+                    if asked.is_some() {
+                        // Named in the dialog already: nothing left to type.
+                        self.status = Some(format!("Converted to {}", kind.label()));
+                        return;
+                    }
                     let name = self
                         .doc
                         .scene()
@@ -9055,11 +9067,17 @@ impl Editor {
 
     /// Animate's Ctrl+F8: an empty symbol, opened for editing.
     fn new_symbol(&mut self) {
+        self.new_symbol_as(None, self.library.new_symbol_kind);
+    }
+
+    /// New Symbol with the name and type the dialog asked for; `None` keeps
+    /// the default name and offers it for typing in the Library.
+    pub fn new_symbol_as(&mut self, name: Option<&str>, kind: buzz_scene::SymbolKind) {
         let folder = self.library.selected_folder.clone();
-        let kind = self.library.new_symbol_kind;
+        let asked = name.map(str::trim).filter(|n| !n.is_empty());
         let mut created = None;
         self.doc.edit("New Symbol", |scene| {
-            created = Some(scene.add_symbol("Symbol", kind, folder.as_deref()));
+            created = Some(scene.add_symbol(asked.unwrap_or("Symbol"), kind, folder.as_deref()));
         });
         if let Some(id) = created {
             self.library.selected = Some(id);
@@ -9071,7 +9089,9 @@ impl Editor {
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| "Symbol".into());
             // The same offer Convert to Symbol makes, for the same reason.
-            self.library.start_naming(id, name);
+            if asked.is_none() {
+                self.library.start_naming(id, name);
+            }
             self.doc.edit_view(|scene| {
                 scene.enter_symbol(id);
             });

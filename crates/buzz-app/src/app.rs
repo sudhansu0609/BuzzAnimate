@@ -1172,6 +1172,8 @@ pub struct App {
     /// A close request with work that would be lost raises this instead of
     /// exiting, so a half-written film is a decision rather than an accident.
     quit_prompt: bool,
+    /// Convert to Symbol / New Symbol, asking for the name and type.
+    symbol_dialog: Option<crate::symbol_dialog::SymbolDialog>,
     /// The export presets, built-in and the user's own, for the Export dialog.
     presets: crate::presets::PresetLibrary,
     /// Lighting geometry kept between frames.
@@ -1627,6 +1629,7 @@ impl App {
             pen_pressure: None,
             pan_last_screen: None,
             quit_prompt: false,
+            symbol_dialog: None,
             presets: crate::presets::PresetLibrary::load(),
             lights: fresh_light_cache(),
             pipeline: crate::encode_ahead::Pipeline::for_app(Arc::clone(&jobs)),
@@ -4389,6 +4392,7 @@ impl App {
         self.script_dialogs.show(&ctx);
         self.quit_prompt_dialog(&ctx);
         self.close_prompt_dialog(&ctx);
+        self.symbol_dialog_ui(&ctx);
         self.export_dialog(&ctx);
         self.lip_sync_dialog(&ctx);
         self.staging_dialog(&ctx);
@@ -9741,6 +9745,9 @@ impl App {
             self.master_audio_confirm = false;
         }
         match command {
+            // Animate asks for the name and type first (`symbol_dialog`).
+            Command::ConvertToSymbol => self.open_symbol_dialog(crate::symbol_dialog::Purpose::Convert),
+            Command::NewSymbol => self.open_symbol_dialog(crate::symbol_dialog::Purpose::New),
             // No longer menu entries: the same dialog as Import to Stage,
             // which takes pictures and sound as well (`import_dialog`).
             Command::ImportSound | Command::ImportImage => {
@@ -15198,6 +15205,43 @@ impl App {
     }
 
     /// The "an export is still running" prompt.
+    /// Raise the Convert to Symbol / Create New Symbol dialog.
+    fn open_symbol_dialog(&mut self, purpose: crate::symbol_dialog::Purpose) {
+        if purpose == crate::symbol_dialog::Purpose::Convert && self.editor.selection.is_empty() {
+            self.editor.status = Some("Select artwork first, then Convert to Symbol".into());
+            return;
+        }
+        self.symbol_dialog = Some(crate::symbol_dialog::SymbolDialog::new(
+            purpose,
+            self.editor.doc.scene(),
+            self.editor.library.new_symbol_kind,
+            self.editor.library.selected_folder.clone(),
+        ));
+    }
+
+    /// Draw the symbol dialog, and convert or create once it is accepted.
+    fn symbol_dialog_ui(&mut self, ctx: &egui::Context) {
+        use crate::symbol_dialog::{Outcome, Purpose};
+        let Some(dialog) = self.symbol_dialog.as_mut() else {
+            return;
+        };
+        let purpose = dialog.purpose;
+        match dialog.show(ctx) {
+            Outcome::Open => {}
+            Outcome::Cancelled => self.symbol_dialog = None,
+            Outcome::Accepted { name, kind } => {
+                self.symbol_dialog = None;
+                // Remembered, as Animate remembers the last type chosen.
+                self.editor.library.new_symbol_kind = kind;
+                match purpose {
+                    Purpose::Convert => self.editor.convert_selection_to_symbol_as(Some(&name), kind),
+                    Purpose::New => self.editor.new_symbol_as(Some(&name), kind),
+                }
+                self.editor.doc.end_gesture();
+            }
+        }
+    }
+
     fn quit_prompt_dialog(&mut self, ctx: &egui::Context) {
         if !self.quit_prompt {
             return;
@@ -20353,7 +20397,7 @@ mod idle_tests {
                     app.editor.selection.set([ids[0], ids[1]]);
                     app.dispatch(Command::GroupSelection);
                 }
-                "instance" => app.dispatch(Command::ConvertToSymbol),
+                "instance" => app.editor.run(Command::ConvertToSymbol),
                 "bitmap" => {
                     let dir = tempfile::tempdir().unwrap();
                     let path = dir.path().join("pic.png");
@@ -20443,7 +20487,7 @@ mod idle_tests {
             );
         });
         app.editor.selection.set([id.unwrap()]);
-        app.dispatch(Command::ConvertToSymbol);
+        app.editor.run(Command::ConvertToSymbol);
         assert_eq!(app.editor.doc.scene().library().len(), 1);
         app.dispatch(Command::Copy);
         app.dispatch(Command::Paste);
@@ -20452,6 +20496,71 @@ mod idle_tests {
         let symbols: Vec<_> = scene.layers().get(layer).unwrap().objects_at(0).iter().filter_map(|o| o.instance().map(|i| i.symbol)).collect();
         assert_eq!(symbols.len(), 2, "two instances");
         assert_eq!(symbols[0], symbols[1], "of the one symbol");
+    }
+
+    /// **F8 asks for the name and type first**, as Animate's Convert to
+    /// Symbol dialog does: nothing is converted until it is accepted, the
+    /// typed name replaces the default, and the chosen type is the symbol's.
+    #[test]
+    fn convert_to_symbol_asks_for_its_name_and_type() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let layer = app.editor.doc.scene().layers().iter().next().unwrap().id;
+        let mut id = None;
+        app.editor.doc.edit("fixture", |s| {
+            id = s.add_shape(
+                layer,
+                buzz_scene::ShapeData::filled(
+                    buzz_geom::Shape::to_path(&buzz_geom::Rect::new(0.0, 0.0, 50.0, 50.0), 1e-9),
+                    peniko::Color::BLACK,
+                ),
+            );
+        });
+        app.editor.selection.set([id.unwrap()]);
+        app.dispatch(Command::ConvertToSymbol);
+        assert!(app.symbol_dialog.is_some(), "the dialog is up");
+        assert_eq!(app.editor.doc.scene().library().len(), 0, "nothing converted yet");
+        assert_eq!(app.symbol_dialog.as_ref().unwrap().name, "Symbol 1");
+
+        let ctx = egui::Context::default();
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput { events, ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| app.symbol_dialog_ui(ui.ctx()));
+        };
+        // First frame focuses the field with the default selected.
+        frame(&mut app, vec![]);
+        app.symbol_dialog.as_mut().unwrap().kind = buzz_scene::SymbolKind::MovieClip;
+        frame(&mut app, vec![egui::Event::Text("Hero Head".into())]);
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![enter]);
+
+        assert!(app.symbol_dialog.is_none(), "Enter accepts");
+        let scene = app.editor.doc.scene();
+        let symbol = scene.library().find_by_name("Hero Head").expect("named as typed");
+        assert_eq!(symbol.kind, buzz_scene::SymbolKind::MovieClip);
+        assert_eq!(app.editor.library.new_symbol_kind, buzz_scene::SymbolKind::MovieClip, "remembered");
+        assert!(app.editor.library.naming().is_none(), "no second ask in the Library");
+
+        // Escape on the next one converts nothing.
+        app.editor.selection.set([]);
+        app.dispatch(Command::NewSymbol);
+        frame(&mut app, vec![]);
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: Some(egui::Key::Escape),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![escape]);
+        assert!(app.symbol_dialog.is_none());
+        assert_eq!(app.editor.doc.scene().library().len(), 1, "cancelled");
     }
 
     /// **The stage menu acts on what was right-clicked**, not on whatever the

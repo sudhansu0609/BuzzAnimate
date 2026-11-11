@@ -64,6 +64,7 @@ pub mod staging;
 pub mod story;
 pub mod storyboard;
 pub mod storyboard_panel;
+pub mod symbol_dialog;
 pub mod tasks;
 pub mod test_movie;
 pub mod thumbnails;

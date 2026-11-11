@@ -310,7 +310,13 @@ fn run_command(app: &mut App, args: &Value) -> AgentResult {
 
     app.agent_editor_mut().status = None;
     app.agent_forget_last_task();
-    app.dispatch(command);
+    if matches!(command, Command::ConvertToSymbol | Command::NewSymbol) {
+        // From the menu these ask for a name in a modal; the agent has no one
+        // to answer it, so it gets the editor's direct conversion.
+        app.agent_editor_mut().run(command);
+    } else {
+        app.dispatch(command);
+    }
     // Lip Sync All Characters hears the dialogue in a job: hand the model its job id.
     if id == "lip_sync_all_characters"
         && let Some(job) = app.agent_track_last_job(id)

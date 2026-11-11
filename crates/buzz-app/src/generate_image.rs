@@ -53,6 +53,9 @@ pub struct Settings {
     /// Load GGUF (Q8) copies of the workflow's models when they are
     /// installed: about 11 GB instead of 19 GB, so nothing swaps.
     pub small_models: bool,
+    /// Place it on the stage at its own pixel size rather than fitted to the
+    /// stage, so an upscaled picture comes in as large as it was made.
+    pub full_size: bool,
 }
 
 impl Default for Settings {
@@ -74,6 +77,7 @@ impl Default for Settings {
             keep_models_loaded: true,
             free_before_tasks: true,
             small_models: true,
+            full_size: true,
         }
     }
 }
@@ -300,6 +304,9 @@ impl GenerateImage {
             Ok((picture, notes)) => {
                 let stem = picture.file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                 let placed = match self.settings.destination {
+                    Destination::Stage if self.settings.full_size => {
+                        editor.import_image_full_size(&picture.file).map_err(|e| e.to_string())
+                    }
                     Destination::Stage => editor.import_image(&picture.file).map_err(|e| e.to_string()),
                     Destination::Library => {
                         let mut out = Err("not added".to_string());
@@ -513,6 +520,15 @@ impl GenerateImage {
                         ui.radio_value(&mut self.settings.destination, Destination::Stage, "Stage (active layer)");
                     });
                     ui.end_row();
+                    if self.settings.destination == Destination::Stage {
+                        ui.label("");
+                        ui.checkbox(&mut self.settings.full_size, "At full size (1 pixel = 1 stage unit)")
+                            .on_hover_text(
+                                "An upscaled 5120\u{d7}2880 picture comes in 5120\u{d7}2880, larger than the stage, for the \
+                                 camera to move across. Off: fitted to the stage.",
+                            );
+                        ui.end_row();
+                    }
                 });
 
                 // **Memory**: whether ComfyUI keeps its models between

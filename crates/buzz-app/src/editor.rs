@@ -6976,6 +6976,23 @@ impl Editor {
         path: &std::path::Path,
         offset: (f64, f64),
     ) -> anyhow::Result<String> {
+        self.place_picture(path, offset, true)
+    }
+
+    /// **At its own size, one picture pixel to one stage unit** — not fitted
+    /// to the stage. What a generated background wants: a 4× upscaled
+    /// 5120×2880 picture is a set the camera pans across, and fitting it to a
+    /// 1920×1080 stage made it no bigger than the picture before the upscale.
+    pub fn import_image_full_size(&mut self, path: &std::path::Path) -> anyhow::Result<String> {
+        self.place_picture(path, (0.0, 0.0), false)
+    }
+
+    fn place_picture(
+        &mut self,
+        path: &std::path::Path,
+        offset: (f64, f64),
+        fit_to_stage: bool,
+    ) -> anyhow::Result<String> {
         // Read and decode before the document is touched, so a file that is
         // not really a picture leaves no library entry behind.
         let bytes = std::fs::read(path)?;
@@ -7007,7 +7024,7 @@ impl Editor {
                 }
             };
             let (w, h) = (asset.width as f64, asset.height as f64);
-            let fit = (stage.width / w).min(stage.height / h).min(1.0);
+            let fit = if fit_to_stage { (stage.width / w).min(stage.height / h).min(1.0) } else { 1.0 };
             let (w, h) = (w * fit, h * fit);
             let rect = buzz_geom::Rect::new(
                 centre.x - w / 2.0,
@@ -19194,6 +19211,27 @@ mod tests {
         e.selection.set_timeline(buzz_ui::TimelineSelection::new([sound], 5, 5, sound, 5));
         e.run(Command::InsertFrame);
         assert_eq!(starts(&e, sound), vec![0, 11]);
+    }
+
+    /// **Full size keeps every pixel's size**; the ordinary import fits a
+    /// picture larger than the stage inside it.
+    #[test]
+    fn a_picture_comes_in_fitted_or_at_full_size() {
+        let dir = std::env::temp_dir().join(format!("buzz_full_size_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide.png");
+        image::RgbaImage::from_pixel(800, 400, image::Rgba([200, 100, 50, 255])).save(&path).unwrap();
+        let mut e = editor();
+        e.doc.edit("Stage", |s| s.stage_mut().size = buzz_geom::Size::new(400.0, 300.0));
+        let width = |e: &Editor| {
+            let id = e.selection.ids()[0];
+            e.scene().find_object(id).unwrap().1.bounds().width().round()
+        };
+        e.import_image(&path).unwrap();
+        assert_eq!(width(&e), 400.0, "fitted to the 400-wide stage");
+        e.import_image_full_size(&path).unwrap();
+        assert_eq!(width(&e), 800.0, "all 800 pixels wide");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **Delete takes the object from the frame you are on, not before it.**

@@ -1208,6 +1208,8 @@ pub struct App {
     /// must not appear over a picture that is meant to show the ordinary
     /// chrome.
     pub(crate) recovery: buzz_ui::RecoveryState,
+    /// Properties coming forward when an object is picked on the stage.
+    panel_follow: PanelFollow,
     /// The Ctrl+K command palette's open state and query.
     command_palette: buzz_ui::CommandPaletteState,
     /// Named version snapshots of the document, and whether the list is open.
@@ -1636,6 +1638,7 @@ impl App {
             },
             warm_stage: None,
             recovery: buzz_ui::RecoveryState::default(),
+            panel_follow: PanelFollow::default(),
             command_palette: buzz_ui::CommandPaletteState::default(),
             snapshots: buzz_doc::SnapshotLibrary::user(),
             show_snapshots: false,
@@ -3724,6 +3727,60 @@ impl App {
     /// `ui_snapshot.rs` can drive the identical panel layout the real window
     /// draws, the same way the headless `dock_drag_tests::Drive` harness below
     /// already does from within this module.
+    /// **Picking an object shows its properties.** When the selection
+    /// changes to objects picked on the stage, Properties comes to the front
+    /// of its section and unrolls, and the Layers panel above it in the same
+    /// column rolls up out of the way; the layers come back when nothing is
+    /// selected. Opening Layers yourself while something is selected keeps it
+    /// open from then on — the panel is moved for you only until you say
+    /// otherwise. A frame clicked in the timeline (which selects that frame's
+    /// artwork too) leaves the panels as they are.
+    fn follow_selection_with_panels(&mut self) {
+        use buzz_ui::PanelId;
+        let picking = matches!(self.editor.tool(), buzz_ui::ToolId::Selection | buzz_ui::ToolId::Subselection);
+        let camera_selected = self.editor.camera_selected;
+        let follow = &mut self.panel_follow;
+        let workspace = &mut self.editor.workspace;
+        let selection = &self.editor.selection;
+        // Rolled up for you, then opened again by hand: that is an answer.
+        if follow.layers_rolled_up && !workspace.is_collapsed(PanelId::Layers) {
+            follow.layers_rolled_up = false;
+            follow.keep_layers_open = true;
+        }
+        let mut picked = selection.ids();
+        picked.sort_unstable();
+        if picked == follow.last {
+            return;
+        }
+        follow.last = picked;
+        if follow.last.is_empty() {
+            if follow.layers_rolled_up {
+                workspace.set_collapsed(PanelId::Layers, false);
+                follow.layers_rolled_up = false;
+            }
+            return;
+        }
+        // Picked with the Selection tools only: the Bone tool, Free
+        // Transform and the rest keep their own options (the Tool tab) in
+        // front, which is what they are being used for.
+        if !picking || selection.timeline().is_some() || camera_selected || !workspace.is_open(PanelId::Properties) {
+            return;
+        }
+        workspace.select_tab(PanelId::Properties);
+        workspace.set_collapsed(PanelId::Properties, false);
+        let beside = |a: PanelId, b: PanelId| {
+            matches!((workspace.slot(a), workspace.slot(b)), (Some(x), Some(y))
+                if x.dock == y.dock && x.group != y.group && x.dock != buzz_ui::Dock::Hidden && x.dock != buzz_ui::Dock::Float)
+        };
+        if !follow.keep_layers_open
+            && beside(PanelId::Layers, PanelId::Properties)
+            && !workspace.is_collapsed(PanelId::Layers)
+        {
+            workspace.set_collapsed(PanelId::Layers, true);
+            follow.layers_rolled_up = true;
+        }
+    }
+
     pub(crate) fn build_ui(&mut self, ui: &mut egui::Ui) -> egui::Rect {
         // A drag from another document's Library that ended anywhere but the
         // stage leaves nothing behind to mislabel the next drag.
@@ -3732,6 +3789,7 @@ impl App {
         }
         let mut commands: Vec<Command> = Vec::new();
         self.editor.forget_bone_if_deselected();
+        self.follow_selection_with_panels();
         // L3: Focus selection, when the active layer has changed.
         self.editor.focus_folders_if_changed();
         // K2: Protect Other Keyframes status lines and held Auto Keyframe.
@@ -27589,6 +27647,18 @@ mod gen_background_tests {
     }
 }
 
+/// What [`App::follow_selection_with_panels`] remembers between frames.
+#[derive(Debug, Default)]
+struct PanelFollow {
+    /// The objects selected last frame, sorted.
+    last: Vec<buzz_scene::ObjectId>,
+    /// The Layers panel was rolled up to make room, and is opened again
+    /// when the selection empties.
+    layers_rolled_up: bool,
+    /// Opened again by hand while something was selected: left alone.
+    keep_layers_open: bool,
+}
+
 #[cfg(test)]
 mod camera_row_ui_tests {
     use super::*;
@@ -27704,3 +27774,83 @@ mod camera_row_ui_tests {
         assert_eq!(app.editor.status.as_deref(), Some(crate::editor::CAMERA_LOCKED));
     }
 }
+
+#[cfg(test)]
+mod panel_follow_tests {
+    use super::*;
+    use buzz_ui::PanelId;
+
+    fn frame(app: &mut App, ctx: &egui::Context) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            app.build_ui(ui);
+        });
+    }
+
+    /// The layout this was asked for in: Layers on top of the right column,
+    /// Properties below it sharing a section with Effects, Effects in front.
+    fn app() -> (App, egui::Context, buzz_scene::ObjectId) {
+        let mut app = crate::ui_snapshot::fixture_app();
+        let ws = &mut app.editor.workspace;
+        ws.locked = false;
+        ws.move_to(PanelId::Layers, buzz_ui::Dock::Right);
+        ws.raise_to_top(PanelId::Layers);
+        ws.group_with(PanelId::Filters, PanelId::Properties);
+        ws.select_tab(PanelId::Filters);
+        ws.set_collapsed(PanelId::Layers, false);
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        frame(&mut app, &ctx);
+        let id = app.editor.scene().layers().iter().find(|l| l.name == "Art").unwrap().objects_at(0)[0].id;
+        (app, ctx, id)
+    }
+
+    fn front(app: &App, id: PanelId) -> bool {
+        app.editor.workspace.slot(id).is_some_and(|s| s.selected)
+    }
+
+    #[test]
+    fn picking_an_object_brings_its_properties_forward_and_rolls_the_layers_up() {
+        let (mut app, ctx, id) = app();
+        assert!(!front(&app, PanelId::Properties) && !app.editor.workspace.is_collapsed(PanelId::Layers));
+
+        app.editor.selection.select_one(id);
+        frame(&mut app, &ctx);
+        assert!(front(&app, PanelId::Properties), "Properties comes to the front of its section");
+        assert!(!app.editor.workspace.is_collapsed(PanelId::Properties));
+        assert!(app.editor.workspace.is_collapsed(PanelId::Layers), "Layers rolls up out of the way");
+
+        app.editor.selection.clear();
+        frame(&mut app, &ctx);
+        assert!(!app.editor.workspace.is_collapsed(PanelId::Layers), "and comes back with nothing selected");
+    }
+
+    #[test]
+    fn layers_opened_by_hand_stay_open() {
+        let (mut app, ctx, id) = app();
+        app.editor.selection.select_one(id);
+        frame(&mut app, &ctx);
+        app.editor.workspace.set_collapsed(PanelId::Layers, false);
+        frame(&mut app, &ctx);
+        app.editor.selection.clear();
+        frame(&mut app, &ctx);
+        app.editor.selection.select_one(id);
+        frame(&mut app, &ctx);
+        assert!(!app.editor.workspace.is_collapsed(PanelId::Layers), "opened by hand: left alone");
+    }
+
+    #[test]
+    fn a_frame_click_leaves_the_panels_alone() {
+        let (mut app, ctx, _) = app();
+        let layer = app.editor.scene().layers().iter().find(|l| l.name == "Art").unwrap().id;
+        app.editor.selection.set_timeline(buzz_ui::TimelineSelection::new([layer], 0, 0, layer, 0));
+        app.editor.selection.select_timeline_contents(app.editor.doc.scene(), 0);
+        frame(&mut app, &ctx);
+        assert!(!app.editor.workspace.is_collapsed(PanelId::Layers));
+        assert!(front(&app, PanelId::Filters));
+    }
+}
+

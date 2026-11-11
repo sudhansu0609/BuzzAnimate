@@ -1891,6 +1891,30 @@ fn frame_picker(
         });
 }
 
+/// **Brightness and Alpha, always in view.** The two colour effects reached
+/// for most, as sliders rather than behind Animate's Style menu, where
+/// Brightness was not there to find until a style was picked. They combine
+/// — a diya dimmed and half faded — and each keeps the other. Tint and
+/// Advanced stay in the Style menu. Returns the new transform.
+fn brightness_alpha_rows(ui: &mut Ui, current: &buzz_scene::ColorTransform) -> Option<buzz_scene::ColorTransform> {
+    let mut out = None;
+    property_row(ui, "Brightness", Some("Darker to the left, lighter to the right. 0 is as drawn."), |ui| {
+        let mut percent = current.brightness_part() * 100.0;
+        if ui.add(egui::Slider::new(&mut percent, -100.0..=100.0).suffix("%")).changed() {
+            out = Some(current.with_brightness(percent / 100.0));
+        }
+    });
+    property_row(ui, "Alpha", Some("How see-through it is. 100 is solid."), |ui| {
+        let mut percent = current.multiply[3] * 100.0;
+        if ui.add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%")).changed() {
+            let mut t = out.unwrap_or(*current);
+            t.multiply[3] = (percent / 100.0).clamp(0.0, 1.0);
+            out = Some(t);
+        }
+    });
+    out
+}
+
 fn instance_properties(
     ui: &mut Ui,
     scene: &mut Scene,
@@ -2185,112 +2209,28 @@ fn instance_properties(
             );
         }
 
-        // **The symbol's type, changeable here** — Animate's Symbol
-        // Properties ▸ Type. It belongs to the symbol, so every instance
-        // changes with it; a graphic plays on the timeline it sits in and gets
-        // the Looping control below, a movie clip shows its first frame.
-        property_row(
-            ui,
-            "Type",
-            Some(
-                "Graphic: plays on the timeline it is placed in (Loop, Play Once, Single Frame). \
-                 Movie Clip: shows its first frame. Changes every instance of this symbol.",
-            ),
-            |ui| {
-                egui::ComboBox::from_id_salt("instance-symbol-kind")
-                    .selected_text(new_kind.label())
-                    .show_ui(ui, |ui| {
-                        for kind in [
-                            buzz_scene::SymbolKind::Graphic,
-                            buzz_scene::SymbolKind::MovieClip,
-                            buzz_scene::SymbolKind::Button,
-                        ] {
-                            ui.selectable_value(&mut new_kind, kind, kind.label());
-                        }
-                    });
-            },
-        );
-
-        property_row(ui, "Frames", None, |ui| {
-            ui.label(RichText::new(format!("{symbol_length}")).weak());
-        });
-
-        property_row(ui, "First frame", None, |ui| {
-            // Frames are shown one-based, as Animate numbers them, while the
-            // model counts from zero.
-            let mut shown = new_first_frame + 1;
-            if ui
-                .add(egui::DragValue::new(&mut shown).range(1..=symbol_length.max(1)))
-                .changed()
-            {
-                new_first_frame = shown.saturating_sub(1);
-                edited = true;
-            }
-        });
-
-        // **Frame Picker** — Animate's: every frame of the symbol as a
-        // picture, and a click shows that one. What a lip sync or a set of
-        // hand poses is picked from by eye instead of by number.
-        frame_picker(
-            ui,
-            instance.symbol,
-            symbol_length,
-            &key_frames,
-            symbol_kind.follows_parent_timeline(),
-            &mut new_first_frame,
-            &mut new_loop,
-            &mut edited,
-            thumbnail,
-        );
-
-        // Only a graphic follows the parent playhead, so only a graphic has
-        // anything to loop. Showing the control for a movie clip would
-        // promise behaviour that cannot happen.
-        if symbol_kind.follows_parent_timeline() {
-            property_row(ui, "Looping", None, |ui| {
-                egui::ComboBox::from_id_salt("instance-loop")
-                    .selected_text(new_loop.label())
-                    .show_ui(ui, |ui| {
-                        for mode in [LoopMode::Loop, LoopMode::PlayOnce, LoopMode::SingleFrame] {
-                            if ui
-                                .selectable_value(&mut new_loop, mode, mode.label())
-                                .clicked()
-                            {
-                                edited = true;
-                            }
-                        }
-                    });
-            });
-        }
-
-        // **Sync to root.** Lock this instance — and everything nested in
-        // it — to the stage's own frame, so a lip sync generated against
-        // the root dialogue lines up wherever the mouth actually lives.
-        // Off leaves the instance to be keyed by hand.
-        property_row(
-            ui,
-            "Sync to root",
-            Some(
-                "Play this instance and its contents on the root timeline's frame number, \
-                 rather than from where it was placed. Turn off for manual timing.",
-            ),
-            |ui| {
-                if ui
-                    .checkbox(&mut new_sync_to_root, "Match the stage frame")
-                    .changed()
-                {
-                    edited = true;
-                }
-            },
-        );
-
+        // **What is changed most, first**: how it looks (Color Effect —
+        // brightness, alpha, tint) and how it plays (Looping, First frame).
+        // The symbol's type, its length and the Frame Picker follow.
         // -- colour effect ---------------------------------------------------
         ui.add_space(Tokens::SPACE_1);
-        ui.label(RichText::new("Color Effect").small().weak());
-        if let Some(t) = color_effect_controls(ui, "instance-effect", egui::Id::new(id), &instance.color) {
+        if let Some(t) = brightness_alpha_rows(ui, &instance.color) {
             new_color = t;
             edited = true;
         }
+        let tinted = matches!(
+            buzz_scene::ColorEffect::from_transform(&instance.color),
+            buzz_scene::ColorEffect::Tint { .. } | buzz_scene::ColorEffect::Advanced
+        );
+        egui::CollapsingHeader::new(RichText::new("Tint and Advanced").small())
+            .id_salt(("instance-tint", id))
+            .default_open(tinted)
+            .show(ui, |ui| {
+                if let Some(t) = color_effect_controls(ui, "instance-effect", egui::Id::new(id), &new_color) {
+                    new_color = t;
+                    edited = true;
+                }
+            });
         if let Some((name, whole, keyed)) = &fade
             && (*whole < 0.999 || *keyed < 0.999)
         {
@@ -2326,6 +2266,106 @@ fn instance_properties(
                 }
             });
         }
+
+        // Only a graphic follows the parent playhead, so only a graphic has
+        // anything to loop. Showing the control for a movie clip would
+        // promise behaviour that cannot happen.
+        if symbol_kind.follows_parent_timeline() {
+            property_row(ui, "Looping", None, |ui| {
+                egui::ComboBox::from_id_salt("instance-loop")
+                    .selected_text(new_loop.label())
+                    .show_ui(ui, |ui| {
+                        for mode in [LoopMode::Loop, LoopMode::PlayOnce, LoopMode::SingleFrame] {
+                            if ui
+                                .selectable_value(&mut new_loop, mode, mode.label())
+                                .clicked()
+                            {
+                                edited = true;
+                            }
+                        }
+                    });
+            });
+        }
+
+        property_row(ui, "First frame", None, |ui| {
+            // Frames are shown one-based, as Animate numbers them, while the
+            // model counts from zero.
+            let mut shown = new_first_frame + 1;
+            if ui
+                .add(egui::DragValue::new(&mut shown).range(1..=symbol_length.max(1)))
+                .changed()
+            {
+                new_first_frame = shown.saturating_sub(1);
+                edited = true;
+            }
+        });
+
+        // **The symbol's type, changeable here** — Animate's Symbol
+        // Properties ▸ Type. It belongs to the symbol, so every instance
+        // changes with it; a graphic plays on the timeline it sits in and gets
+        // the Looping control below, a movie clip shows its first frame.
+        property_row(
+            ui,
+            "Type",
+            Some(
+                "Graphic: plays on the timeline it is placed in (Loop, Play Once, Single Frame). \
+                 Movie Clip: shows its first frame. Changes every instance of this symbol.",
+            ),
+            |ui| {
+                egui::ComboBox::from_id_salt("instance-symbol-kind")
+                    .selected_text(new_kind.label())
+                    .show_ui(ui, |ui| {
+                        for kind in [
+                            buzz_scene::SymbolKind::Graphic,
+                            buzz_scene::SymbolKind::MovieClip,
+                            buzz_scene::SymbolKind::Button,
+                        ] {
+                            ui.selectable_value(&mut new_kind, kind, kind.label());
+                        }
+                    });
+            },
+        );
+
+        property_row(ui, "Frames", None, |ui| {
+            ui.label(RichText::new(format!("{symbol_length}")).weak());
+        });
+
+        // **Sync to root.** Lock this instance — and everything nested in
+        // it — to the stage's own frame, so a lip sync generated against
+        // the root dialogue lines up wherever the mouth actually lives.
+        // Off leaves the instance to be keyed by hand.
+        property_row(
+            ui,
+            "Sync to root",
+            Some(
+                "Play this instance and its contents on the root timeline's frame number, \
+                 rather than from where it was placed. Turn off for manual timing.",
+            ),
+            |ui| {
+                if ui
+                    .checkbox(&mut new_sync_to_root, "Match the stage frame")
+                    .changed()
+                {
+                    edited = true;
+                }
+            },
+        );
+
+
+        // **Frame Picker** — Animate's: every frame of the symbol as a
+        // picture, and a click shows that one. What a lip sync or a set of
+        // hand poses is picked from by eye instead of by number.
+        frame_picker(
+            ui,
+            instance.symbol,
+            symbol_length,
+            &key_frames,
+            symbol_kind.follows_parent_timeline(),
+            &mut new_first_frame,
+            &mut new_loop,
+            &mut edited,
+            thumbnail,
+        );
     });
     if reset_whole_layer {
         scene.update_layer(layer, |l| l.alpha = 1.0);

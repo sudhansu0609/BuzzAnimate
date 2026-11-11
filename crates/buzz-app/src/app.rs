@@ -3763,7 +3763,12 @@ impl App {
         // Picked with the Selection tools only: the Bone tool, Free
         // Transform and the rest keep their own options (the Tool tab) in
         // front, which is what they are being used for.
-        if !picking || selection.timeline().is_some() || camera_selected || !workspace.is_open(PanelId::Properties) {
+        if !picking || selection.timeline().is_some() || camera_selected {
+            return;
+        }
+        // Its layer, scrolled into view in the timeline.
+        follow.reveal = follow.last.first().and_then(|id| self.editor.doc.scene().find_object(*id)).map(|(layer, _)| layer);
+        if !workspace.is_open(PanelId::Properties) {
             return;
         }
         workspace.select_tab(PanelId::Properties);
@@ -6433,6 +6438,7 @@ impl App {
                     range_anchor: self.editor.selection.range_anchor(),
                     timeline_selection: self.editor.selection.timeline().cloned(),
                     camera_selected: self.editor.camera_selected,
+                    reveal_layer: self.panel_follow.reveal.take(),
                     selected_light: self.editor.light_panel.selected,
                     playing: self.editor.playback.playing,
                     onion_enabled: self.editor.onion.enabled,
@@ -27657,6 +27663,8 @@ struct PanelFollow {
     layers_rolled_up: bool,
     /// Opened again by hand while something was selected: left alone.
     keep_layers_open: bool,
+    /// The picked object's layer, for the timeline to scroll to once.
+    reveal: Option<buzz_scene::LayerId>,
 }
 
 #[cfg(test)]
@@ -27783,6 +27791,7 @@ mod panel_follow_tests {
     fn frame(app: &mut App, ctx: &egui::Context) {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+            time: Some(ctx.input(|i| i.time) + 0.1),
             ..Default::default()
         };
         let _ = ctx.run_ui(input, |ui| {
@@ -27840,6 +27849,43 @@ mod panel_follow_tests {
         app.editor.selection.select_one(id);
         frame(&mut app, &ctx);
         assert!(!app.editor.workspace.is_collapsed(PanelId::Layers), "opened by hand: left alone");
+    }
+
+    fn drawn_rows(ctx: &egui::Context) -> Vec<buzz_scene::LayerId> {
+        ctx.data(|d| d.get_temp::<(u64, Vec<buzz_scene::LayerId>)>(egui::Id::new(buzz_ui::timeline_panel::ROWS_DRAWN)))
+            .map(|(_, rows)| rows)
+            .unwrap_or_default()
+    }
+
+    /// **Picking an object on the stage scrolls its layer into view** in the
+    /// timeline, wherever the timeline was scrolled to.
+    #[test]
+    fn picking_an_object_scrolls_its_layer_into_view() {
+        let mut app = crate::ui_snapshot::fixture_app_with_many_layers();
+        app.editor.workspace.bottom_height = 140.0;
+        let target = app.editor.scene().layers().iter().find(|l| l.name == "Layer_1").unwrap().id;
+        let mut id = None;
+        app.editor.doc.edit("Draw", |s| {
+            let object = buzz_scene::Object::shape(
+                s.next_object_id(),
+                buzz_scene::ShapeData::filled(kurbo::Shape::to_path(&kurbo::Rect::new(0.0, 0.0, 50.0, 50.0), 0.1), peniko::Color::WHITE),
+            );
+            id = Some(object.id);
+            s.add_object(target, object);
+        });
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+        }
+        assert!(!drawn_rows(&ctx).contains(&target), "the layer starts out of view: {:?}", drawn_rows(&ctx));
+
+        app.editor.selection.select_one(id.unwrap());
+        // The scroll is animated: let the clock run.
+        for _ in 0..30 {
+            frame(&mut app, &ctx);
+        }
+        assert!(drawn_rows(&ctx).contains(&target), "its row is scrolled into view");
     }
 
     #[test]

@@ -779,6 +779,11 @@ pub struct TimelineState {
     /// The camera row is the selected one, so the camera is what the Camera
     /// menu's keyframe commands act on.
     pub camera_selected: bool,
+    /// **Scroll this layer's row into view**, once: set for the frame after
+    /// an object is picked on the stage, so its layer can be found. A row in
+    /// a collapsed folder (or filtered out) shows its nearest visible folder
+    /// instead; nothing is expanded for it.
+    pub reveal_layer: Option<LayerId>,
     /// Which light's channel is highlighted — the one the light keyframe
     /// commands act on, and the one whose row is always shown so it can be keyed.
     pub selected_light: Option<LightId>,
@@ -1363,6 +1368,12 @@ pub fn timeline_panel_with_tools_slot(
             }
 
             let layer_ids: Vec<LayerId> = scene.layers().iter().map(|l| l.id).collect();
+            let mut reveal = state.reveal_layer;
+            while let Some(id) = reveal
+                && state.row_filter.row_hidden(scene.layers(), id)
+            {
+                reveal = scene.layers().get(id).and_then(|l| l.parent);
+            }
             for id in layer_ids {
                 // I2: a row nested inside a collapsed folder is not drawn —
                 // neither its own row nor a light keyed to it — though the
@@ -1380,7 +1391,16 @@ pub fn timeline_panel_with_tools_slot(
                 let Some(layer) = scene.layers().get(id) else {
                     continue;
                 };
+                let top = ui.cursor().min.y;
                 layer_row(ui, scene, layer, columns, state, &mut response);
+                if reveal == Some(id) {
+                    // Up or down only: the frame the grid shows stays.
+                    let clip = ui.clip_rect();
+                    let row = egui::Rect::from_x_y_ranges(clip.x_range(), top..=ui.cursor().min.y);
+                    if row.top() < clip.top() || row.bottom() > clip.bottom() {
+                        ui.scroll_to_rect(row, Some(egui::Align::Center));
+                    }
+                }
             }
 
             // The rows a frame drag covers, now that every row has been laid out.
@@ -4735,6 +4755,7 @@ mod tests {
 
     fn state() -> TimelineState {
         TimelineState {
+            reveal_layer: None,
             beats: Vec::new(),
             waveforms: Default::default(),
             current_frame: 4,

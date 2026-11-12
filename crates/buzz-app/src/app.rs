@@ -10016,7 +10016,7 @@ impl App {
                 self.editor.doc.edit("Place Asset", |scene| {
                     let layers_before: std::collections::HashSet<buzz_scene::LayerId> =
                         scene.layers().iter().map(|l| l.id).collect();
-                    outcome = Some(library.place(&asset, scene));
+                    outcome = Some(library.place_at_frame(&asset, scene, frame));
                     // A Cast character remembers its asset (CAST_POSES_PLAN C2 e2), so
                     // "Save changes to <name>" can write the edited copy back.
                     if matches!(outcome, Some(Ok(_))) && is_cast(&asset.folder) {

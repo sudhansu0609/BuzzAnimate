@@ -9339,7 +9339,7 @@ impl Editor {
         type Placed = (buzz_scene::MergeReport, Vec<ObjectId>);
         let mut outcome: Option<Result<Placed, buzz_doc::DocError>> = None;
         self.doc.edit("Place Asset", |scene| {
-            let report = match library.place(asset, scene) {
+            let report = match library.place_at_frame(asset, scene, frame) {
                 Ok(report) => report,
                 Err(e) => {
                     outcome = Some(Err(e));
@@ -27571,6 +27571,42 @@ mod tests {
             (centre.x - expected.x).abs() < 1.0 && (centre.y - expected.y).abs() < 1.0,
             "the asset should land centred on the drop, {centre:?} vs {expected:?}"
         );
+    }
+
+    /// **An asset lands on the frame the playhead is on, on a new layer**,
+    /// as an Animate library item does — not on frame 1, where it was out of
+    /// sight of the frame being worked on and could not be selected there.
+    #[test]
+    fn a_placed_asset_starts_on_the_current_frame_on_a_new_layer() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut e = editor();
+        e.assets = buzz_doc::AssetLibrary::at(dir.path());
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let art = draw_square(&mut e, 0.0, 0.0, 40.0, Color::WHITE).expect("a square");
+        e.selection.set([art]);
+        e.run(Command::ConvertToSymbol);
+        e.run(Command::SymbolToAsset);
+        let asset = e.assets.assets().first().cloned().expect("the asset");
+
+        let mut f = editor();
+        f.assets = buzz_doc::AssetLibrary::at(dir.path());
+        let layers_before: Vec<_> = f.doc.scene().layers().iter().map(|l| l.id).collect();
+        f.set_frame(25);
+        f.place_asset_at(&asset, Point::new(120.0, 80.0));
+
+        let scene = f.doc.scene();
+        let new: Vec<_> = scene
+            .layers()
+            .iter()
+            .filter(|l| !layers_before.contains(&l.id))
+            .collect();
+        assert!(!new.is_empty(), "the asset arrives on a layer of its own");
+        let layer = new[0];
+        assert!(layer.objects_at(0).is_empty(), "nothing on frame 1");
+        assert!(layer.objects_at(24).is_empty(), "nothing before the playhead");
+        assert!(!layer.objects_at(25).is_empty(), "the asset is on the current frame");
+        assert!(layer.frames.is_keyframe(25));
+        assert!(!f.selection.is_empty(), "and arrives selected there");
     }
 
     /// **The report: a symbol could not be named when it was made.**

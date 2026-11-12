@@ -315,6 +315,32 @@ impl AssetLibrary {
         Ok(scene.merge(&incoming, ImportTarget::Stage))
     }
 
+    /// Place an asset so it **starts on `frame`**, as Animate places a
+    /// library item on the frame the playhead is on.
+    ///
+    /// Its layers still arrive as new layers on top of the timeline being
+    /// edited; each is pushed along so its first frame is `frame`, with blank
+    /// frames before it.
+    pub fn place_at_frame(
+        &self,
+        asset: &Asset,
+        scene: &mut Scene,
+        frame: u32,
+    ) -> Result<MergeReport, DocError> {
+        let before: std::collections::HashSet<_> = scene.layers().iter().map(|l| l.id).collect();
+        let report = self.place(asset, scene)?;
+        let arrived: Vec<_> = scene
+            .layers()
+            .iter()
+            .map(|l| l.id)
+            .filter(|id| !before.contains(id))
+            .collect();
+        for id in arrived {
+            scene.update_layer(id, |l| l.frames.delay(frame));
+        }
+        Ok(report)
+    }
+
     /// Delete an asset from disk.
     pub fn delete(&mut self, asset: &Asset) -> Result<(), DocError> {
         std::fs::remove_file(&asset.path).map_err(DocError::Io)?;

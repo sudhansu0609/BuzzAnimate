@@ -830,6 +830,22 @@ impl LayerTimeline {
         *self = Self::from_parts(std::mem::take(&mut self.keyframes), length);
     }
 
+    /// **Start everything `frames` later**, with a blank span before it.
+    ///
+    /// How a placed asset lands on the frame the playhead is on rather than on
+    /// frame 1: its keyframes, tweens, labels and sounds all move together, so
+    /// it plays exactly as it did, just from here.
+    pub fn delay(&mut self, frames: u32) {
+        if frames == 0 {
+            return;
+        }
+        for keyframe in &mut self.keyframes {
+            keyframe.start += frames;
+        }
+        let length = self.length + frames;
+        *self = Self::from_parts(std::mem::take(&mut self.keyframes), length);
+    }
+
     /// Rebuild from parts, for the importer and the loader.
     pub fn from_parts(mut keyframes: Vec<Keyframe>, length: u32) -> Self {
         keyframes.sort_by_key(|k| k.start);

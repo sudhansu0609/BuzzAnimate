@@ -482,6 +482,21 @@ pub enum Pick {
     AnimateKeymap,
 }
 
+/// **The AI work is done: give its memory back.** The ONNX models (SAM 2, LaMa,
+/// the segmenters), the transcription model and the LM Studio models this app
+/// picked are unloaded; each loads again the next time a task needs it. On a
+/// thread of its own, since LM Studio can take a few seconds to unload.
+fn release_ai_memory() {
+    let _ = std::thread::Builder::new().name("release-ai".into()).spawn(|| {
+        let onnx = buzz_ai::onnx::release_pool();
+        let whisper = buzz_ai::transcribe::release_pooled();
+        let lm_studio = crate::produce::release_used_lm_studio();
+        if onnx > 0 || whisper || !lm_studio.is_empty() {
+            tracing::info!(onnx, whisper, ?lm_studio, "AI work done: models unloaded");
+        }
+    });
+}
+
 /// A compact UTC timestamp, `YYYY-MM-DD HHhMM`, for naming a snapshot. Built
 /// from the Unix clock with civil-date arithmetic so it needs no date crate;
 /// UTC rather than local, which is honest about having no timezone database.
@@ -12856,8 +12871,10 @@ impl App {
             self.editor.status = Some("Select a picture or some artwork first".into());
             return;
         }
-        if scene.layers().get(layer).is_none_or(|l| l.frames.keyframe_count() != 1 || l.frames.keyframe_start(frame) != Some(0)) {
-            self.editor.status = Some("Split into Layers needs the artwork on a layer with a single keyframe".into());
+        // Only the keyframe under the playhead is split (`split_artwork::apply`); a tween on it
+        // would be lost when its shapes move into symbols.
+        if scene.layers().get(layer).and_then(|l| l.frames.keyframe_at(frame)).is_some_and(|k| k.tween.is_active()) {
+            self.editor.status = Some("Split into Layers can't split a tweened keyframe: remove the tween first, or split a keyframe without one".into());
             return;
         }
         let (send, receive) = crossbeam_channel::bounded(1);
@@ -14222,7 +14239,9 @@ impl App {
     /// applying a result is an ordinary edit at an ordinary moment rather than
     /// another thread reaching into the document.
     fn poll_tasks(&mut self) {
+        let mut ai_done = false;
         for (id, kind, outcome) in self.tasks.poll() {
+            ai_done |= matches!(kind, crate::tasks::TaskKind::Ai | crate::tasks::TaskKind::Trace);
             let for_job = (kind == crate::tasks::TaskKind::Ai
                 && self.agent_jobs.iter().any(|j| j.task == id))
             .then(|| outcome.clone());
@@ -14256,6 +14275,14 @@ impl App {
             if let Some(outcome) = for_job {
                 self.settle_agent_job(id, &outcome);
             }
+        }
+        // The AI work is done (a trace that goes on to a split has started it by now):
+        // give the models' memory back.
+        let ai_busy = self.tasks.running().any(|t| matches!(t.kind, crate::tasks::TaskKind::Ai | crate::tasks::TaskKind::Trace))
+            || self.trace_running.is_some()
+            || self.editor.pending_trace.is_some();
+        if ai_done && !ai_busy {
+            release_ai_memory();
         }
     }
 

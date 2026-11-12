@@ -210,6 +210,17 @@ pub fn replace_pooled(id: ModelId, session: OnnxSession) {
     pool().lock().unwrap().insert(id, Arc::new(Mutex::new(session)));
 }
 
+/// Drops every pooled session, giving their memory back once no run still
+/// holds one; the next `pooled()` loads the model again. Returns how many
+/// were pooled.
+pub fn release_pool() -> usize {
+    let Some(pool) = POOL.get() else { return 0 };
+    let mut pool = pool.lock().unwrap();
+    let n = pool.len();
+    pool.clear();
+    n
+}
+
 /// Pre-loads (warms) each of `ids` in its own background thread, returning
 /// `(id, elapsed, loaded)` once every thread has finished. `loaded` is
 /// `false` when the model file was missing or failed to load — the pool

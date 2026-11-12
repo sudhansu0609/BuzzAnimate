@@ -603,6 +603,13 @@ fn pooled() -> Result<(Arc<Mutex<Whisper>>, u128)> {
     Ok((w, t.elapsed().as_millis()))
 }
 
+/// Drops the pooled transcription model (the voice-command one stays, so a
+/// spoken command is not kept waiting on a load). Returns whether one was
+/// loaded.
+pub fn release_pooled() -> bool {
+    POOL.get().is_some_and(|cell| cell.lock().unwrap().take().is_some())
+}
+
 /// Transcribes a decoded sound (any rate, any channels).
 pub fn transcribe_clip(
     clip: &buzz_audio::Clip,

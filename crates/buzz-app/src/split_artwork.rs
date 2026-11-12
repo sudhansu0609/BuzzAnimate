@@ -1716,13 +1716,32 @@ pub fn result_json(plan: &ArtworkPlan, made: &[String]) -> serde_json::Value {
     })
 }
 
+/// The keyframe of `layer` governing `frame`: its first frame and the frame after its last.
+pub fn keyframe_span(scene: &Scene, layer: LayerId, frame: u32) -> Option<(u32, u32)> {
+    let frames = &scene.layers().get(layer)?.frames;
+    let start = frames.keyframe_start(frame)?;
+    let end = frames.keyframes().iter().map(|k| k.start).find(|&k| k > start).unwrap_or(frames.length());
+    Some((start, end))
+}
+
+/// Take `id` off the keyframe starting at `start` only. A keyframe made with F6 shares its
+/// objects, ids and all, with the one it was made from, so a remove by id alone could empty
+/// the first keyframe holding it instead of the one being split.
+fn take_at(scene: &mut Scene, layer: LayerId, start: u32, id: ObjectId) -> Option<Arc<Object>> {
+    let object = scene.layers().get(layer)?.frames.objects_at(start).iter().find(|o| o.id == id)?.clone();
+    scene.remove_object_where(buzz_scene::EditAt::exact(start), id).then_some(object)
+}
+
 /// Carry the plan out on `scene` (inside one `Document::edit`): per object one symbol,
 /// one layer above the source, the filler behind the source's remaining shapes.
-/// Returns the names of the layers made.
+/// Only the keyframe at `plan.frame` is split: the new layers show their objects over that
+/// keyframe's frames and are blank before and after it, and the source's other keyframes
+/// keep their artwork. Returns the names of the layers made.
 pub fn apply(scene: &mut Scene, plan: &ArtworkPlan) -> Vec<String> {
     let layer = plan.layer;
     let folder = scene.layers().get(layer).and_then(|l| l.parent);
     let span = scene.layers().get(layer).map_or(1, |l| l.frames.length());
+    let (start, end) = keyframe_span(scene, layer, plan.frame).unwrap_or((0, span));
     let mut made = Vec::new();
     // Object fillers go into the depth layer behind them, under that layer's shapes.
     let mut under: [Vec<Arc<Object>>; 3] = Default::default();
@@ -1749,7 +1768,7 @@ pub fn apply(scene: &mut Scene, plan: &ArtworkPlan) -> Vec<String> {
     for o in &plan.objects {
         // Whole shapes and cut-off inside pieces, in the source's paint order.
         let at = |id: &ObjectId| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
-        let mut taken: Vec<(usize, Arc<Object>)> = o.shape_ids.iter().filter_map(|id| scene.remove_object(*id).map(|x| (at(id), x))).collect();
+        let mut taken: Vec<(usize, Arc<Object>)> = o.shape_ids.iter().filter_map(|id| take_at(scene, layer, start, *id).map(|x| (at(id), x))).collect();
         for c in &o.cuts {
             let inside = insides.next().unwrap_or_else(|| c.inside.clone());
             let Some(orig) = cut_origs.get(&c.id).cloned() else { continue };
@@ -1760,19 +1779,32 @@ pub fn apply(scene: &mut Scene, plan: &ArtworkPlan) -> Vec<String> {
             taken.push((at(&c.id), piece));
             match &c.rest {
                 Some(rest) => {
-                    scene.update_object(c.id, |x| {
+                    scene.update_object_at(start, c.id, |x| {
                         if let ObjectKind::Shape(sd) = &mut x.kind {
                             *sd = rest.clone();
                         }
                     });
                 }
                 None => {
-                    scene.remove_object(c.id);
+                    take_at(scene, layer, start, c.id);
                 }
             }
         }
         taken.sort_by_key(|t| t.0);
-        let mut taken: Vec<Arc<Object>> = taken.into_iter().map(|t| t.1).collect();
+        // A shape the source's other keyframes still hold goes into the symbol under a new id,
+        // so no id is in two places.
+        let mut taken: Vec<Arc<Object>> = taken
+            .into_iter()
+            .map(|(_, x)| {
+                if scene.layers().get(layer).is_some_and(|l| l.find_object(x.id).is_some()) {
+                    let mut copy = (*x).clone();
+                    copy.id = scene.next_object_id();
+                    Arc::new(copy)
+                } else {
+                    x
+                }
+            })
+            .collect();
         if o.plate.is_some() {
             // The layer's base first (behind), then the fillers of the objects above it.
             let mut filler = o.filler.clone();
@@ -1798,18 +1830,26 @@ pub fn apply(scene: &mut Scene, plan: &ArtworkPlan) -> Vec<String> {
         if let Some(i) = scene.layer_index(layer) {
             scene.reorder_layer(new, i.saturating_sub(1));
         }
-        scene.update_layer(new, |l| l.parent = folder);
-        scene.add_instance_at(new, 0, symbol, Affine::IDENTITY);
+        scene.update_layer(new, |l| {
+            l.parent = folder;
+            if start > 0 {
+                l.frames.insert_blank_keyframe(start);
+            }
+        });
+        scene.add_instance_at(new, start, symbol, Affine::IDENTITY);
         scene.update_layer(new, |l| {
             if l.frames.length() < span {
                 l.frames.insert_frame(span - 1);
+            }
+            if end < span {
+                l.frames.insert_blank_keyframe(end);
             }
         });
         made.push(name);
     }
     // What the fitted sky draws instead (S18).
     for id in &plan.removed {
-        scene.remove_object(*id);
+        take_at(scene, layer, start, *id);
     }
     // Nothing left on the source layer: remove it when empty.
     if scene.layers().get(layer).is_some_and(|l| l.frames.keyframes().iter().all(|k| k.objects.is_empty())) {
@@ -2247,4 +2287,65 @@ pub fn outline_points(mask: &GrayImage, opts: &ObjectOptions) -> Vec<Vec<Point>>
         _ => {}
     });
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: f64) -> ShapeData {
+        ShapeData::filled(Rect::new(x, 0.0, x + 100.0, 100.0).to_path(1e-9), peniko::Color::from_rgb8(200, 80, 40))
+    }
+
+    /// A split of the middle keyframe of three (F6 copies sharing their objects) takes the
+    /// shapes from that keyframe only, and the object's layer shows it over that span alone.
+    #[test]
+    fn a_split_of_one_keyframe_leaves_the_others_alone() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().unwrap().id;
+        let house = scene.add_shape_at(layer, 0, rect(0.0)).unwrap();
+        let tree = scene.add_shape_at(layer, 0, rect(300.0)).unwrap();
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(29);
+            l.frames.insert_keyframe(10);
+            l.frames.insert_keyframe(20);
+        });
+        let plan = ArtworkPlan {
+            layer,
+            frame: 12,
+            objects: vec![ArtworkObject {
+                plate: None,
+                behind: Plate::Land,
+                label: "House".into(),
+                n: 1,
+                bbox: [0, 0, 100, 100],
+                mask: GrayImage::new(1, 1),
+                shape_ids: vec![house],
+                cuts: Vec::new(),
+                filler: Vec::new(),
+                filler_at: Affine::IDENTITY,
+            }],
+            notes: Vec::new(),
+            picture: RgbaImage::new(1, 1),
+            to_world: Affine::IDENTITY,
+            record: None,
+            removed: Vec::new(),
+        };
+        assert_eq!(apply(&mut scene, &plan), vec!["House 1".to_string()]);
+
+        let ids = |s: &Scene, l: LayerId, f: u32| -> Vec<ObjectId> { s.layers().get(l).unwrap().frames.objects_at(f).iter().map(|o| o.id).collect() };
+        let source = &scene.layers().get(layer).unwrap().frames;
+        assert_eq!(source.keyframes().iter().map(|k| k.start).collect::<Vec<_>>(), vec![0, 10, 20], "no keyframe made at the playhead");
+        assert_eq!(ids(&scene, layer, 0), vec![house, tree], "the first keyframe keeps the house");
+        assert_eq!(ids(&scene, layer, 10), vec![tree], "the split keyframe gave it away");
+        assert_eq!(ids(&scene, layer, 20), vec![house, tree], "the last keyframe keeps the house");
+
+        let new = scene.layers().iter().find(|l| l.name == "House 1").unwrap();
+        assert_eq!(new.frames.keyframes().iter().map(|k| (k.start, k.objects.len())).collect::<Vec<_>>(), vec![(0, 0), (10, 1), (20, 0)]);
+        assert_eq!(new.frames.length(), 30);
+        let symbol = new.frames.objects_at(10)[0].instance().unwrap().symbol;
+        let inner: Vec<ObjectId> = scene.library().get(symbol).unwrap().layers.iter().next().unwrap().frames.objects_at(0).iter().map(|o| o.id).collect();
+        assert_eq!(inner.len(), 1);
+        assert_ne!(inner[0], house, "the moved house has an id of its own");
+    }
 }

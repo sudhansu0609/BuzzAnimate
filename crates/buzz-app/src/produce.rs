@@ -385,9 +385,39 @@ impl Comfy {
 
 // ------------------------------------------------------------------ the breakdown's model
 
+/// The LM Studio models BuzzAnimate picked since the last [`release_used_lm_studio`]:
+/// the ones it unloads when its AI work is done.
+static LM_STUDIO_USED: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// LM Studio's `lms` command: on the PATH, else where LM Studio installs it (an app
+/// opened from the Finder or the Start menu does not have it on its PATH).
+fn lms_command() -> std::process::Command {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
+    let installed = home
+        .map(|h| h.join(".lmstudio").join("bin").join(if cfg!(windows) { "lms.exe" } else { "lms" }))
+        .filter(|p| p.exists());
+    let mut command = std::process::Command::new(installed.unwrap_or_else(|| PathBuf::from("lms")));
+    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    command
+}
+
 /// LM Studio's model for a breakdown: a loaded Gemma, else any Gemma, else the
-/// first chat model (`examples/breakdown.rs`).
+/// first chat model (`examples/breakdown.rs`). Starts LM Studio's server when it
+/// is not answering; the model it names is loaded by LM Studio on first request.
 pub(crate) fn lmstudio_model(backend: &buzz_ai::llm::Backend) -> Option<(String, &'static str)> {
+    let picked = pick_lmstudio_model(backend).or_else(|| {
+        let started = lms_command().args(["server", "start"]).status().is_ok_and(|s| s.success());
+        started.then(|| pick_lmstudio_model(backend)).flatten()
+    });
+    if let Some((model, _)) = &picked
+        && let Ok(mut used) = LM_STUDIO_USED.lock()
+    {
+        used.insert(model.clone());
+    }
+    picked
+}
+
+fn pick_lmstudio_model(backend: &buzz_ai::llm::Backend) -> Option<(String, &'static str)> {
     let chat: Vec<String> = backend
         .list_models()
         .ok()?
@@ -1526,12 +1556,10 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
 /// F2: unload every model LM Studio holds (`lms unload --all`, else its REST
 /// endpoint). Never fails the run.
 fn release_lm_studio(say: &mut dyn FnMut(&str)) {
-    let cli = std::process::Command::new("lms")
-        .args(["unload", "--all"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    if let Ok(mut used) = LM_STUDIO_USED.lock() {
+        used.clear();
+    }
+    let cli = lms_command().args(["unload", "--all"]).status();
     if matches!(&cli, Ok(st) if st.success()) {
         say("released LM Studio's models (lms unload --all)");
         return;
@@ -1562,6 +1590,26 @@ fn release_lm_studio(say: &mut dyn FnMut(&str)) {
         Ok(n) => say(&format!("released {n} LM Studio model(s) through its REST endpoint")),
         Err(e) => say(&format!("could not release LM Studio's model (no lms, REST said: {e})")),
     }
+}
+
+/// Unload the LM Studio models BuzzAnimate picked ([`lmstudio_model`]) since the
+/// last release, and only those: a model loaded for something else stays. Blocks
+/// (call off the UI thread). Returns the models unloaded.
+pub(crate) fn release_used_lm_studio() -> Vec<String> {
+    let used: Vec<String> = match LM_STUDIO_USED.lock() {
+        Ok(mut used) => std::mem::take(&mut *used).into_iter().collect(),
+        Err(_) => return Vec::new(),
+    };
+    let base = "http://127.0.0.1:1234";
+    used.into_iter()
+        .filter(|model| {
+            lms_command().args(["unload", model]).status().is_ok_and(|s| s.success())
+                || ureq::post(&format!("{base}/api/v1/models/unload"))
+                    .timeout(Duration::from_secs(30))
+                    .send_json(json!({"instance_id": model}))
+                    .is_ok()
+        })
+        .collect()
 }
 
 /// One scene's preview MP4, through the headless render (sounds included).

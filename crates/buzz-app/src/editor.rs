@@ -5929,6 +5929,16 @@ impl Editor {
                     self.workspace.save();
                 }
             }
+            ToggleFramesOnLockedLayers => {
+                let on = !self.workspace.frames_on_locked_layers;
+                self.workspace.frames_on_locked_layers = on;
+                self.workspace.save();
+                self.status = Some(if on {
+                    "Frame commands now work on locked layers too".into()
+                } else {
+                    "Locked layers' frames are protected".into()
+                });
+            }
             ToggleProtectKeyframes => {
                 let on = !self.workspace.protect_keyframes;
                 self.set_protect_keyframes(on);
@@ -7128,24 +7138,36 @@ impl Editor {
     /// down (never up) to fit the stage, selected. Centred on `at` in document
     /// coordinates, or on the camera centre without one.
     pub fn place_library_image(&mut self, id: buzz_scene::ImageId, at: Option<Point>) {
+        self.place_library_image_sized(id, at, true);
+    }
+
+    /// [`Self::place_library_image`], or at the picture's own pixel size when
+    /// `fit_to_stage` is off (Generate Image's "At full size"). Says whether
+    /// it was placed; the status line says why not.
+    pub fn place_library_image_sized(
+        &mut self,
+        id: buzz_scene::ImageId,
+        at: Option<Point>,
+        fit_to_stage: bool,
+    ) -> bool {
         let Some(asset) = self.doc.scene().images().get(id).cloned() else {
             self.status = Some("That picture is no longer in the Library".into());
-            return;
+            return false;
         };
         let Some(layer) = self.active_layer() else {
             self.status = Some("No layer available to place it on".into());
-            return;
+            return false;
         };
         if self.doc.scene().layers().is_effectively_locked(layer) {
             self.status = Some("The active layer is locked".into());
-            return;
+            return false;
         }
 
         let stage = self.doc.scene().stage().size;
         let centre = at.unwrap_or(self.camera.center);
         let frame = self.current_frame;
         let (w, h) = (asset.width as f64, asset.height as f64);
-        let fit = (stage.width / w).min(stage.height / h).min(1.0);
+        let fit = if fit_to_stage { (stage.width / w).min(stage.height / h).min(1.0) } else { 1.0 };
         let (w, h) = (w * fit, h * fit);
         let rect = buzz_geom::Rect::new(
             centre.x - w / 2.0,
@@ -7163,8 +7185,12 @@ impl Editor {
             Some(object) => {
                 self.selection.set([object]);
                 self.status = Some(format!("Placed {name} on the stage"));
+                true
             }
-            None => self.status = Some("Could not place it on this frame".into()),
+            None => {
+                self.status = Some("Could not place it on this frame".into());
+                false
+            }
         }
     }
 
@@ -7203,18 +7229,22 @@ impl Editor {
                 let Some(name) = self.doc.scene().images().get(id).map(|a| a.name.clone()) else {
                     return;
                 };
-                let uses = self.doc.scene().image_usage().get(&id).copied().unwrap_or(0);
-                if uses > 0 {
-                    self.status = Some(format!(
-                        "{name} is still used {uses} time(s) in the document; delete those first"
-                    ));
-                    return;
-                }
+                // As Animate does: the bitmap goes, and every use of it with
+                // it, in one step that Undo brings all back. Refusing while it
+                // was used meant a picture on the stage could never be deleted.
+                let mut removed = 0;
                 self.doc.edit("Delete Picture", |scene| {
-                    scene.images_mut().remove(id);
+                    removed = scene.remove_image_everywhere(id);
                 });
                 self.doc.end_gesture();
-                self.status = Some(format!("Deleted {name} from the Library"));
+                self.selection.prune(self.doc.scene());
+                self.status = Some(if removed > 0 {
+                    format!(
+                        "Deleted {name} from the Library and its {removed} use(s) in the document \u{2014} Undo brings it back"
+                    )
+                } else {
+                    format!("Deleted {name} from the Library")
+                });
             }
             LibraryMedia::Sound(id) => {
                 let Some(name) = self.doc.scene().sounds().get(id).map(|s| s.name.clone()) else {
@@ -9689,9 +9719,10 @@ impl Editor {
         }
         let mut changed = 0usize;
         let mut skipped = 0usize;
+        let allow_locked = self.workspace.frames_on_locked_layers;
         self.doc.edit("Tween", |scene| {
             for (layer, frame) in starts.iter().copied() {
-                if scene.layers().is_effectively_locked(layer) {
+                if !allow_locked && scene.layers().is_effectively_locked(layer) {
                     skipped += 1;
                     continue;
                 }
@@ -11845,6 +11876,7 @@ impl Editor {
         let label = op.label();
         let mut changed = 0usize;
         let mut skipped = 0usize;
+        let allow_locked = self.workspace.frames_on_locked_layers;
 
         self.doc.edit(label, |scene| {
             for (layer, frame) in targets.iter().copied() {
@@ -11852,7 +11884,7 @@ impl Editor {
                     .layers()
                     .get(layer)
                     .is_some_and(|l| l.kind.holds_artwork())
-                    && !scene.layers().is_effectively_locked(layer);
+                    && (allow_locked || !scene.layers().is_effectively_locked(layer));
                 if !eligible {
                     skipped += 1;
                     continue;
@@ -11958,6 +11990,7 @@ impl Editor {
             &self.layer_rows.current(),
             selection.layers.iter().copied(),
             rows,
+            self.workspace.frames_on_locked_layers,
         ) {
             Ok(pairs) => pairs,
             Err(why) => {
@@ -12113,10 +12146,11 @@ impl Editor {
         self.frame_clipboard = Some(clip);
 
         let mut locked = 0;
+        let allow_locked = self.workspace.frames_on_locked_layers;
         if and_clear {
             self.doc.edit("Cut Frames", |scene| {
                 for &(layer, a, b) in &spans {
-                    if scene.layers().is_effectively_locked(layer) {
+                    if !allow_locked && scene.layers().is_effectively_locked(layer) {
                         locked += 1;
                         continue;
                     }
@@ -12167,13 +12201,14 @@ impl Editor {
         let mut pasted = 0usize;
         let mut layers = 0usize;
         let mut locked = 0usize;
+        let allow_locked = self.workspace.frames_on_locked_layers;
         self.doc.edit("Paste Frames", |scene| {
             for clipped in &clipboard {
                 let layer = clipped.layer;
                 if scene.layers().get(layer).is_none() {
                     continue;
                 }
-                if scene.layers().is_effectively_locked(layer) {
+                if !allow_locked && scene.layers().is_effectively_locked(layer) {
                     locked += 1;
                     continue;
                 }
@@ -19233,6 +19268,46 @@ mod tests {
         assert_eq!(starts(&e, sound), vec![0, 11]);
     }
 
+    /// **A picture in use can be deleted from the Library**, as in Animate:
+    /// it goes with every use of it — on the stage and inside a symbol — in
+    /// one step, and Undo brings the lot back. It used to be refused for as
+    /// long as anything used it, so a placed picture could never be deleted.
+    #[test]
+    fn a_used_picture_is_deleted_with_its_uses_and_undo_restores_it() {
+        let dir = std::env::temp_dir().join(format!("buzz_delete_pic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("photo.png");
+        image::RgbaImage::from_pixel(40, 30, image::Rgba([10, 200, 90, 255])).save(&path).unwrap();
+        let mut e = editor();
+        e.import_image(&path).unwrap();
+        let image = *e.scene().images().iter().next().map(|a| &a.id).expect("in the library");
+        // A second use, inside a symbol.
+        e.import_image(&path).ok();
+        let second = e.selection.ids()[0];
+        e.selection.set([second]);
+        e.run(Command::ConvertToSymbol);
+        let uses = |e: &Editor| e.scene().image_usage().values().sum::<usize>();
+        assert!(uses(&e) >= 1);
+        let objects = |e: &Editor| e.scene().layers().iter().map(|l| l.all_objects().count()).sum::<usize>();
+        let before = objects(&e);
+
+        e.run_library_media(buzz_ui::library_panel::MediaRequest::Delete(
+            buzz_ui::library_panel::LibraryMedia::Picture(image),
+        ));
+        assert!(e.scene().images().get(image).is_none(), "gone from the Library");
+        assert!(
+            e.scene().image_usage().get(&image).is_none(),
+            "and from the stage and the symbol: {:?}",
+            e.status
+        );
+        assert!(objects(&e) < before, "the placed picture went with it");
+
+        e.run(Command::Undo);
+        assert!(e.scene().images().get(image).is_some(), "Undo brings the picture back");
+        assert_eq!(objects(&e), before, "and its uses");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **Full size keeps every pixel's size**; the ordinary import fits a
     /// picture larger than the stage inside it.
     #[test]
@@ -25471,6 +25546,8 @@ mod tests {
     /// frame 2; the third is locked. Frames 2–4 of all three are selected.
     fn editor_with_frames_to_move() -> (Editor, [LayerId; 3]) {
         let mut e = editor();
+        // These are about what a lock protects, so the lock protects frames.
+        e.workspace.frames_on_locked_layers = false;
         let mut ids = Vec::new();
         e.doc.edit("Setup", |s| {
             for name in ["A", "B", "Locked"] {
@@ -25705,6 +25782,7 @@ mod tests {
     #[test]
     fn a_locked_or_folder_target_refuses_the_whole_move() {
         let mut e = editor();
+        e.workspace.frames_on_locked_layers = false;
         let (mut a, mut locked, mut folder) = (LayerId(0), LayerId(0), LayerId(0));
         e.doc.edit("Setup", |s| {
             a = add_drawn_layer(s, "A", 1, 4);
@@ -26674,9 +26752,42 @@ mod tests {
         assert_eq!(e.tool(), ToolId::Camera);
     }
 
+    /// **Locked layers still take frame commands by default** (Edit Frames
+    /// on Locked Layers): the lock guards the artwork on the stage, not the
+    /// timing. Switched off, a locked layer's frames are left alone.
+    #[test]
+    fn frame_commands_reach_a_locked_layer_unless_switched_off() {
+        let mut e = editor();
+        assert!(e.workspace.frames_on_locked_layers, "on by default");
+        let layer = e.selection.active_layer().unwrap();
+        e.doc.edit("Lock", |s| {
+            s.update_layer(layer, |l| l.locked = true);
+        });
+        let keys = |e: &Editor| e.scene().layers().get(layer).unwrap().frames.keyframe_count();
+
+        e.set_frame(5);
+        e.run(Command::InsertKeyframe);
+        assert_eq!(keys(&e), 2, "F6 keys the locked layer");
+        e.run(Command::ClearKeyframe);
+        assert_eq!(keys(&e), 1, "Shift+F6 clears it again");
+        e.run(Command::InsertBlankKeyframe);
+        assert_eq!(keys(&e), 2, "F7 too");
+        e.run(Command::RemoveFrame);
+        e.run(Command::InsertFrame);
+        assert!(e.scene().layers().get(layer).unwrap().locked, "and the lock stays on");
+
+        e.run(Command::ToggleFramesOnLockedLayers);
+        assert!(!e.workspace.frames_on_locked_layers);
+        let before = keys(&e);
+        e.set_frame(8);
+        e.run(Command::InsertKeyframe);
+        assert_eq!(keys(&e), before, "switched off, the locked layer is left alone");
+    }
+
     #[test]
     fn frame_operations_are_refused_on_a_locked_layer() {
         let mut e = editor();
+        e.workspace.frames_on_locked_layers = false;
         let layer = e.selection.active_layer().unwrap();
         e.doc.edit("Lock", |s| {
             s.update_layer(layer, |l| l.locked = true);

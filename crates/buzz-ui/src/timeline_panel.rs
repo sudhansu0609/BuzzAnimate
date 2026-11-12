@@ -135,6 +135,8 @@ pub struct TimelineResponse {
     pub toggle_focus_folders: bool,
     /// K2: the Protect Other Keyframes lock was clicked.
     pub toggle_protect_keyframes: bool,
+    /// The Edit Frames on Locked Layers toggle was clicked.
+    pub toggle_frames_on_locked_layers: bool,
     /// K2: a Protect scope was picked from the dropdown beside the lock.
     pub set_protect_scope: Option<buzz_scene::ProtectScope>,
 }
@@ -614,23 +616,26 @@ pub fn frame_move_targets(
     layers: impl IntoIterator<Item = LayerId>,
     rows: i32,
 ) -> Result<Vec<(LayerId, LayerId)>, String> {
-    frame_move_targets_filtered(scene, &RowFilter::default(), layers, rows)
+    frame_move_targets_filtered(scene, &RowFilter::default(), layers, rows, false)
 }
 
 /// [`frame_move_targets`], counting rows as the layer filter (L1) shows them,
 /// so a drag across a filtered timeline lands where its ghost was drawn.
+/// `allow_locked` is Edit Frames on Locked Layers: locked layers move and
+/// receive frames like any other.
 pub fn frame_move_targets_filtered(
     scene: &Scene,
     filter: &RowFilter,
     layers: impl IntoIterator<Item = LayerId>,
     rows: i32,
+    allow_locked: bool,
 ) -> Result<Vec<(LayerId, LayerId)>, String> {
     let stack = scene.layers();
     let sources: Vec<LayerId> = layers
         .into_iter()
         .filter(|&id| {
             stack.get(id).is_some_and(|l| l.kind.holds_artwork())
-                && !stack.is_effectively_locked(id)
+                && (allow_locked || !stack.is_effectively_locked(id))
         })
         .collect();
     if rows == 0 {
@@ -655,7 +660,7 @@ pub fn frame_move_targets_filtered(
                 layer.name
             ));
         }
-        if stack.is_effectively_locked(target) {
+        if !allow_locked && stack.is_effectively_locked(target) {
             return Err(format!("\u{201C}{}\u{201D} is locked", layer.name));
         }
         pairs.push((source, target));
@@ -721,6 +726,7 @@ fn frame_move_drag(
             &state.row_filter,
             selection.layers.iter().copied(),
             drag.rows,
+            state.frames_on_locked_layers,
         )
         .is_err();
         let count = selection.last_frame - selection.first_frame + 1;
@@ -808,6 +814,8 @@ pub struct TimelineState {
     pub focus_folders: bool,
     /// K2: Protect Other Keyframes, with its scope; `None` when off.
     pub protect_keyframes: Option<buzz_scene::ProtectScope>,
+    /// Edit Frames on Locked Layers (`Workspace::frames_on_locked_layers`).
+    pub frames_on_locked_layers: bool,
     /// L1: which rows the layer filter keeps (`Workspace::layer_filter`).
     pub layer_filter: LayerFilter,
     /// L1: the layer search text. Not saved.
@@ -1699,6 +1707,17 @@ fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Time
             .clicked()
         {
             out.toggle_focus_folders = true;
+        }
+        if ui
+            .add(egui::Button::new("\u{1F513} Locked").selected(state.frames_on_locked_layers))
+            .on_hover_text(
+                "Edit Frames on Locked Layers \u{2014} insert and remove frames and \
+                 keyframes, tweens, and move, cut or paste frames on locked layers too. \
+                 The lock still keeps their artwork from being clicked or drawn over.",
+            )
+            .clicked()
+        {
+            out.toggle_frames_on_locked_layers = true;
         }
         // K2: Protect Other Keyframes — the lock, and its scope beside it.
         if ui
@@ -4776,6 +4795,7 @@ mod tests {
             compact: false,
             focus_folders: false,
             protect_keyframes: None,
+            frames_on_locked_layers: true,
             layer_filter: Default::default(),
             layer_search: String::new(),
             row_filter: Default::default(),

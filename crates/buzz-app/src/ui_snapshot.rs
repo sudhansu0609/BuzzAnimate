@@ -367,6 +367,7 @@ fn draw_icon_contact_sheet(ui: &mut egui::Ui) {
                     compact: false,
                     focus_folders: false,
                     protect_keyframes: None,
+                    frames_on_locked_layers: true,
                     layer_filter: Default::default(),
                     layer_search: String::new(),
                     row_filter: Default::default(),

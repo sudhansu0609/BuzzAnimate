@@ -69,7 +69,10 @@ impl Default for Settings {
             random_seed: true,
             width: 1280,
             height: 720,
-            skip_upscale: true,
+            // The workflow's 4\u{d7} upscaler runs unless switched off: a
+            // generated set is a backdrop the camera moves across, and wants
+            // the pixels.
+            skip_upscale: false,
             start_comfy: true,
             show_in_comfy: true,
             destination: Destination::Library,
@@ -142,7 +145,9 @@ pub struct GenerateImage {
     workflow_note: Option<String>,
     job: Option<Arc<Mutex<JobState>>>,
     status: Option<String>,
-    preview: Option<(egui::TextureHandle, String)>,
+    /// The last picture: its texture, its file, and where it is in the
+    /// Library, so the preview can be dragged onto the stage.
+    preview: Option<(egui::TextureHandle, String, Option<buzz_scene::ImageId>)>,
     /// When the running job began: the window shows the seconds, so a cold
     /// model load that is quiet for minutes reads as working, not hung.
     job_began: Option<std::time::Instant>,
@@ -303,23 +308,33 @@ impl GenerateImage {
             Err(e) => self.status = Some(format!("Failed: {e}")),
             Ok((picture, notes)) => {
                 let stem = picture.file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                let placed = match self.settings.destination {
-                    Destination::Stage if self.settings.full_size => {
-                        editor.import_image_full_size(&picture.file).map_err(|e| e.to_string())
-                    }
-                    Destination::Stage => editor.import_image(&picture.file).map_err(|e| e.to_string()),
-                    Destination::Library => {
-                        let mut out = Err("not added".to_string());
-                        editor.doc.edit("Generate Image", |scene| {
-                            out = scene.add_image(&stem, &picture.bytes).map(|a| a.name.clone()).map_err(|e| e.to_string());
-                        });
-                        editor.doc.end_gesture();
-                        out
-                    }
-                };
-                let mut text = match &placed {
-                    Ok(name) => match self.settings.destination {
-                        Destination::Stage => format!("Placed \u{201c}{name}\u{201d} on the stage (seed {})", picture.seed),
+                // **Into the Library always**, then onto the stage when asked:
+                // a picture that could not be placed (a locked layer, say) is
+                // still kept, to drag out of the preview or the Library.
+                let mut added = Err("not added".to_string());
+                editor.doc.edit("Generate Image", |scene| {
+                    added = scene
+                        .add_image(&stem, &picture.bytes)
+                        .map(|a| (a.id, a.name.clone()))
+                        .map_err(|e| e.to_string());
+                });
+                editor.doc.end_gesture();
+                let mut text = match &added {
+                    Ok((id, name)) => match self.settings.destination {
+                        Destination::Stage => {
+                            if editor.place_library_image_sized(*id, None, !self.settings.full_size) {
+                                format!(
+                                    "Placed \u{201c}{name}\u{201d} on the stage and in the Library (seed {})",
+                                    picture.seed
+                                )
+                            } else {
+                                format!(
+                                    "Added \u{201c}{name}\u{201d} to the Library, but could not place it: {} (seed {})",
+                                    editor.status.clone().unwrap_or_default(),
+                                    picture.seed
+                                )
+                            }
+                        }
                         Destination::Library => format!("Added \u{201c}{name}\u{201d} to the Library (seed {})", picture.seed),
                     },
                     Err(e) => format!("Generated, but could not add it: {e}"),
@@ -334,7 +349,7 @@ impl GenerateImage {
                     let size = [rgba.width() as usize, rgba.height() as usize];
                     let colour = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
                     let tex = ctx.load_texture("generate-image-preview", colour, egui::TextureOptions::LINEAR);
-                    self.preview = Some((tex, picture.file.display().to_string()));
+                    self.preview = Some((tex, picture.file.display().to_string(), added.ok().map(|(id, _)| id)));
                 }
             }
         }
@@ -655,10 +670,29 @@ impl GenerateImage {
                 if let Some(status) = &self.status {
                     ui.label(egui::RichText::new(status).small());
                 }
-                if let Some((tex, file)) = &self.preview {
+                if let Some((tex, file, id)) = &self.preview {
                     let size = tex.size_vec2();
                     let scale = (ui.available_width() / size.x).min(1.0);
-                    ui.add(egui::Image::new(tex).fit_to_exact_size(size * scale)).on_hover_text(file);
+                    let image = egui::Image::new(tex).fit_to_exact_size(size * scale);
+                    // **Drag it onto the stage**, as from the Library: the same
+                    // payload, so it lands where it is let go.
+                    match id.filter(|id| editor.doc.scene().images().get(*id).is_some()) {
+                        Some(id) => {
+                            let drag = ui
+                                .dnd_drag_source(
+                                    egui::Id::new(("generate-image-drag", id.0)),
+                                    buzz_ui::library_panel::DraggedMedia(
+                                        buzz_ui::library_panel::LibraryMedia::Picture(id),
+                                    ),
+                                    |ui| ui.add(image),
+                                )
+                                .response;
+                            drag.on_hover_text(format!("Drag onto the stage to place it\n{file}"));
+                        }
+                        None => {
+                            ui.add(image).on_hover_text(file);
+                        }
+                    }
                 }
               });
             });

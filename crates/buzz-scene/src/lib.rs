@@ -1421,6 +1421,120 @@ impl Scene {
         counts
     }
 
+    /// **Delete a picture and every use of it**, as Animate deletes a bitmap
+    /// from the Library together with its instances.
+    ///
+    /// The picture's paint is taken off every shape that uses it — on the
+    /// main timeline and inside every symbol, on every keyframe, through
+    /// groups, warps and rig parts. A shape left with neither fill nor stroke
+    /// (a placed picture is exactly that: a rectangle filled with it) goes
+    /// too; one that also had a stroke keeps the stroke. Rig parts are kept,
+    /// paint removed, so the rig's bones still have their parts. Returns how
+    /// many uses were taken off.
+    pub fn remove_image_everywhere(&mut self, image: ImageId) -> usize {
+        use crate::object::Paint;
+        use std::sync::Arc;
+
+        fn is(paint: &Paint, image: ImageId) -> bool {
+            paint.image().is_some_and(|i| i.asset.id == image)
+        }
+        fn shape_uses(data: &ShapeData, image: ImageId) -> bool {
+            data.fill.as_ref().is_some_and(|f| is(&f.paint, image))
+                || data.stroke.as_ref().is_some_and(|s| is(&s.paint, image))
+        }
+        fn uses(object: &Object, image: ImageId) -> bool {
+            match &object.kind {
+                ObjectKind::Shape(data) => shape_uses(data, image),
+                ObjectKind::Warp(warp) => shape_uses(&warp.shape, image),
+                ObjectKind::Group(children) => children.iter().any(|c| uses(c, image)),
+                ObjectKind::Armature(rig) => rig.parts.iter().any(|p| uses(&p.artwork, image)),
+                ObjectKind::Instance(_) => false,
+            }
+        }
+        /// Take the paint off; `true` when nothing is left to draw.
+        fn strip_shape(data: &mut ShapeData, image: ImageId, removed: &mut usize) -> bool {
+            if data.fill.as_ref().is_some_and(|f| is(&f.paint, image)) {
+                data.fill = None;
+                *removed += 1;
+            }
+            if data.stroke.as_ref().is_some_and(|s| is(&s.paint, image)) {
+                data.stroke = None;
+                *removed += 1;
+            }
+            data.fill.is_none() && data.stroke.is_none()
+        }
+        /// The object without the picture, or `None` when it should go.
+        fn strip(
+            object: &Arc<Object>,
+            image: ImageId,
+            removed: &mut usize,
+            drop_empty: bool,
+        ) -> Option<Arc<Object>> {
+            if !uses(object, image) {
+                return Some(Arc::clone(object));
+            }
+            let mut copy = (**object).clone();
+            let empty = match &mut copy.kind {
+                ObjectKind::Shape(data) => strip_shape(data, image, removed),
+                ObjectKind::Warp(warp) => strip_shape(&mut warp.shape, image, removed),
+                ObjectKind::Group(children) => {
+                    *children = children
+                        .iter()
+                        .filter_map(|c| strip(c, image, removed, true))
+                        .collect();
+                    children.is_empty()
+                }
+                ObjectKind::Armature(rig) => {
+                    for part in &mut rig.parts {
+                        if let Some(artwork) = strip(&part.artwork, image, removed, false) {
+                            part.artwork = artwork;
+                        }
+                    }
+                    false
+                }
+                ObjectKind::Instance(_) => false,
+            };
+            (!(empty && drop_empty)).then(|| Arc::new(copy))
+        }
+        fn strip_stack(stack: &mut LayerStack, image: ImageId, removed: &mut usize) {
+            let affected: Vec<LayerId> = stack
+                .iter()
+                .filter(|l| l.all_objects().any(|o| uses(o, image)))
+                .map(|l| l.id)
+                .collect();
+            for id in affected {
+                stack.update(id, |layer| {
+                    for keyframe in layer.frames.keyframes_mut() {
+                        if keyframe.objects.iter().any(|o| uses(o, image)) {
+                            keyframe.objects = Arc::new(
+                                keyframe
+                                    .objects
+                                    .iter()
+                                    .filter_map(|o| strip(o, image, removed, true))
+                                    .collect(),
+                            );
+                        }
+                    }
+                });
+            }
+        }
+
+        let mut removed = 0;
+        strip_stack(&mut self.layers, image, &mut removed);
+        let symbols: Vec<SymbolId> = self
+            .library
+            .iter()
+            .filter(|s| s.layers.iter().any(|l| l.all_objects().any(|o| uses(o, image))))
+            .map(|s| s.id)
+            .collect();
+        for id in symbols {
+            self.library.update(id, |symbol| strip_stack(&mut symbol.layers, image, &mut removed));
+        }
+        self.images_mut().remove(image);
+        self.bump();
+        removed
+    }
+
     /// Sounds placed anywhere, including inside symbols, for the Library
     /// panel's use count.
     pub fn sound_usage(&self) -> std::collections::BTreeMap<SoundId, usize> {

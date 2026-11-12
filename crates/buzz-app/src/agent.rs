@@ -167,7 +167,7 @@ pub fn route(command: Command) -> Route {
         | CreateShapeTween | RemoveTween | InsertFrame | RemoveFrame | InsertKeyframe
         | InsertBlankKeyframe | ClearKeyframe | PlayPause | NextFrame | PreviousFrame
         | FirstFrame | LastFrame | CutFrames | CopyFrames | PasteFrames | SelectAllFrames | CopyMotion | CopyPose | ClearFrames
-        | ReverseFrames | ToggleOnionSkin | ToggleAutoKeyframe | ToggleEditMultipleFrames
+        | ReverseFrames | ToggleOnionSkin | ToggleAutoKeyframe | ToggleFramesOnLockedLayers | ToggleEditMultipleFrames
         | ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere
         | ToggleCamera | AddCameraKeyframe | RemoveCameraKeyframe | ResetCamera
         | AddLightKeyframe | RemoveLightKeyframe | SaveAsTemplate | RenameBodyLayers

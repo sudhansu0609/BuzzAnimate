@@ -6455,6 +6455,7 @@ impl App {
                     compact: self.editor.workspace.row_scale_before_compact.is_some(),
                     focus_folders: self.editor.workspace.focus_folders,
                     protect_keyframes: self.editor.workspace.protect_scope(),
+                    frames_on_locked_layers: self.editor.workspace.frames_on_locked_layers,
                     layer_filter: self.editor.workspace.layer_filter,
                     layer_search: self.editor.layer_search.clone(),
                     row_filter,
@@ -8283,6 +8284,9 @@ impl App {
             self.editor.focus_seen = None;
         }
         // K2: the Protect lock and its scope run the same commands as the menu.
+        if response.toggle_frames_on_locked_layers {
+            commands.push(Command::ToggleFramesOnLockedLayers);
+        }
         if response.toggle_protect_keyframes {
             self.editor.run(Command::ToggleProtectKeyframes);
         }

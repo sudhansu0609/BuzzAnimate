@@ -594,6 +594,9 @@ pub enum Command {
     RigHead,
     ToggleOnionSkin,
     ToggleAutoKeyframe,
+    /// **Edit Frames on Locked Layers**: frame commands reach locked layers
+    /// (`Workspace::frames_on_locked_layers`).
+    ToggleFramesOnLockedLayers,
     /// **Edit ▸ Protect Other Keyframes**: an edit inside a shared symbol
     /// opened in place changes only the clicked keyframe (a copy is made), and
     /// Auto Keyframe is held on (`docs/MASTER_AUDIO_AND_PROTECT_PLAN.md` K2).
@@ -934,6 +937,7 @@ command_table! {
             RigHead => "rig_head",
             ToggleOnionSkin => "toggle_onion_skin",
             ToggleAutoKeyframe => "toggle_auto_keyframe",
+            ToggleFramesOnLockedLayers => "toggle_frames_on_locked_layers",
             ToggleProtectKeyframes => "toggle_protect_keyframes",
             ProtectThisKeyframe => "protect_scope_this_keyframe",
             ProtectFromHere => "protect_scope_from_here",
@@ -1416,6 +1420,7 @@ impl Command {
             RigHead => "Rig Head",
             ToggleOnionSkin => "Onion Skin",
             ToggleAutoKeyframe => "Auto Keyframe",
+            ToggleFramesOnLockedLayers => "Edit Frames on Locked Layers",
             ToggleProtectKeyframes => "Protect Other Keyframes",
             ProtectThisKeyframe => "This Keyframe",
             ProtectFromHere => "This Keyframe and Later",
@@ -1676,6 +1681,7 @@ impl Command {
             RigHead => None,
             ToggleOnionSkin => None,
             ToggleAutoKeyframe => None,
+            ToggleFramesOnLockedLayers => None,
             ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere => None,
             ToggleEditMultipleFrames => None,
 
@@ -1874,6 +1880,7 @@ pub fn palette_commands() -> Vec<Command> {
         RigHead,
         ToggleOnionSkin,
         ToggleAutoKeyframe,
+        ToggleFramesOnLockedLayers,
         ToggleProtectKeyframes,
         ProtectThisKeyframe,
         ProtectFromHere,
@@ -2129,6 +2136,7 @@ mod tests {
             RenameFaceLayers,
             ToggleOnionSkin,
             ToggleAutoKeyframe,
+            ToggleFramesOnLockedLayers,
             ToggleEditMultipleFrames,
             ToggleCamera,
             AddCameraKeyframe,
@@ -2309,7 +2317,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            246
+            247
         );
     }
 

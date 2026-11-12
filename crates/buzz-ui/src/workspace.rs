@@ -535,6 +535,14 @@ pub struct Workspace {
     /// leaving the earlier ones alone is what people expect.
     #[serde(default = "default_auto_keyframe")]
     pub auto_keyframe: bool,
+    /// **Edit Frames on Locked Layers**: the frame commands (insert and remove
+    /// frames, insert, blank and clear keyframes, tweens, move, cut and paste
+    /// frames) work on a locked layer too. The lock still keeps its artwork
+    /// from being clicked, moved or drawn over. On unless switched off — a
+    /// lock is usually there to stop stray clicks on the stage, not to stop
+    /// the timing being worked on.
+    #[serde(default = "yes")]
+    pub frames_on_locked_layers: bool,
     /// **Exports at once** — how many exports the queue runs side by side
     /// (step P of `docs/PRODUCTION_SPEED_PLAN.md`), set in the Tasks panel.
     /// The queue still holds it under what the GPU's free memory allows. A
@@ -1422,6 +1430,7 @@ impl Workspace {
             pan_speed: default_pan_speed(),
             auto_save: default_auto_save(),
             auto_keyframe: default_auto_keyframe(),
+            frames_on_locked_layers: true,
             exports_at_once: default_exports_at_once(),
             brush_tips: crate::brush::BrushTips::default(),
             drawing_modes: crate::style::ToolDrawingModes::default(),

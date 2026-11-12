@@ -632,6 +632,21 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             ui.separator();
             item(ui, Command::ToggleOnionSkin, true, &mut raised);
             item(ui, Command::ToggleAutoKeyframe, true, &mut raised);
+            if ui
+                .button(format!(
+                    "{}{}",
+                    if state.workspace.frames_on_locked_layers { "\u{2714} " } else { "   " },
+                    Command::ToggleFramesOnLockedLayers.label()
+                ))
+                .on_hover_text(
+                    "Insert and remove frames and keyframes on locked layers too; \
+                     the lock still protects their artwork on the stage",
+                )
+                .clicked()
+            {
+                raised.push(Command::ToggleFramesOnLockedLayers);
+                ui.close();
+            }
             item(ui, Command::ToggleEditMultipleFrames, true, &mut raised);
             ui.separator();
             // Animate keeps sound on the frame it starts from, so its commands

@@ -699,12 +699,25 @@ fn last3(dims: &[i64]) -> [usize; 3] {
     [at(3), at(2), at(1)]
 }
 
+/// The pooled SAM 2 session for `id`. On macOS it is a CPU session: CoreML
+/// refuses the decoder's empty box tensor (a point-only prompt, as the depth
+/// layers use) and may run the encoder at half precision, so the masks would
+/// differ from Windows' DirectML ones. SAM 2 tiny runs in about a second on
+/// the CPU.
+fn sam2_session(id: ModelId) -> Option<std::sync::Arc<std::sync::Mutex<OnnxSession>>> {
+    if cfg!(target_os = "macos") {
+        crate::onnx::pooled_cpu(id)
+    } else {
+        pooled(id)
+    }
+}
+
 /// Encodes `img` with the SAM 2.1 hiera-tiny vision encoder (the
 /// transformers.js ONNX layout: input `pixel_values` [1,3,1024,1024],
 /// outputs `image_embeddings.{0,1,2}`). Returns `None` when the encoder
 /// model isn't installed, so callers can fall back to a non-SAM path.
 pub fn sam2_encode(img: &RgbaImage) -> Result<Option<Sam2Embeddings>> {
-    let Some(session) = pooled(ModelId::Sam2Encoder) else {
+    let Some(session) = sam2_session(ModelId::Sam2Encoder) else {
         return Ok(None);
     };
     let mut sess = session.lock().unwrap();
@@ -770,7 +783,7 @@ pub fn sam2_mask(
     points: &[Sam2Point],
     box_prompt: Option<[f32; 4]>,
 ) -> Result<Option<(GrayImage, f32)>> {
-    let Some(session) = pooled(ModelId::Sam2Decoder) else {
+    let Some(session) = sam2_session(ModelId::Sam2Decoder) else {
         return Ok(None);
     };
     let mut sess = session.lock().unwrap();

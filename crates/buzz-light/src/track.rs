@@ -36,8 +36,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// It carries the whole animatable snapshot — the colour, the intensity, the
 /// crescent softness, and the kind's own numbers — so interpolation is one
-/// blend of two keys rather than a scatter of per-field tracks. The static
-/// fields (`id`, `name`, `enabled`, `shadows`) stay on the base [`Light`].
+/// blend of two keys rather than a scatter of per-field tracks, and whether
+/// the light is **on** there. The static fields (`id`, `name`, `shadows`) stay
+/// on the base [`Light`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LightKey {
     pub frame: u32,
@@ -52,6 +53,22 @@ pub struct LightKey {
     /// radius for a lamp, the horizon colour for a sky. Interpolated within a
     /// matching variant.
     pub kind: LightKind,
+    /// Whether the light is **on** from this key: a light switched off on one
+    /// key stays on at the keys before it. Never blended. On in every key of an
+    /// older file, whose keys did not carry it.
+    #[serde(default = "on")]
+    pub enabled: bool,
+    /// **Blend into the next key** (`true`), or **hold** this key's state until
+    /// the next one (`false`). A key made now holds, as an Animate keyframe
+    /// without a tween does: a change made at a key starts there, and the
+    /// frames before it stay as they were. Keys of an older file blend, as
+    /// they always did.
+    #[serde(default = "on")]
+    pub tween: bool,
+}
+
+fn on() -> bool {
+    true
 }
 
 impl LightKey {
@@ -66,6 +83,8 @@ impl LightKey {
             shadow_strength: light.shadow_strength,
             shadow_adjustment: light.shadow_adjustment,
             kind: light.kind,
+            enabled: light.enabled,
+            tween: false,
         }
     }
 }
@@ -146,6 +165,7 @@ impl LightTrack {
         light.shadow_strength = key.shadow_strength;
         light.shadow_adjustment = key.shadow_adjustment;
         light.kind = key.kind;
+        light.enabled = key.enabled;
         light
     }
 
@@ -166,6 +186,10 @@ impl LightTrack {
         let after = self.keys.partition_point(|k| k.frame <= frame);
         let a = self.keys[after - 1];
         let b = self.keys[after];
+        // A holding key: its state until the next one.
+        if !a.tween {
+            return a;
+        }
         let span = (b.frame - a.frame) as f64;
         let t = if span > 0.0 {
             (frame - a.frame) as f64 / span
@@ -203,6 +227,8 @@ fn lerp_key(a: &LightKey, b: &LightKey, t: f64) -> LightKey {
         shadow_strength: lerp(a.shadow_strength as f64, b.shadow_strength as f64, t) as f32,
         shadow_adjustment: lerp_shadow(a.shadow_adjustment, b.shadow_adjustment, t),
         kind: lerp_kind(a.kind, b.kind, t),
+        enabled: a.enabled,
+        tween: a.tween,
     }
 }
 
@@ -302,6 +328,8 @@ mod tests {
 
     fn key(frame: u32, elevation: f64, intensity: f32) -> LightKey {
         LightKey {
+            enabled: true,
+            tween: true,
             frame,
             color: Color::WHITE,
             intensity,

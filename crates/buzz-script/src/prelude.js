@@ -113,7 +113,8 @@
       scaleY: partOf("scaleY"),
       skewX: partOf("skewX"),
       skewY: partOf("skewY"),
-      // "loop" | "play once" | "single frame"; "" on anything not an instance.
+      // "loop" | "play once" | "single frame" | "play once reverse" |
+      // "loop reverse"; "" on anything not an instance.
       loop: partOf("loop"),
       name: partOf("name"),
     });
@@ -300,6 +301,12 @@
         set: function (v) { host.setFrameTweenKind(layerIndex, frame, String(v)); },
         enumerable: true,
       },
+      // Animate's ease slider: -100 eases in, 100 eases out, 0 is none.
+      tweenEasing: {
+        get: function () { return host.frameTweenEasing(layerIndex, frame); },
+        set: function (v) { host.setFrameTweenEasing(layerIndex, frame, Number(v) || 0); },
+        enumerable: true,
+      },
       // `{name, sourceFilePath}` if a sound starts on this keyframe, else
       // `null`. BuzzAnimate's sound library holds decoded audio rather than
       // a path on disk, so `sourceFilePath` is a synthesised `file:///name`
@@ -369,14 +376,19 @@
         },
         enumerable: true,
       },
-      // Animate's layer parenting: the layer this one follows, or null.
+      // **Animate's `parentLayer`: the layer's container** — the folder it is
+      // in, or the mask / guide over a masked / guided layer — or null. Not
+      // layer parenting: that is `getRigParentAtFrame` / `setRigParentAtFrame`
+      // below, as in Animate. The shelf's Ctrl+R and Shift+R skip layers whose
+      // `parentLayer` is set, meaning "inside a folder"; reading parenting here
+      // made them skip every parented arm, wrist and palm.
       parentLayer: {
         get: function () {
-          var p = host.layerFollows(index);
+          var p = host.layerContainerIndex(index);
           return p < 0 ? null : new Layer(p);
         },
         set: function (v) {
-          host.setLayerFollows(index, v && typeof v.index === "number" ? v.index : -1, 0);
+          host.setLayerParentFolder(index, v && typeof v.index === "number" ? v.index : -1);
         },
         enumerable: true,
       },
@@ -426,7 +438,8 @@
   // the shelf's own unparent spelling `setRigParentAtFrame(0, -1)` and a null /
   // -1 parent both unlink.
   Layer.prototype.getRigParentAtFrame = function () {
-    return this.parentLayer;
+    var p = host.layerFollows(this.index);
+    return p < 0 ? null : new Layer(p);
   };
   Layer.prototype.setRigParentAtFrame = function (parent, frame) {
     var idx = -1;

@@ -198,12 +198,12 @@ pub enum Command {
     TraceLineArt,
     /// Trace Bitmap with the options dialog open first, rather than the
     /// built-in defaults straight away. In the AI menu as **Trace Picture…**;
-    /// `TraceLineArt` and `TraceBoldSplit` are in no menu (the dialog has the
-    /// Line art preset, Split Picture into Layers the rest).
+    /// `TraceLineArt` is in no menu (the dialog has the Line art preset).
     TraceBitmapOptions,
     /// **Trace Bold + Split into Layers** (T16b): the selected picture is traced with
     /// the Bold preset (Keep textures on), then the artwork it became is cut into
-    /// Sky / Far / Land and objects (AI > Split Picture into Layers), in one go.
+    /// Sky / Far / Land (or a Room, indoors) and objects (AI > Split Picture into
+    /// Layers), in one go. In the AI menu under Picture.
     TraceBoldSplit,
     ConvertLinesToFills,
     ExpandFill,
@@ -597,6 +597,7 @@ pub enum Command {
     /// **Edit Frames on Locked Layers**: frame commands reach locked layers
     /// (`Workspace::frames_on_locked_layers`).
     ToggleFramesOnLockedLayers,
+    ToggleEqualLayerLengths,
     /// **Edit ▸ Protect Other Keyframes**: an edit inside a shared symbol
     /// opened in place changes only the clicked keyframe (a copy is made), and
     /// Auto Keyframe is held on (`docs/MASTER_AUDIO_AND_PROTECT_PLAN.md` K2).
@@ -938,6 +939,7 @@ command_table! {
             ToggleOnionSkin => "toggle_onion_skin",
             ToggleAutoKeyframe => "toggle_auto_keyframe",
             ToggleFramesOnLockedLayers => "toggle_frames_on_locked_layers",
+            ToggleEqualLayerLengths => "toggle_equal_layer_lengths",
             ToggleProtectKeyframes => "toggle_protect_keyframes",
             ProtectThisKeyframe => "protect_scope_this_keyframe",
             ProtectFromHere => "protect_scope_from_here",
@@ -1421,6 +1423,7 @@ impl Command {
             ToggleOnionSkin => "Onion Skin",
             ToggleAutoKeyframe => "Auto Keyframe",
             ToggleFramesOnLockedLayers => "Edit Frames on Locked Layers",
+            ToggleEqualLayerLengths => "Equal Layer Lengths",
             ToggleProtectKeyframes => "Protect Other Keyframes",
             ProtectThisKeyframe => "This Keyframe",
             ProtectFromHere => "This Keyframe and Later",
@@ -1445,6 +1448,21 @@ impl Command {
             Align { op, .. } => op.label(),
             Distribute(op) => op.label(),
             MatchSize(op) => op.label(),
+        }
+    }
+
+    /// **Extra built-in keys**, raising the command besides its main one.
+    ///
+    /// Play/Pause also on ⌘Space (Ctrl+Space elsewhere): Space alone is the
+    /// hand, held to pan the stage. Convert to Symbol also on ⌘⇧8: on a Mac
+    /// keyboard F8 is the media Play key unless fn is held, so Animate's F8
+    /// never reaches the app.
+    pub fn extra_shortcuts(self) -> Vec<KeyboardShortcut> {
+        use Command::*;
+        match self {
+            PlayPause => vec![KeyboardShortcut::new(Modifiers::COMMAND, Key::Space)],
+            ConvertToSymbol => vec![KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Num8)],
+            _ => Vec::new(),
         }
     }
 
@@ -1682,6 +1700,7 @@ impl Command {
             ToggleOnionSkin => None,
             ToggleAutoKeyframe => None,
             ToggleFramesOnLockedLayers => None,
+            ToggleEqualLayerLengths => None,
             ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere => None,
             ToggleEditMultipleFrames => None,
 
@@ -1881,6 +1900,7 @@ pub fn palette_commands() -> Vec<Command> {
         ToggleOnionSkin,
         ToggleAutoKeyframe,
         ToggleFramesOnLockedLayers,
+        ToggleEqualLayerLengths,
         ToggleProtectKeyframes,
         ProtectThisKeyframe,
         ProtectFromHere,
@@ -2137,6 +2157,7 @@ mod tests {
             ToggleOnionSkin,
             ToggleAutoKeyframe,
             ToggleFramesOnLockedLayers,
+            ToggleEqualLayerLengths,
             ToggleEditMultipleFrames,
             ToggleCamera,
             AddCameraKeyframe,
@@ -2225,8 +2246,7 @@ mod tests {
     #[test]
     fn shortcuts_do_not_collide() {
         let mut seen: HashMap<String, Command> = HashMap::new();
-        for c in all_commands() {
-            let Some(sc) = c.shortcut() else { continue };
+        for (c, sc) in all_commands().into_iter().flat_map(|c| c.shortcut().into_iter().chain(c.extra_shortcuts()).map(move |sc| (c, sc))) {
             let key = format!("{:?}+{:?}", sc.modifiers, sc.logical_key);
             if let Some(previous) = seen.insert(key.clone(), c) {
                 // TogglePasteboard and ZoomShowAll deliberately share a binding
@@ -2280,6 +2300,10 @@ mod tests {
         expect(Command::ConvertToSymbol, Modifiers::NONE, Key::F8);
         expect(Command::NewSymbol, Modifiers::COMMAND, Key::F8);
         expect(Command::EditSymbol, Modifiers::COMMAND, Key::E);
+        // F8 is the media Play key on a Mac keyboard: ⌘⇧8 reaches the app.
+        assert!(Command::ConvertToSymbol.extra_shortcuts().contains(&KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Num8)));
+        // Space alone is the hand; ⌘Space plays, beside Enter.
+        assert!(Command::PlayPause.extra_shortcuts().contains(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Space)));
     }
 
     #[test]
@@ -2317,7 +2341,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            247
+            248
         );
     }
 

@@ -558,10 +558,13 @@ pub fn loose_parts(scene: &Scene, frame: u32) -> Vec<buzz_ui::LoosePart> {
 /// exists at all: on a character standing in a rest pose the arms are over the
 /// body, and a drag cannot choose between two things under one pixel.
 pub fn part_at(scene: &Scene, frame: u32, at: Point) -> Option<buzz_ui::LoosePart> {
+    // `resolved_bounds`, not `Object::bounds`: an instance's own bounds are a
+    // small placeholder about its origin, so a head or a hand that is a symbol
+    // could not be clicked into its slot at all.
     loose_parts(scene, frame).into_iter().rev().find(|part| {
         scene
             .find_object(part.object)
-            .is_some_and(|(_, object)| object.bounds().contains(at))
+            .is_some_and(|(_, object)| scene.resolved_bounds(object).contains(at))
     })
 }
 
@@ -942,6 +945,19 @@ pub fn rig_character_layers(
     pattern: &RigPattern,
     slots: &[Option<ObjectId>],
 ) -> Option<LayerRig> {
+    rig_character_layers_named(scene, frame, pattern, slots, &|slot| pattern.slots[slot].name.clone())
+}
+
+/// [`rig_character_layers`], each part's layer named by `name_of(slot)` —
+/// the user's own names for the parts (`leftArm`, `leftWrist`), which the
+/// rig is read back by just as well (see `buzz_rig::pattern::body_part`).
+pub fn rig_character_layers_named(
+    scene: &mut Scene,
+    frame: u32,
+    pattern: &RigPattern,
+    slots: &[Option<ObjectId>],
+    name_of: &dyn Fn(usize) -> String,
+) -> Option<LayerRig> {
     // Paint order, as in `rig_character`.
     let mut ordered: Vec<(usize, ObjectId)> = Vec::new();
     let mut home = None;
@@ -966,7 +982,7 @@ pub fn rig_character_layers(
         .iter()
         .map(|(slot, art)| LayerPart {
             slot: *slot,
-            name: pattern.slots[*slot].name.clone(),
+            name: name_of(*slot),
             artwork: (**art).clone(),
             // A drawing too small to measure turns about its own middle.
             joint: fitted[*slot].map_or_else(|| art.bounds().center(), |(head, _)| head),
@@ -2686,7 +2702,7 @@ use style_cut::split_merged_styled;
 /// H1: Rig Head (`HeadStyle`), `docs/HEAD_RIG_PLAN.md`.
 mod head_rig;
 mod head_cut;
-pub use head_rig::{HeadRigReport, flatten_rest, head_rig_flag, head_symbol_for, head_target, rig_head};
+pub use head_rig::{HeadRigReport, flatten_rest, head_layer_name, head_rig_flag, head_symbol_for, head_target, rig_head};
 
 /// E2: Even Out Lines, `docs/EVEN_LINES_PLAN.md`.
 mod even_lines;
@@ -4999,6 +5015,45 @@ pub fn rename_face_layers(
 
 #[cfg(test)]
 mod tests {
+    /// **A symbol is clicked into its slot**: a head that is an instance,
+    /// standing away from the origin, is the part under a click on its drawing.
+    #[test]
+    fn an_instance_is_the_part_under_a_click() {
+        use buzz_geom::Shape as _;
+        let mut scene = buzz_scene::Scene::default();
+        let head = scene.add_symbol("head", buzz_scene::SymbolKind::Graphic, None);
+        let inner = scene.library().get(head).unwrap().layers.iter().next().unwrap().id;
+        let square = buzz_scene::ShapeData::filled(buzz_geom::Rect::new(0.0, 0.0, 100.0, 100.0).to_path(0.1), peniko::Color::WHITE);
+        scene.library_mut().update(head, |s| {
+            s.layers.update(inner, |l| {
+                l.frames.set_objects(0, vec![std::sync::Arc::new(buzz_scene::Object::shape(buzz_scene::ObjectId(900), square))]);
+            });
+        });
+        let layer = scene.layers().iter().next().unwrap().id;
+        let id = scene.add_instance_at(layer, 0, head, buzz_geom::Affine::translate((500.0, 300.0))).unwrap();
+        let part = super::part_at(&scene, 0, buzz_geom::Point::new(550.0, 350.0)).expect("the head is under the click");
+        assert_eq!(part.object, id);
+    }
+
+    /// Rig Head's names for a head's layers follow the user's Shift+R command
+    /// (`renameHeadLayers.jsfl`), on names from their own heads.
+    #[test]
+    fn head_layers_get_the_shift_r_names() {
+        let named = |name: &str| {
+            let layer = buzz_scene::Layer::new(buzz_scene::LayerId(1), name, buzz_scene::LayerKind::Normal);
+            super::head_layer_name(&layer)
+        };
+        assert_eq!(named("EyeWhite").as_deref(), Some("eyeWhite"));
+        assert_eq!(named("leftEyeWhite2").as_deref(), Some("leftEyeWhite"));
+        assert_eq!(named("eyeBalls").as_deref(), Some("eyeBall"));
+        assert_eq!(named("righteyebrow").as_deref(), Some("rightEyebrow"));
+        assert_eq!(named("rightEyebrow1").as_deref(), Some("rightEyebrow"));
+        assert_eq!(named("SideMouthBestPink").as_deref(), Some("mouth"));
+        assert_eq!(named("hair").as_deref(), Some("hair"));
+        assert_eq!(named("eyeLid").as_deref(), Some("eyeLid"));
+        assert_eq!(named("Layer_7"), None, "the command leaves Layer… alone");
+    }
+
     use super::*;
     use buzz_geom::{Rect, Shape as _};
     use buzz_scene::ShapeData;

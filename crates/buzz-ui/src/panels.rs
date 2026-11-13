@@ -647,6 +647,18 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 raised.push(Command::ToggleFramesOnLockedLayers);
                 ui.close();
             }
+            if ui
+                .button(format!(
+                    "{}{}",
+                    if state.workspace.equal_layer_lengths { "\u{2714} " } else { "   " },
+                    Command::ToggleEqualLayerLengths.label()
+                ))
+                .on_hover_text("Every layer runs as long as the longest, whatever is put on one")
+                .clicked()
+            {
+                raised.push(Command::ToggleEqualLayerLengths);
+                ui.close();
+            }
             item(ui, Command::ToggleEditMultipleFrames, true, &mut raised);
             ui.separator();
             // Animate keeps sound on the frame it starts from, so its commands
@@ -851,6 +863,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::AddLifeToAllCharacters, true, &mut raised);
             ui.menu_button("Symbol", |ui| {
                 // The selected instance's symbol, else the Library's.
+                item(ui, Command::DuplicateSymbol, true, &mut raised);
                 item(ui, Command::ClearAllKeyframes, true, &mut raised);
             });
             // Animate's Modify ▸ Timeline: layer housekeeping (L2).
@@ -1016,6 +1029,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::AiGenerateImage, true, &mut raised);
             item(ui, Command::TraceBitmapOptions, has_selection, &mut raised);
             item(ui, Command::AiSplitPictureIntoLayers, true, &mut raised);
+            // The same as Split Picture into Layers on a picture, named for what it does.
+            item(ui, Command::TraceBoldSplit, has_selection, &mut raised);
             item(ui, Command::AiRemoveObject, true, &mut raised);
             item(ui, Command::AiGenerateBackground, true, &mut raised);
             item(ui, Command::AiSceneFromImage, true, &mut raised);
@@ -1100,6 +1115,13 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
 /// Actions panel or a tall timeline takes that height away — which is
 /// exactly the case the column-count decision below exists for.
 pub fn tool_bar(ui: &mut Ui, active: ToolId, style: &mut DrawStyle) -> Option<ToolId> {
+    tool_bar_with_keys(ui, active, style, &|tool: ToolId| tool.shortcut().map(|key| key.name().to_string()).into_iter().collect())
+}
+
+/// [`tool_bar`], each tool's tooltip naming the keys that really select it
+/// (`keys`: the user's keymap, so a tool moved to another key, or given a
+/// second one, says so; none when it has no key).
+pub fn tool_bar_with_keys(ui: &mut Ui, active: ToolId, style: &mut DrawStyle, keys: &dyn Fn(ToolId) -> Vec<String>) -> Option<ToolId> {
     let mut chosen = None;
     let tools = crate::tools::all_tools();
 
@@ -1135,19 +1157,19 @@ pub fn tool_bar(ui: &mut Ui, active: ToolId, style: &mut DrawStyle) -> Option<To
 
         if columns == 1 {
             for tool in tools.iter().copied() {
-                place_tool_button(ui, tool, active, &mut chosen, &mut anchors);
+                place_tool_button(ui, tool, active, &mut chosen, &mut anchors, keys);
             }
         } else {
             for pair in tools.chunks(2) {
                 ui.horizontal(|ui| {
                     for tool in pair.iter().copied() {
-                        place_tool_button(ui, tool, active, &mut chosen, &mut anchors);
+                        place_tool_button(ui, tool, active, &mut chosen, &mut anchors, keys);
                     }
                 });
             }
         }
 
-        draw_family_flyouts(ui, active, &anchors, &mut chosen);
+        draw_family_flyouts(ui, active, &anchors, &mut chosen, keys);
 
         ui.add_space(Tokens::SPACE_2);
         ui.separator();
@@ -1209,8 +1231,9 @@ fn place_tool_button(
     active: ToolId,
     chosen: &mut Option<ToolId>,
     anchors: &mut Vec<(ToolId, egui::Rect)>,
+    keys: &dyn Fn(ToolId) -> Vec<String>,
 ) {
-    let response = tool_button(ui, tool, tool == active);
+    let response = tool_button(ui, tool, tool == active, keys);
     if response.clicked() {
         *chosen = Some(tool);
     }
@@ -1242,6 +1265,7 @@ fn draw_family_flyouts(
     active: ToolId,
     anchors: &[(ToolId, egui::Rect)],
     chosen: &mut Option<ToolId>,
+    keys: &dyn Fn(ToolId) -> Vec<String>,
 ) {
     for family in TOOL_FAMILIES {
         if family.len() <= 1 {
@@ -1266,7 +1290,7 @@ fn draw_family_flyouts(
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         for tool in family.iter().copied() {
-                            if tool_button(ui, tool, tool == active).clicked() {
+                            if tool_button(ui, tool, tool == active, keys).clicked() {
                                 picked = Some(tool);
                             }
                         }
@@ -1299,7 +1323,7 @@ fn draw_family_flyouts(
     }
 }
 
-fn tool_button(ui: &mut Ui, tool: ToolId, active: bool) -> egui::Response {
+fn tool_button(ui: &mut Ui, tool: ToolId, active: bool, keys: &dyn Fn(ToolId) -> Vec<String>) -> egui::Response {
     let size = egui::vec2(Metrics::TOOL_BUTTON, Metrics::TOOL_BUTTON);
     let ready = tool.is_ready();
     // Hover only, not click, when the tool is not ready — the tooltip still
@@ -1354,9 +1378,9 @@ fn tool_button(ui: &mut Ui, tool: ToolId, active: bool) -> egui::Response {
     }
 
     let tip = match tool.status() {
-        ToolStatus::Ready => match tool.shortcut() {
-            Some(key) => format!("{} ({})", tool.name(), key.name()),
-            None => tool.name().to_string(),
+        ToolStatus::Ready => match keys(tool).as_slice() {
+            [] => tool.name().to_string(),
+            keys => format!("{} ({})", tool.name(), keys.join(" or ")),
         },
         ToolStatus::Planned(note) => format!("{} — not yet available\n{note}", tool.name()),
     };
@@ -1818,6 +1842,7 @@ fn frame_picker(
     loop_mode: &mut buzz_scene::LoopMode,
     edited: &mut bool,
     thumbnail: FrameThumbnails<'_>,
+    open: Option<bool>,
 ) {
     const TILE: f32 = 56.0;
     const LABEL: f32 = 14.0;
@@ -1829,6 +1854,7 @@ fn frame_picker(
     egui::CollapsingHeader::new(format!("Frame Picker \u{2014} {length} frames"))
         .id_salt("frame-picker")
         .default_open(true)
+        .open(open)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui
@@ -2070,8 +2096,19 @@ fn instance_properties(
     let mut include: Option<buzz_scene::SymbolId> = None;
     let mut remove: Option<buzz_scene::SymbolId> = None;
 
+    // **A newly picked symbol shows its properties**, whatever was rolled up
+    // for the last one: the section and the Frame Picker open themselves the
+    // first frame a different instance is selected, and are the user's to
+    // roll up again after that.
+    let last_key = egui::Id::new("instance-section-last");
+    let fresh = ui.data(|d| d.get_temp::<buzz_scene::ObjectId>(last_key)) != Some(id);
+    if fresh {
+        ui.data_mut(|d| d.insert_temp(last_key, id));
+    }
+    let force_open = fresh.then_some(true);
+
     ui.add_space(Tokens::SPACE_2);
-    property_section(ui, "instance-section", "Symbol Instance", true, |ui| {
+    property_section_open(ui, "instance-section", "Symbol Instance", true, force_open, |ui| {
         property_row(ui, "Symbol", None, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&symbol_name).strong())
@@ -2285,20 +2322,28 @@ fn instance_properties(
         // Only a graphic follows the parent playhead, so only a graphic has
         // anything to loop. Showing the control for a movie clip would
         // promise behaviour that cannot happen.
+        // All five modes in view as buttons, as Animate's Looping section shows
+        // them, rather than behind a menu: which one is on is read at a glance.
         if symbol_kind.follows_parent_timeline() {
             property_row(ui, "Looping", None, |ui| {
-                egui::ComboBox::from_id_salt("instance-loop")
-                    .selected_text(new_loop.label())
-                    .show_ui(ui, |ui| {
-                        for mode in [LoopMode::Loop, LoopMode::PlayOnce, LoopMode::SingleFrame] {
-                            if ui
-                                .selectable_value(&mut new_loop, mode, mode.label())
-                                .clicked()
-                            {
-                                edited = true;
-                            }
+                ui.horizontal_wrapped(|ui| {
+                    for mode in LoopMode::ALL {
+                        let hover = match mode {
+                            LoopMode::Loop => "Play on from the first frame, and start again after the last",
+                            LoopMode::PlayOnce => "Play on from the first frame once, then hold the last",
+                            LoopMode::SingleFrame => "Hold the first frame",
+                            LoopMode::PlayOnceReverse => "Play backwards from the first frame once, then hold frame 1",
+                            LoopMode::LoopReverse => "Play backwards from the first frame, and wrap round to the last",
+                        };
+                        if ui
+                            .selectable_value(&mut new_loop, mode, mode.label())
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            edited = true;
                         }
-                    });
+                    }
+                });
             });
         }
 
@@ -2323,7 +2368,7 @@ fn instance_properties(
             ui,
             "Type",
             Some(
-                "Graphic: plays on the timeline it is placed in (Loop, Play Once, Single Frame). \
+                "Graphic: plays on the timeline it is placed in (Loop, Play Once, Single Frame, Reverse). \
                  Movie Clip: shows its first frame. Changes every instance of this symbol.",
             ),
             |ui| {
@@ -2380,6 +2425,7 @@ fn instance_properties(
             &mut new_loop,
             &mut edited,
             thumbnail,
+            force_open,
         );
     });
     if reset_whole_layer {
@@ -3862,6 +3908,19 @@ fn property_section<R>(
     default_open: bool,
     add_body: impl FnOnce(&mut Ui) -> R,
 ) -> Option<R> {
+    property_section_open(ui, id, title, default_open, None, add_body)
+}
+
+/// [`property_section`] with `open` forcing the header open or shut for this
+/// frame (`Some`), or leaving it to the user's last click (`None`).
+fn property_section_open<R>(
+    ui: &mut Ui,
+    id: &str,
+    title: &str,
+    default_open: bool,
+    open: Option<bool>,
+    add_body: impl FnOnce(&mut Ui) -> R,
+) -> Option<R> {
     let mut result = None;
     // `.strong()` alone resolves to `Visuals::strong_text_color()` —
     // `widgets.active.fg_stroke`, meant to read *on the accent fill* — not
@@ -3873,6 +3932,7 @@ fn property_section<R>(
     egui::CollapsingHeader::new(RichText::new(title).strong().color(Palette::text()))
         .id_salt(id)
         .default_open(default_open)
+        .open(open)
         .show(ui, |ui| {
             result = Some(add_body(ui));
         });

@@ -1333,48 +1333,59 @@ impl Scene {
     ///
     /// It is the same distinction saving makes, for the same reason.
     pub fn stage_cues(&self) -> Vec<SoundCue> {
-        let mut cues = Vec::new();
-        for layer in self.stage_layers().iter() {
-            // A hidden layer is still heard: hiding a layer hides *artwork*,
-            // and an animator hides layers constantly while working. Losing
-            // the soundtrack because a layer was hidden would be surprising in
-            // exactly the way this whole design is trying to avoid.
-            // A Master Audio guide layer is never heard.
-            if layer.audio_guide {
-                continue;
-            }
-            let keyframes = layer.frames.keyframes();
-            for (i, keyframe) in keyframes.iter().enumerate() {
-                let Some(sound) = keyframe.sound else {
-                    continue;
-                };
-                if sound.sync == SoundSync::Stop {
-                    continue;
-                }
-                // A stream is tied to the timeline, so it lasts only as long as
-                // its frames do: it stops at the next keyframe on this layer —
-                // which is how a blank keyframe cuts it short — or at the end of
-                // the layer's span. An event or start sound runs on its own
-                // clock once triggered and ignores this.
-                let end_frame = (sound.sync == SoundSync::Stream).then(|| {
-                    keyframes
-                        .get(i + 1)
-                        .map(|next| next.start)
-                        .unwrap_or_else(|| layer.frames.length())
-                });
-                cues.push(SoundCue {
-                    sound: sound.sound,
-                    start_frame: keyframe.start,
-                    end_frame,
-                    trim_start: sound.trim_start,
-                    trim_end: sound.trim_end,
-                    volume: sound.volume,
-                    sync: sound.sync,
-                });
-            }
+        cues_on(self.stage_layers())
+    }
+
+    /// Every sound on the timeline of the **symbol open for editing**: its own
+    /// dialogue or effects, heard while it is open, on top of the document's
+    /// soundtrack ([`Self::stage_cues`]) which keeps playing too. Empty on the
+    /// main timeline. Nothing inside a symbol plays from the main timeline, as
+    /// in Animate, where a graphic symbol's sounds are not heard.
+    pub fn open_symbol_cues(&self) -> Vec<SoundCue> {
+        if self.editing.is_empty() {
+            return Vec::new();
         }
-        cues.sort_by_key(|c| c.start_frame);
-        cues
+        cues_on(self.layers())
+    }
+
+    /// **The main sound** of the timeline being edited (the open symbol's, else
+    /// the main timeline's): the first cue (a streamed one first) on its layer
+    /// marked [`Layer::main_sound`]. `None` when no layer of it is marked.
+    pub fn main_sound_cue(&self) -> Option<SoundCue> {
+        main_cue_on(self.layers())
+    }
+
+    /// **Every layer as long as the longest**, on the timeline being edited:
+    /// a layer shorter than the longest is extended (held on its last
+    /// keyframe), none is shortened. What Equal Layer Lengths runs after each
+    /// edit, so a drawing put on a layer is seen for the whole timeline.
+    pub fn equalize_layer_lengths(&mut self) {
+        let longest = self.layers().iter().filter(|l| l.kind != LayerKind::Folder).map(|l| l.frames.length()).max().unwrap_or(0);
+        let short: Vec<LayerId> = self
+            .layers()
+            .iter()
+            .filter(|l| l.kind != LayerKind::Folder && l.frames.length() < longest)
+            .map(|l| l.id)
+            .collect();
+        for id in short {
+            self.update_layer(id, |l| {
+                l.frames.insert_frame(longest - 1);
+            });
+        }
+    }
+
+    /// [`Self::main_sound_cue`] of the main timeline, whatever is open.
+    pub fn stage_main_sound_cue(&self) -> Option<SoundCue> {
+        main_cue_on(self.stage_layers())
+    }
+
+    /// Make `layer` the **main sound layer** of the timeline being edited, and
+    /// no other layer of it. See [`Layer::main_sound`].
+    pub fn set_main_sound_layer(&mut self, layer: LayerId) {
+        let ids: Vec<LayerId> = self.layers().iter().map(|l| l.id).collect();
+        for id in ids {
+            self.update_layer(id, |l| l.main_sound = id == layer);
+        }
     }
 
     /// Bitmaps drawn anywhere — the stage, symbols, groups, rigs — counted as
@@ -3053,6 +3064,68 @@ impl Scene {
         out
     }
 
+    /// **Frames of several layers, as a document of their own** — what Copy
+    /// Frames carries when it is pasted somewhere other than where it was
+    /// copied (another symbol, the main timeline, another document).
+    ///
+    /// `spans` are `(layer, first, last)` on the timeline being edited, top
+    /// layer first. Each becomes a layer of the result, named and kinded like
+    /// its source (a mask stays a mask over what it masks), holding from its
+    /// own offset after the earliest span what its frames held: the drawing at
+    /// its first frame and every keyframe starting inside it, for as long. The
+    /// result's library is every symbol those drawings use, nested ones
+    /// included, as [`extract`](Self::extract) takes it.
+    pub fn extract_frames(&self, spans: &[(LayerId, u32, u32)]) -> Scene {
+        let mut out = Scene::empty();
+        let Some(first) = spans.iter().map(|(_, a, _)| *a).min() else {
+            return out;
+        };
+        let mut wanted: Vec<SymbolId> = Vec::new();
+        // Bottom layer first: `add_layer` puts each new layer on top.
+        for &(id, a, b) in spans.iter().rev() {
+            let Some(source) = self.layers().get(id) else { continue };
+            let frames = &source.frames;
+            let drawings: Vec<(u32, Vec<Arc<Object>>)> = (a..=b)
+                .filter(|&f| f == a || frames.is_keyframe(f))
+                .filter_map(|f| Some((f - first, frames.frame_contents(f)?)))
+                .collect();
+            let layer = out.add_layer(source.name.clone(), source.kind);
+            out.update_layer(layer, |l| {
+                l.frames.insert_frame(b - first);
+                for (at, objects) in &drawings {
+                    if *at > 0 {
+                        l.frames.insert_blank_keyframe(*at);
+                    }
+                    l.frames.set_objects(*at, objects.clone());
+                }
+            });
+            for (_, objects) in &drawings {
+                for object in objects {
+                    collect_symbols(object, &mut wanted);
+                    out.ids.reserve_above(object.id.0);
+                }
+            }
+        }
+        let mut seen: Vec<SymbolId> = Vec::new();
+        while let Some(id) = wanted.pop() {
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            let Some(symbol) = self.library.get(id) else {
+                continue;
+            };
+            for inner in symbol.layers.iter().flat_map(|l| l.frames.keyframes()) {
+                for object in inner.objects.iter() {
+                    collect_symbols(object, &mut wanted);
+                }
+            }
+            out.library.insert((**symbol).clone());
+            out.ids.reserve_above(id.0);
+        }
+        out
+    }
+
     /// **One symbol, as a document of its own** — the Library's counterpart of
     /// [`extract`](Self::extract).
     ///
@@ -3113,6 +3186,21 @@ impl Scene {
         self.layers()
             .iter()
             .find_map(|l| l.find_object(id).map(|o| (l.id, o)))
+    }
+
+    /// The object **as it stands on the keyframe that owns `frame`** — the
+    /// reading half of [`Self::update_object_at`]. F6 and a new keyframe leave
+    /// the same id on several keyframes, and [`Self::find_object`] meets the
+    /// earliest: a head keyed at frame 2252 with First Frame 2252 would read as
+    /// its frame-0 copy with First Frame 0. Falls back to that earliest copy
+    /// when the object is not on the keyframe at `frame`.
+    pub fn find_object_at(&self, frame: u32, id: ObjectId) -> Option<(LayerId, &Arc<Object>)> {
+        let (layer, earliest) = self.find_object(id)?;
+        let at = self
+            .layers()
+            .get(layer)
+            .and_then(|l| l.frames.objects_at(frame).iter().find(|o| o.id == id));
+        Some((layer, at.unwrap_or(earliest)))
     }
 
     /// Edit an object in place, wherever on the current timeline it lives.
@@ -3665,6 +3753,70 @@ fn armature_resolved_bounds(
         (Some(a), None) => a,
         (None, Some(b)) => b,
         (None, None) => object.bounds(),
+    }
+}
+
+
+/// The sound cues on `layers`, in start order: what [`Scene::stage_cues`] and
+/// [`Scene::open_symbol_cues`] read from their timelines.
+fn cues_on(layers: &LayerStack) -> Vec<SoundCue> {
+    let mut cues = Vec::new();
+    for layer in layers.iter() {
+        layer_cues(layer, &mut cues);
+    }
+    cues.sort_by_key(|c| c.start_frame);
+    cues
+}
+
+/// The first cue (a streamed one first) on the layer of `layers` marked as the
+/// main sound.
+fn main_cue_on(layers: &LayerStack) -> Option<SoundCue> {
+    let layer = layers.iter().find(|l| l.main_sound && !l.audio_guide)?;
+    let mut cues = Vec::new();
+    layer_cues(layer, &mut cues);
+    cues.iter().find(|c| c.sync.follows_timeline()).or(cues.first()).cloned()
+}
+
+/// The sound cues on one layer, added to `cues`.
+fn layer_cues(layer: &Layer, cues: &mut Vec<SoundCue>) {
+    {
+        // A hidden layer is still heard: hiding a layer hides *artwork*,
+        // and an animator hides layers constantly while working. Losing
+        // the soundtrack because a layer was hidden would be surprising in
+        // exactly the way this whole design is trying to avoid.
+        // A Master Audio guide layer is never heard.
+        if layer.audio_guide {
+            return;
+        }
+        let keyframes = layer.frames.keyframes();
+        for (i, keyframe) in keyframes.iter().enumerate() {
+            let Some(sound) = keyframe.sound else {
+                continue;
+            };
+            if sound.sync == SoundSync::Stop {
+                continue;
+            }
+            // A stream is tied to the timeline, so it lasts only as long as
+            // its frames do: it stops at the next keyframe on this layer —
+            // which is how a blank keyframe cuts it short — or at the end of
+            // the layer's span. An event or start sound runs on its own
+            // clock once triggered and ignores this.
+            let end_frame = (sound.sync == SoundSync::Stream).then(|| {
+                keyframes
+                    .get(i + 1)
+                    .map(|next| next.start)
+                    .unwrap_or_else(|| layer.frames.length())
+            });
+            cues.push(SoundCue {
+                sound: sound.sound,
+                start_frame: keyframe.start,
+                end_frame,
+                trim_start: sound.trim_start,
+                trim_end: sound.trim_end,
+                volume: sound.volume,
+                sync: sound.sync,
+            });
+        }
     }
 }
 

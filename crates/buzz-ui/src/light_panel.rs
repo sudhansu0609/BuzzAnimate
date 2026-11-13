@@ -50,6 +50,8 @@ pub struct LightResponse {
     pub set_base: Option<Color>,
     /// How strongly shading and highlights are drawn.
     pub set_modelling: Option<f32>,
+    /// Cast shadows only, with no shading, tint, pools or gloom.
+    pub set_shadows_only: Option<bool>,
     /// What the light draws its bands around: nothing, each shape, or the
     /// whole figure.
     pub set_edges: Option<EdgeMode>,
@@ -897,6 +899,18 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
             if response.changed() {
                 out.set_model = Some(model);
             }
+        }
+
+        // **Shadows only**: characters keep their cast shadows and nothing else
+        // the light does — the flat look with people still on the ground.
+        ui.label("Shadows only");
+        let mut only = rig.shadows_only;
+        if ui
+            .checkbox(&mut only, "")
+            .on_hover_text("Characters throw their shadows, and the light changes nothing else: no shading, no colour tint, no glow or pools")
+            .changed()
+        {
+            out.set_shadows_only = Some(only);
         }
 
         // **Edges before strength**, because it is the bigger decision. See

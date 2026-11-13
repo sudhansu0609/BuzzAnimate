@@ -60,6 +60,9 @@ pub struct SoundBank {
     /// The revision the player's cues were built from, so they are rebuilt
     /// when the document changes and not on every frame.
     cued_revision: Option<u64>,
+    /// The symbols open when they were built: opening one is not an edit (no
+    /// new revision), but it does change what is heard.
+    cued_path: Vec<buzz_scene::SymbolId>,
 }
 
 impl SoundBank {
@@ -69,6 +72,7 @@ impl SoundBank {
             failed: BTreeMap::new(),
             player: Player::new(fps),
             cued_revision: None,
+            cued_path: Vec::new(),
         }
     }
 
@@ -142,9 +146,12 @@ impl SoundBank {
     /// Called whenever the document changes. It deliberately never consults
     /// the edit path: see this module's documentation.
     pub fn rebuild_cues(&mut self, scene: &Scene) {
+        // The document's soundtrack always, and the open symbol's own sounds
+        // while it is open (`Scene::open_symbol_cues`).
         let cues = scene
             .stage_cues()
             .into_iter()
+            .chain(scene.open_symbol_cues())
             .filter_map(|cue| {
                 let clip = self.clips.get(&cue.sound)?;
                 Some(buzz_audio::player::Cue {
@@ -170,6 +177,13 @@ impl SoundBank {
         self.player.set_fps(scene.stage().frame_rate);
         self.player.set_cues(cues);
         self.cued_revision = Some(scene.revision());
+        self.cued_path = scene.edit_path().to_vec();
+    }
+
+    /// Whether the cues were built from another revision, or with another
+    /// symbol open.
+    fn cues_stale(&self, scene: &Scene) -> bool {
+        self.cued_revision != Some(scene.revision()) || self.cued_path != scene.edit_path()
     }
 
     /// Rebuild the cues if the document has moved on since they were built.
@@ -180,7 +194,7 @@ impl SoundBank {
     /// play, running lip sync — and by the tests. The **per-frame** refresh the
     /// window does is [`Self::refresh_cues`], which never decodes; see there.
     pub fn refresh(&mut self, scene: &Scene) {
-        if self.cued_revision != Some(scene.revision()) {
+        if self.cues_stale(scene) {
             self.sync_with(scene);
             self.rebuild_cues(scene);
         }
@@ -195,7 +209,7 @@ impl SoundBank {
     /// lands its layer simply has no waveform and its cue no sound, which is a
     /// blank frame or two, not a hang.
     pub fn refresh_cues(&mut self, scene: &Scene) {
-        if self.cued_revision != Some(scene.revision()) {
+        if self.cues_stale(scene) {
             self.clips.retain(|id, _| scene.sounds().get(*id).is_some());
             self.failed
                 .retain(|id, _| scene.sounds().get(*id).is_some());
@@ -302,13 +316,11 @@ impl SoundBank {
     ///
     /// "The root audio layer", in the user's terms: it comes from the stage
     /// timeline whatever symbol is open, so lip sync inside a character's head
-    /// symbol still works from the dialogue on the root.
+    /// symbol still works from the dialogue on the root — unless the open
+    /// symbol has a sound of its own on its timeline, which is then the one
+    /// (a scene kept in a symbol, with its own dialogue).
     pub fn stage_track(&self, scene: &Scene) -> Option<(SoundId, u32, Arc<Clip>)> {
-        scene
-            .stage_cues()
-            .into_iter()
-            .find(|cue| cue.sync.follows_timeline())
-            .or_else(|| scene.stage_cues().into_iter().next())
+        track_cue(scene)
             .and_then(|cue| {
                 let clip = self.clips.get(&cue.sound)?;
                 Some((cue.sound, cue.start_frame, Arc::clone(clip)))
@@ -326,11 +338,7 @@ impl SoundBank {
     /// only that slice, or analysis searches audio that never plays here at
     /// all.
     pub fn stage_track_trimmed(&self, scene: &Scene) -> Option<(SoundId, u32, Arc<Clip>)> {
-        let cue = scene
-            .stage_cues()
-            .into_iter()
-            .find(|cue| cue.sync.follows_timeline())
-            .or_else(|| scene.stage_cues().into_iter().next())?;
+        let cue = track_cue(scene)?;
         let clip = self.clips.get(&cue.sound)?;
         let clip = if cue.trim_start > 0.0 || cue.trim_end.is_some() {
             Arc::new(clip.trimmed(cue.trim_start, cue.trim_end))
@@ -339,6 +347,19 @@ impl SoundBank {
         };
         Some((cue.sound, cue.start_frame, clip))
     }
+}
+
+/// The cue lip sync works from. The open symbol's own sound when it has one —
+/// its **main sound layer**'s (the layer a sound was last placed or attached
+/// on), else its first streamed sound, else its first — and otherwise the main
+/// timeline's, chosen the same way.
+fn track_cue(scene: &Scene) -> Option<buzz_scene::SoundCue> {
+    let pick = |cues: Vec<buzz_scene::SoundCue>| cues.iter().find(|cue| cue.sync.follows_timeline()).or(cues.first()).cloned();
+    let open = !scene.edit_path().is_empty();
+    open.then(|| scene.main_sound_cue().or_else(|| pick(scene.open_symbol_cues())))
+        .flatten()
+        .or_else(|| scene.stage_main_sound_cue())
+        .or_else(|| pick(scene.stage_cues()))
 }
 
 impl std::fmt::Debug for SoundBank {

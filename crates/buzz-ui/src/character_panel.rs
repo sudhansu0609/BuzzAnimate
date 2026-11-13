@@ -121,9 +121,28 @@ pub struct AddPoseAsk {
     /// 0 Library symbol, 1 picture, 2 FLA symbol.
     pub source: usize,
     pub symbol: String,
+    /// Typed over the Library symbol list: only the names holding it are listed.
+    pub symbol_search: String,
     pub picture: String,
     pub fla: String,
     pub fla_symbol: String,
+}
+
+impl AddPoseAsk {
+    /// Add Pose for `asset`, starting from the symbol of what is selected on
+    /// the stage when there is one: its name is the pose's name to start with.
+    pub fn for_asset(asset: &Asset, selected: Option<&str>) -> Self {
+        let mut ask = AddPoseAsk { asset: Some(asset.clone()), ..AddPoseAsk::default() };
+        if let Some(symbol) = selected {
+            ask.symbol = symbol.to_string();
+            // "Character Back" -> "Back": the character's name is put in front again.
+            ask.label = symbol.strip_prefix(asset.name.as_str()).unwrap_or(symbol).trim().to_string();
+            if ask.label.is_empty() {
+                ask.label = symbol.to_string();
+            }
+        }
+        ask
+    }
 }
 
 /// The Start Fresh confirmation, open while the user decides.
@@ -178,6 +197,9 @@ pub struct CastPanelState {
     /// (the Add Pose source list), the open character's poses (main first; empty
     /// when it is a single pose), and the Cast asset the stage selection came from.
     pub library_symbols: Vec<String>,
+    /// The symbol of the instance selected on the stage, if one is: what
+    /// **Add Selected as Pose** adds.
+    pub selected_symbol: Option<String>,
     pub character_poses: Vec<String>,
     pub save_target: Option<Asset>,
     /// "Add breath + blinks" is ticked by default: this is its inverse, so a default panel has it on.
@@ -597,10 +619,20 @@ fn add_pose_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<
             });
             match ask.source {
                 0 => {
+                    ui.horizontal(|ui| {
+                        ui.label("Search");
+                        ui.add(egui::TextEdit::singleline(&mut ask.symbol_search).hint_text("part of a symbol's name").desired_width(160.0));
+                    });
+                    let needle = ask.symbol_search.trim().to_lowercase();
+                    let shown: Vec<&String> = library.iter().filter(|s| needle.is_empty() || s.to_lowercase().contains(&needle)).collect();
                     egui::ComboBox::from_id_salt("add-pose-symbol")
                         .selected_text(if ask.symbol.is_empty() { "choose a symbol" } else { ask.symbol.as_str() })
+                        .height(320.0)
                         .show_ui(ui, |ui| {
-                            for s in &library {
+                            if shown.is_empty() {
+                                ui.label(RichText::new("No symbol has that in its name").small().weak());
+                            }
+                            for s in shown {
                                 ui.selectable_value(&mut ask.symbol, s.clone(), s);
                             }
                         });
@@ -788,12 +820,32 @@ fn character_sheet(
             }
         });
     }
-    if ui
-        .small_button("Add Pose\u{2026}")
-        .on_hover_text("Add a pose from a Library symbol, a picture or an FLA symbol")
-        .clicked()
-    {
-        state.add_pose = Some(AddPoseAsk { asset: Some(asset.clone()), ..AddPoseAsk::default() });
+    ui.horizontal(|ui| {
+        // The quick way: select the pose on the stage, then this.
+        let selected = state.selected_symbol.clone();
+        if let Some(symbol) = &selected
+            && ui
+                .small_button("Add Selected as Pose\u{2026}")
+                .on_hover_text(format!("Add {symbol} (selected on the stage) to {} as another pose", asset.name))
+                .clicked()
+        {
+            state.add_pose = Some(AddPoseAsk::for_asset(asset, Some(symbol)));
+        }
+        if ui
+            .small_button("Add Pose\u{2026}")
+            .on_hover_text("Add a pose from a Library symbol, a picture or an FLA symbol")
+            .clicked()
+        {
+            state.add_pose = Some(AddPoseAsk::for_asset(asset, selected.as_deref()));
+        }
+    });
+    if state.selected_symbol.is_none() {
+        ui.label(
+            RichText::new("Tip: select a pose on the stage to add it with one click.")
+                .small()
+                .weak()
+                .italics(),
+        );
     }
 
     ui.add_space(4.0);
@@ -840,6 +892,20 @@ mod tests {
             rig_kind: None,
             tags: Vec::new(),
         }
+    }
+
+    /// **Add Selected as Pose** starts from the stage selection's symbol, the
+    /// pose named after it without the character's name in front (it is put
+    /// back when the pose is saved); with nothing selected it starts empty.
+    #[test]
+    fn a_pose_starts_from_the_selected_symbol() {
+        let ana = a_character();
+        let ask = AddPoseAsk::for_asset(&ana, Some("Ana Back"));
+        assert_eq!((ask.source, ask.symbol.as_str(), ask.label.as_str()), (0, "Ana Back", "Back"));
+        let ask = AddPoseAsk::for_asset(&ana, Some("SideWalk"));
+        assert_eq!((ask.symbol.as_str(), ask.label.as_str()), ("SideWalk", "SideWalk"));
+        let ask = AddPoseAsk::for_asset(&ana, None);
+        assert!(ask.symbol.is_empty() && ask.label.is_empty());
     }
 
     /// The panel draws through every state it can be in — empty, listed, a

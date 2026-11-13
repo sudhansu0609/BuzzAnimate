@@ -846,6 +846,33 @@ impl LayerTimeline {
         *self = Self::from_parts(std::mem::take(&mut self.keyframes), length);
     }
 
+    /// **Start everything `frames` earlier** — [`Self::delay`] undone: what
+    /// showed at `frames` shows at frame 0, and what came before it is gone.
+    pub fn advance(&mut self, frames: u32) {
+        if frames == 0 {
+            return;
+        }
+        let mut kept: Vec<Keyframe> = Vec::new();
+        let mut covering: Option<Keyframe> = None;
+        for keyframe in &self.keyframes {
+            if keyframe.start >= frames {
+                let mut keyframe = keyframe.clone();
+                keyframe.start -= frames;
+                kept.push(keyframe);
+            } else {
+                covering = Some(keyframe.clone());
+            }
+        }
+        if kept.first().map(|k| k.start) != Some(0)
+            && let Some(mut first) = covering
+        {
+            first.start = 0;
+            kept.insert(0, first);
+        }
+        let length = self.length.saturating_sub(frames).max(1);
+        *self = Self::from_parts(kept, length);
+    }
+
     /// Rebuild from parts, for the importer and the loader.
     pub fn from_parts(mut keyframes: Vec<Keyframe>, length: u32) -> Self {
         keyframes.sort_by_key(|k| k.start);

@@ -34,6 +34,28 @@ const CUT_OVERLAP_MIN: f64 = 150.0;
 const CUT_AREA_MIN: f64 = 64.0;
 /// How far (px) an object's mask is grown when deciding which shapes belong to it.
 const REACH: i32 = 4;
+/// A stroke goes with an object only when this much of its box lies inside the object's box.
+const STROKE_INSIDE_MIN: f64 = 0.6;
+/// How far (px) the piece an object cuts off a shape runs past the cut, over what stays: the two
+/// halves overlap instead of meeting edge to edge, where both soft edges let the background show
+/// through as a pale line.
+const SEAM_OVERLAP: i32 = 2;
+/// The width of an object's outline (bitmap px) at the least: a bold line, whatever the artwork's.
+const OUTLINE_WIDTH: f64 = 3.5;
+/// How much of the pixel staircase a traced mask outline keeps (px; see `TraceOptions::detail`).
+const OUTLINE_DETAIL: f64 = 1.5;
+/// How much a traced mask outline's corners are rounded (`TraceOptions::smooth`).
+const OUTLINE_SMOOTH: f64 = 0.6;
+/// How much (px) a SAM 2 mask is smoothed before the shapes are cut along it.
+const MASK_SMOOTH: f32 = 3.0;
+/// How much (px) an object's silhouette is smoothed before its outline and its hole filler are traced.
+const SILHOUETTE_SMOOTH: f32 = 1.5;
+/// Holes in an object's silhouette smaller than this share of it are filled (the outline goes round them).
+const SILHOUETTE_HOLE_MAX: f64 = 0.02;
+/// Bits of an object's silhouette smaller than this (px) get no outline of their own.
+const SILHOUETTE_ISLAND_MIN: usize = 150;
+/// The fewest pixels round a hole its colour is read from.
+const RING_MIN: usize = 20;
 /// The longest side of the bitmap the VLM and SAM see.
 const MAX_SIDE: f64 = 1920.0;
 /// Depth layers by SAM 2 (S16): a plate whose mask covers more of the picture than this is rejected.
@@ -126,6 +148,10 @@ pub struct ArtworkObject {
     pub filler: Vec<ShapeData>,
     /// Filler pixels -> the source layer's space.
     pub filler_at: Affine,
+    /// An object's outline round everything it took, in rendered-bitmap pixels (placed with the
+    /// plan's `to_world`), drawn in the artwork's line style on top of its shapes so the cut
+    /// edges read as drawn ones; `None` for a depth layer.
+    pub outline: Option<ShapeData>,
 }
 
 /// What the worker thread decided; `apply` carries it out.
@@ -198,11 +224,23 @@ fn render_in(scene: &Scene, layer: LayerId, frame: u32, shapes: &[Arc<Object>], 
 #[allow(clippy::too_many_arguments)]
 fn render_on(ex: &mut buzz_export::Exporter, scene: &Scene, layer: LayerId, frame: u32, shapes: &[Arc<Object>], region: Rect, size: (u32, u32), transparent: bool) -> Result<RgbaImage, String> {
     let mut only = scene.clone();
-    let ids: Vec<_> = only.stage_layers().iter().map(|l| l.id).collect();
+    // The shapes are cut in their layer's own space, so the render must be of that space: a
+    // scene camera (pan, zoom) would move the picture against the cuts made from it.
+    only.camera_mut().enabled = false;
+    // The timeline being edited: a symbol's own when one is open (what the exporter draws then),
+    // the stage's otherwise. Only `layer` and the folders holding it stay visible.
+    let mut keep = vec![layer];
+    while let Some(parent) = keep.last().and_then(|id| only.layers().get(*id)).and_then(|l| l.parent) {
+        keep.push(parent);
+    }
+    let ids: Vec<_> = only.layers().iter().map(|l| l.id).collect();
     for id in ids {
-        only.update_stage_layer(id, |l| {
+        only.update_layer(id, |l| {
             if id == layer {
                 l.frames.set_objects(frame, shapes.to_vec());
+                l.visible = true;
+            } else if keep.contains(&id) {
+                l.visible = true;
             } else {
                 l.visible = false;
             }
@@ -1177,17 +1215,30 @@ pub fn plan_split(
     let to_px = to_world.inverse();
     note("Finding the objects (VLM + SAM 2)");
     let mut notes = Vec::new();
+    // An indoor scene (a room, a shop inside) has no sky: its furniture is asked for, and
+    // everything that is not an object stays on one Room layer.
+    let indoor = crate::bg_objects::scene_is_indoor(&picture, opts, &mut notes);
+    let opts = &ObjectOptions { indoor, ..opts.clone() };
     // The SAM 2 embedding of the picture is made once: the objects and the sky / ground use it.
     let (mut found, emb) = crate::bg_objects::detect_objects_with(&picture, opts, &mut notes, true);
     let record = crate::split_cache::take_last_run();
     if found.is_empty() {
         notes.push("no objects found; nothing split".into());
     }
+    // The shapes are cut along smooth curves, not along SAM 2's coarse, ragged edge. A thin thing
+    // (a pole, a pen) that the smoothing would wear away is smoothed less, or kept as it is.
+    for d in &mut found {
+        let area = |m: &GrayImage| m.iter().filter(|&&v| v > 127).count();
+        let before = area(&d.mask);
+        if let Some(smooth) = [MASK_SMOOTH, 1.0].into_iter().map(|sigma| smooth_mask(&d.mask, sigma)).find(|m| area(m) as f64 >= 0.7 * before as f64) {
+            d.mask = smooth;
+        }
+    }
 
     note("Splitting the depth layers");
     // Sky and Land by SAM 2 (S16); the colour rule of `split_plates` is the fallback for all of it
     // (no SAM 2) or for the ground (its mask rejected).
-    let sam = emb.as_ref().and_then(|e| sam_depth(e, &picture, &mut notes));
+    let sam = emb.as_ref().filter(|_| !indoor).and_then(|e| sam_depth(e, &picture, &mut notes));
     let by_sam = sam.is_some();
     // An object whose mask lies mostly inside the sky is sky (a VLM box over the empty sky above a
     // roof, S16c): dropped, its shapes go to the plates as usual.
@@ -1201,7 +1252,7 @@ pub fn plan_split(
             !is_sky
         });
     }
-    let plates = sam.as_ref().is_none_or(|s| s.land.is_none()).then(|| crate::backdrop::split_plates(&picture));
+    let plates = (!indoor && sam.as_ref().is_none_or(|s| s.land.is_none())).then(|| crate::backdrop::split_plates(&picture));
     let plate_mask = |a: &RgbaImage, b: Option<&RgbaImage>| {
         let mut m = GrayImage::new(w, h);
         for (x, y, p) in m.enumerate_pixels_mut() {
@@ -1214,6 +1265,8 @@ pub fn plan_split(
     // The ground line of each column (a row), for the sky pieces of Far (S18).
     let mut ground: Vec<usize> = Vec::new();
     let plate_masks: [(Plate, GrayImage); 3] = match (sam, colour) {
+        // Indoors: no sky and no far plate; the whole room is the one plate behind the objects.
+        _ if indoor => [(Plate::Sky, GrayImage::new(w, h)), (Plate::Far, GrayImage::new(w, h)), (Plate::Land, GrayImage::from_pixel(w, h, image::Luma([255])))],
         (Some(s), colour) => {
             let sky = s.sky.unwrap_or_else(|| GrayImage::new(w, h));
             let mut land = match (s.land, colour) {
@@ -1247,7 +1300,9 @@ pub fn plan_split(
         (None, Some([sky, far, land])) => [(Plate::Sky, sky), (Plate::Far, far), (Plate::Land, land)],
         (None, None) => [(Plate::Sky, GrayImage::new(w, h)), (Plate::Far, GrayImage::new(w, h)), (Plate::Land, GrayImage::new(w, h))],
     };
-    {
+    if indoor {
+        notes.push("scene: indoors with no sky; one Room layer behind the objects instead of Sky / Far / Land".into());
+    } else {
         let share = |m: &GrayImage| m.iter().filter(|&&v| v > 127).count() as f64 * 100.0 / (w as f64 * h as f64);
         let (sky, far, land) = (share(&plate_masks[0].1), share(&plate_masks[1].1), share(&plate_masks[2].1));
         notes.push(format!(
@@ -1286,8 +1341,18 @@ pub fn plan_split(
                 best = Some((i, c));
             }
         }
+        // A line that runs on far beyond the object (the picture's frame, a long wall edge) is not
+        // the object's own, however much of it passes close by: it stays where it is.
+        let stays_inside = |i: usize| {
+            sd.stroke.is_none() || {
+                let mut b = sd.path.clone();
+                b.apply_affine(to_px * o.transform);
+                let bb = b.bounding_box().inflate(1.0, 1.0);
+                bb.intersect(reach_box[i]).area() >= STROKE_INSIDE_MIN * bb.area()
+            }
+        };
         match best {
-            Some((i, c)) if c >= take => owner.push(Some(i)),
+            Some((i, c)) if c >= take && stays_inside(i) => owner.push(Some(i)),
             _ => {
                 owner.push(None);
                 if sd.fill.is_some() && sd.stroke.is_none() {
@@ -1328,6 +1393,8 @@ pub fn plan_split(
     let mut orphans: Vec<ObjectId> = Vec::new();
     // Objects dropped by the painted check below (already reported there).
     let mut dropped = vec![false; found.len()];
+    // What each kept object paints on its own: its outline goes round this.
+    let mut silhouettes: Vec<Option<GrayImage>> = vec![None; found.len()];
     for &i in &order {
         let d = &mut found[i];
         let ids: Vec<ObjectId> = shapes.iter().zip(&owner).filter(|(_, o)| **o == Some(i)).map(|(s, _)| s.id).collect();
@@ -1335,6 +1402,8 @@ pub fn plan_split(
         let mut left_after: Vec<(usize, BezPath)> = Vec::new();
         if !cut_of[i].is_empty() {
             let outline = mask_outline(&d.mask, opts);
+            let grown = GrayImage::from_raw(w, h, buzz_ai::segment::dilate(d.mask.as_raw(), w, h, SEAM_OVERLAP)).unwrap_or_else(|| d.mask.clone());
+            let outline_in = mask_outline(&grown, opts);
             for &k in &cut_of[i] {
                 let o = &shapes[k];
                 let ObjectKind::Shape(sd) = &o.kind else { continue };
@@ -1349,8 +1418,10 @@ pub fn plan_split(
                 }
                 let mut local = outline.clone();
                 local.apply_affine(m.inverse());
-                let bo = buzz_geom::boolean::options_for(&[cur.clone(), local.clone()]).fast();
-                let inside = buzz_geom::boolean::boolean(cur, &local, buzz_geom::boolean::BoolOp::Intersect, bo);
+                let mut local_in = outline_in.clone();
+                local_in.apply_affine(m.inverse());
+                let bo = buzz_geom::boolean::options_for(&[cur.clone(), local.clone(), local_in.clone()]).fast();
+                let inside = buzz_geom::boolean::boolean(cur, &local_in, buzz_geom::boolean::BoolOp::Intersect, bo);
                 if inside.elements().is_empty() {
                     continue;
                 }
@@ -1389,6 +1460,7 @@ pub fn plan_split(
                 orphans.extend(ids);
                 continue;
             }
+            silhouettes[i] = Some(GrayImage::from_fn(w, h, |x, y| image::Luma([if alone.get_pixel(x, y)[3] > 127 { 255 } else { 0 }])));
             for (m, p) in d.mask.iter_mut().zip(alone.pixels()) {
                 if p[3] > 8 {
                     *m = 255;
@@ -1447,16 +1519,12 @@ pub fn plan_split(
             }
         }
     }
-    let mut plate = picture.clone();
-    let patched = patch_hole(&mut plate, &union, 2);
-    if patched.not_installed > 0 {
-        notes.push(format!("fillers: LaMa is not installed; colour fill used for {} hole piece(s)", patched.not_installed));
-    }
-    if patched.failed > 0 {
-        notes.push(format!("fillers: LaMa failed on {} hole piece(s); colour fill used for those", patched.failed));
-    }
-    if patched.skipped > 0 {
-        notes.push(format!("fillers: {} hole piece(s) too small for LaMa; colour fill used", patched.skipped));
+    // A hole's colour is read from round it, never from another object or the sky.
+    let mut exclude = union;
+    for (e, s) in exclude.iter_mut().zip(plate_masks[0].1.iter()) {
+        if *s > 127 {
+            *e = 255;
+        }
     }
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
     let mut objects: Vec<ArtworkObject> = Vec::new();
@@ -1527,27 +1595,27 @@ pub fn plan_split(
             plate_ids[k].push(left[i].0);
         }
     }
-    // The filler of each kept object: the filled plate under the mask grown by 2 px, traced. The
-    // crops are cut here in a fixed order; the traces (independent of each other and of the sky
-    // base) then run at the same time and are put back in that order.
+    // Each kept object's silhouette (what its shapes paint), smoothed and with its small holes
+    // filled, gives it its bold outline and the filler of the hole it leaves: one flat shape in
+    // the colour round it, none where the sky is behind it (the Sky layer shows there).
     struct Crop {
         label: String,
         bbox: [u32; 4],
         sam: GrayImage,
         shape_ids: Vec<ObjectId>,
         cuts: Vec<Cut>,
-        pixels: RgbaImage,
-        at: (u32, u32),
+        filler: Vec<ShapeData>,
+        outline: Option<ShapeData>,
     }
+    let (line_colour, line_px) = line_style(&shapes, to_px);
     let mut crops: Vec<Crop> = Vec::new();
-    for ((((d, shape_ids), cuts), sam), dropped) in found.into_iter().zip(taken_ids).zip(cuts).zip(sam_masks).zip(dropped) {
+    for (((((d, shape_ids), cuts), sam), dropped), silhouette) in found.into_iter().zip(taken_ids).zip(cuts).zip(sam_masks).zip(dropped).zip(silhouettes) {
         if shape_ids.is_empty() && cuts.is_empty() {
             if !dropped {
                 notes.push(format!("objects: {} {:?} skipped (no shape is mostly inside it)", d.label, d.bbox));
             }
             continue;
         }
-        let grown = buzz_ai::segment::dilate(d.mask.as_raw(), w, h, 2);
         let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
         for (x, y, p) in d.mask.enumerate_pixels() {
             if p[0] > 127 {
@@ -1557,16 +1625,26 @@ pub fn plan_split(
                 y1 = y1.max(y + 1);
             }
         }
-        let (cx0, cy0, cx1, cy1) = (x0.saturating_sub(2), y0.saturating_sub(2), (x1 + 2).min(w), (y1 + 2).min(h));
-        let (cw, ch) = (cx1 - cx0, cy1 - cy0);
-        let mut crop = image::imageops::crop_imm(&plate, cx0, cy0, cw, ch).to_image();
-        for y in 0..ch {
-            for x in 0..cw {
-                let on = grown[((cy0 + y) * w + cx0 + x) as usize] > 0;
-                crop.get_pixel_mut(x, y)[3] = if on { 255 } else { 0 };
+        let silhouette = silhouette.unwrap_or_else(|| d.mask.clone());
+        let area = silhouette.iter().filter(|&&v| v > 127).count();
+        let silhouette = tidy_mask(&smooth_mask(&silhouette, SILHOUETTE_SMOOTH), (area as f64 * SILHOUETTE_HOLE_MAX) as usize, SILHOUETTE_ISLAND_MIN);
+        let mut hole = GrayImage::from_raw(w, h, buzz_ai::segment::dilate(silhouette.as_raw(), w, h, 2)).unwrap_or_else(|| silhouette.clone());
+        for (o, s) in hole.iter_mut().zip(plate_masks[0].1.iter()) {
+            if *s > 127 {
+                *o = 0;
             }
         }
-        crops.push(Crop { label: d.label, bbox: [x0, y0, x1, y1], sam, shape_ids, cuts, pixels: crop, at: (cx0, cy0) });
+        let filler = if hole.iter().any(|&v| v > 127) {
+            let colour = ring_colour(&picture, &hole, &exclude);
+            let path = mask_outline(&hole, opts);
+            if path.elements().is_empty() { Vec::new() } else { vec![ShapeData::filled(path, colour)] }
+        } else {
+            Vec::new()
+        };
+        let outline = Some(mask_outline(&silhouette, opts))
+            .filter(|path| !path.elements().is_empty())
+            .map(|path| ShapeData::stroked(path, line_colour, line_px));
+        crops.push(Crop { label: d.label, bbox: [x0, y0, x1, y1], sam, shape_ids, cuts, filler, outline });
     }
     // Without SAM 2 (colour rule): the sky carried straight down (and up) its columns, so the sky
     // base reads as more sky.
@@ -1601,24 +1679,16 @@ pub fn plan_split(
         }
         sky
     });
-    let trace_options = opts.trace.trace_options();
-    let (mut sky_filler, fillers) = {
-        use rayon::prelude::*;
-        rayon::join(
-            || {
-                if by_sam {
-                    // The fitted ramp and glows over the whole frame; the sky's own pieces sit on it.
-                    return sky_fit;
-                }
-                // The sky base keeps the sky's own pixels where they are textured or graded (T16b).
-                let mut sky_options = trace_options;
-                sky_options.keep_textures = true;
-                sky_base.as_ref().map(|sky| buzz_scene::trace(w, h, sky.as_raw(), &sky_options).shapes)
-            },
-            || crops.par_iter().map(|c| buzz_scene::trace(c.pixels.width(), c.pixels.height(), c.pixels.as_raw(), &trace_options).shapes).collect::<Vec<_>>(),
-        )
+    let mut sky_filler = if by_sam {
+        // The fitted ramp and glows over the whole frame; the sky's own pieces sit on it.
+        sky_fit
+    } else {
+        // The sky base keeps the sky's own pixels where they are textured or graded (T16b).
+        let mut sky_options = opts.trace.trace_options();
+        sky_options.keep_textures = true;
+        sky_base.as_ref().map(|sky| buzz_scene::trace(w, h, sky.as_raw(), &sky_options).shapes)
     };
-    for (c, filler) in crops.into_iter().zip(fillers) {
+    for c in crops {
         let behind = match &plates {
             Some(plates) if !by_sam => {
                 if crate::bg_objects::plate_at_bottom(plates, &c.sam) == crate::bg_objects::PlateId::Far {
@@ -1638,14 +1708,44 @@ pub fn plan_split(
             mask: c.sam,
             shape_ids: c.shape_ids,
             cuts: c.cuts,
-            filler,
-            filler_at: to_world * Affine::translate((c.at.0 as f64, c.at.1 as f64)),
+            filler: c.filler,
+            filler_at: to_world,
+            outline: c.outline,
         });
     }
     // Nearest first (lower bottom edge): `apply` puts each new layer right above the source, so
     // the first made ends up topmost and the farthest lowest.
     // Equal bottoms in a fixed order (label, box), so the numbering never depends on the order found.
-    objects.sort_by(|a, b| b.bbox[3].cmp(&a.bbox[3]).then_with(|| a.label.cmp(&b.label)).then_with(|| a.bbox.cmp(&b.bbox)));
+    // Indoors, a thing standing on another (a kettle on the counter) sits inside that one's box but
+    // ends higher up the picture: it counts as just nearer than what holds it, so its layer is in front.
+    let front: Vec<u32> = {
+        let area = |b: [u32; 4]| (b[2] - b[0]) as f64 * (b[3] - b[1]) as f64;
+        let mut front: Vec<u32> = objects.iter().map(|o| o.bbox[3]).collect();
+        if indoor {
+            for _ in 0..objects.len() {
+                let mut changed = false;
+                for (i, o) in objects.iter().enumerate() {
+                    for (j, c) in objects.iter().enumerate() {
+                        let (a, b) = (o.bbox, c.bbox);
+                        let ix = a[2].min(b[2]).saturating_sub(a[0].max(b[0])) as f64;
+                        let iy = a[3].min(b[3]).saturating_sub(a[1].max(b[1])) as f64;
+                        if i != j && area(b) > area(a) && ix * iy >= 0.8 * area(a) && front[i] <= front[j] {
+                            front[i] = front[j] + 1;
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        front
+    };
+    let mut order: Vec<usize> = (0..objects.len()).collect();
+    order.sort_by(|&i, &j| front[j].cmp(&front[i]).then_with(|| objects[i].label.cmp(&objects[j].label)).then_with(|| objects[i].bbox.cmp(&objects[j].bbox)));
+    let mut slots: Vec<Option<ArtworkObject>> = objects.into_iter().map(Some).collect();
+    let mut objects: Vec<ArtworkObject> = order.into_iter().filter_map(|i| slots[i].take()).collect();
     for o in &mut objects {
         o.n = *counts.entry(o.label.clone()).and_modify(|c| *c += 1).or_insert(1);
     }
@@ -1667,6 +1767,7 @@ pub fn plan_split(
         let name = match plate {
             Plate::Sky => "Sky",
             Plate::Far => "Far",
+            Plate::Land if indoor => "Room",
             Plate::Land => "Land",
         };
         objects.push(ArtworkObject {
@@ -1680,6 +1781,7 @@ pub fn plan_split(
             cuts: std::mem::take(&mut plate_cuts[k]),
             filler,
             filler_at: to_world,
+            outline: None,
         });
     }
     Ok(ArtworkPlan { layer, frame, objects, notes, picture, to_world, record, removed })
@@ -1817,6 +1919,9 @@ pub fn apply(scene: &mut Scene, plan: &ArtworkPlan) -> Vec<String> {
         if taken.is_empty() {
             continue;
         }
+        if let Some(line) = &o.outline {
+            taken.push(Arc::new(Object::shape(scene.next_object_id(), line.clone()).with_transform(plan.to_world)));
+        }
         let name = if o.plate.is_some() { o.label.clone() } else { format!("{} {}", o.label, o.n) };
         let symbol = scene.add_symbol(name.clone(), SymbolKind::Graphic, Some("Split objects"));
         let Some(inner) = scene.library().get(symbol).and_then(|s| s.layers.iter().next()).map(|l| l.id) else { continue };
@@ -1858,8 +1963,37 @@ pub fn apply(scene: &mut Scene, plan: &ArtworkPlan) -> Vec<String> {
     made
 }
 
-/// The outline of `mask` (bitmap pixels) as one path, traced from its bounding box.
-fn mask_outline(mask: &GrayImage, opts: &ObjectOptions) -> BezPath {
+/// The colour and width (bitmap px) of the bold outline round each object cut out of the
+/// artwork: its most used stroke colour and its boldest common width (the 90th percentile), never
+/// thinner than [`OUTLINE_WIDTH`]; near-black when it has no strokes (a trace whose ink is filled
+/// shapes).
+fn line_style(shapes: &[Arc<Object>], to_px: Affine) -> (peniko::Color, f64) {
+    let scale = |m: Affine| m.determinant().abs().sqrt();
+    let mut colours: std::collections::BTreeMap<[u8; 4], usize> = Default::default();
+    let mut widths: Vec<f64> = Vec::new();
+    for o in shapes {
+        let ObjectKind::Shape(sd) = &o.kind else { continue };
+        let Some(stroke) = &sd.stroke else { continue };
+        let buzz_scene::Paint::Solid(colour) = stroke.paint else { continue };
+        if stroke.width > 0.0 {
+            *colours.entry(colour.to_rgba8().to_u8_array()).or_default() += 1;
+            widths.push(stroke.width * scale(o.transform) * scale(to_px));
+        }
+    }
+    widths.sort_by(f64::total_cmp);
+    let width = widths.get(widths.len() * 9 / 10).copied().unwrap_or(0.0).max(OUTLINE_WIDTH);
+    match colours.into_iter().max_by_key(|(c, n)| (*n, *c)) {
+        Some(([r, g, b, _], _)) => (peniko::Color::from_rgb8(r, g, b), width),
+        None => (peniko::Color::from_rgb8(16, 16, 16), width),
+    }
+}
+
+/// The outline of `mask` (bitmap pixels) as one path of smooth curves, traced from its bounding
+/// box. Its own trace settings, whatever the caller's look: filled regions only (a bold trace's
+/// outline strokes would add centre-lines to the path), the pixel staircase taken out
+/// ([`OUTLINE_DETAIL`]) and the corners rounded ([`OUTLINE_SMOOTH`]), so neither a cut along it nor
+/// a line drawn on it looks torn.
+fn mask_outline(mask: &GrayImage, _opts: &ObjectOptions) -> BezPath {
     let (w, h) = mask.dimensions();
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
     for (x, y, p) in mask.enumerate_pixels() {
@@ -1883,8 +2017,16 @@ fn mask_outline(mask: &GrayImage, opts: &ObjectOptions) -> BezPath {
             }
         }
     }
-    let t = buzz_scene::TraceOptions { colours: 2, detail: 1.0, speckle: 4, drop_background: false, smooth: 0.2, ..opts.trace.trace_options() };
-    for sd in buzz_scene::trace(cw, ch, &px, &t).shapes {
+    let t = buzz_scene::TraceOptions {
+        mode: buzz_scene::TraceMode::Outline,
+        colours: 2,
+        detail: OUTLINE_DETAIL,
+        smooth: OUTLINE_SMOOTH,
+        speckle: 16,
+        drop_background: false,
+        ..buzz_scene::TraceOptions::default()
+    };
+    for sd in buzz_scene::trace(cw, ch, &px, &t).shapes.into_iter().filter(|sd| sd.fill.is_some()) {
         out.extend(sd.path.iter());
     }
     out.apply_affine(Affine::translate((x0 as f64, y0 as f64)));
@@ -2269,6 +2411,71 @@ pub fn apply_remove(scene: &mut Scene, plan: &RemovePlan) -> usize {
     n
 }
 
+/// `mask` with its edge smoothed: blurred by `sigma` px and cut at half, which rounds off the
+/// staircase and the ragged bits of a mask scaled up from SAM 2's coarse grid.
+fn smooth_mask(mask: &GrayImage, sigma: f32) -> GrayImage {
+    let blurred = image::imageops::blur(mask, sigma);
+    GrayImage::from_fn(mask.width(), mask.height(), |x, y| image::Luma([if blurred.get_pixel(x, y)[0] > 127 { 255 } else { 0 }]))
+}
+
+/// `mask` with the enclosed holes smaller than `max_area` px filled, and the islands smaller than
+/// `min_island` px dropped: what an object's outline goes round.
+fn tidy_mask(mask: &GrayImage, max_area: usize, min_island: usize) -> GrayImage {
+    let (w, h) = mask.dimensions();
+    let mut out = mask.clone();
+    let inverse: Vec<u8> = mask.iter().map(|&v| if v > 127 { 0 } else { 255 }).collect();
+    for hole in buzz_ai::segment::connected_components(&inverse, w, h) {
+        let on_edge = hole.iter().any(|&i| {
+            let (x, y) = ((i as u32) % w, (i as u32) / w);
+            x == 0 || y == 0 || x + 1 == w || y + 1 == h
+        });
+        if !on_edge && hole.len() < max_area {
+            for i in hole {
+                out.as_mut()[i] = 255;
+            }
+        }
+    }
+    for island in buzz_ai::segment::connected_components(out.as_raw(), w, h) {
+        if island.len() < min_island {
+            for i in island {
+                out.as_mut()[i] = 0;
+            }
+        }
+    }
+    out
+}
+
+/// The colour round `region` in `picture`: the median of the pixels 3 to 9 px outside it that no
+/// pixel of `exclude` covers (the other objects, the sky); those taken too when that leaves too
+/// few; the region's own colour when nothing is round it.
+fn ring_colour(picture: &RgbaImage, region: &GrayImage, exclude: &GrayImage) -> peniko::Color {
+    let (w, h) = region.dimensions();
+    let near = buzz_ai::segment::dilate(region.as_raw(), w, h, 3);
+    let far = buzz_ai::segment::dilate(region.as_raw(), w, h, 9);
+    let median = |pick: &dyn Fn(usize) -> bool| -> Option<peniko::Color> {
+        let mut ch: [Vec<u8>; 3] = Default::default();
+        for i in (0..(w * h) as usize).filter(|&i| pick(i)) {
+            let p = picture.as_raw();
+            for k in 0..3 {
+                ch[k].push(p[i * 4 + k]);
+            }
+        }
+        if ch[0].len() < RING_MIN {
+            return None;
+        }
+        for c in &mut ch {
+            c.sort_unstable();
+        }
+        let m = |c: &Vec<u8>| c[c.len() / 2];
+        Some(peniko::Color::from_rgb8(m(&ch[0]), m(&ch[1]), m(&ch[2])))
+    };
+    let ring = |i: usize| far[i] > 0 && near[i] == 0;
+    median(&|i| ring(i) && exclude.as_raw()[i] <= 127)
+        .or_else(|| median(&ring))
+        .or_else(|| median(&|i| region.as_raw()[i] > 127))
+        .unwrap_or(peniko::Color::from_rgb8(0, 0, 0))
+}
+
 /// The outline of `mask` as polylines in bitmap pixels (for drawing the preview).
 pub fn outline_points(mask: &GrayImage, opts: &ObjectOptions) -> Vec<Vec<Point>> {
     let mut lines: Vec<Vec<Point>> = Vec::new();
@@ -2295,6 +2502,53 @@ mod tests {
 
     fn rect(x: f64) -> ShapeData {
         ShapeData::filled(Rect::new(x, 0.0, x + 100.0, 100.0).to_path(1e-9), peniko::Color::from_rgb8(200, 80, 40))
+    }
+
+    /// Inside an open symbol the split draws that symbol's layer with only the shapes asked for. It
+    /// used to edit the stage's layers instead and so drew the whole symbol every time: every
+    /// object came out as the whole picture (no clicking it, outlines and fillers all wrong).
+    #[test]
+    fn a_render_inside_a_symbol_shows_only_the_shapes_asked_for() {
+        let mut scene = Scene::default();
+        let symbol = scene.add_symbol("Art", SymbolKind::Graphic, None);
+        assert!(scene.enter_symbol(symbol));
+        let layer = scene.layers().iter().next().unwrap().id;
+        let left = scene.add_shape_at(layer, 0, rect(0.0)).unwrap();
+        scene.add_shape_at(layer, 0, rect(300.0)).unwrap();
+        let only: Vec<_> = scene.layers().get(layer).unwrap().frames.objects_at(0).iter().filter(|o| o.id == left).cloned().collect();
+        let Ok(img) = render_in(&scene, layer, 0, &only, Rect::new(0.0, 0.0, 400.0, 100.0), (400, 100), true) else {
+            return; // no GPU here
+        };
+        assert!(img.get_pixel(50, 50)[3] > 200, "the shape asked for is drawn");
+        assert!(img.get_pixel(350, 50)[3] < 10, "the other one is not");
+    }
+
+    /// An object's silhouette loses its pinholes and its specks before it is outlined.
+    #[test]
+    fn a_silhouette_is_tidied_before_its_outline() {
+        let mut m = GrayImage::from_fn(60, 40, |x, y| image::Luma([if (10..50).contains(&x) && (5..35).contains(&y) { 255 } else { 0 }]));
+        m.put_pixel(30, 20, image::Luma([0])); // a pinhole
+        m.put_pixel(2, 2, image::Luma([255])); // a speck
+        let t = tidy_mask(&m, 20, 5);
+        assert_eq!(t.get_pixel(30, 20)[0], 255, "the hole is filled");
+        assert_eq!(t.get_pixel(2, 2)[0], 0, "the speck is gone");
+        assert_eq!(t.get_pixel(12, 6)[0], 255, "the rest stays");
+    }
+
+    /// The hole an object leaves takes the colour round it, not another object's.
+    #[test]
+    fn a_hole_takes_the_colour_round_it() {
+        let wall = image::Rgba([90, 100, 80, 255]);
+        let mut picture = RgbaImage::from_pixel(80, 60, wall);
+        let mut other = GrayImage::new(80, 60);
+        for y in 0..60 {
+            for x in 50..80 {
+                picture.put_pixel(x, y, image::Rgba([200, 30, 30, 255]));
+                other.put_pixel(x, y, image::Luma([255]));
+            }
+        }
+        let region = GrayImage::from_fn(80, 60, |x, y| image::Luma([if (30..45).contains(&x) && (20..40).contains(&y) { 255 } else { 0 }]));
+        assert_eq!(ring_colour(&picture, &region, &other).to_rgba8().to_u8_array(), [90, 100, 80, 255]);
     }
 
     /// A split of the middle keyframe of three (F6 copies sharing their objects) takes the
@@ -2324,6 +2578,7 @@ mod tests {
                 cuts: Vec::new(),
                 filler: Vec::new(),
                 filler_at: Affine::IDENTITY,
+                outline: None,
             }],
             notes: Vec::new(),
             picture: RgbaImage::new(1, 1),

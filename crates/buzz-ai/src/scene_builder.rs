@@ -197,8 +197,9 @@ pub fn decompose_background_objects_with(
 /// Version of the two Split Picture prompts below. Bump it whenever their text
 /// changes: a saved object list (the detection cache) is only reused for the
 /// version it was made with. 2: asked without hidden reasoning (a list made while the
-/// model was thinking can be empty).
-pub const BACKGROUND_OBJECTS_PROMPT_VERSION: u32 = 2;
+/// model was thinking can be empty). 3: the indoor prompt asks for a counter as one object and
+/// for the things standing on it.
+pub const BACKGROUND_OBJECTS_PROMPT_VERSION: u32 = 3;
 
 /// As [`decompose_background_objects_with`], with sampling options for the model call
 /// (Split Picture asks at temperature 0 and a fixed seed so a picture lists the same
@@ -235,9 +236,64 @@ bounding box [x0, y0, x1, y1] (normalised 0.0 to 1.0) that covers its FULL exten
 overlap. kind is prop, vehicle or other; facing is na. Also give ground_y (horizon, 0.0 to 1.0) and camera (wide, \
 medium, close). Respond strictly in JSON according to the schema.");
     }
+    ask_background_objects(llm, model, png_bytes, &system_prompt, opts)
+}
+
+/// As [`decompose_background_objects_opts`] for an **indoor** picture (a room, a shop
+/// inside, a corridor): its furniture and props, each whole; walls, floor and ceiling stay
+/// in the room.
+pub fn decompose_indoor_objects_opts(
+    llm: &impl Llm,
+    model: &str,
+    png_bytes: &[u8],
+    opts: crate::llm::ChatOpts,
+) -> Result<DetectedSceneLayout, LlmError> {
+    let system_prompt = "You are a 2D animation layout artist cutting an INDOOR background picture (a room, the inside \
+of a shop, a corridor) into separately movable objects. List each piece of furniture and each large prop as ONE whole \
+object INCLUDING everything on or attached to it: a shelf unit with all the goods stacked on it, a counter or table \
+with its top and front, a door with its frame and bars, a cupboard, bed, chair, crate, box, chest, lamp, hanging \
+bulb, fan, window, picture frame. Each shelf unit or rack is one object; never list its single shelves or the goods on \
+it separately. A counter, desk or table is ONE object from end to end, however long: give it one box over its whole \
+length, never two halves. Each thing standing or lying ON a counter, desk or table (a kettle, pot, lamp, book, \
+notebook, register, pen, phone, box) IS its own object with its own tight box. Do NOT list the walls, the floor, the \
+ceiling, or people and animals. Give each object a TIGHT bounding box [x0, y0, x1, y1] (normalised 0.0 to 1.0) that \
+covers its FULL extent. Boxes of different objects may overlap. kind is prop or other; facing is na. Also give \
+ground_y (where the floor meets the back wall, 0.0 to 1.0) and camera (wide, medium, close). Respond strictly in \
+JSON according to the schema.";
+    ask_background_objects(llm, model, png_bytes, system_prompt, opts)
+}
+
+/// Whether a picture shows an **indoor** scene with no sky in it (Split Picture then makes
+/// one Room layer instead of Sky / Far / Land).
+pub fn scene_is_indoor(llm: &impl Llm, model: &str, png_bytes: &[u8], opts: crate::llm::ChatOpts) -> Result<bool, LlmError> {
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        indoor: bool,
+        sky_visible: bool,
+    }
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "indoor": { "type": "boolean" }, "sky_visible": { "type": "boolean" } },
+        "required": ["indoor", "sky_visible"]
+    });
+    let system = "You look at one background picture for a 2D animation. Say whether the scene is indoors (inside a \
+room, a shop, a hall, a vehicle) and whether any sky is visible in it (through a window or door counts). Ignore any \
+plain border round the picture. Respond strictly in JSON according to the schema.";
+    let answer: Answer = llm.chat_json_opts(model, system, "Is this scene indoors, and is sky visible?", &[png_bytes], schema, opts)?;
+    Ok(answer.indoor && !answer.sky_visible)
+}
+
+/// One object-list request with `system_prompt`, boxes normalised to the picture.
+fn ask_background_objects(
+    llm: &impl Llm,
+    model: &str,
+    png_bytes: &[u8],
+    system_prompt: &str,
+    opts: crate::llm::ChatOpts,
+) -> Result<DetectedSceneLayout, LlmError> {
     let user_prompt = "List the whole, separately movable objects of this background with full-extent boxes.";
     let mut layout: DetectedSceneLayout =
-        llm.chat_json_opts(model, &system_prompt, user_prompt, &[png_bytes], scene_decomposition_schema(), opts)?;
+        llm.chat_json_opts(model, system_prompt, user_prompt, &[png_bytes], scene_decomposition_schema(), opts)?;
     if let Ok((w, h)) = image::ImageReader::new(std::io::Cursor::new(png_bytes))
         .with_guessed_format()
         .map_err(|_| ())

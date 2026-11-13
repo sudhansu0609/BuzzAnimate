@@ -54,11 +54,14 @@ pub struct ObjectOptions {
     /// Ask the VLM again even when a saved object list matches the picture, and save the new
     /// list over the old one (Shift on the menu command, `redetect` for the agent).
     pub redetect: bool,
+    /// An indoor picture (`scene_is_indoor`): its furniture and props are asked for instead of
+    /// buildings, and the split makes one Room layer instead of Sky / Far / Land.
+    pub indoor: bool,
 }
 
 impl Default for ObjectOptions {
     fn default() -> Self {
-        Self { max_objects: 8, small_objects: false, trace: BackdropOptions::default(), redetect: false }
+        Self { max_objects: 8, small_objects: false, trace: BackdropOptions::default(), redetect: false, indoor: false }
     }
 }
 
@@ -141,14 +144,29 @@ pub fn normalise_label(raw: &str) -> String {
             return name.to_string();
         }
     }
-    l.split_whitespace()
+    short_label(&l)
+}
+
+/// An indoor object's label (`scene_is_indoor`): the VLM's own words, shortened. The street
+/// names of [`normalise_label`] do not apply indoors (a lamp is no pole, a kettle no tea stall).
+pub fn normalise_indoor_label(raw: &str) -> String {
+    short_label(&raw.to_lowercase().replace(['_', '-'], " "))
+}
+
+/// The first two words of `l` before any joining word ("Door with iron bars" -> "Door"),
+/// each capitalised; "Object" when that leaves nothing.
+fn short_label(l: &str) -> String {
+    let label = l
+        .split_whitespace()
+        .take_while(|w| !matches!(*w, "with" | "of" | "and" | "on" | "in" | "for" | "behind" | "near"))
         .take(2)
         .map(|w| {
             let mut c = w.chars();
             c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    if label.is_empty() { "Object".into() } else { label }
 }
 
 fn is_person_or_animal(label: &str, kind: &str) -> bool {
@@ -369,6 +387,41 @@ fn iou(a: [u32; 4], b: [u32; 4]) -> f64 {
     inter / (area(a) + area(b) - inter).max(1.0)
 }
 
+/// The vision model objects are asked of: the Claude API when set up, else LM Studio's.
+fn vlm() -> Option<(buzz_ai::llm::Backend, String)> {
+    let claude = buzz_ai::ai_config::use_claude();
+    let backend = if claude { buzz_ai::llm::Backend::default_claude_api() } else { buzz_ai::llm::Backend::default_openai() };
+    let model = if claude { Some(buzz_ai::ai_config::claude_model()) } else { crate::produce::lmstudio_model(&backend).map(|m| m.0) };
+    model.filter(|m| !m.is_empty()).map(|m| (backend, m))
+}
+
+/// Whether `picture` is an **indoor** scene with no sky (a room, the inside of a shop), asked of
+/// the VLM at temperature 0. The answer is saved with the picture's object list and reused with
+/// it (unless `opts.redetect`); for a list saved before the question existed it is asked.
+/// Without a VLM, or when it fails, the picture is taken as outdoor (Sky / Far / Land).
+pub fn scene_is_indoor(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>) -> bool {
+    use crate::split_cache as cache;
+    let Some((backend, model)) = vlm() else { return false };
+    if !opts.redetect {
+        // A saved indoor list, else a saved list that was asked and found outdoor.
+        if cache::find(picture, &model, opts.small_objects, Some(true)).is_some() {
+            return true;
+        }
+        if cache::find(picture, &model, opts.small_objects, Some(false)).is_some_and(|s| s.indoor == Some(false)) {
+            return false;
+        }
+    }
+    let Some(png) = png_bytes(picture) else { return false };
+    let sampling = buzz_ai::llm::ChatOpts { temperature: Some(cache::TEMPERATURE), seed: Some(cache::SEED), no_thinking: true };
+    match buzz_ai::scene_builder::scene_is_indoor(&backend, &model, &png, sampling) {
+        Ok(indoor) => indoor,
+        Err(e) => {
+            notes.push(format!("scene: could not ask whether it is indoors ({e}); split as outdoor"));
+            false
+        }
+    }
+}
+
 /// Ask the local VLM for the picture's objects (people and animals dropped), best first.
 ///
 /// **Same picture, same list** (SPLIT_PICTURE_PLAN S11): the VLM is asked at temperature 0 with
@@ -386,10 +439,7 @@ fn candidates(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>
         notes.push("objects: could not encode the picture for the VLM".into());
         return Vec::new();
     };
-    let claude = buzz_ai::ai_config::use_claude();
-    let backend = if claude { buzz_ai::llm::Backend::default_claude_api() } else { buzz_ai::llm::Backend::default_openai() };
-    let model = if claude { Some(buzz_ai::ai_config::claude_model()) } else { crate::produce::lmstudio_model(&backend).map(|m| m.0) };
-    let Some(model) = model.filter(|m| !m.is_empty()) else {
+    let Some((backend, model)) = vlm() else {
         notes.push("objects: no VLM available; plates only".into());
         return Vec::new();
     };
@@ -406,8 +456,14 @@ fn candidates(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>
     let sampling = buzz_ai::llm::ChatOpts { temperature: Some(cache::TEMPERATURE), seed: Some(cache::SEED), no_thinking: true };
     // The local VLM server drops a request now and then: a pass that fails is asked once more, but
     // after the others are done (below), not in its own thread.
-    let ask = |bytes: &[u8]| buzz_ai::scene_builder::decompose_background_objects_opts(&backend, &model, bytes, opts.small_objects, sampling);
-    let saved = cache::find(picture, &model, opts.small_objects);
+    let ask = |bytes: &[u8]| {
+        if opts.indoor {
+            buzz_ai::scene_builder::decompose_indoor_objects_opts(&backend, &model, bytes, sampling)
+        } else {
+            buzz_ai::scene_builder::decompose_background_objects_opts(&backend, &model, bytes, opts.small_objects, sampling)
+        }
+    };
+    let saved = cache::find(picture, &model, opts.small_objects, Some(opts.indoor));
     let reuse = saved.as_ref().filter(|_| !opts.redetect);
     let mut passes: Vec<serde_json::Value> = Vec::new();
     let (objects, ground_y, cache_file) = if let Some(s) = reuse {
@@ -462,7 +518,7 @@ fn candidates(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>
         }
         // Only a complete list is saved; a re-detect writes over the entry it matched.
         let file = if complete {
-            cache::save(picture, &model, opts.small_objects, &layout.objects, layout.ground_y, saved.as_ref().map(|s| s.path.as_path()))
+            cache::save(picture, &model, opts.small_objects, opts.indoor, &layout.objects, layout.ground_y, saved.as_ref().map(|s| s.path.as_path()))
         } else {
             None
         };
@@ -494,7 +550,8 @@ fn candidates(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>
         // saved list holds no pass names, so the cut line is found from the box itself.
         let tol = 0.01 * w as f64;
         let fragment = opts.small_objects && ((x1 as f64 - 0.55 * w as f64).abs() <= tol || (x0 as f64 - 0.45 * w as f64).abs() <= tol);
-        scored.push((score, normalise_label(&o.label), [x0, y0, x1, y1], fragment));
+        let label = if opts.indoor { normalise_indoor_label(&o.label) } else { normalise_label(&o.label) };
+        scored.push((score, label, [x0, y0, x1, y1], fragment));
     }
     if let Some(dir) = debug_dir() {
         let _ = std::fs::write(
@@ -541,6 +598,7 @@ fn candidates(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>
     }
     record(serde_json::json!({
         "route": route,
+        "indoor": opts.indoor,
         "picture": [w, h],
         "model": model,
         "prompt_version": buzz_ai::scene_builder::BACKGROUND_OBJECTS_PROMPT_VERSION,
@@ -837,6 +895,9 @@ pub fn detect_objects_with(
     }
     if opts.small_objects {
         merge_fragments(&mut out, &mut vlm, notes);
+        if opts.indoor {
+            merge_halves(&mut out, notes);
+        }
         drop_multi_building(&mut out, notes);
         merge_parts(&mut out, notes);
     }
@@ -892,6 +953,51 @@ fn merge_fragments(out: &mut Vec<Detected>, vlm: &mut Vec<([u32; 4], bool)>, not
             big.bbox = [big.bbox[0].min(part.bbox[0]), big.bbox[1].min(part.bbox[1]), big.bbox[2].max(part.bbox[2]), big.bbox[3].max(part.bbox[3])];
             notes.push(format!("objects: {} {:?} merged into {} (cut by a half pass)", part.label, part.bbox, big.label));
             continue 'again;
+        }
+        break;
+    }
+}
+
+/// Indoors: one long thing (a counter, a desk, a shelf) found as two halves, one by each half
+/// pass, is **joined**. Two objects of the same label are halves of one when they share a row
+/// (each one's height overlaps the other's by >= 60 % of the shorter), their masks touch, and
+/// they meet in the middle band of the picture where the half passes overlap (0.40..0.60 of the
+/// width) — so two crates standing side by side elsewhere stay two. Repeats until nothing joins.
+fn merge_halves(out: &mut Vec<Detected>, notes: &mut Vec<String>) {
+    'again: loop {
+        for a in 0..out.len() {
+            for b in a + 1..out.len() {
+                if out[a].label != out[b].label {
+                    continue;
+                }
+                let (ba, bb) = (out[a].bbox, out[b].bbox);
+                let (w, h) = out[a].mask.dimensions();
+                let yo = ba[3].min(bb[3]) as f64 - ba[1].max(bb[1]) as f64;
+                let short = (ba[3] - ba[1]).min(bb[3] - bb[1]).max(1) as f64;
+                if yo < 0.6 * short {
+                    continue;
+                }
+                // Where they meet: the stretch between the left one's right edge and the right one's left edge.
+                let (left, right) = if ba[0] <= bb[0] { (ba, bb) } else { (bb, ba) };
+                let (m0, m1) = (left[2].min(right[0]) as f64, left[2].max(right[0]) as f64);
+                if m1 < 0.40 * w as f64 || m0 > 0.60 * w as f64 {
+                    continue;
+                }
+                let near = buzz_ai::segment::dilate(out[b].mask.as_raw(), w, h, 3);
+                if !out[a].mask.iter().zip(near.iter()).any(|(p, q)| *p > 127 && *q > 0) {
+                    continue;
+                }
+                let part = out.remove(b);
+                let whole = &mut out[a];
+                for (u, m) in whole.mask.iter_mut().zip(part.mask.iter()) {
+                    if *m > 127 {
+                        *u = 255;
+                    }
+                }
+                whole.bbox = [whole.bbox[0].min(part.bbox[0]), whole.bbox[1].min(part.bbox[1]), whole.bbox[2].max(part.bbox[2]), whole.bbox[3].max(part.bbox[3])];
+                notes.push(format!("objects: {} {:?} joined to {} (two halves of one)", part.label, part.bbox, whole.label));
+                continue 'again;
+            }
         }
         break;
     }
@@ -1120,6 +1226,17 @@ pub fn result_json(placed: &[Placed], notes: &[String]) -> serde_json::Value {
 mod tests {
     use super::*;
     use image::{Luma, Rgba};
+
+    /// Indoor labels keep the VLM's own words, cut before a joining word; street names stay outdoors.
+    #[test]
+    fn indoor_labels_are_the_objects_own_words() {
+        assert_eq!(normalise_indoor_label("Door with iron bars"), "Door");
+        assert_eq!(normalise_indoor_label("hanging-lamp"), "Hanging Lamp");
+        assert_eq!(normalise_indoor_label("Tea kettle on counter"), "Tea Kettle");
+        assert_eq!(normalise_indoor_label("with nothing"), "Object");
+        assert_eq!(normalise_label("Street lamp"), "Pole");
+        assert_eq!(normalise_label("Counter with shelves"), "Counter");
+    }
 
     fn plates(n: u32) -> Plates {
         let blank = || RgbaImage::from_pixel(n, n, Rgba([0, 0, 0, 0]));

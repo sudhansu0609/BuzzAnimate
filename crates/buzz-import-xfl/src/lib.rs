@@ -2662,13 +2662,12 @@ impl FrameContext {
                         // right and the pose was wrong.
                         if let buzz_scene::ObjectKind::Instance(placed) = &mut object.kind {
                             placed.first_frame = attr_u32(attrs, "firstFrame", 0);
-                            placed.loop_mode = match attrs.get("loop").map(String::as_str) {
-                                Some("single frame") => buzz_scene::LoopMode::SingleFrame,
-                                Some("play once") => buzz_scene::LoopMode::PlayOnce,
-                                // Animate's default, and what it writes for
-                                // everything else.
-                                _ => buzz_scene::LoopMode::Loop,
-                            };
+                            // Loop is Animate's default, and what it writes
+                            // for everything else.
+                            placed.loop_mode = attrs
+                                .get("loop")
+                                .and_then(|name| buzz_scene::LoopMode::from_animate_name(name))
+                                .unwrap_or_default();
                         }
                         frame.objects.push(std::sync::Arc::new(object));
                         report.instances += 1;

@@ -294,9 +294,8 @@ fn build(job: &RenderJob, report: &mut Vec<String>) -> Result<Document> {
             selection: Vec::new(),
             active_layer: None,
             config_dir: buzz_script::default_config_dir(),
-            asset_root: buzz_doc::AssetLibrary::user()
-                .root()
-                .map(|p| p.to_path_buf()),
+            // The folder, not a scan of it (`AssetLibrary::user` opens every asset).
+            asset_root: Some(buzz_doc::assets::default_root()),
             // Unattended: every `prompt()` answers with its own default.
             prompt_answers: Vec::new(),
             hooks: Default::default(),

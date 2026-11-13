@@ -614,6 +614,9 @@ fn key_after_edit(scene: &mut Scene, id: LightId, frame: u32, auto_key: bool, pr
             if let Some(track) = light.track.as_mut() {
                 track.set_key(key);
             }
+            // On/off is keyed now: the base, which only says whether the light
+            // is lit anywhere, is on while any key is.
+            light.enabled = light.track.as_ref().is_some_and(|t| t.keys().iter().any(|k| k.enabled));
         }
     } else if auto_key {
         let key0 = (frame > 0).then(|| LightKey::from_light(0, pre));
@@ -625,6 +628,7 @@ fn key_after_edit(scene: &mut Scene, id: LightId, frame: u32, auto_key: bool, pr
             }
             track.set_key(key);
             track.enabled = true;
+            light.enabled = track.keys().iter().any(|k| k.enabled);
         }
     }
 }
@@ -1154,7 +1158,8 @@ mod tests {
         scene.lights_mut().enabled = true;
         let light = scene.lights_mut().get_mut(id).expect("just added");
         light.intensity = 1.0;
-        let key0 = LightKey::from_light(0, light);
+        // A tween from frame 0 to 20: a blending key, not a holding one.
+        let key0 = LightKey { tween: true, ..LightKey::from_light(0, light) };
         let mut key1 = key0;
         key1.frame = 20;
         key1.intensity = 3.0;

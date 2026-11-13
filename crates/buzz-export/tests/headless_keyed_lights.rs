@@ -48,6 +48,8 @@ fn document() -> Scene {
     track.enabled = true;
     // Low on the horizon at frame 0 …
     track.set_key(LightKey {
+            enabled: true,
+            tween: true,
         frame: 0,
         color: Color::WHITE,
         intensity: 1.0,
@@ -62,6 +64,8 @@ fn document() -> Scene {
     });
     // … overhead at frame 20.
     track.set_key(LightKey {
+            enabled: true,
+            tween: true,
         frame: 20,
         color: Color::WHITE,
         intensity: 1.0,

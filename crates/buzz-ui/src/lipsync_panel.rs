@@ -9,6 +9,10 @@
 
 use egui::{RichText, Ui};
 
+/// **Adobe Animate's twelve visemes**, in its Lip Syncing dialog's order — the
+/// same list as `buzz_audio::ANIMATE_VISEMES`, which this crate does not depend on.
+pub const ANIMATE_VISEMES: [&str; 12] = ["Neutral", "Ah", "D", "Ee", "F", "L", "M", "Oh", "R", "S", "Uh", "W-Oo"];
+
 /// A choice offered in the dialog.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Choice {
@@ -34,6 +38,16 @@ pub struct LipSyncState {
     pub hold: u32,
     /// What the last run reported.
     pub result: Option<String>,
+    /// **The mouth was picked on the stage**: offer only its own layer, so
+    /// the keys cannot be sent anywhere else by accident.
+    pub only_layer: bool,
+    /// **Set Visemes**: the frame of the mouth chart (0-based) for each of
+    /// Animate's twelve visemes ([`ANIMATE_VISEMES`]). Filled by
+    /// the app for the chosen mouth; stored on it when the sync runs.
+    pub visemes: Option<[u32; 12]>,
+    /// The mouth `visemes` were filled for, and how many frames it has.
+    pub visemes_for: Option<u64>,
+    pub chart_frames: u32,
 }
 
 impl LipSyncState {
@@ -59,6 +73,10 @@ pub struct LipSyncResponse {
     pub cancelled: bool,
     /// Make a placeholder mouth symbol to draw over.
     pub make_mouth: bool,
+    /// Fill the visemes from the animator's Animate mapping.
+    pub visemes_mine: bool,
+    /// Fill the visemes by reading the chart's drawings.
+    pub visemes_drawings: bool,
 }
 
 /// Draw the dialog.
@@ -90,7 +108,7 @@ pub fn lip_sync_dialog(
                     ui.label(RichText::new("Soundtrack").small().strong());
                     ui.label(name);
                     ui.label(
-                        RichText::new("From the main timeline, wherever you are editing")
+                        RichText::new("The open symbol's main sound layer, else the main timeline's")
                             .small()
                             .weak(),
                     );
@@ -120,6 +138,42 @@ pub fn lip_sync_dialog(
                         response.make_mouth = true;
                     }
                 });
+            }
+
+            // **Set Visemes**, as Animate's Lip Syncing dialog has it: which
+            // frame of this mouth chart draws each of its twelve visemes.
+            if let Some(visemes) = state.visemes.as_mut() {
+                ui.separator();
+                egui::CollapsingHeader::new(RichText::new("Set Visemes").small().strong())
+                    .id_salt("lip-sync-visemes")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let last = state.chart_frames.max(1);
+                        egui::Grid::new("lip-sync-viseme-grid").num_columns(4).spacing([10.0, 3.0]).show(ui, |ui| {
+                            for (slot, name) in ANIMATE_VISEMES.iter().enumerate() {
+                                ui.label(RichText::new(*name).small());
+                                let mut shown = visemes[slot] + 1;
+                                if ui
+                                    .add(egui::DragValue::new(&mut shown).range(1..=last).prefix("frame "))
+                                    .on_hover_text(format!("The frame of the mouth chart that draws {name}"))
+                                    .changed()
+                                {
+                                    visemes[slot] = shown.saturating_sub(1);
+                                }
+                                if slot % 2 == 1 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.small_button("My Animate mapping").on_hover_text("The mapping your Animate lip sync used (autoLipSyncImporter)").clicked() {
+                                response.visemes_mine = true;
+                            }
+                            if ui.small_button("Read from drawings").on_hover_text("Guess each viseme's frame from how open, wide and round each drawing is").clicked() {
+                                response.visemes_drawings = true;
+                            }
+                        });
+                    });
             }
 
             ui.separator();

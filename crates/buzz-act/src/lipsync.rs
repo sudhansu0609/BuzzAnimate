@@ -101,6 +101,83 @@ pub fn apply(
     ))
 }
 
+/// **Write lip sync keys given as Animate visemes** — what a speech recogniser
+/// (Rhubarb) hears: `keys` are `(frame from the sound's start, slot of
+/// buzz_audio::ANIMATE_VISEMES)`, `length` the frames the dialogue covers.
+/// Each slot shows the chart frame `chart` maps it to (Set Visemes), one
+/// keyframe per change of frame; what an earlier sync left over the same
+/// stretch is cleared first.
+pub fn write_viseme_keys(
+    scene: &mut Scene,
+    keys: &[(u32, usize)],
+    length: u32,
+    sound_start: u32,
+    layer: LayerId,
+    mouth: SymbolId,
+    placement: Affine,
+    chart: &[u32; 12],
+) -> LipSyncReport {
+    // One key per change of the frame shown: two visemes drawn on the same
+    // frame of the chart are one key.
+    let mut shown: Vec<(u32, usize, u32)> = Vec::new();
+    for (frame, slot) in keys {
+        let chart_frame = chart[(*slot).min(11)];
+        if shown.last().is_some_and(|(_, _, f)| *f == chart_frame) {
+            continue;
+        }
+        shown.push((*frame, *slot, chart_frame));
+    }
+    let ids: Vec<ObjectId> = (0..shown.len()).map(|_| scene.next_object_id()).collect();
+    let last_frame = sound_start + length;
+    let rest_frame = chart[0];
+    let silent = keys.iter().filter(|(_, slot)| *slot == 0 || chart[(*slot).min(11)] == rest_frame).count() as u32;
+    scene.update_layer(layer, |target| {
+        while target.frames.length() <= last_frame {
+            target.frames.insert_frame(target.frames.length());
+        }
+        let stale: Vec<u32> = target
+            .frames
+            .keyframes()
+            .iter()
+            .map(|k| k.start)
+            .filter(|s| *s > sound_start && *s <= last_frame)
+            .collect();
+        for start in stale {
+            target.frames.clear_keyframe(start);
+        }
+        for ((frame, slot, chart_frame), id) in shown.iter().zip(&ids) {
+            let at = sound_start + frame;
+            target.frames.insert_keyframe(at);
+            let mut instance = SymbolInstance::new(mouth);
+            instance.first_frame = *chart_frame;
+            instance.loop_mode = buzz_scene::LoopMode::SingleFrame;
+            let object = Object {
+                id: *id,
+                name: Some(format!("Mouth {}", buzz_audio::ANIMATE_VISEMES[(*slot).min(11)])),
+                transform: placement,
+                kind: ObjectKind::Instance(instance),
+                locked: false,
+                visible: true,
+                filters: Vec::new(),
+                blend: buzz_scene::Blend::Normal,
+                spatial: Default::default(),
+                pivot: None,
+                modifiers: Vec::new(),
+                text: None,
+                turnaround: Default::default(),
+                drawing_object: false,
+            };
+            target.frames.set_objects(at, vec![Arc::new(object)]);
+        }
+    });
+    LipSyncReport {
+        keyframes: shown.len() as u32,
+        frames: length,
+        silent,
+        message: format!("Lip sync (Rhubarb): {} keyframes over {} frames", shown.len(), length),
+    }
+}
+
 /// Write an already-analysed track onto a layer.
 ///
 /// Separated from [`apply`] so the analysis can be reviewed — or replaced by a
@@ -125,11 +202,28 @@ pub fn write_track(
     let ids: Vec<ObjectId> = (0..runs.len()).map(|_| scene.next_object_id()).collect();
 
     let last_frame = sound_start + track.len() as u32;
+    // **The chart's own frames**: the visemes set on it (Animate's Set
+    // Visemes), so a chart drawn in any order shows the right mouth. A chart
+    // with none is taken to be drawn in this program's own order.
+    let map = crate::face::stored_viseme_map(scene, mouth);
     scene.update_layer(layer, |target| {
         // The layer has to be long enough to hold the dialogue, or the later
         // keyframes would fall beyond its span and never be seen.
         while target.frames.length() <= last_frame {
             target.frames.insert_frame(target.frames.length());
+        }
+        // **A second sync replaces the first.** The keys an earlier run left
+        // over this stretch are cleared before the new ones go in; added
+        // between them instead, the old shapes kept showing through.
+        let stale: Vec<u32> = target
+            .frames
+            .keyframes()
+            .iter()
+            .map(|k| k.start)
+            .filter(|s| *s > sound_start && *s <= last_frame)
+            .collect();
+        for start in stale {
+            target.frames.clear_keyframe(start);
         }
 
         for ((start, viseme, _), id) in runs.iter().zip(&ids) {
@@ -140,7 +234,7 @@ pub fn write_track(
             // The viseme *is* the frame of the mouth symbol. A graphic symbol
             // in single-frame mode shows exactly that frame and nothing else,
             // which is what a mouth shape is.
-            instance.first_frame = viseme.frame();
+            instance.first_frame = map.map_or(viseme.frame(), |m| m[viseme.frame() as usize]);
             instance.loop_mode = buzz_scene::LoopMode::SingleFrame;
 
             let object = Object {
@@ -509,5 +603,31 @@ mod tests {
         let report = write_track(&mut scene, &track, 0, layer, mouth, Affine::IDENTITY);
         assert_eq!(report.keyframes, 1, "one run means one keyframe");
         assert_eq!(report.silent, 10);
+    }
+
+    /// **Set Visemes is obeyed**: with the animator's Animate mapping on the
+    /// chart (Neutral on frame 4, Ah on 1, M on 5 — 1-based), the keys show
+    /// those frames, not this program's own order.
+    #[test]
+    fn keys_land_on_the_frames_the_visemes_were_set_to() {
+        let (mut scene, layer, mouth) = document();
+        let mine = [4u32, 1, 7, 7, 3, 1, 5, 2, 2, 7, 9, 8].map(|f| f - 1);
+        crate::face::set_animate_chart(&mut scene, mouth, mine);
+        let track = VisemeTrack {
+            frames: vec![Viseme::Rest, Viseme::Rest, Viseme::Ai, Viseme::Ai, Viseme::MBP, Viseme::MBP],
+            fps: 24.0,
+        };
+        write_track(&mut scene, &track, 0, layer, mouth, Affine::IDENTITY);
+        let shown = |frame: u32| {
+            scene.layers().get(layer).and_then(|l| l.objects_at(frame).first().and_then(|o| o.instance()).map(|i| i.first_frame))
+        };
+        assert_eq!(shown(0), Some(3), "Neutral: the chart's frame 4");
+        assert_eq!(shown(2), Some(0), "Ah: frame 1");
+        assert_eq!(shown(4), Some(4), "M: frame 5");
+        // Synced again with one shape: the earlier keys over the span are gone.
+        let again = VisemeTrack { frames: vec![Viseme::Rest; 6], fps: 24.0 };
+        write_track(&mut scene, &again, 0, layer, mouth, Affine::IDENTITY);
+        let keys = scene.layers().get(layer).map(|l| l.frames.keyframes().iter().filter(|k| k.start <= 6).count()).unwrap_or(0);
+        assert_eq!(keys, 1, "a second sync replaces the first, it does not add to it");
     }
 }

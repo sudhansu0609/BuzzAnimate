@@ -77,15 +77,49 @@ pub enum LoopMode {
     PlayOnce,
     /// Freeze on a single frame.
     SingleFrame,
+    /// Play backwards from the first frame once and hold frame 1. Animate's
+    /// "Play Graphic in Reverse Once".
+    PlayOnceReverse,
+    /// Play backwards from the first frame, wrapping round to the last.
+    /// Animate's "Loop Reverse".
+    LoopReverse,
 }
 
 impl LoopMode {
+    /// Every mode, in the order Animate's Looping section lists them.
+    pub const ALL: [Self; 5] = [
+        Self::Loop,
+        Self::PlayOnce,
+        Self::SingleFrame,
+        Self::PlayOnceReverse,
+        Self::LoopReverse,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Loop => "Loop",
             Self::PlayOnce => "Play Once",
             Self::SingleFrame => "Single Frame",
+            Self::PlayOnceReverse => "Play Once Reverse",
+            Self::LoopReverse => "Loop Reverse",
         }
+    }
+
+    /// The name Animate writes in XFL (`loop="play once reverse"`) and JSFL's
+    /// `symbolInstance.loop` reads and sets.
+    pub fn animate_name(self) -> &'static str {
+        match self {
+            Self::Loop => "loop",
+            Self::PlayOnce => "play once",
+            Self::SingleFrame => "single frame",
+            Self::PlayOnceReverse => "play once reverse",
+            Self::LoopReverse => "loop reverse",
+        }
+    }
+
+    /// The mode Animate's name stands for; `None` for a name it does not use.
+    pub fn from_animate_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.animate_name() == name)
     }
 }
 
@@ -364,6 +398,25 @@ impl SymbolInstance {
             LoopMode::SingleFrame => self.first_frame.min(length - 1),
             LoopMode::Loop => (self.first_frame + elapsed) % length,
             LoopMode::PlayOnce => (self.first_frame + elapsed).min(length - 1),
+            LoopMode::PlayOnceReverse => self.first_frame.min(length - 1).saturating_sub(elapsed),
+            LoopMode::LoopReverse => (self.first_frame % length + length - elapsed % length) % length,
+        }
+    }
+
+    /// **The first frame that makes this instance show `target`** after it has
+    /// been on stage `elapsed` frames — [`Self::resolve_frame`] run backwards,
+    /// for each looping mode. What "match the frame number" sets, so a head
+    /// inside a body shows the body's frame 240 on the body's frame 240.
+    pub fn first_frame_showing(&self, target: u32, elapsed: u32, symbol_length: u32) -> u32 {
+        let length = symbol_length.max(1);
+        let target = target.min(length - 1);
+        match self.loop_mode {
+            LoopMode::SingleFrame => target,
+            LoopMode::Loop if elapsed <= target => target - elapsed,
+            LoopMode::Loop => (target + length - elapsed % length) % length,
+            LoopMode::PlayOnce => target.saturating_sub(elapsed),
+            LoopMode::PlayOnceReverse => (target + elapsed).min(length - 1),
+            LoopMode::LoopReverse => (target + elapsed) % length,
         }
     }
 
@@ -379,6 +432,9 @@ impl SymbolInstance {
             LoopMode::SingleFrame => self.first_frame.min(length - 1),
             LoopMode::Loop => root_frame % length,
             LoopMode::PlayOnce => root_frame.min(length - 1),
+            // Backwards from the symbol's last frame as the stage moves on.
+            LoopMode::PlayOnceReverse => (length - 1).saturating_sub(root_frame),
+            LoopMode::LoopReverse => length - 1 - root_frame % length,
         }
     }
 }
@@ -1119,6 +1175,52 @@ mod tests {
         instance.loop_mode = LoopMode::SingleFrame;
         instance.first_frame = 2;
         assert_eq!(instance.resolve_frame(SymbolKind::Graphic, 12, 5), 2);
+    }
+
+    /// Animate's two reverse modes count down from the first frame: Play Once
+    /// Reverse stops on frame 1, Loop Reverse wraps round to the last frame.
+    #[test]
+    fn reverse_modes_play_backwards_from_the_first_frame() {
+        let mut instance = SymbolInstance { first_frame: 3, ..SymbolInstance::new(SymbolId(1)) };
+
+        instance.loop_mode = LoopMode::PlayOnceReverse;
+        let shown: Vec<u32> = (0..6).map(|e| instance.resolve_frame(SymbolKind::Graphic, e, 5)).collect();
+        assert_eq!(shown, [3, 2, 1, 0, 0, 0], "holds frame 1 once it gets there");
+
+        instance.loop_mode = LoopMode::LoopReverse;
+        let shown: Vec<u32> = (0..7).map(|e| instance.resolve_frame(SymbolKind::Graphic, e, 5)).collect();
+        assert_eq!(shown, [3, 2, 1, 0, 4, 3, 2], "wraps from frame 1 to the last");
+
+        for mode in LoopMode::ALL {
+            assert_eq!(LoopMode::from_animate_name(mode.animate_name()), Some(mode));
+        }
+        assert_eq!(LoopMode::LoopReverse.animate_name(), "loop reverse");
+        assert_eq!(LoopMode::PlayOnceReverse.animate_name(), "play once reverse");
+    }
+
+    /// **The first frame that shows a given frame**, in every mode — what
+    /// "match the frame number" needs to set on a head inside a body.
+    #[test]
+    fn first_frame_showing_undoes_resolve_frame() {
+        for mode in LoopMode::ALL {
+            let instance = SymbolInstance { loop_mode: mode, ..SymbolInstance::new(SymbolId(1)) };
+            for (target, elapsed) in [(240, 48), (240, 0), (10, 30), (0, 5), (4440, 7)] {
+                let set = SymbolInstance {
+                    first_frame: instance.first_frame_showing(target, elapsed, 4441),
+                    ..instance.clone()
+                };
+                let shown = set.resolve_frame(SymbolKind::Graphic, elapsed, 4441);
+                // Play Once cannot show a frame before the one it started on
+                // once it has played past it, nor Play Once Reverse one after.
+                if mode == LoopMode::PlayOnce && elapsed > target {
+                    assert_eq!(shown, elapsed, "{mode:?}");
+                } else if mode == LoopMode::PlayOnceReverse && target + elapsed > 4440 {
+                    assert_eq!(shown, 4440 - elapsed, "{mode:?}");
+                } else {
+                    assert_eq!(shown, target, "{mode:?} target {target} elapsed {elapsed}");
+                }
+            }
+        }
     }
 
     #[test]

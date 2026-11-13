@@ -191,11 +191,7 @@ pub(crate) fn install<'js>(
             let skew_x = (-c).atan2(d).to_degrees();
             let (loop_mode, name) = match &obj.kind {
                 ObjectKind::Instance(i) => (
-                    match i.loop_mode {
-                        buzz_scene::LoopMode::Loop => "loop",
-                        buzz_scene::LoopMode::PlayOnce => "play once",
-                        buzz_scene::LoopMode::SingleFrame => "single frame",
-                    },
+                    i.loop_mode.animate_name(),
                     obj.name.clone().unwrap_or_default(),
                 ),
                 _ => ("", obj.name.clone().unwrap_or_default()),
@@ -265,11 +261,7 @@ pub(crate) fn install<'js>(
                     o.name = if n.is_empty() { None } else { Some(n) };
                 }
                 if let (ObjectKind::Instance(i), Some(l)) = (&mut o.kind, loop_mode) {
-                    i.loop_mode = match l.as_str() {
-                        "play once" => buzz_scene::LoopMode::PlayOnce,
-                        "single frame" => buzz_scene::LoopMode::SingleFrame,
-                        _ => buzz_scene::LoopMode::Loop,
-                    };
+                    i.loop_mode = buzz_scene::LoopMode::from_animate_name(&l).unwrap_or_default();
                 }
             });
             Ok(())

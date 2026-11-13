@@ -543,6 +543,11 @@ pub struct Workspace {
     /// the timing being worked on.
     #[serde(default = "yes")]
     pub frames_on_locked_layers: bool,
+    /// **Equal Layer Lengths**: after any edit every layer of the timeline
+    /// being edited runs as long as the longest, so whatever is put on a
+    /// layer is there to the end. On unless switched off.
+    #[serde(default = "yes")]
+    pub equal_layer_lengths: bool,
     /// **Exports at once** — how many exports the queue runs side by side
     /// (step P of `docs/PRODUCTION_SPEED_PLAN.md`), set in the Tasks panel.
     /// The queue still holds it under what the GPU's free memory allows. A
@@ -1087,8 +1092,10 @@ impl Workspace {
 
     /// Whether the user has changed this command's shortcut from its default.
     /// **Every key that raises `command`**: its main key (the override, else
-    /// the built-in one) and any extra keys a keymap gave it. A tool's main key
-    /// is its letter unless the keymap moved or removed it.
+    /// the built-in one), its built-in extra keys
+    /// ([`crate::command::Command::extra_shortcuts`]) unless the user unbound
+    /// the command, and any extra keys a keymap gave it. A tool's main key is
+    /// its letter unless the keymap moved or removed it.
     pub fn shortcuts_for(&self, command: crate::command::Command) -> Vec<egui::KeyboardShortcut> {
         let id = command_id(command);
         let main = match (self.keymap.get(&id), command) {
@@ -1098,9 +1105,19 @@ impl Workspace {
                 .map(|key| egui::KeyboardShortcut::new(egui::Modifiers::NONE, key)),
             (None, other) => other.shortcut(),
         };
-        main.into_iter()
+        let unbound = matches!(self.keymap.get(&id), Some(None));
+        let mut keys: Vec<egui::KeyboardShortcut> = main.into_iter().collect();
+        for key in command
+            .extra_shortcuts()
+            .into_iter()
+            .filter(|_| !unbound)
             .chain(self.extra_keys.get(&id).into_iter().flatten().filter_map(KeyChord::to_shortcut))
-            .collect()
+        {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
     }
 
     pub fn has_shortcut_override(&self, command: crate::command::Command) -> bool {
@@ -1431,6 +1448,7 @@ impl Workspace {
             auto_save: default_auto_save(),
             auto_keyframe: default_auto_keyframe(),
             frames_on_locked_layers: true,
+            equal_layer_lengths: true,
             exports_at_once: default_exports_at_once(),
             brush_tips: crate::brush::BrushTips::default(),
             drawing_modes: crate::style::ToolDrawingModes::default(),

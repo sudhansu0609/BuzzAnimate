@@ -332,9 +332,8 @@ pub fn import_cast_fla(app: &mut App, args: &Value) -> AgentResult {
     let (Some(fla), Some(series)) = (text("fla"), text("series")) else {
         return AgentResult::err("missing required args: fla, series");
     };
-    let Some(root) = buzz_doc::AssetLibrary::user().root().map(std::path::Path::to_path_buf) else {
-        return AgentResult::err("there is no asset library folder on this machine");
-    };
+    // The folder, not a scan of it (`AssetLibrary::user` opens every asset).
+    let root = buzz_doc::assets::default_root();
     let only: Vec<String> = map.get("roles").and_then(Value::as_array).map(|a| a.iter().filter_map(|r| r.as_str().map(String::from)).collect()).unwrap_or_default();
     let ai_rig = map.get("ai_rig").and_then(Value::as_bool).unwrap_or(true);
     let req = crate::cast_fla::CastFlaRequest { fla: std::path::PathBuf::from(fla), root, series, ai_rig, only };

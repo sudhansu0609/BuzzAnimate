@@ -1234,6 +1234,11 @@ pub struct LightRig {
     /// better model can simply be the one it starts with.
     #[serde(default)]
     pub model: ShadeModel,
+    /// **Shadows only**: the characters throw their cast shadows, and that is
+    /// all — no shading or tint on the artwork, no lamp pools, no gloom. For a
+    /// flat cartoon look that still has people standing on the ground.
+    #[serde(default)]
+    pub shadows_only: bool,
 }
 
 /// **Where a light's terminator comes from.**
@@ -1426,6 +1431,7 @@ impl LightRig {
         self.modelling.to_bits().hash(&mut hasher);
         self.edges.hash(&mut hasher);
         self.model.hash(&mut hasher);
+        self.shadows_only.hash(&mut hasher);
         self.lights.len().hash(&mut hasher);
 
         // Each light hashes itself, through the same routine `Light::fingerprint`
@@ -1454,6 +1460,7 @@ impl Default for LightRig {
             // mentioned `model` is a different question, and
             // `#[serde(default)]` answers it `Crescent` instead.
             model: ShadeModel::Form,
+            shadows_only: false,
         }
     }
 }
@@ -1553,6 +1560,7 @@ impl LightRig {
             modelling: self.modelling,
             edges: self.edges,
             model: self.model,
+            shadows_only: self.shadows_only,
         }
     }
 

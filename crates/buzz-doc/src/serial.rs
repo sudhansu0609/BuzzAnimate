@@ -366,6 +366,9 @@ pub struct LightRigDto {
     /// [`buzz_scene::ShadeModel`].
     #[serde(default)]
     pub model: buzz_scene::ShadeModel,
+    /// Cast shadows without the light's shading and tint. Absent → off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shadows_only: bool,
     pub lights: Vec<LightDto>,
 }
 
@@ -487,6 +490,13 @@ pub struct LightKeyDto {
     pub throw: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<f64>,
+    /// The light on from this key (absent: on, as every key of an older file).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// Blend into the next key (absent: blend, as every key of an older file);
+    /// `false` holds.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub tween: bool,
 }
 
 /// The flat serialised form of a [`buzz_scene::LightKind`]: a kind string plus
@@ -632,6 +642,8 @@ impl LightKeyDto {
             radius: flat.radius,
             throw: flat.throw,
             width: flat.width,
+            enabled: key.enabled,
+            tween: key.tween,
         }
     }
 
@@ -655,6 +667,8 @@ impl LightKeyDto {
                 self.throw,
                 self.width,
             )?,
+            enabled: self.enabled,
+            tween: self.tween,
         })
     }
 }
@@ -1275,6 +1289,10 @@ pub struct LayerDto {
     /// an ordinary layer, which is every layer of every older document.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub audio_guide: bool,
+    /// The main sound layer of its timeline (see `Layer::main_sound`). Absent
+    /// means not, which is every layer of every older document.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub main_sound: bool,
     /// Where a lifted Cast character came from (see `Layer::cast_source`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_source: Option<String>,
@@ -2666,6 +2684,7 @@ impl LayerDto {
             depth: layer.depth,
             collapsed: layer.collapsed,
             audio_guide: layer.audio_guide,
+            main_sound: layer.main_sound,
             cast_source: layer.cast_source.clone(),
             filters: layer.filters.iter().map(FilterDto::from_filter).collect(),
             length: layer.frames.length(),
@@ -2736,6 +2755,7 @@ impl LayerDto {
         };
         layer.collapsed = self.collapsed;
         layer.audio_guide = self.audio_guide;
+        layer.main_sound = self.main_sound;
         layer.cast_source = self.cast_source.clone();
         layer.brightness = self.brightness;
         if let Some(t) = &self.tint {
@@ -2959,6 +2979,7 @@ impl DocumentDto {
                 modelling: scene.lights().modelling,
                 edges: scene.lights().edges,
                 model: scene.lights().model,
+                shadows_only: scene.lights().shadows_only,
                 lights: scene
                     .lights()
                     .lights
@@ -3225,6 +3246,7 @@ impl DocumentDto {
             lights.modelling = rig.modelling;
             lights.edges = rig.edges;
             lights.model = rig.model;
+            lights.shadows_only = rig.shadows_only;
 
             for dto in &rig.lights {
                 // An unknown kind loads as a sky rather than being dropped: a
@@ -5760,6 +5782,8 @@ mod layer_alpha_tests {
         let mut track = buzz_scene::LightTrack::new();
         track.enabled = true;
         track.set_key(buzz_scene::LightKey {
+            enabled: true,
+            tween: true,
             frame: 0,
             color: peniko::Color::from_rgb8(0x0B, 0x0E, 0x18),
             intensity: 1.0,
@@ -5770,6 +5794,8 @@ mod layer_alpha_tests {
             kind,
         });
         track.set_key(buzz_scene::LightKey {
+            enabled: true,
+            tween: true,
             frame: 48,
             color: peniko::Color::from_rgb8(0x0B, 0x0E, 0x18),
             intensity: 0.4,
@@ -5815,6 +5841,8 @@ mod layer_alpha_tests {
         let mut track = buzz_scene::LightTrack::new();
         track.enabled = true;
         track.set_key(buzz_scene::LightKey {
+            enabled: true,
+            tween: true,
             frame: 0,
             color: peniko::Color::WHITE,
             intensity: 1.0,
@@ -5828,6 +5856,8 @@ mod layer_alpha_tests {
             },
         });
         track.set_key(buzz_scene::LightKey {
+            enabled: true,
+            tween: true,
             frame: 24,
             color: peniko::Color::from_rgb8(0xFF, 0x80, 0x00),
             intensity: 2.0,

@@ -832,6 +832,32 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             .map(|p| p as i32)
             .unwrap_or(-1))
     });
+    // Animate's `layer.parentLayer`: the folder holding the layer, or for a
+    // masked or guided layer the mask or guide over it. -1 for none.
+    host_fn!(ctx, host, state, "layerContainerIndex", |state, index: i32| {
+        let s = state.borrow();
+        let l = layer_at(&s, index)?;
+        let layers = s.scene().layers();
+        let container = layers.mask_for(l.id).or_else(|| layers.guide_for(l.id)).or(l.parent);
+        Ok(container
+            .and_then(|c| layers.iter().position(|x| x.id == c))
+            .map(|p| p as i32)
+            .unwrap_or(-1))
+    });
+    // Setting `parentLayer`: into that folder (a folder only), or out of any
+    // with -1 — Animate's way of filing a layer from a script.
+    host_fn!(ctx, host, state, "setLayerParentFolder", |state, index: i32, folder: i32| {
+        let id = layer_id(&state.borrow(), index)?;
+        let folder = if folder < 0 {
+            None
+        } else {
+            let s = state.borrow();
+            let f = layer_at(&s, folder)?;
+            (f.kind == buzz_scene::LayerKind::Folder).then_some(f.id)
+        };
+        state.borrow_mut().scene_mut().update_layer(id, |l| l.parent = folder);
+        Ok(())
+    });
     host_fn!(ctx, host, state, "layerFrameCount", |state, index: i32| {
         let s = state.borrow();
         Ok(layer_at(&s, index)?.frames.length() as i32)
@@ -904,6 +930,36 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             // do against real Animate.
             s.scene_mut().update_layer(id, |l| {
                 l.frames.set_tween(frame, tween);
+            });
+            Ok(())
+        }
+    );
+    // `frame.tweenEasing`: Animate's ease slider on the keyframe governing
+    // `frame`, -100 (ease in) ..= 100 (ease out), 0 for none.
+    host_fn!(ctx, host, state, "frameTweenEasing", |state, layer: i32, frame: u32| {
+        let s = state.borrow();
+        let l = layer_at(&s, layer)?;
+        let ease = l.frames.keyframe_start(frame).and_then(|start| l.frames.keyframe_at(start)).map(|k| match k.tween.easing {
+            buzz_scene::Easing::Strength(v) => v * 100.0,
+            _ => 0.0,
+        });
+        Ok(ease.unwrap_or(0.0))
+    });
+    host_fn!(
+        ctx,
+        host,
+        state,
+        "setFrameTweenEasing",
+        |state, layer: i32, frame: u32, value: f64| {
+            let mut s = state.borrow_mut();
+            let id = layer_id(&s, layer)?;
+            let v = if value.is_finite() { value.clamp(-100.0, 100.0) } else { 0.0 };
+            s.scene_mut().update_layer(id, |l| {
+                if let Some(start) = l.frames.keyframe_start(frame)
+                    && let Some(k) = l.frames.keyframe_at_mut(start)
+                {
+                    k.tween.easing = if v == 0.0 { buzz_scene::Easing::Linear } else { buzz_scene::Easing::Strength(v / 100.0) };
+                }
             });
             Ok(())
         }

@@ -56,8 +56,19 @@ pub struct ClippedLayer {
     pub drawings: Vec<(u32, Vec<std::sync::Arc<Object>>)>,
 }
 
-/// The frame clipboard: Copy Frames' layers, in the order they were met.
-pub type FrameClip = Vec<ClippedLayer>;
+/// The frame clipboard: Copy Frames' layers, in the order they were met, and
+/// where they were copied from.
+#[derive(Debug, Clone)]
+pub struct FrameClip {
+    pub layers: Vec<ClippedLayer>,
+    /// The document (`Document::uid`), its scene and the symbols open when the
+    /// frames were copied: pasted there they go back onto their own layers.
+    pub source: (u64, Option<buzz_doc::SceneKey>, Vec<buzz_scene::SymbolId>),
+    /// The same frames as a document of their own, with the symbols they use
+    /// (`Scene::extract_frames`): pasted anywhere else they arrive from this,
+    /// as new layers.
+    pub scene: buzz_scene::Scene,
+}
 
 /// What a camera edit says when the camera is locked: the lock is a small
 /// icon on the Camera row, easy to forget, so the message says where it is.
@@ -546,6 +557,9 @@ type CachedLevels = (usize, std::sync::Arc<Vec<f32>>, std::sync::Arc<Vec<(f32, f
 #[derive(Default)]
 struct WaveformCache {
     revision: Option<u64>,
+    /// The symbols open when it was built: the timeline shows the open
+    /// symbol's layers, and opening one is not an edit.
+    path: Vec<buzz_scene::SymbolId>,
     map: std::collections::BTreeMap<LayerId, buzz_ui::Waveform>,
     levels: std::collections::HashMap<(buzz_scene::SoundId, u64), CachedLevels>,
 }
@@ -871,6 +885,9 @@ impl Editor {
     /// document (view state there, so every document opened or made gets it).
     pub fn sync_protect_keyframes(&mut self) {
         self.doc.set_protect_keyframes(self.workspace.protect_scope());
+        // Equal Layer Lengths travels with it: a document setting the
+        // workspace holds.
+        self.doc.set_equal_layer_lengths(self.workspace.equal_layer_lengths);
         self.protect_seen_revision = self.doc.scene().revision();
     }
 
@@ -4230,7 +4247,7 @@ impl Editor {
         let ObjectKind::Shape(shape) = &object.kind else {
             return None;
         };
-        if object.text.is_some() {
+        if object.text.is_some() || is_placed_bitmap(object) {
             return None;
         }
         let scale = object.transform.determinant().abs().sqrt();
@@ -4297,7 +4314,7 @@ impl Editor {
         self.doc
             .scene()
             .find_object(id)
-            .is_some_and(|(_, o)| matches!(o.kind, ObjectKind::Shape(_)) && o.text.is_none())
+            .is_some_and(|(_, o)| matches!(o.kind, ObjectKind::Shape(_)) && o.text.is_none() && !is_placed_bitmap(o))
     }
 
     /// Every selected raw shape, as it is drawn — what the stage hatches.
@@ -5929,6 +5946,21 @@ impl Editor {
                     self.workspace.save();
                 }
             }
+            ToggleEqualLayerLengths => {
+                let on = !self.workspace.equal_layer_lengths;
+                self.workspace.equal_layer_lengths = on;
+                self.workspace.save();
+                self.sync_protect_keyframes();
+                if on {
+                    self.doc.edit("Equal Layer Lengths", |scene| scene.equalize_layer_lengths());
+                    self.doc.end_gesture();
+                }
+                self.status = Some(if on {
+                    "Every layer now runs as long as the longest".into()
+                } else {
+                    "Layers keep their own lengths".into()
+                });
+            }
             ToggleFramesOnLockedLayers => {
                 let on = !self.workspace.frames_on_locked_layers;
                 self.workspace.frames_on_locked_layers = on;
@@ -5972,6 +6004,9 @@ impl Editor {
             AddCameraMove(movement) => self.add_camera_move(movement),
 
             // -- lights ------------------------------------------------------
+            // Lights are the main timeline's alone; see `lights_at_root`.
+            AddLightKeyframe if !self.lights_at_root() => {}
+            RemoveLightKeyframe if !self.lights_at_root() => {}
             AddLightKeyframe => self.add_light_key(),
             RemoveLightKeyframe => self.remove_light_key(),
 
@@ -5980,6 +6015,7 @@ impl Editor {
             BrushFromSelection => self.brush_from_selection(),
 
             // -- lighting -----------------------------------------------------
+            AddSun | AddSky | AddLamp | AddGloom | AddFire | AddStorm if !self.lights_at_root() => {}
             AddSun => self.add_light(buzz_scene::LightKind::sun()),
             AddSky => self.add_light(buzz_scene::LightKind::sky()),
             AddLamp => self.add_light(buzz_scene::LightKind::lamp(self.camera.center)),
@@ -6084,7 +6120,16 @@ impl Editor {
                 if self.doc.master_audio_mode() {
                     self.enforce_master_audio_now();
                 } else {
-                    self.status = Some("Master Audio mode is off (Sequence \u{25b8} Master Audio Mode)".into());
+                    // Mode off: still give every character and head its locked
+                    // master layer on top, removing nothing.
+                    match self.doc.add_master_audio_guides() {
+                        Ok(report) => {
+                            self.status = Some(format!("Master audio added on top of {} character and head symbol(s)", report.symbols_given_guide));
+                            let scene = self.doc.scene().clone();
+                            self.sound.refresh(&scene);
+                        }
+                        Err(e) => self.status = Some(e),
+                    }
                 }
             }
             AddPerson => self.add_person(),
@@ -6498,6 +6543,9 @@ impl Editor {
     /// nothing, on a rig that works perfectly the moment the lamp is dragged an
     /// inch off centre.
     pub fn add_light(&mut self, kind: buzz_scene::LightKind) {
+        if !self.lights_at_root() {
+            return;
+        }
         let seen = self.light_frame();
         let kind = match kind {
             buzz_scene::LightKind::Lamp { height, radius, .. } => {
@@ -6590,6 +6638,22 @@ impl Editor {
         self.status = Some("Added a storm \u{2014} scrub the timeline to see it strike".into());
     }
 
+    /// **Lights belong to the main timeline only.** They light the stage, are
+    /// keyed on its frames and stand in its layer stack; inside a symbol the
+    /// playhead is the symbol's own, so a key made there landed on the wrong
+    /// frame of the film, and a light seemed to live in the symbol. While a
+    /// symbol is open: false, with the way back on the status line.
+    pub fn lights_at_root(&mut self) -> bool {
+        if self.doc.scene().edit_path().is_empty() {
+            return true;
+        }
+        self.status = Some(
+            "Lights are on the main timeline only \u{2014} leave the symbol (Edit \u{25b8} Edit Document) to add or change one"
+                .into(),
+        );
+        false
+    }
+
     /// Start a light drag, if a handle is under the pointer.
     ///
     /// Only with the Selection tool. On-stage handles belong to Selection the
@@ -6599,6 +6663,10 @@ impl Editor {
         // The same conditions the stage draws under, so what can be
         // grabbed is exactly what can be seen.
         if !self.light_panel.gizmos || !self.doc.scene().lights().enabled {
+            return false;
+        }
+        // Not drawn inside a symbol (`stage::draw_lights`), so not grabbed.
+        if !self.doc.scene().edit_path().is_empty() {
             return false;
         }
         if self.tool() != ToolId::Selection {
@@ -6897,10 +6965,11 @@ impl Editor {
         let mut imported = None;
         let mut placed = false;
         let fps = self.doc.scene().stage().frame_rate.max(1.0);
+        let frame = self.current_frame;
         self.doc.edit("Import Sound", |scene| {
             let id = scene.add_sound(&name, bytes, &format, rate, channels, length);
             imported = Some(id);
-            placed = place && place_sound_on_stage(scene, id, fps);
+            placed = place && place_sound_here(scene, id, fps, frame);
         });
         self.doc.end_gesture();
 
@@ -7206,15 +7275,19 @@ impl Editor {
             return;
         };
         let fps = self.doc.scene().stage().frame_rate.max(1.0);
+        let frame = self.current_frame;
+        let in_symbol = !self.doc.scene().edit_path().is_empty();
         let mut placed = false;
         self.doc.edit("Place Sound", |scene| {
-            placed = place_sound_on_stage(scene, id, fps);
+            placed = place_sound_here(scene, id, fps, frame);
         });
         self.doc.end_gesture();
         let scene = self.doc.scene().clone();
         self.sound.refresh(&scene);
-        self.status = Some(if placed {
-            format!("Placed {name} on a layer of its own from frame 1")
+        self.status = Some(if placed && in_symbol {
+            format!("Placed {name} on a layer of its own in this symbol from frame {} \u{2014} the main sound here, for lip sync", frame + 1)
+        } else if placed {
+            format!("Placed {name} on a layer of its own from frame 1 \u{2014} the main sound, for lip sync")
         } else {
             format!("{name} has no length to place")
         });
@@ -7316,32 +7389,25 @@ impl Editor {
             return;
         }
 
-        // **A sound inside a symbol is a sound nobody hears.**
-        //
-        // What plays and what is exported is `Scene::stage_cues`, which reads
-        // the document's own timeline; a cue put on a layer of the symbol that
-        // happened to be open would sit there for ever, silent on the stage and
-        // absent from the film, with the status bar cheerfully reporting that
-        // it was attached. Saying so is the only honest answer \u2014 attaching it
-        // somewhere the animator did not ask for would be worse.
-        if !self.doc.scene().edit_path().is_empty() {
-            self.status = Some(
-                "Sound goes on the main timeline. Leave this symbol first \
-                 (the breadcrumb above the stage), then attach it."
-                    .into(),
-            );
-            return;
-        }
-
+        // Inside a symbol too: its sound is heard while the symbol is open
+        // (`Scene::open_symbol_cues`) and lip sync there reads it \u{2014} though, as
+        // in Animate, a graphic symbol's sound is not heard from the main
+        // timeline.
+        let in_symbol = !self.doc.scene().edit_path().is_empty();
         let frame = self.current_frame;
         let mut attached = false;
         self.doc.edit("Attach Sound", |scene| {
             attached =
                 scene.set_frame_sound(layer, frame, Some(buzz_scene::SoundRef::stream(sound)));
+            if attached {
+                scene.set_main_sound_layer(layer);
+            }
         });
         self.doc.end_gesture();
 
-        self.status = Some(if attached {
+        self.status = Some(if attached && in_symbol {
+            "Sound attached in this symbol \u{2014} heard while it is open, and the main sound for lip sync here".into()
+        } else if attached {
             "Sound attached - press Enter to play".into()
         } else {
             "That frame is not a keyframe; press F6 first".to_string()
@@ -7374,7 +7440,8 @@ impl Editor {
     /// reassembles the map. See [`WaveformCache`].
     pub fn waveforms(&mut self) -> std::collections::BTreeMap<LayerId, buzz_ui::Waveform> {
         let revision = self.doc.scene().revision();
-        if self.waveform_cache.revision == Some(revision) {
+        let path = self.doc.scene().edit_path().to_vec();
+        if self.waveform_cache.revision == Some(revision) && self.waveform_cache.path == path {
             return self.waveform_cache.map.clone();
         }
         // Mid-drag the revision moves every pointer move, and no drag of
@@ -7388,7 +7455,9 @@ impl Editor {
         let fps_bits = fps.to_bits();
         let mut map = std::collections::BTreeMap::new();
 
-        for layer in self.doc.scene().stage_layers().iter() {
+        // The timeline being shown: an open symbol's own sound layers have
+        // their waveform there, as the main timeline's do.
+        for layer in self.doc.scene().layers().iter() {
             for keyframe in layer.frames.keyframes() {
                 let Some(reference) = keyframe.sound else {
                     continue;
@@ -7431,6 +7500,7 @@ impl Editor {
         }
 
         self.waveform_cache.revision = Some(revision);
+        self.waveform_cache.path = path;
         self.waveform_cache.map = map.clone();
         map
     }
@@ -7459,9 +7529,9 @@ impl Editor {
     pub fn lip_sync_choices(&self) -> (Option<String>, Vec<buzz_ui::Choice>, Vec<buzz_ui::Choice>) {
         let scene = self.doc.scene();
 
-        // The soundtrack comes from the document's own timeline, whichever
-        // symbol is open — which is the whole point, and is why it is named in
-        // the dialog rather than left implicit.
+        // The soundtrack: the open symbol's own main sound when it has one,
+        // else the document's own timeline whichever symbol is open — named in
+        // the dialog rather than left implicit (`SoundBank::stage_track`).
         let track = self.sound.stage_track(scene).map(|(id, start, clip)| {
             let name = scene
                 .sounds()
@@ -7474,10 +7544,25 @@ impl Editor {
             )
         });
 
+        // **Only mouths.** The whole library used to be offered, fog and
+        // trees first, and a fog picked by mistake went onto every key in
+        // place of the mouth — the mouth vanished. Offered now: the mouth
+        // chosen (picked on the stage, or made with New Mouth Symbol), and
+        // whatever stands on a layer called "mouth" on this timeline.
         let needed = buzz_audio::Viseme::COUNT;
-        let mouths = scene
-            .library()
+        let mut offered: Vec<buzz_scene::SymbolId> = self.lip_sync.mouth.map(buzz_scene::SymbolId).into_iter().collect();
+        if !self.lip_sync.only_layer {
+            for layer in scene.layers().iter().filter(|l| is_mouth_layer(&l.name)) {
+                for instance in layer.all_objects().filter_map(|o| o.instance()) {
+                    if !offered.contains(&instance.symbol) {
+                        offered.push(instance.symbol);
+                    }
+                }
+            }
+        }
+        let mouths = offered
             .iter()
+            .filter_map(|id| scene.library().get(*id))
             .map(|symbol| {
                 let length = symbol.length();
                 buzz_ui::Choice {
@@ -7495,13 +7580,22 @@ impl Editor {
 
         // The layers offered are those of the timeline being *edited*: the
         // mouth goes where you are working, which may be several symbols deep.
+        // A mouth picked on the stage offers its own layer alone; otherwise
+        // only layers called "mouth" — the eyebrows and the base are never
+        // where a lip sync goes. A picked mouth's layer under another name is
+        // renamed "mouth" when the sync runs (`apply_lip_sync_keys`).
+        let only = self.lip_sync.only_layer.then_some(self.lip_sync.layer).flatten();
         let layers = scene
             .layers()
             .iter()
+            .filter(|layer| match only {
+                Some(id) => layer.id.0 == id,
+                None => is_mouth_layer(&layer.name),
+            })
             .map(|layer| buzz_ui::Choice {
                 id: layer.id.0,
                 name: layer.name.clone(),
-                detail: String::new(),
+                detail: if is_mouth_layer(&layer.name) { String::new() } else { "renamed \u{201c}mouth\u{201d} when synced".into() },
                 usable: layer.kind.holds_artwork(),
             })
             .collect();
@@ -7518,14 +7612,107 @@ impl Editor {
     /// 0, but equally any other sound trimmed by hand — is analysed only
     /// over the section that actually plays here. See
     /// `docs/SEQUENCE_SETUPS_PLAN.md` S7.
-    pub fn run_lip_sync(&mut self) {
+    /// What a lip sync runs on: the soundtrack (cut to what plays), the frame
+    /// it starts on, the mouth chart, its layer, and where the mouth sits.
+    /// `None` (with the reason in the window) when something is missing.
+    pub fn lip_sync_inputs(&mut self) -> Option<(std::sync::Arc<buzz_audio::Clip>, u32, u64, u64, Affine)> {
         let scene = self.doc.scene().clone();
         let Some((_, start, clip)) = self.sound.stage_track_trimmed(&scene) else {
             self.lip_sync.result = Some("There is no sound on the main timeline".into());
-            return;
+            return None;
         };
         let (Some(mouth), Some(layer)) = (self.lip_sync.mouth, self.lip_sync.layer) else {
             self.lip_sync.result = Some("Choose a mouth symbol and a layer".into());
+            return None;
+        };
+        let placement = self.lip_sync_placement(mouth, layer);
+        Some((clip, start, mouth, layer, placement))
+    }
+
+    /// **The mouth layer of the timeline open**, for a Lip Sync opened with no
+    /// mouth picked: the active layer when it is called "mouth", else the
+    /// first layer that is, with the chart standing on it (if any).
+    pub fn mouth_layer_here(&self) -> Option<(buzz_scene::LayerId, Option<buzz_scene::SymbolId>)> {
+        let scene = self.doc.scene();
+        let active = self.selection.active_layer().and_then(|id| scene.layers().get(id)).filter(|l| is_mouth_layer(&l.name));
+        let layer = active.or_else(|| scene.layers().iter().find(|l| is_mouth_layer(&l.name)))?;
+        let chart = layer
+            .objects_at(self.current_frame)
+            .iter()
+            .chain(layer.all_objects())
+            .find_map(|o| o.instance().map(|i| i.symbol));
+        Some((layer.id, chart))
+    }
+
+    /// Where the lip-synced mouth goes on `layer`: where a mouth already on it
+    /// stands, else the middle of the layer's artwork, else the stage's.
+    fn lip_sync_placement(&self, mouth: u64, layer: u64) -> Affine {
+        let existing = self.doc.scene().layers().get(buzz_scene::LayerId(layer)).and_then(|l| {
+            l.objects_at(self.current_frame)
+                .iter()
+                .chain(l.all_objects())
+                .find(|o| o.instance().is_some_and(|i| i.symbol.0 == mouth))
+                .map(|o| o.transform)
+        });
+        existing
+            .or_else(|| {
+                self.doc
+                    .scene()
+                    .layers()
+                    .get(buzz_scene::LayerId(layer))
+                    .and_then(|l| l.bounds_at(self.current_frame))
+                    .map(|b| Affine::translate(b.center().to_vec2()))
+            })
+            .unwrap_or_else(|| {
+                let stage = self.doc.scene().stage().stage_rect();
+                Affine::translate(stage.center().to_vec2())
+            })
+    }
+
+    /// **Put what Rhubarb heard on the mouth**: `keys` as Animate visemes from
+    /// the sound's start, on the chart's frames as Set Visemes maps them (the
+    /// mapping stored on the chart in the same step). One undo step.
+    pub fn apply_lip_sync_keys(&mut self, keys: &[(u32, usize)], length: u32, start: u32, mouth: u64, layer: u64, placement: Affine) {
+        // The layer it was started on must still be the one open: Rhubarb
+        // answers a moment later, and a head left in the meantime (or a copy
+        // of it with the same layer ids) is not where these keys belong.
+        if self.doc.scene().layers().get(buzz_scene::LayerId(layer)).is_none_or(|l| {
+            l.all_objects().all(|o| o.instance().is_none_or(|i| i.symbol.0 != mouth)) && !is_mouth_layer(&l.name)
+        }) {
+            let message = "The mouth's layer is not open any more \u{2014} open its head and run Lip Sync again".to_string();
+            self.lip_sync.result = Some(message.clone());
+            self.status = Some(message);
+            return;
+        }
+        let visemes = self.lip_sync.visemes;
+        let mut report = None;
+        self.doc.edit("Lip Sync", |scene| {
+            // The layer a lip sync goes on is called "mouth", which is how a
+            // head's mouth is found again (Auto Lip Sync among others).
+            scene.update_layer(buzz_scene::LayerId(layer), |l| {
+                if !is_mouth_layer(&l.name) {
+                    l.name = "mouth".into();
+                }
+            });
+            let mouth_id = buzz_scene::SymbolId(mouth);
+            if let Some(mapping) = visemes
+                && buzz_act::face::animate_chart_of(scene, mouth_id) != Some(mapping)
+            {
+                buzz_act::face::set_animate_chart(scene, mouth_id, mapping);
+            }
+            let chart = buzz_act::face::animate_chart_of(scene, mouth_id)
+                .unwrap_or_else(|| buzz_act::face::animate_from_map(&buzz_act::face::viseme_map_of(scene, mouth_id)));
+            report = Some(buzz_act::lipsync::write_viseme_keys(scene, keys, length, start, buzz_scene::LayerId(layer), mouth_id, placement, &chart));
+        });
+        self.doc.end_gesture();
+        if let Some(report) = report {
+            self.lip_sync.result = Some(report.message.clone());
+            self.status = Some(report.message);
+        }
+    }
+
+    pub fn run_lip_sync(&mut self) {
+        let Some((clip, start, mouth, layer, placement)) = self.lip_sync_inputs() else {
             return;
         };
 
@@ -7534,24 +7721,16 @@ impl Editor {
             hold: self.lip_sync.hold,
         };
 
-        // The mouth is placed where the layer's existing artwork is, and only
-        // falls back to the middle of the stage when there is none. A mouth
-        // landing at the origin, off the character's face, would be the first
-        // thing to fix by hand every single time.
-        let placement = self
-            .doc
-            .scene()
-            .layers()
-            .get(buzz_scene::LayerId(layer))
-            .and_then(|l| l.bounds_at(self.current_frame))
-            .map(|b| Affine::translate(b.center().to_vec2()))
-            .unwrap_or_else(|| {
-                let stage = self.doc.scene().stage().stage_rect();
-                Affine::translate(stage.center().to_vec2())
-            });
-
         let mut outcome = None;
+        // The visemes set in the window go on the mouth chart first, so the
+        // keys below land on the chart's own frames (Animate's Set Visemes).
+        let visemes = self.lip_sync.visemes;
         self.doc.edit("Lip Sync", |scene| {
+            if let Some(mapping) = visemes
+                && buzz_act::face::animate_chart_of(scene, buzz_scene::SymbolId(mouth)) != Some(mapping)
+            {
+                buzz_act::face::set_animate_chart(scene, buzz_scene::SymbolId(mouth), mapping);
+            }
             outcome = Some(buzz_act::lipsync::apply(
                 scene,
                 &clip,
@@ -7786,6 +7965,25 @@ impl Editor {
     pub(crate) fn master_audio_import_refusal(&self) -> Option<String> {
         self.master_audio_lock()
             .map(|(_, name)| Self::master_audio_refusal_text(&name))
+    }
+
+    /// A character (every pose and head of it) just arrived: give it the
+    /// master's guide layer. Master Audio mode enforces the whole rule; with
+    /// the mode off but a master set, only the missing guides are added.
+    pub fn guide_new_characters(&mut self) {
+        if self.doc.master_audio_mode() {
+            self.enforce_master_audio_now();
+            return;
+        }
+        if self.doc.master_audio().is_none() {
+            return;
+        }
+        if let Ok(report) = self.doc.add_master_audio_guides() {
+            if report.symbols_given_guide > 0 {
+                let scene = self.doc.scene().clone();
+                self.sound.refresh(&scene);
+            }
+        }
     }
 
     /// Run `Document::enforce_master_audio` and say what it did on the status
@@ -8718,16 +8916,19 @@ impl Editor {
             config_dir: buzz_script::default_config_dir(),
             // The Assets panel's own folder. A script filing a cast there
             // is filing it where the panel will show it, which is the
-            // whole point of an asset outliving its document.
-            asset_root: buzz_doc::AssetLibrary::user()
-                .root()
-                .map(|p| p.to_path_buf()),
+            // whole point of an asset outliving its document. The library
+            // the editor already holds: `AssetLibrary::user()` would scan the
+            // whole folder — every asset opened, pictures decoded — before
+            // each run, seconds between a command's key and its effect.
+            asset_root: self.assets.root().map(|p| p.to_path_buf()),
             prompt_answers: answers,
             hooks: Default::default(),
             overrides: Vec::new(),
         };
 
         let mut working = self.doc.scene().clone();
+        let frame = self.current_frame;
+        let before = instance_timing(&working, frame);
         let outcome = buzz_script::run(
             &mut working,
             context,
@@ -8739,6 +8940,13 @@ impl Editor {
             return outcome;
         }
 
+        // In the same undo step: a body matched to the frame takes its head
+        // with it.
+        let nested = if outcome.changed && outcome.error.is_none() {
+            match_nested_frames(&mut working, frame, &before)
+        } else {
+            0
+        };
         if outcome.changed {
             self.doc.edit(label, |scene| *scene = working);
             self.doc.end_gesture();
@@ -8755,7 +8963,11 @@ impl Editor {
         }
         self.selection.ensure_active_layer(self.doc.scene());
 
-        self.status = Some(outcome.summary());
+        let mut status = outcome.summary();
+        if nested > 0 {
+            status.push_str(&format!("; {nested} symbol(s) inside also set to frame {}", frame + 1));
+        }
+        self.status = Some(status);
         outcome
     }
 
@@ -9156,10 +9368,37 @@ impl Editor {
         // matrix and its layer's parenting together say where the symbol's
         // space lands on the timeline that is open now; opening it in place
         // means drawing its contents through exactly that.
+        let hit = self.object_at(point, tolerance).filter(|id| {
+            self.doc.scene().find_object(*id).is_some_and(|(_, o)| o.instance().is_some())
+        });
+        match hit {
+            Some(id) => {
+                self.enter_instance_in_place(id);
+            }
+            None => {
+                // Nothing under the pointer: out one level, as Animate does.
+                let mut left = false;
+                self.doc.edit_view(|scene| left = scene.exit_symbol());
+                if left {
+                    self.library.selected = self.doc.scene().editing_symbol();
+                    self.after_context_change();
+                }
+            }
+        }
+    }
+
+    /// **Open the instance `object` in place**, as a double-click on it does:
+    /// drawn where it stands, on the frame it is showing. `false` when it is
+    /// not an instance on the open timeline.
+    pub fn enter_instance_in_place(&mut self, object: ObjectId) -> bool {
         let frame = self.current_frame;
+        // The copy on the keyframe under the playhead: an earlier keyframe's
+        // copy of the same id has its own First Frame, and opening through it
+        // started a head at frame 1 instead of the frame it was showing.
         let opened = self
-            .object_at(point, tolerance)
-            .and_then(|id| self.doc.scene().find_object(id))
+            .doc
+            .scene()
+            .find_object_at(frame, object)
             .and_then(|(layer, object)| {
                 let instance = object.instance()?;
                 let scene = self.doc.scene();
@@ -9188,6 +9427,7 @@ impl Editor {
             });
 
         match opened {
+            None => false,
             Some((id, place, inner, origin, depth)) => {
                 self.enter_frame = inner;
                 let mut entered = false;
@@ -9212,15 +9452,7 @@ impl Editor {
                         .unwrap_or_default();
                     self.status = Some(format!("Editing {name}"));
                 }
-            }
-            None => {
-                // Nothing under the pointer: out one level, as Animate does.
-                let mut left = false;
-                self.doc.edit_view(|scene| left = scene.exit_symbol());
-                if left {
-                    self.library.selected = self.doc.scene().editing_symbol();
-                    self.after_context_change();
-                }
+                entered
             }
         }
     }
@@ -9246,8 +9478,30 @@ impl Editor {
             return;
         };
 
+        // **On the frame the instance is showing**, as a double-click opens
+        // it: a head opened at the stage's frame 240 shows its own frame 240,
+        // so the shelf's "match the frame" command (F) and the mouth keys line
+        // up with the stage, instead of everything starting over at frame 1.
+        if from_instance.is_some() {
+            let frame = self.current_frame;
+            let scene = self.doc.scene();
+            self.enter_frame = self
+                .selection
+                .iter()
+                .next()
+                .and_then(|id| scene.find_object_at(frame, id))
+                .and_then(|(layer, object)| {
+                    let instance = object.instance()?;
+                    let symbol = scene.library().get(instance.symbol)?;
+                    let elapsed = scene.layers().get(layer).map(|l| elapsed_on(l, frame)).unwrap_or(0);
+                    Some(instance.resolve_frame(symbol.kind, elapsed, symbol.length()))
+                });
+        }
         let mut entered = false;
         self.doc.edit_view(|scene| entered = scene.enter_symbol(id));
+        if !entered {
+            self.enter_frame = None;
+        }
         if entered {
             self.library.selected = Some(id);
             self.after_context_change();
@@ -9411,6 +9665,7 @@ impl Editor {
             outcome = Some(Ok((report, arrived)));
         });
 
+        let placed = matches!(outcome, Some(Ok(_)));
         match outcome {
             Some(Ok((report, arrived))) if !arrived.is_empty() => {
                 // Arrives selected with the transform handles on it, exactly as
@@ -9432,6 +9687,11 @@ impl Editor {
                 self.status = Some(format!("Could not place {}: {e}", asset.name));
             }
             None => {}
+        }
+        // The character just placed (every pose of it) gets the master's
+        // guide layer at once, like the ones already here.
+        if placed {
+            self.guide_new_characters();
         }
     }
 
@@ -9536,8 +9796,28 @@ impl Editor {
         ));
     }
 
+    /// **Duplicate Symbol** — the selected instance's symbol, else the
+    /// Library's, copied as "<name> copy" with the name offered for typing.
+    ///
+    /// From the stage it is Animate's right-click ▸ Duplicate Symbol: the
+    /// instance is switched to the copy (on the keyframe under the playhead),
+    /// so the copy can be changed without touching every other use of the
+    /// original. It used to read the Library selection only, so on the stage
+    /// it copied whatever was last clicked in the Library, or nothing.
     fn duplicate_library_symbol(&mut self) {
-        let Some(id) = self.library.selected else {
+        let frame = self.current_frame;
+        let from_library = std::mem::take(&mut self.library.duplicate_from_library);
+        let instance = if from_library {
+            None
+        } else {
+            let scene = self.doc.scene();
+            self.selection.iter().find_map(|id| {
+                let (_, object) = scene.find_object_at(frame, id)?;
+                object.instance().map(|i| (id, i.symbol))
+            })
+        };
+        let Some(id) = instance.map(|(_, symbol)| symbol).or(self.library.selected) else {
+            self.status = Some("Select an instance on the stage or a symbol in the Library first".into());
             return;
         };
         let mut created = None;
@@ -9545,18 +9825,33 @@ impl Editor {
             let Some(source) = scene.library().get(id).cloned() else {
                 return;
             };
-            let new_id =
-                scene.add_symbol(source.name.clone(), source.kind, source.folder.as_deref());
+            let new_id = scene.add_symbol(
+                format!("{} copy", source.name),
+                source.kind,
+                source.folder.as_deref(),
+            );
             // Copying the layer stack wholesale shares every `Arc` inside it;
             // the artwork is only cloned if one of the two is edited.
             scene.library_mut().update(new_id, |s| {
                 s.layers = source.layers.clone();
                 s.registration = source.registration;
+                s.tags = source.tags.clone();
             });
+            if let Some((object, _)) = instance {
+                scene.update_object_at(frame, object, |o| {
+                    if let ObjectKind::Instance(i) = &mut o.kind {
+                        i.symbol = new_id;
+                    }
+                });
+            }
             created = Some(new_id);
         });
         if let Some(new_id) = created {
             self.library.selected = Some(new_id);
+            let name = self.doc.scene().library().get(new_id).map(|s| s.name.clone()).unwrap_or_default();
+            self.status = Some(format!("Duplicated as {name}"));
+            // The same offer Convert to Symbol and New Symbol make.
+            self.library.start_naming(new_id, name);
         }
     }
 
@@ -10285,7 +10580,7 @@ impl Editor {
         let frame = self.current_frame;
         let scene = self.doc.scene();
         self.selection.iter().find_map(|id| {
-            let (layer, object) = scene.find_object(id)?;
+            let (layer, object) = scene.find_object_at(frame, id)?;
             let instance = object.instance().filter(|i| i.symbol == symbol)?;
             let def = scene.library().get(instance.symbol)?;
             let elapsed = scene.layers().get(layer).map(|l| elapsed_on(l, frame)).unwrap_or(0);
@@ -12129,7 +12424,7 @@ impl Editor {
             self.status = Some("There is no frame here to copy".into());
             return;
         };
-        let clip: FrameClip = spans
+        let clipped: Vec<ClippedLayer> = spans
             .iter()
             .filter_map(|&(id, a, b)| {
                 let frames = &scene.layers().get(id)?.frames;
@@ -12140,8 +12435,17 @@ impl Editor {
                 Some(ClippedLayer { layer: id, offset: a - first, length: b - a + 1, drawings })
             })
             .collect();
-        let count: usize = clip.iter().flat_map(|c| &c.drawings).map(|(_, objects)| objects.len()).sum();
-        let layers = clip.len();
+        // Top layer first, as the timeline shows them, for the layers a paste
+        // elsewhere makes.
+        let mut stacked = spans.clone();
+        stacked.sort_by_key(|(l, ..)| scene.layers().index_of(*l).unwrap_or(usize::MAX));
+        let clip = FrameClip {
+            layers: clipped,
+            source: (self.doc.uid(), self.doc.scene_key(self.doc.active_scene()), scene.edit_path().to_vec()),
+            scene: scene.extract_frames(&stacked),
+        };
+        let count: usize = clip.layers.iter().flat_map(|c| &c.drawings).map(|(_, objects)| objects.len()).sum();
+        let layers = clip.layers.len();
         let last = spans.iter().map(|(_, _, b)| *b).max().unwrap_or(first);
         self.frame_clipboard = Some(clip);
 
@@ -12192,10 +12496,19 @@ impl Editor {
     /// pasted frames as it was. The objects are given fresh ids, so pasting
     /// twice gives two drawings rather than one shared between two frames.
     fn paste_frames(&mut self) {
-        let Some(clipboard) = self.frame_clipboard.clone() else {
+        let Some(clip) = self.frame_clipboard.clone() else {
             self.status = Some("There are no frames on the clipboard".into());
             return;
         };
+        // **Somewhere else** — another symbol, the main timeline, another
+        // document: the layers they came from are not here (or are other
+        // layers that happen to share an id), so they arrive as new layers.
+        let here = (self.doc.uid(), self.doc.scene_key(self.doc.active_scene()), self.doc.scene().edit_path().to_vec());
+        if clip.source != here || clip.layers.iter().any(|c| self.doc.scene().layers().get(c.layer).is_none()) {
+            self.paste_frames_as_layers(&clip);
+            return;
+        }
+        let clipboard = clip.layers;
 
         let frame = self.current_frame;
         let mut pasted = 0usize;
@@ -12262,6 +12575,49 @@ impl Editor {
             } else {
                 String::new()
             }
+        ));
+    }
+
+    /// **Paste Frames somewhere other than where they were copied**: each
+    /// copied layer arrives as a new layer named like it, on top of the
+    /// timeline being edited, its frames starting at the playhead — with the
+    /// symbols they use, as Paste brings them: one this document already holds
+    /// unchanged is not copied again, one from another document arrives as
+    /// its own. One undo step.
+    fn paste_frames_as_layers(&mut self, clip: &FrameClip) {
+        let mut lifted = clip.scene.clone();
+        let shared: Vec<buzz_scene::SymbolId> = lifted
+            .library()
+            .iter()
+            .filter(|s| self.doc.scene().library().get(s.id).is_some_and(|mine| **mine == ***s))
+            .map(|s| s.id)
+            .collect();
+        for id in shared {
+            lifted.library_mut().remove(id);
+        }
+        let frame = self.current_frame;
+        let before: Vec<LayerId> = self.doc.scene().layers().iter().map(|l| l.id).collect();
+        let mut arrived: Vec<LayerId> = Vec::new();
+        self.doc.edit("Paste Frames", |scene| {
+            scene.merge(&lifted, buzz_scene::ImportTarget::Stage);
+            arrived = scene.layers().iter().map(|l| l.id).filter(|id| !before.contains(id)).collect();
+            if frame > 0 {
+                for id in &arrived {
+                    scene.update_layer(*id, |l| l.frames.delay(frame));
+                }
+            }
+        });
+        self.doc.end_gesture();
+        if let Some(top) = arrived.first() {
+            self.selection.set_active_layer(Some(*top));
+        }
+        let count: usize = clip.layers.iter().flat_map(|c| &c.drawings).map(|(_, objects)| objects.len()).sum();
+        self.status = Some(format!(
+            "Pasted {count} object{} at frame {} on {} new layer{}",
+            if count == 1 { "" } else { "s" },
+            frame + 1,
+            arrived.len(),
+            if arrived.len() == 1 { "" } else { "s" },
         ));
     }
 
@@ -13230,15 +13586,23 @@ impl Editor {
     /// captures the whole camera.
     pub fn key_light_at(&mut self, id: buzz_scene::LightId, frame: u32) {
         self.doc.edit("Light Keyframe", |scene| {
-            let key = scene
-                .lights()
-                .get(id)
-                .map(|light| buzz_scene::LightKey::from_light(frame, light));
-            if let Some(key) = key
-                && let Some(light) = scene.lights_mut().get_mut(id)
-            {
+            let Some(light) = scene.lights().get(id).cloned() else { return };
+            // The light as it looks here: the track's state when it animates.
+            let animates = light.track.as_ref().is_some_and(|t| t.animates());
+            let shown = match &light.track {
+                Some(track) if animates => track.state_at(frame, &light),
+                _ => light.clone(),
+            };
+            let key = buzz_scene::LightKey::from_light(frame, &shown);
+            // The first key, made later than frame 1, also keys frame 1 as the
+            // light stands, so a change made at this key does not reach back.
+            let first = (!animates && frame > 0).then(|| buzz_scene::LightKey::from_light(0, &light));
+            if let Some(light) = scene.lights_mut().get_mut(id) {
                 let track = light.track.get_or_insert_with(buzz_scene::LightTrack::new);
                 track.enabled = true;
+                if let Some(first) = first.filter(|_| !track.has_key_at(0)) {
+                    track.set_key(first);
+                }
                 track.set_key(key);
             }
         });
@@ -14913,23 +15277,58 @@ impl Editor {
 
     // -- view ----------------------------------------------------------------
 
-    /// Zoom In / Zoom Out, the zoom buttons, Ctrl+wheel and a pinch: **about
-    /// the stage**, which ends up in the middle of the view — Animate's View ▸
-    /// Zoom keeps the stage centred rather than whatever had been scrolled to
-    /// the middle. The Zoom tool still zooms where it is clicked.
+    /// Zoom In / Zoom Out, the zoom buttons, Ctrl+wheel and a pinch.
+    /// **Zoom keeping what is in focus where it is on screen**: the selection
+    /// when some of it is in view, else the middle of the view. The view never
+    /// jumps back to the stage, so zooming in on a character's hand, or into a
+    /// symbol's artwork far from the stage, stays on it.
     pub fn zoom_by(&mut self, factor: f64) {
-        let centre = Point::new(
-            self.camera.viewport.width / 2.0,
-            self.camera.viewport.height / 2.0,
-        );
-        self.camera.zoom_by_at(factor, centre);
-        self.centre_on_stage();
+        let pivot = self.zoom_focus();
+        self.camera.zoom_by_at(factor, pivot);
     }
 
-    /// Set the zoom to `percent` with the stage in the middle of the view.
+    /// Zoom about a point on screen (the pointer's, for a pinch or the
+    /// wheel) — unless something is selected and in view, which then stays
+    /// put instead, as [`Self::zoom_by`] keeps it.
+    pub fn zoom_by_at(&mut self, factor: f64, screen: Point) {
+        let pivot = self.selection_on_screen().unwrap_or(screen);
+        self.camera.zoom_by_at(factor, pivot);
+    }
+
+    /// Set the zoom to `percent`, keeping what is in focus where it is (see
+    /// [`Self::zoom_by`]).
     pub fn set_zoom_centred(&mut self, percent: f64) {
-        self.camera.set_zoom_percent(percent);
-        self.centre_on_stage();
+        let now = self.camera.zoom_percent();
+        if now > 0.0 && percent.is_finite() && percent > 0.0 {
+            self.zoom_by(percent / now);
+        }
+    }
+
+    /// The screen point zooming keeps still: the selection's centre when it is
+    /// in view, else the middle of the view.
+    fn zoom_focus(&self) -> Point {
+        let middle = Point::new(self.camera.viewport.width / 2.0, self.camera.viewport.height / 2.0);
+        self.selection_on_screen().unwrap_or(middle)
+    }
+
+    /// The selection's centre on screen, when some of the selection is in view.
+    ///
+    /// Measured from where each object is **drawn on the stage** — through the
+    /// scene camera — not on the focal plane: at the root the camera moves the
+    /// artwork on screen, and a pivot taken before it zoomed about somewhere
+    /// else, so the object slid away (inside a symbol there is no camera,
+    /// which is why it only went wrong at the root).
+    fn selection_on_screen(&self) -> Option<Point> {
+        let bounds = self
+            .selection
+            .iter()
+            .filter_map(|id| self.object_quad(id))
+            .map(|quad| quad[1..].iter().fold(Rect::from_points(quad[0], quad[0]), |r, p| r.union_pt(*p)))
+            .reduce(|a, b| a.union(b))?;
+        let corners = [bounds.origin(), Point::new(bounds.x1, bounds.y1)].map(|p| self.camera.doc_to_screen(p));
+        let on_screen = Rect::from_points(corners[0], corners[1]);
+        let view = Rect::new(0.0, 0.0, self.camera.viewport.width, self.camera.viewport.height);
+        (on_screen.intersect(view).area() > 0.0 || view.contains(on_screen.center())).then(|| self.camera.doc_to_screen(bounds.center()))
     }
 
     /// Scroll so the stage's centre is the view's centre, zoom unchanged.
@@ -14941,6 +15340,23 @@ impl Editor {
         let stage = self.doc.scene().stage().stage_rect();
         self.camera.fit_to_rect(stage, 1.2);
     }
+}
+
+/// **A placed bitmap**, as Animate has it before Break Apart: a rectangle
+/// whose fill is the picture, selected like any object — an outline round it,
+/// not the dots of loose artwork. Break Apart bakes the placement into the
+/// fill and tiles it (see `break_apart_selection`); from then on it is paint,
+/// and dotted like paint.
+fn is_placed_bitmap(object: &Object) -> bool {
+    let ObjectKind::Shape(shape) = &object.kind else {
+        return false;
+    };
+    shape
+        .fill
+        .as_ref()
+        .and_then(|f| f.paint.image())
+        // Brush paint is a picture too, but it is drawing, and dotted as drawing.
+        .is_some_and(|image| !image.asset.painted && !(object.transform == Affine::IDENTITY && image.tile))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -15029,6 +15445,12 @@ pub fn is_character_symbol(symbol: &buzz_scene::Symbol) -> bool {
 /// `buzz_render::document::elapsed_on`, which a rendered instance uses for
 /// exactly the same reason `break_apart_selection` does: to open the frame an
 /// instance is *actually showing*, not always its first.
+/// Is this the layer a head's mouth lives on? Called "mouth", whatever the
+/// case — the one name lip sync looks for and gives.
+pub(crate) fn is_mouth_layer(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case("mouth")
+}
+
 fn elapsed_on(layer: &buzz_scene::Layer, frame: u32) -> u32 {
     frame
         - layer
@@ -15037,6 +15459,105 @@ fn elapsed_on(layer: &buzz_scene::Layer, frame: u32) -> u32 {
             .map(|k| k.start)
             .unwrap_or(0)
             .min(frame)
+}
+
+/// How every instance on the open timeline plays at `frame`: its First Frame
+/// and Looping, by id. Taken before a script runs, to see afterwards which
+/// instances it re-timed.
+fn instance_timing(scene: &Scene, frame: u32) -> std::collections::HashMap<ObjectId, (u32, buzz_scene::LoopMode)> {
+    scene
+        .layers()
+        .iter()
+        .flat_map(|layer| layer.objects_at(frame))
+        .filter_map(|o| o.instance().map(|i| (o.id, (i.first_frame, i.loop_mode))))
+        .collect()
+}
+
+/// **Carry "match the frame number" down into the symbols a script matched.**
+///
+/// The shelf's F (`setFrameOfSymbolsToCurrentFrame`) sets each symbol on the
+/// open timeline to show the frame the playhead is on — a body at the stage's
+/// frame 2300 shows its own frame 2300. The head inside the body kept
+/// whatever it was keyed to, so it took a second F from inside the body to
+/// line it up. Every instance the script re-timed (First Frame or Looping
+/// changed, compared with `before`) that now shows `frame` has the same done
+/// inside it, all the way down. Returns how many nested instances changed.
+fn match_nested_frames(
+    scene: &mut Scene,
+    frame: u32,
+    before: &std::collections::HashMap<ObjectId, (u32, buzz_scene::LoopMode)>,
+) -> usize {
+    let mut matched: Vec<buzz_scene::SymbolId> = Vec::new();
+    for layer in scene.layers().iter() {
+        let elapsed = elapsed_on(layer, frame);
+        for object in layer.objects_at(frame) {
+            let Some(instance) = object.instance() else { continue };
+            let Some(was) = before.get(&object.id) else { continue };
+            if *was == (instance.first_frame, instance.loop_mode) || instance.sync_to_root {
+                continue;
+            }
+            let Some(symbol) = scene.library().get(instance.symbol) else { continue };
+            if symbol.kind.follows_parent_timeline()
+                && instance.resolve_frame(symbol.kind, elapsed, symbol.length()) == frame
+            {
+                matched.push(instance.symbol);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    matched.into_iter().map(|symbol| match_frames_inside(scene, symbol, frame, &mut seen)).sum()
+}
+
+/// Inside `symbol` at its own `frame`, set every instance long enough to have
+/// that frame (the shelf script's own test) to show it, then do the same
+/// inside each of those. A mouth or an eye chart is a few frames long and is
+/// left alone, so a lip sync survives. Each symbol is visited once.
+fn match_frames_inside(
+    scene: &mut Scene,
+    symbol: buzz_scene::SymbolId,
+    frame: u32,
+    seen: &mut std::collections::HashSet<buzz_scene::SymbolId>,
+) -> usize {
+    if !seen.insert(symbol) {
+        return 0;
+    }
+    let Some(def) = scene.library().get(symbol) else {
+        return 0;
+    };
+    let mut sets: Vec<(LayerId, ObjectId, u32)> = Vec::new();
+    let mut inside: Vec<buzz_scene::SymbolId> = Vec::new();
+    for layer in def.layers.iter() {
+        let elapsed = elapsed_on(layer, frame);
+        for object in layer.objects_at(frame) {
+            let Some(instance) = object.instance() else { continue };
+            let Some(nested) = scene.library().get(instance.symbol) else { continue };
+            if !nested.kind.follows_parent_timeline() || instance.sync_to_root || frame >= nested.length() {
+                continue;
+            }
+            if instance.resolve_frame(nested.kind, elapsed, nested.length()) != frame {
+                let first = instance.first_frame_showing(frame, elapsed, nested.length());
+                sets.push((layer.id, object.id, first));
+            }
+            inside.push(instance.symbol);
+        }
+    }
+    let changed = sets.len();
+    if !sets.is_empty() {
+        scene.library_mut().update(symbol, |def| {
+            for (layer, id, first) in sets {
+                def.layers.update(layer, |layer| {
+                    let Some(keyframe) = layer.frames.keyframe_at_mut(frame) else { return };
+                    let objects = Arc::make_mut(&mut keyframe.objects);
+                    if let Some(object) = objects.iter_mut().find(|o| o.id == id)
+                        && let ObjectKind::Instance(instance) = &mut Arc::make_mut(object).kind
+                    {
+                        instance.first_frame = first;
+                    }
+                });
+            }
+        });
+    }
+    changed + inside.into_iter().map(|nested| match_frames_inside(scene, nested, frame, seen)).sum::<usize>()
 }
 
 /// The layer Extend Part writes, at the bottom of a part's symbol.
@@ -17691,6 +18212,33 @@ fn merge_shape_into_layer(
 /// the same silence by a different route.
 ///
 /// `false` when there was nothing to place \u2014 a sound of no length.
+/// Place `sound` on a new layer of the timeline being edited, and make that
+/// layer its main sound: on the main timeline from frame 1
+/// ([`place_sound_on_stage`]); in an open symbol from `frame`, the frame the
+/// playhead is on there.
+fn place_sound_here(scene: &mut buzz_scene::Scene, sound: buzz_scene::SoundId, fps: f64, frame: u32) -> bool {
+    if scene.edit_path().is_empty() {
+        return place_sound_on_stage(scene, sound, fps);
+    }
+    let Some(asset) = scene.sounds().get(sound) else { return false };
+    let (frames, name) = (asset.duration_frames(fps), asset.name.clone());
+    if frames == 0 {
+        return false;
+    }
+    let id = scene.add_layer(name, buzz_scene::LayerKind::Normal);
+    scene.update_layer(id, |layer| {
+        if frame > 0 {
+            layer.frames.insert_blank_keyframe(frame);
+        }
+        layer.frames.insert_frame(frame + frames.saturating_sub(1));
+        if let Some(keyframe) = layer.frames.keyframe_at_mut(frame) {
+            keyframe.sound = Some(buzz_scene::SoundRef::stream(sound));
+        }
+    });
+    scene.set_main_sound_layer(id);
+    true
+}
+
 fn place_sound_on_stage(
     scene: &mut buzz_scene::Scene,
     sound: buzz_scene::SoundId,
@@ -17722,6 +18270,11 @@ fn place_sound_on_stage(
             keyframe.sound = Some(buzz_scene::SoundRef::stream(sound));
         }
     });
+    // The newest sound layer is the one lip sync reads.
+    let ids: Vec<_> = scene.stage_layers().iter().map(|l| l.id).collect();
+    for other in ids {
+        scene.update_stage_layer(other, |l| l.main_sound = other == id);
+    }
     true
 }
 
@@ -19268,6 +19821,26 @@ mod tests {
         assert_eq!(starts(&e, sound), vec![0, 11]);
     }
 
+    /// **A placed picture is selected like an object** — an outline, no dots —
+    /// and only once broken apart is it dotted like paint.
+    #[test]
+    fn a_placed_picture_is_outlined_and_dotted_only_once_broken_apart() {
+        let dir = std::env::temp_dir().join(format!("buzz_pic_select_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("photo.png");
+        image::RgbaImage::from_pixel(40, 30, image::Rgba([10, 200, 90, 255])).save(&path).unwrap();
+        let mut e = editor();
+        e.import_image(&path).unwrap();
+        let placed = e.selection.ids()[0];
+        assert!(!e.shows_hatch(placed), "a placed picture is not dotted");
+        assert!(e.selected_drawn_shapes().is_empty());
+        e.run(Command::BreakApart);
+        let broken = e.selection.ids()[0];
+        assert!(e.shows_hatch(broken), "broken apart, it is paint");
+        assert_eq!(e.selected_drawn_shapes().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **A picture in use can be deleted from the Library**, as in Animate:
     /// it goes with every use of it — on the stage and inside a symbol — in
     /// one step, and Undo brings the lot back. It used to be refused for as
@@ -19367,6 +19940,123 @@ mod tests {
         assert_eq!((on(&e, 29), on(&e, 30)), (1, 0));
     }
 
+    /// **Copy Frames, pasted somewhere else** (⌘⌥C, ⌘⌥V): frames of two layers
+    /// copied on the main timeline and pasted inside a symbol — and then in
+    /// another document — arrive as new layers named like their sources,
+    /// starting at the playhead, with the symbol they use. It used to paste
+    /// nothing anywhere but the timeline it was copied from.
+    #[test]
+    fn copied_frames_paste_into_another_timeline_as_new_layers() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let first = e.selection.active_layer().expect("a layer");
+        let second = e.doc_add_layer("Eyes", buzz_scene::LayerKind::Normal);
+        let mut symbol = None;
+        e.doc.edit("Symbol", |scene| symbol = Some(scene.add_symbol("Pupil", buzz_scene::SymbolKind::Graphic, None)));
+        for layer in [first, second] {
+            e.selection.set_active_layer(Some(layer));
+            e.apply(ToolAction::AddShape { shape: ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE), label: "Draw" });
+        }
+        let pupil = symbol.expect("a symbol");
+        e.doc.edit("Place", |scene| {
+            scene.add_instance_at(second, 0, pupil, buzz_geom::Affine::IDENTITY);
+        });
+        // As the timeline stacks them, top first.
+        let names: Vec<String> = e.scene().layers().iter().filter(|l| l.id == first || l.id == second).map(|l| l.name.clone()).collect();
+        e.selection.set_timeline(buzz_ui::TimelineSelection::new([first, second], 0, 0, first, 0));
+        e.run(Command::CopyFrames);
+
+        // Inside the symbol, at frame 4.
+        e.doc.edit_view(|scene| {
+            scene.enter_symbol(pupil);
+        });
+        e.doc.edit("Long", |scene| {
+            let inner = scene.layers().iter().next().unwrap().id;
+            scene.update_layer(inner, |l| {
+                l.frames.insert_frame(9);
+            });
+        });
+        e.current_frame = 3;
+        let before = e.scene().layers().len();
+        e.run(Command::PasteFrames);
+        assert_eq!(e.scene().layers().len(), before + 2, "two new layers: {:?}", e.status);
+        let arrived: Vec<String> = e.scene().layers().iter().take(2).map(|l| l.name.clone()).collect();
+        assert_eq!(arrived, names, "named like the originals, in their order");
+        let top = e.scene().layers().iter().next().unwrap();
+        assert!(top.objects_at(2).is_empty() && !top.objects_at(3).is_empty(), "from the playhead on");
+
+        // Another document altogether, at its first frame: the symbol comes too.
+        e.doc = buzz_doc::Document::new(buzz_scene::Scene::default());
+        e.current_frame = 0;
+        e.run(Command::PasteFrames);
+        let scene = e.scene();
+        assert!(scene.library().iter().any(|s| s.name == "Pupil"), "the symbol the frames use came with them");
+        let eyes = scene.layers().iter().find(|l| l.name.starts_with("Eyes")).expect("the Eyes layer");
+        let instance = eyes.objects_at(0).iter().find_map(|o| o.instance().map(|i| i.symbol)).expect("the instance");
+        assert!(scene.library().get(instance).is_some(), "pointing at a symbol this document has");
+    }
+
+    /// **A light keyframe changes the light from there on, not before.**
+    /// Keyed at frame 21 and switched off there, the light stays on over
+    /// frames 1–20; made brighter at a key on frame 11, frames 1–10 keep the
+    /// old brightness, held rather than blended. It used to switch the light
+    /// off everywhere (on/off was not keyed), and a first key reached back to
+    /// frame 1.
+    #[test]
+    fn a_light_key_changes_the_light_from_there_on() {
+        let mut e = editor();
+        let mut id = None;
+        e.doc.edit("Light", |scene| id = Some(scene.add_light(buzz_scene::LightKind::Sun { azimuth: 0.0, elevation: 0.5 })));
+        let id = id.expect("a light");
+        let at = |e: &Editor, f: u32| e.scene().lights().keyed_at(f).get(id).cloned().expect("the light");
+        let intensity = at(&e, 0).intensity;
+
+        e.key_light_at(id, 20);
+        let mut off = at(&e, 20);
+        off.enabled = false;
+        e.doc.edit("Light Settings", |scene| crate::lights::apply_light_edit(scene, off, 20, false));
+        assert!(at(&e, 0).enabled && at(&e, 19).enabled, "on before the key");
+        assert!(!at(&e, 20).enabled && !at(&e, 40).enabled, "off from the key on");
+        assert!(e.scene().lights().is_active(), "lit somewhere, so the stage still lights");
+
+        e.key_light_at(id, 10);
+        let mut bright = at(&e, 10);
+        bright.intensity = intensity * 3.0;
+        e.doc.edit("Light Settings", |scene| crate::lights::apply_light_edit(scene, bright, 10, false));
+        assert_eq!(at(&e, 9).intensity, intensity, "frames before the key keep their brightness");
+        assert_eq!(at(&e, 15).intensity, intensity * 3.0, "held from the key, not blended");
+        assert!(at(&e, 15).enabled, "and still on until the off key");
+
+        // Saved and opened again, the same.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("lights.buzz");
+        e.doc.save_as(&path).expect("saved");
+        let back = buzz_doc::Document::open(&path).expect("opened");
+        let light = |f: u32| back.scene().lights().keyed_at(f).get(id).cloned().expect("the light");
+        assert!(light(19).enabled && !light(20).enabled);
+        assert_eq!(light(9).intensity, intensity);
+    }
+
+    /// **Equal Layer Lengths**: a drawing put on a short layer, or a layer made
+    /// longer, leaves every layer as long as the longest — in the same undo
+    /// step, so Undo takes the extension back with the edit.
+    #[test]
+    fn every_layer_runs_as_long_as_the_longest() {
+        let mut e = editor();
+        assert!(e.workspace.equal_layer_lengths, "on by default");
+        let first = e.selection.active_layer().expect("a layer");
+        let second = e.doc_add_layer("Second", buzz_scene::LayerKind::Normal);
+        e.doc.edit("Long", |scene| {
+            scene.update_layer(first, |l| {
+                l.frames.insert_frame(39);
+            });
+        });
+        let length = |e: &Editor, id: LayerId| e.scene().layers().get(id).unwrap().frames.length();
+        assert_eq!((length(&e, first), length(&e, second)), (40, 40), "the short layer was extended with it");
+        e.doc.undo();
+        assert_eq!(length(&e, first), length(&e, second), "and Undo takes both back together");
+    }
+
     /// **Cut Frames cuts the frame selected, nothing else.** Cmd+Opt+X on
     /// frame 5 of one layer emptied every layer, and the whole span that
     /// frame was in: the drawing before and after it, on every layer.
@@ -19439,8 +20129,10 @@ mod tests {
         assert_eq!(e.selection.active_layer(), Some(rows[rows.len() - 2]), "the bottom row hands it up");
     }
 
+    /// Frames whose layers have since been deleted are not lost: they paste
+    /// back as new layers, named like the ones they came from.
     #[test]
-    fn pasting_frames_whose_layers_are_gone_says_so() {
+    fn pasting_frames_whose_layers_are_gone_brings_them_back() {
         let mut e = editor();
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
         let layer = e.doc_add_layer("Doomed", buzz_scene::LayerKind::Normal);
@@ -19449,6 +20141,7 @@ mod tests {
             shape: ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE),
             label: "Draw",
         });
+        let name = e.scene().layers().get(layer).unwrap().name.clone();
         e.run(buzz_ui::Command::CopyFrames);
 
         // Take every layer the clipboard refers to away.
@@ -19459,19 +20152,9 @@ mod tests {
             }
         });
 
-        let before = e.scene().revision();
-        e.set_frame(4);
         e.run(buzz_ui::Command::PasteFrames);
-        let said = e.status.clone().unwrap_or_default();
-        assert!(
-            said.contains("gone") || said.contains("locked"),
-            "it should say why nothing was pasted, and said {said:?}"
-        );
-        assert_eq!(
-            e.scene().revision(),
-            before,
-            "and left the document exactly as it was"
-        );
+        let back = e.scene().layers().iter().find(|l| l.name == name).expect("the layer came back");
+        assert_eq!(back.objects_at(e.current_frame).len(), 1, "with its drawing: {:?}", e.status);
     }
 
     /// **A brush made from artwork keeps that artwork's colour.** The whole
@@ -21586,6 +22269,9 @@ mod tests {
     #[test]
     fn chrome_for_another_keyframe_uses_that_keyframes_parenting() {
         let mut e = editor();
+        // About layers of their own lengths.
+        e.workspace.equal_layer_lengths = false;
+        e.sync_protect_keyframes();
         let child_layer = e.active_layer().expect("a layer");
         let mut art = None;
 
@@ -25546,8 +26232,11 @@ mod tests {
     /// frame 2; the third is locked. Frames 2–4 of all three are selected.
     fn editor_with_frames_to_move() -> (Editor, [LayerId; 3]) {
         let mut e = editor();
-        // These are about what a lock protects, so the lock protects frames.
+        // These are about what a lock protects, so the lock protects frames;
+        // and about layers of their own lengths.
         e.workspace.frames_on_locked_layers = false;
+        e.workspace.equal_layer_lengths = false;
+        e.sync_protect_keyframes();
         let mut ids = Vec::new();
         e.doc.edit("Setup", |s| {
             for name in ["A", "B", "Locked"] {
@@ -27873,6 +28562,234 @@ mod tests {
             .expect("the character instance")
     }
 
+    /// A 300-frame body on the stage from frame 0, with a 300-frame head
+    /// inside and a 10-frame mouth chart inside that, held on its frame 4.
+    /// The head's layer is keyed at 0 and again at 120 by F6, so the same head
+    /// id is on both keyframes; the copy at 120 starts on `head_first`.
+    /// Returns the body and the head instances and the head and mouth symbols.
+    fn body_with_rekeyed_head(
+        e: &mut Editor,
+        head_first: u32,
+    ) -> (ObjectId, ObjectId, buzz_scene::SymbolId, buzz_scene::SymbolId) {
+        let mut made = None;
+        e.doc.edit("Fixture", |scene| {
+            let lengthen = |scene: &mut Scene, symbol, frames: u32| {
+                scene.library_mut().update(symbol, |s: &mut buzz_scene::Symbol| {
+                    let layer = s.layers.iter().next().expect("a layer").id;
+                    s.layers.update(layer, |l| {
+                        l.frames.insert_frame(frames - 1);
+                    });
+                });
+            };
+            let mouth = scene.add_symbol("Mouth", buzz_scene::SymbolKind::Graphic, None);
+            lengthen(scene, mouth, 10);
+            let head = scene.add_symbol("Head", buzz_scene::SymbolKind::Graphic, None);
+            let mouth_id = scene.next_object_id();
+            scene.library_mut().update(head, |s| {
+                let layer = s.layers.iter().next().expect("a layer").id;
+                s.layers.update(layer, |l| {
+                    let mut chart = Object::instance_of(mouth_id, mouth);
+                    if let ObjectKind::Instance(i) = &mut chart.kind {
+                        i.loop_mode = buzz_scene::LoopMode::SingleFrame;
+                        i.first_frame = 3;
+                    }
+                    l.frames.push_object(0, Arc::new(chart));
+                    l.frames.insert_frame(299);
+                });
+            });
+            let body = scene.add_symbol("Body", buzz_scene::SymbolKind::Graphic, None);
+            let head_id = scene.next_object_id();
+            scene.library_mut().update(body, |s| {
+                let layer = s.layers.iter().next().expect("a layer").id;
+                s.layers.update(layer, |l| {
+                    l.frames.push_object(0, Arc::new(Object::instance_of(head_id, head)));
+                    l.frames.insert_frame(299);
+                    l.frames.insert_keyframe(120);
+                    let key = l.frames.keyframe_at_mut(120).expect("the F6 key");
+                    for object in Arc::make_mut(&mut key.objects).iter_mut() {
+                        if let ObjectKind::Instance(i) = &mut Arc::make_mut(object).kind {
+                            i.first_frame = head_first;
+                        }
+                    }
+                });
+            });
+            let layer = scene.add_layer("Character", LayerKind::Normal);
+            let body_id = scene.next_object_id();
+            scene.add_object_at(layer, 0, Object::instance_of(body_id, body));
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(299);
+            });
+            made = Some((body_id, head_id, head, mouth));
+        });
+        made.expect("the fixture was built")
+    }
+
+    /// **Lights are the main timeline's alone.** Inside a symbol, adding or
+    /// keying a light is refused with the way back on the status line, and
+    /// nothing changes; back on the main timeline the same commands work.
+    #[test]
+    fn lights_are_added_and_keyed_on_the_main_timeline_only() {
+        let mut e = editor();
+        let character = place_nested_character(&mut e);
+        e.selection.select_one(character);
+        e.run(Command::EditSymbol);
+        assert!(!e.scene().edit_path().is_empty(), "inside the symbol");
+
+        for command in [Command::AddSun, Command::AddLamp, Command::AddFire, Command::AddStorm] {
+            e.run(command);
+            assert!(e.scene().lights().lights.is_empty(), "{command:?} added a light inside a symbol");
+            assert!(
+                e.status.as_deref().is_some_and(|s| s.contains("main timeline only")),
+                "{command:?}: {:?}",
+                e.status
+            );
+        }
+
+        e.run(Command::EditDocument);
+        assert!(e.scene().edit_path().is_empty(), "back on the main timeline");
+        e.run(Command::AddSun);
+        assert_eq!(e.scene().lights().lights.len(), 1, "the sun is added on the main timeline");
+        let sun = e.light_panel.selected.expect("the new sun is selected");
+
+        e.selection.select_one(character);
+        e.run(Command::EditSymbol);
+        e.set_frame(3);
+        e.run(Command::AddLightKeyframe);
+        assert!(
+            e.scene().lights().get(sun).is_some_and(|l| l.track.as_ref().is_none_or(|t| t.is_empty())),
+            "no key from inside the symbol"
+        );
+    }
+
+    /// **Duplicate Symbol on the stage** copies the selected instance's
+    /// symbol as "<name> copy", switches that instance to the copy and offers
+    /// the name for typing; the original stays in the Library. Raised from the
+    /// Library it copies the Library's symbol, whatever is selected on stage.
+    #[test]
+    fn duplicate_symbol_copies_the_selected_instance_and_switches_it() {
+        let mut e = editor();
+        let character = place_nested_character(&mut e);
+        let symbol_of = |e: &Editor| {
+            e.scene().find_object(character).and_then(|(_, o)| o.instance().map(|i| i.symbol)).expect("an instance")
+        };
+        let original = symbol_of(&e);
+        let name = e.scene().library().get(original).unwrap().name.clone();
+        let count = e.scene().library().iter().count();
+
+        e.selection.select_one(character);
+        e.run(Command::DuplicateSymbol);
+        let copy = symbol_of(&e);
+        assert_ne!(copy, original, "the instance now shows the copy");
+        assert_eq!(e.scene().library().get(copy).unwrap().name, format!("{name} copy"));
+        assert!(e.scene().library().get(original).is_some(), "the original stays");
+        assert_eq!(e.scene().library().iter().count(), count + 1);
+        assert_eq!(e.library.naming(), Some(copy), "the new name is offered for typing");
+        assert_eq!(
+            e.scene().library().get(copy).unwrap().length(),
+            e.scene().library().get(original).unwrap().length()
+        );
+
+        // From the Library: its own symbol, not the instance's.
+        e.library.selected = Some(original);
+        e.library.duplicate_from_library = true;
+        e.run(Command::DuplicateSymbol);
+        assert_eq!(symbol_of(&e), copy, "the stage instance is left alone");
+        let copied = e.library.selected.expect("the second copy is selected");
+        assert_ne!(copied, copy);
+        assert!(e.scene().library().get(copied).unwrap().name.starts_with(&format!("{name} copy")));
+    }
+
+    /// **A head opens on the frame it is showing, whichever way it is
+    /// opened.** F6 left the head's id on two keyframes inside the body; the
+    /// lookup met the frame-0 copy (First Frame 0) instead of the one under
+    /// the playhead (First Frame 120), so the head opened on its frame 30 —
+    /// or frame 1 when the playhead sat on the key — and F inside it then set
+    /// everything there to that frame.
+    #[test]
+    fn a_head_opens_on_the_frame_it_is_showing() {
+        for edit_symbol in [false, true] {
+            let mut e = editor();
+            let (body, head, _, _) = body_with_rekeyed_head(&mut e, 120);
+            e.set_frame(150);
+            assert!(e.enter_instance_in_place(body));
+            assert_eq!(e.current_frame, 150, "the body opens on the frame it shows");
+            if edit_symbol {
+                e.selection.select_one(head);
+                e.run(Command::EditSymbol);
+            } else {
+                assert!(e.enter_instance_in_place(head));
+            }
+            assert_eq!(
+                e.current_frame, 150,
+                "the head opened by {} on the frame it shows",
+                if edit_symbol { "Edit Symbol" } else { "a double-click" }
+            );
+        }
+    }
+
+    /// **F on the stage takes the head inside the body with it.** The shelf's
+    /// `setFrameOfSymbolsToCurrentFrame` sets the body to show frame 200; the
+    /// head inside it, keyed to play from its own frame 0, now shows 200 as
+    /// well, in the same undo step. The mouth chart inside the head is ten
+    /// frames long and keeps the pose it was held on.
+    #[test]
+    fn matching_the_frame_on_the_stage_matches_the_head_inside() {
+        let mut e = editor();
+        let (body, _, head, mouth) = body_with_rekeyed_head(&mut e, 0);
+        let character = e.scene().find_object(body).map(|(l, _)| l).expect("the body's layer");
+        e.doc.edit("Key", |scene| {
+            scene.update_layer(character, |l| {
+                l.frames.insert_keyframe(200);
+            });
+        });
+        e.set_frame(200);
+        let script = r#"
+            var tl = fl.getDocumentDOM().getTimeline();
+            var at = tl.currentFrame;
+            for (var i = 0; i < tl.layers.length; i++) {
+                var frame = tl.layers[i].frames[at];
+                if (!frame || !frame.elements) continue;
+                for (var j = 0; j < frame.elements.length; j++) {
+                    var el = frame.elements[j];
+                    if (el.libraryItem && at < el.libraryItem.timeline.frameCount) el.firstFrame = at;
+                }
+            }
+        "#;
+        let outcome = e.run_script_source("setFrameOfSymbolsToCurrentFrame", script, Vec::new(), true);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        fn shown(scene: &Scene, layers: &buzz_scene::LayerStack, frame: u32) -> Vec<(buzz_scene::SymbolId, u32, u32)> {
+            layers
+                .iter()
+                .flat_map(|l| {
+                    let elapsed = elapsed_on(l, frame);
+                    l.objects_at(frame).iter().filter_map(move |o| {
+                        let i = o.instance()?;
+                        let def = scene.library().get(i.symbol)?;
+                        Some((i.symbol, i.first_frame, i.resolve_frame(def.kind, elapsed, def.length())))
+                    })
+                })
+                .collect()
+        }
+        let scene = e.scene();
+        let stage = shown(scene, scene.layers(), 200);
+        assert_eq!(stage.iter().map(|s| s.2).collect::<Vec<_>>(), [200], "the body shows frame 200");
+        let body_symbol = stage[0].0;
+        let inside = shown(scene, &scene.library().get(body_symbol).unwrap().layers, 200);
+        assert_eq!(inside, [(head, 120, 200)], "the head inside shows the body's frame 200");
+        let in_head = shown(scene, &scene.library().get(head).unwrap().layers, 200);
+        assert_eq!(in_head, [(mouth, 3, 3)], "the mouth chart keeps its pose");
+        assert!(
+            e.status.as_deref().is_some_and(|s| s.contains("1 symbol(s) inside also set to frame 201")),
+            "{:?}",
+            e.status
+        );
+
+        e.run(Command::Undo);
+        let inside = shown(e.scene(), &e.scene().library().get(body_symbol).unwrap().layers, 200);
+        assert_eq!(inside[0].1, 0, "one undo puts the head back with the body");
+    }
+
     /// **A character measures its artwork, not a placeholder.**
     ///
     /// `Object::bounds` returns a two-unit box for an instance, because an
@@ -28201,21 +29118,70 @@ mod tests {
         assert_eq!(e.selection.iter().collect::<Vec<_>>(), vec![part], "and a click there selects it");
     }
 
-    /// **Zoom keeps the stage in the middle.** Scrolled off to one side, Zoom
-    /// In, Zoom Out and 100% all bring the stage's centre back to the view's.
+    /// **Zoom keeps what is in focus in focus.** With nothing selected, Zoom
+    /// In, Zoom Out and 100% keep the middle of the view where it is, wherever
+    /// the view was scrolled to; with something selected, it stays where it is
+    /// on screen however far the zoom goes.
     #[test]
-    fn zooming_centres_the_stage() {
+    fn zooming_keeps_the_focus() {
         let mut e = editor();
-        let stage = e.scene().stage().stage_rect().center();
         for command in [Command::ZoomIn, Command::ZoomOut, Command::ZoomActual] {
             e.camera.center = Point::new(-3000.0, 4000.0);
             e.run(command);
-            assert!((e.camera.center - stage).hypot() < 1e-6, "{command:?} left the view off the stage");
+            assert!((e.camera.center - Point::new(-3000.0, 4000.0)).hypot() < 1e-6, "{command:?} moved the view off what it showed");
         }
-        e.camera.center = Point::new(-3000.0, 4000.0);
         e.set_zoom_centred(250.0);
         assert!((e.camera.zoom_percent() - 250.0).abs() < 1e-9);
-        assert!((e.camera.center - stage).hypot() < 1e-6);
+
+        let mut e = editor();
+        e.run(Command::ZoomActual);
+        let id = draw_square(&mut e, 100.0, 100.0, 140.0, Color::WHITE).expect("a square");
+        e.selection.select_one(id);
+        let centre = e.selection_bounds_drawn().expect("drawn").center();
+        let before = e.camera.doc_to_screen(centre);
+        for command in [Command::ZoomIn, Command::ZoomIn, Command::ZoomOut, Command::ZoomActual] {
+            e.run(command);
+            let after = e.camera.doc_to_screen(centre);
+            assert!((after - before).hypot() < 1e-6, "{command:?} moved the selection on screen");
+        }
+        // A pinch or the wheel pivots on the selection too, not the pointer.
+        e.zoom_by_at(1.5, Point::new(5.0, 5.0));
+        assert!((e.camera.doc_to_screen(centre) - before).hypot() < 1e-6);
+        // With nothing selected it pivots on the pointer.
+        e.selection.clear();
+        let pointer = Point::new(30.0, 40.0);
+        let under = e.camera.screen_to_doc(pointer);
+        e.zoom_by_at(2.0, pointer);
+        assert!((e.camera.doc_to_screen(under) - pointer).hypot() < 1e-6);
+    }
+
+    /// At the root, **through a moved and zoomed scene camera**: the object is
+    /// drawn somewhere other than its focal-plane spot, and zooming has to hold
+    /// where it is drawn.
+    #[test]
+    fn zooming_keeps_the_focus_through_the_scene_camera() {
+        let mut e = editor();
+        e.run(Command::ZoomActual);
+        let id = draw_square(&mut e, 100.0, 100.0, 140.0, Color::WHITE).expect("a square");
+        e.run(Command::ToggleCamera);
+        e.doc.edit("Frame", |scene| {
+            let stage = scene.stage().size;
+            let mut key = scene.camera().state_at(0).expect("enabling the camera seeds a key");
+            key.frame = 0;
+            key.center = Point::new(stage.width / 2.0 - 90.0, stage.height / 2.0 + 40.0);
+            key.zoom = 1.4;
+            scene.camera_mut().set_key(key);
+        });
+        e.selection.select_one(id);
+        let drawn = |e: &Editor| {
+            let q = e.object_quad(id).expect("drawn");
+            e.camera.doc_to_screen(Point::new((q[0].x + q[2].x) / 2.0, (q[0].y + q[2].y) / 2.0))
+        };
+        let before = drawn(&e);
+        for command in [Command::ZoomIn, Command::ZoomIn, Command::ZoomOut] {
+            e.run(command);
+            assert!((drawn(&e) - before).hypot() < 1e-6, "{command:?} slid the selection off");
+        }
     }
 
     /// The same for a **symbol instance**, which is the case that matters:
@@ -29188,7 +30154,8 @@ mod tests {
         e.doc.edit("Setup", |scene| {
             let light = scene.lights_mut().get_mut(id).expect("just added");
             light.kind = buzz_scene::LightKind::lamp(Point::new(0.0, 0.0));
-            let key0 = buzz_scene::LightKey::from_light(0, light);
+            // A tween from frame 0 to 20: a blending key, not a holding one.
+            let key0 = buzz_scene::LightKey { tween: true, ..buzz_scene::LightKey::from_light(0, light) };
             let mut key1 = key0;
             key1.frame = 20;
             key1.kind = buzz_scene::LightKind::lamp(Point::new(200.0, 0.0));
@@ -29422,46 +30389,57 @@ mod tests {
         );
     }
 
-    /// A sound attached while a symbol is open would be neither heard nor
-    /// exported, so it is refused with the reason rather than silently lost.
+    /// **A sound in a symbol** (a scene kept in a symbol, with its own
+    /// dialogue): imported with the symbol open it lands on a new layer *in*
+    /// it, from the frame the playhead is on, and is that timeline's main
+    /// sound — heard while the symbol is open, its waveform shown, and what lip
+    /// sync reads there — while the main timeline's soundtrack is untouched.
+    /// Attaching a sound on another layer makes that one the main sound.
     #[test]
-    fn sound_is_not_attached_inside_a_symbol() {
+    fn a_sound_goes_into_the_open_symbol_as_its_main_sound() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("Line.wav");
-        std::fs::write(&path, test_wav(0.2)).expect("wrote the tone");
+        let outer = dir.path().join("Music.wav");
+        let inner = dir.path().join("Line.wav");
+        std::fs::write(&outer, test_wav(0.5)).expect("wrote the tone");
+        std::fs::write(&inner, test_wav(0.3)).expect("wrote the tone");
 
         let mut e = Editor::default();
-        e.import_sound(&path).expect("the sound imports");
+        e.import_sound(&outer).expect("the music imports");
+        assert!(e.scene().stage_layers().iter().any(|l| l.name == "Music" && l.main_sound), "the newest sound layer is the main one");
 
-        let symbol = e.doc.scene().library().iter().next().map(|s| s.id);
-        let symbol = match symbol {
-            Some(id) => id,
-            None => {
-                let mut made = None;
-                e.doc.edit("Symbol", |scene| {
-                    made = Some(scene.add_symbol("Head", buzz_scene::SymbolKind::Graphic, None));
-                });
-                e.doc.end_gesture();
-                made.expect("a symbol")
-            }
-        };
-        e.doc.edit("Enter", |scene| {
-            scene.enter_symbol(symbol);
-        });
+        let mut symbol = None;
+        e.doc.edit("Symbol", |scene| symbol = Some(scene.add_symbol("Scene", buzz_scene::SymbolKind::Graphic, None)));
         e.doc.end_gesture();
+        e.doc.edit_view(|scene| {
+            scene.enter_symbol(symbol.expect("a symbol"));
+        });
+        e.current_frame = 5;
+        e.import_sound(&inner).expect("the line imports");
 
-        let before = e.scene().stage_cues().len();
+        let layer = e.scene().layers().iter().find(|l| l.name == "Line").expect("a layer in the symbol");
+        let line = layer.id;
+        assert!(layer.main_sound, "the symbol's main sound");
+        assert_eq!(layer.frames.keyframe_at(5).and_then(|k| k.sound).map(|s| s.sync), Some(buzz_scene::SoundSync::Stream));
+        assert_eq!(e.scene().stage_cues().len(), 1, "the main timeline keeps just its own");
+        let cues = e.scene().open_symbol_cues();
+        assert_eq!((cues.len(), cues[0].start_frame), (1, 5), "heard in the symbol from frame 6");
+
+        let scene = e.scene().clone();
+        e.sound.refresh(&scene);
+        let line_sound = scene.sounds().iter().find(|s| s.name == "Line").map(|s| s.id);
+        assert_eq!(e.sound.stage_track(&scene).map(|t| (Some(t.0), t.1)), Some((line_sound, 5)), "lip sync reads the symbol's own line");
+        assert!(e.waveforms().contains_key(&line), "its waveform is on the symbol's timeline");
+
+        // Attach Sound on another layer of the symbol: that one becomes the main sound.
+        let mut other = None;
+        e.doc.edit("Layer", |scene| other = Some(scene.add_layer("Voice", buzz_scene::LayerKind::Normal)));
+        e.doc.end_gesture();
+        let other = other.expect("a layer");
+        e.selection.set_active_layer(Some(other));
+        e.current_frame = 0;
         e.attach_sound_to_frame();
-        assert_eq!(
-            e.scene().stage_cues().len(),
-            before,
-            "nothing was attached where nothing could be heard"
-        );
-        let said = e.status.clone().unwrap_or_default();
-        assert!(
-            said.contains("main timeline"),
-            "and the reason was given, got {said:?}"
-        );
+        assert!(e.scene().layers().get(other).is_some_and(|l| l.main_sound));
+        assert!(e.scene().layers().get(line).is_some_and(|l| !l.main_sound), "only one main sound per timeline");
     }
 
     /// A WAV of a 440 Hz tone, written rather than committed: a fixture would be

@@ -256,6 +256,13 @@ pub struct Layer {
     /// and XFL export skip it). `false` for every layer of every older document.
     pub audio_guide: bool,
 
+    /// **The main sound layer** of its timeline: the one lip sync reads, set on
+    /// the layer a sound was last placed or attached on (Import Sound, a sound
+    /// dragged from the Library, Attach Sound) and cleared on the others of the
+    /// same timeline. `false` everywhere in an older document, where the first
+    /// streamed sound is used as before.
+    pub main_sound: bool,
+
     /// **Where a lifted Cast character came from** (CAST_POSES_PLAN C2): on the
     /// layer folder of a character unpacked onto the stage, its Cast asset
     /// (`Cast/<Series>/<Name>`); on each layer of one of its poses,
@@ -325,6 +332,7 @@ impl Layer {
             depth: 0.0,
             collapsed: false,
             audio_guide: false,
+            main_sound: false,
             cast_source: None,
             filters: Vec::new(),
             frames: LayerTimeline::new(),
@@ -723,10 +731,13 @@ impl LayerStack {
             }
             _ => Affine::IDENTITY,
         };
+        // Resolved exactly as the layer is drawn: in its own parent's rest
+        // space (`resolved_at_rigged`). A wrist under a mirrored, unevenly
+        // scaled arm tweens differently that way than its stored matrix does,
+        // and passing the plain tween on left the palm up to 32 px off the
+        // wrist mid-tween, back in place on the keys.
         let anchor = |at: f64| {
-            layer
-                .frames
-                .resolved_at(at)
+            self.resolved_at_rigged(id, at)
                 .iter()
                 .next()
                 .map(|object| object.transform * through(object))
@@ -1602,6 +1613,63 @@ mod tests {
         // head — without anything having been keyed on the head at all.
         let moved = s.inherited_transform(LayerId(2), 10);
         assert_eq!(moved, Affine::translate((60.0, 0.0)));
+    }
+
+    /// **A layer passes on the motion it is drawn with.** A wrist under a
+    /// mirrored, unevenly scaled arm is tweened in the arm's rest space
+    /// (`resolved_at_rigged`); the palm following it inherited the plain tween
+    /// of the wrist's stored matrix instead, and slid off the wrist between
+    /// the keys — the hand scripts' palms, 32 px adrift mid-swing.
+    #[test]
+    fn a_followed_layer_passes_on_the_tween_it_is_drawn_with() {
+        use crate::object::{Object, ObjectId, ShapeData};
+        use buzz_geom::{Rect, Shape as _};
+
+        let square = |id: u64, t: Affine| {
+            Arc::new(
+                Object::shape(
+                    ObjectId(id),
+                    ShapeData::filled(Rect::new(0.0, 0.0, 20.0, 20.0).to_path(1e-9), Color::BLACK),
+                )
+                .with_transform(t),
+            )
+        };
+        let arm_rest = Affine::new([-0.52, 0.0, 0.0, 0.64, 100.0, 50.0]);
+        let mut arm = Layer::normal(LayerId(1), "Arm");
+        arm.frames.set_objects(0, vec![square(100, arm_rest)]);
+        arm.rest_pose = Some(arm_rest);
+
+        let start = arm_rest * Affine::translate((30.0, 0.0));
+        let mut wrist = Layer::normal(LayerId(2), "Wrist");
+        wrist.frames.set_objects(0, vec![square(200, start)]);
+        wrist.frames.insert_keyframe(10);
+        wrist.frames.set_objects(10, vec![square(200, start * Affine::rotate(0.8))]);
+        wrist.frames.set_tween(0, crate::tween::Tween::classic());
+        wrist.follows = Some(LayerId(1));
+        wrist.rest_pose = Some(start);
+
+        let mut palm = Layer::normal(LayerId(3), "Palm");
+        palm.follows = Some(LayerId(2));
+
+        let mut s = LayerStack::new();
+        s.push_front(arm);
+        s.push_front(wrist);
+        s.push_front(palm);
+
+        let drawn = |f: u32| s.resolved_at_rigged(LayerId(2), f).iter().next().unwrap().transform;
+        let plain = s.get(LayerId(2)).unwrap().frames.resolved_at(5).iter().next().unwrap().transform;
+        let apart = |a: Affine, b: Affine| {
+            a.as_coeffs().iter().zip(b.as_coeffs()).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max)
+        };
+        assert!(apart(plain, drawn(5)) > 0.01, "the fixture tweens differently the two ways");
+        for f in 0..=10 {
+            let passed = s.motion_of(LayerId(2), f);
+            assert!(
+                apart(passed, drawn(f) * start.inverse()) < 1e-9,
+                "frame {f}: the palm inherits {passed:?}, the wrist is drawn moved by {:?}",
+                drawn(f) * start.inverse()
+            );
+        }
     }
 
     /// Motion accumulates down a chain: hand follows arm follows body.

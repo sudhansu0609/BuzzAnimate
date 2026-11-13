@@ -93,6 +93,10 @@ struct StageStamp {
     /// **into** it. See the reuse test in `run`: it is what makes the frame
     /// after a brush stroke rebuild rather than keep the stale ink.
     painted_preview: bool,
+    /// The unlocked mask layer being drawn on, if the active layer is one: the
+    /// one mask the stage draws unclipped (`MaskDisplay::Editing`), so moving
+    /// on to or off it has to redraw.
+    mask_drawn_on: Option<u64>,
 }
 
 /// A batch of shading geometry being built off the UI thread.
@@ -713,6 +717,17 @@ enum AiResult {
     /// File > AI > Story to Screenplay (ANIMATE_COPILOT_PLAN B1): the cast
     /// lines and where `screenplay.md` was written.
     StoryConverted { cast: Vec<String>, screenplay: std::path::PathBuf },
+    /// The Lip Sync window's Sync, heard by Rhubarb: keys as Animate visemes
+    /// from the sound's start, and where they go.
+    LipSyncHeard {
+        keys: Vec<(u32, usize)>,
+        length: u32,
+        start: u32,
+        mouth: u64,
+        layer: u64,
+        placement: buzz_geom::Affine,
+        secs: f64,
+    },
     /// Sequence > Lip Sync All Characters (E3): the dialogue heard and matched to the script's lines.
     LipSyncAllHeard {
         lines: Vec<crate::scene_life::SpokenLine>,
@@ -1264,10 +1279,6 @@ pub struct App {
     /// Top-left of the stage this frame, so the right-click menu can turn a
     /// pointer position into a document point the way the tools do.
     stage_area_min: egui::Pos2,
-    /// While Space is held: whether a mouse button went down during it. A
-    /// press and release with no button between is a tap — Play/Pause; with
-    /// one it was the hold-to-pan gesture and plays nothing.
-    space_held: Option<bool>,
     /// AI ▸ Remove Object while it waits for clicks on the stage.
     remove_pick: Option<RemovePick>,
     thumbnails: crate::thumbnails::Thumbnails,
@@ -1315,6 +1326,22 @@ pub struct App {
     /// is a walk of the whole thing. Rebuilt when the open character changes or
     /// after a recolour writes it back. See [`Self::cast_panel`].
     cast_sheet: Option<CastSheet>,
+    /// **What each Cast character in a shot looked like when it arrived** —
+    /// cast in, or found when the shot was opened: `(document, scene, folder)`
+    /// → [`crate::cast_pose_edit::lifted_character_print`]. ⌘S writes a
+    /// character back over its Cast asset only when its print has moved, so a
+    /// shot that never touched it cannot undo what another shot saved.
+    cast_prints: std::collections::HashMap<(u64, usize, buzz_scene::LayerId), u64>,
+    /// The Rig panel's body slots of each timeline worked on, by edit path
+    /// (`rig_slots_path` is the one showing).
+    rig_slots_kept: std::collections::HashMap<Vec<u64>, (usize, Vec<Option<buzz_scene::ObjectId>>)>,
+    rig_slots_path: Option<Vec<u64>>,
+    /// The Rig panel's slots as they were last looked at, so a slot filled
+    /// since renames its layer once (`App::name_tagged_layers`).
+    rig_slots_seen: Vec<Option<buzz_scene::ObjectId>>,
+    /// Documents (and the master set on each) already given the master's
+    /// guide layers (`App::guide_with_master_audio`).
+    master_guided: std::collections::HashSet<(u64, String)>,
     /// The Export dialog's test render. See [`crate::preview`].
     preview: crate::preview::Preview,
     /// The whole film, playing in an overlay — Ctrl+Enter. See
@@ -1671,7 +1698,6 @@ impl App {
             animate_import: None,
             merging: false,
             stage_area_min: egui::Pos2::ZERO,
-            space_held: None,
             remove_pick: None,
             thumbnails: crate::thumbnails::Thumbnails::default(),
             asset_thumbnails: crate::thumbnails::AssetThumbnails::default(),
@@ -1695,6 +1721,11 @@ impl App {
             commands_ui: crate::commands_panel::CommandsPanel::default(),
             arrange_rx: None,
             cast_sheet: None,
+            cast_prints: std::collections::HashMap::new(),
+            rig_slots_kept: std::collections::HashMap::new(),
+            rig_slots_path: None,
+            rig_slots_seen: Vec::new(),
+            master_guided: std::collections::HashSet::new(),
             preview: crate::preview::Preview::default(),
             test_movie: None,
             test_movie_retired: Vec::new(),
@@ -3244,6 +3275,51 @@ fn keyboard_commands(ctx: &egui::Context, editor: &mut Editor) -> (Vec<Command>,
     (out, scripts)
 }
 
+/// Is an instance of `symbol` on a layer called `layer_name` a **mouth**: a
+/// symbol or layer named for a mouth or lips, or a chart with a frame per mouth
+/// shape — but never something that *holds* a mouth (a head, whose thousands
+/// of frames would otherwise pass for a chart).
+fn is_mouth(scene: &buzz_scene::Scene, symbol: buzz_scene::SymbolId, layer_name: &str) -> bool {
+    let Some(s) = scene.library().get(symbol) else {
+        return false;
+    };
+    if mouth_holder(scene, s).is_some() {
+        return false;
+    }
+    mouthy(&s.name) || mouthy(layer_name) || (s.length() >= buzz_audio::Viseme::COUNT && s.length() <= 120)
+}
+
+fn mouthy(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("mouth") || n.contains("lip")
+}
+
+/// The layer of `symbol` its mouth is on — directly, or inside a head on that
+/// layer — when it holds one.
+fn mouth_holder(scene: &buzz_scene::Scene, symbol: &buzz_scene::Symbol) -> Option<buzz_scene::LayerId> {
+    fn holds(scene: &buzz_scene::Scene, symbol: &buzz_scene::Symbol, depth: usize) -> Option<buzz_scene::LayerId> {
+        if depth > 4 {
+            return None;
+        }
+        // A mouth here first, then a head that has one.
+        let direct = symbol.layers.iter().find(|l| {
+            l.all_objects().any(|o| {
+                o.instance().and_then(|i| scene.library().get(i.symbol)).is_some_and(|inner| mouthy(&l.name) || mouthy(&inner.name))
+            })
+        });
+        if let Some(l) = direct {
+            return Some(l.id);
+        }
+        symbol.layers.iter().find_map(|l| {
+            l.all_objects().find_map(|o| {
+                let inner = scene.library().get(o.instance()?.symbol)?;
+                (inner.id != symbol.id && holds(scene, inner, depth + 1).is_some()).then_some(l.id)
+            })
+        })
+    }
+    holds(scene, symbol, 0)
+}
+
 /// One `VectorPartCandidate` per non-empty layer of `symbol`, covering
 /// *every* object drawn on that layer at frame 0 — not just the first, so a
 /// layer built from several shapes rigs as a whole instead of losing every
@@ -3752,7 +3828,8 @@ impl App {
     /// selected. Opening Layers yourself while something is selected keeps it
     /// open from then on — the panel is moved for you only until you say
     /// otherwise. A frame clicked in the timeline (which selects that frame's
-    /// artwork too) leaves the panels as they are.
+    /// artwork too) leaves the panels as they are. A Properties panel that
+    /// was closed is reopened in its default place.
     fn follow_selection_with_panels(&mut self) {
         use buzz_ui::PanelId;
         let picking = matches!(self.editor.tool(), buzz_ui::ToolId::Selection | buzz_ui::ToolId::Subselection);
@@ -3786,8 +3863,14 @@ impl App {
         }
         // Its layer, scrolled into view in the timeline.
         follow.reveal = follow.last.first().and_then(|id| self.editor.doc.scene().find_object(*id)).map(|(layer, _)| layer);
+        // Closed altogether: put it back where the default arrangement has
+        // it, so picking a symbol always shows its Looping, First frame and
+        // Frame Picker without a trip to the Window menu.
         if !workspace.is_open(PanelId::Properties) {
-            return;
+            workspace.restore_default_place(PanelId::Properties);
+            if !workspace.is_open(PanelId::Properties) {
+                return;
+            }
         }
         workspace.select_tab(PanelId::Properties);
         workspace.set_collapsed(PanelId::Properties, false);
@@ -4689,7 +4772,6 @@ impl App {
         self.jsfl_frame(&ctx);
         let (keyed, keyed_scripts) = keyboard_commands(&ctx, &mut self.editor);
         commands.extend(keyed);
-        commands.extend(self.space_tap(&ctx));
         // While a script owns the document — or an import is being merged —
         // nothing else may touch it, keyboard shortcuts included, which the
         // modal backdrop does not catch. The one thing still live is the
@@ -4820,6 +4902,13 @@ impl App {
         let mut state = std::mem::take(&mut self.editor.cast_panel);
         // What the sheet's pose list, Add Pose and Save changes need from the shell.
         state.library_symbols = self.editor.doc.scene().library().iter().map(|s| s.name.clone()).collect();
+        state.selected_symbol = {
+            let scene = self.editor.doc.scene();
+            self.editor.selection.iter().find_map(|id| match &scene.find_object(id)?.1.kind {
+                buzz_scene::ObjectKind::Instance(i) => scene.library().get(i.symbol).map(|s| s.name.clone()),
+                _ => None,
+            })
+        };
         state.character_poses = self.cast_sheet.as_ref().map(|s| crate::cast_pose_edit::pose_names(&s.scene)).unwrap_or_default();
         state.save_target =
             crate::cast_pose_edit::source_of(self.editor.doc.scene(), &self.editor.assets, self.editor.selection.iter().next());
@@ -4872,6 +4961,9 @@ impl App {
                 } else {
                     format!("Cast {} into the shot, breathing and blinking from frame {frame}", asset.name)
                 });
+                // Every pose and head of the character just cast gets the
+                // master's guide layer at once.
+                self.editor.guide_new_characters();
             }
             Some(Err(e)) => {
                 self.editor.doc.undo();
@@ -5666,42 +5758,6 @@ impl App {
         }
     }
 
-    /// **A tap of Space plays and pauses**, as in most editors an animator
-    /// comes from; holding Space and dragging still pans the stage. Decided
-    /// on release: a mouse button pressed while Space was down makes it a pan.
-    /// Skipped while a widget has keyboard focus (a space is being typed, or
-    /// egui is about to press the focused button) and when the user has bound
-    /// Play/Pause to Space themselves, which the keymap already handles.
-    fn space_tap(&mut self, ctx: &egui::Context) -> Option<Command> {
-        let bound_to_space = self
-            .editor
-            .workspace
-            .shortcut_for(Command::PlayPause)
-            .is_some_and(|s| s.logical_key == egui::Key::Space);
-        if ctx.memory(|m| m.focused().is_some()) || bound_to_space {
-            self.space_held = None;
-            return None;
-        }
-        let (down, pointer, plain) =
-            ctx.input(|i| (i.key_down(egui::Key::Space), i.pointer.any_down(), i.modifiers.is_none()));
-        match (&mut self.space_held, down) {
-            (None, true) => {
-                self.space_held = Some(pointer || !plain);
-                None
-            }
-            (Some(used), true) => {
-                *used |= pointer || !plain;
-                None
-            }
-            (Some(used), false) => {
-                let tap = !*used;
-                self.space_held = None;
-                tap.then_some(Command::PlayPause)
-            }
-            (None, false) => None,
-        }
-    }
-
     /// Commands a person may still raise while the Assistant runs: view,
     /// layout and playback only. Everything else would edit the document.
     pub(crate) fn user_command_allowed(&self, command: Command) -> bool {
@@ -5749,7 +5805,14 @@ impl App {
         use buzz_ui::PanelId::*;
         match id {
             Tools => {
-                if let Some(tool) = panels::tool_bar(ui, self.editor.tool(), &mut self.editor.style)
+                // The keys each tool really has (the user's keymap), for its tooltip.
+                let active = self.editor.tool();
+                let workspace = &self.editor.workspace;
+                let ctx = ui.ctx().clone();
+                let keys = |tool: buzz_ui::ToolId| -> Vec<String> {
+                    workspace.shortcuts_for(Command::SelectTool(tool)).iter().map(|s| ctx.format_shortcut(s)).collect()
+                };
+                if let Some(tool) = panels::tool_bar_with_keys(ui, active, &mut self.editor.style, &keys)
                 {
                     commands.push(Command::SelectTool(tool));
                 }
@@ -6471,6 +6534,14 @@ impl App {
                     focus_folders: self.editor.workspace.focus_folders,
                     protect_keyframes: self.editor.workspace.protect_scope(),
                     frames_on_locked_layers: self.editor.workspace.frames_on_locked_layers,
+                    key_names: {
+                        use Command::*;
+                        let ctx = ui.ctx();
+                        [FirstFrame, PreviousFrame, PlayPause, NextFrame, LastFrame, ToggleOnionSkin, ToggleAutoKeyframe, ToggleEditMultipleFrames]
+                            .into_iter()
+                            .map(|c| (c, self.editor.workspace.shortcuts_for(c).iter().map(|s| ctx.format_shortcut(s)).collect::<Vec<_>>().join(" or ")))
+                            .collect()
+                    },
                     layer_filter: self.editor.workspace.layer_filter,
                     layer_search: self.editor.layer_search.clone(),
                     row_filter,
@@ -7089,7 +7160,10 @@ impl App {
             self.commands_ui.ask(name, outcome.prompts.clone());
             return;
         }
-        let mut status = format!("{name}: {}", outcome.summary());
+        // The editor's status is the summary plus anything it did on top, such
+        // as carrying a matched frame down into the head.
+        let summary = self.editor.status.clone().unwrap_or_else(|| outcome.summary());
+        let mut status = format!("{name}: {summary}");
         if let Some(alert) = outcome.alerts.first() {
             status.push_str(&format!(" \u{2014} {alert}"));
         }
@@ -7130,6 +7204,21 @@ impl App {
     }
 
     fn light_panel(&mut self, ui: &mut egui::Ui) {
+        // Lights are the main timeline's alone (`Editor::lights_at_root`):
+        // inside a symbol the panel says so and offers the way back.
+        if !self.editor.scene().edit_path().is_empty() {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Lights are on the main timeline only.").strong());
+            ui.label(
+                egui::RichText::new("They light the whole stage and are keyed on its frames, so they are added and changed outside any symbol.")
+                    .weak(),
+            );
+            ui.add_space(4.0);
+            if ui.button("Back to the main timeline").clicked() {
+                self.dispatch(Command::EditDocument);
+            }
+            return;
+        }
         // What the last stage encode had to leave out, so the panel can say so
         // rather than leaving the animator to wonder why a lamp models nothing.
         // See `buzz_render::document::LightDetail`.
@@ -7229,6 +7318,12 @@ impl App {
             });
         }
 
+        if let Some(only) = response.set_shadows_only {
+            editor.doc.edit("Shadows Only", |scene| {
+                scene.lights_mut().shadows_only = only;
+            });
+        }
+
         if let Some(edges) = response.set_edges {
             editor.doc.edit("Light Edges", |scene| {
                 scene.lights_mut().edges = edges;
@@ -7268,7 +7363,57 @@ impl App {
         // Everything on the stage that could still become a limb, and — for a
         // character that has already been rigged from a pattern — what is
         // standing in each of its slots.
+        self.name_tagged_layers();
         let parts = rigging::loose_parts(self.editor.scene(), self.editor.frame());
+        // **The slots belong to the timeline they were filled on**: opening
+        // the head (or any symbol) puts the body's slots aside, and coming
+        // back out brings them back, instead of the parts list of the head
+        // emptying them.
+        //
+        // **Going deeper keeps them.** Opening the head *inside* the body is
+        // working on part of the same character, and the body list going
+        // empty the moment the head was opened read as the body rig being
+        // lost. Only a timeline that is not inside the one the slots were
+        // filled on (out to the stage, or another symbol) puts them aside.
+        let path: Vec<u64> = self.editor.scene().edit_path().iter().map(|s| s.0).collect();
+        let deeper = self.rig_slots_path.as_ref().is_some_and(|filled| path.starts_with(filled));
+        if self.rig_slots_path.as_ref() != Some(&path) && !deeper {
+            if let Some(old) = self.rig_slots_path.take() {
+                let state = &self.editor.rig_panel;
+                self.rig_slots_kept.insert(old, (state.pattern, state.slots.clone()));
+                let (pattern, slots) = self.rig_slots_kept.remove(&path).unwrap_or((self.editor.rig_panel.pattern, Vec::new()));
+                self.editor.rig_panel.pattern = pattern;
+                self.editor.rig_panel.slots = slots;
+                self.editor.rig_panel.armed = None;
+            }
+            self.rig_slots_path = Some(path);
+        }
+        // A slot's drawing on another keyframe of this timeline is still there
+        // — and so is one on a timeline this one is open inside (the body's
+        // arm, with the head open), named for the layer it is on.
+        let (alive, kept_names) = {
+            let scene = self.editor.scene();
+            let mut stacks: Vec<&buzz_scene::LayerStack> = vec![scene.stage_layers()];
+            stacks.extend(scene.edit_path().iter().filter_map(|id| scene.library().get(*id)).map(|s| &s.layers));
+            let mut alive = Vec::new();
+            let mut names = Vec::new();
+            for id in self.editor.rig_panel.slots.iter().flatten().copied() {
+                let found = stacks.iter().rev().find_map(|stack| {
+                    stack.iter().find_map(|l| {
+                        l.find_object(id)
+                            .filter(|o| !matches!(o.kind, buzz_scene::ObjectKind::Armature(_) | buzz_scene::ObjectKind::Warp(_)))
+                            .map(|o| o.name.clone().unwrap_or_else(|| l.name.clone()))
+                    })
+                });
+                if let Some(name) = found {
+                    alive.push(id);
+                    names.push((id, name));
+                }
+            }
+            (alive, names)
+        };
+        self.editor.rig_panel.alive = alive;
+        self.editor.rig_panel.kept_names = kept_names;
         let bound = selected
             .and_then(|id| self.editor.scene().find_object(id))
             .and_then(|(_, object)| match &object.kind {
@@ -7292,6 +7437,38 @@ impl App {
         // The Default limits table starts as the saved one.
         if self.editor.rig_panel.default_limits.is_none() {
             self.editor.rig_panel.default_limits = Some(crate::rig_limits::load_or_default());
+        }
+        // The head the Rig Head section works on, and the names its layers
+        // would get (the user's Shift+R names).
+        // **It stays on the head being rigged**: clicking a prop, an eye or
+        // empty stage does not swap it for another head (and lose the names
+        // picked for it); selecting a different head does.
+        self.editor.rig_panel.head = {
+            let scene = self.editor.doc.scene();
+            let picked = self
+                .editor
+                .selection
+                .iter()
+                .find_map(|id| scene.find_object(id).and_then(|(_, o)| o.instance().map(|i| i.symbol)));
+            let chosen = picked.and_then(|s| crate::rigging::head_symbol_for(scene, s));
+            let kept = self.editor.rig_panel.head.as_ref().map(|h| h.symbol).filter(|s| scene.library().get(*s).is_some());
+            chosen.or(kept).or_else(|| crate::rigging::head_target(scene, picked)).and_then(|id| {
+                let symbol = scene.library().get(id)?;
+                Some(buzz_ui::rig_panel::HeadSection {
+                    symbol: id,
+                    name: symbol.name.clone(),
+                    layers: symbol
+                        .layers
+                        .iter()
+                        .filter(|l| l.kind != buzz_scene::LayerKind::Folder)
+                        .map(|l| (l.id, l.name.clone(), crate::rigging::head_layer_name(l)))
+                        .collect(),
+                })
+            })
+        };
+        // The user's naming profile: the slots go by their names.
+        if self.editor.rig_panel.profile.is_none() {
+            self.editor.rig_panel.profile = crate::rigging::naming_profile(None).ok();
         }
         // **Convert to bone rig** is offered when the selection is a part of
         // a layer rig.
@@ -7327,6 +7504,21 @@ impl App {
             && let Some(object) = selected
         {
             self.convert_to_layer_rig(object);
+        }
+        if let Some((head, renames)) = response.name_head_layers {
+            let count = renames.len();
+            self.editor.doc.edit("Name Head Layers", |scene| {
+                scene.library_mut().update(head, |symbol| {
+                    for (layer, name) in &renames {
+                        symbol.layers.update(*layer, |l| l.name = name.clone());
+                    }
+                });
+            });
+            self.editor.doc.end_gesture();
+            self.editor.status = Some(format!("Named {count} head layer{}", if count == 1 { "" } else { "s" }));
+        }
+        if let Some(head) = response.rig_head {
+            let _ = self.editor.rig_head(Some(head));
         }
 
         if let Some(table) = response.save_default_limits {
@@ -7556,16 +7748,19 @@ impl App {
             self.editor.status = Some(format!("No rig pattern called {pattern_name}."));
             return;
         }
-        // The saved joint limits (`rig_limits.json`), not only the built-in ones.
-        let pattern = crate::rig_limits::pattern_with_saved_limits(pattern_name);
+        // The saved joint limits (`rig_limits.json`), not only the built-in
+        // ones — and the parts the user added to it in the Rig panel.
+        let pattern = self.editor.rig_panel.with_extras(crate::rig_limits::pattern_with_saved_limits(pattern_name));
         let frame = self.editor.frame();
         let count = slots.iter().filter(|s| s.is_some()).count();
         let mut built = None;
 
         if self.editor.rig_panel.kind == buzz_rig::RigKind::Layers {
             let mut layered = None;
+            // Each part's layer is named as it was tagged (the user's names).
+            let names: Vec<String> = pattern.slots.iter().map(|s| buzz_ui::rig_panel::slot_label(&self.editor.rig_panel, &s.name)).collect();
             self.editor.doc.edit("Rig Character (Layers)", |scene| {
-                layered = rigging::rig_character_layers(scene, frame, &pattern, slots);
+                layered = rigging::rig_character_layers_named(scene, frame, &pattern, slots, &|slot| names[slot].clone());
             });
             match layered {
                 Some(rig) => {
@@ -7723,11 +7918,56 @@ impl App {
     }
 
     /// Fill an armed slot with whatever drawing was clicked on the stage.
+    /// **A tagged part's layer takes the tag's name.** Every slot filled
+    /// since the panel last looked (a click on the stage, a drop, Auto) renames
+    /// the layer its drawing is on to the slot's name — the user's own
+    /// (`leftArm`, `leftWrist`) — so the timeline reads like the rig and the
+    /// shelf's commands find the layers. Only a layer that holds that drawing
+    /// alone: one holding several parts is left as it is. One undo step.
+    fn name_tagged_layers(&mut self) {
+        let slots = self.editor.rig_panel.slots.clone();
+        let seen = std::mem::replace(&mut self.rig_slots_seen, slots.clone());
+        if seen.len() != slots.len() {
+            return;
+        }
+        let pattern = self.editor.rig_panel.pattern();
+        let frame = self.editor.frame();
+        let scene = self.editor.scene();
+        let renames: Vec<(buzz_scene::LayerId, String)> = slots
+            .iter()
+            .enumerate()
+            .filter(|(i, held)| held.is_some() && seen.get(*i) != Some(held))
+            .filter_map(|(i, held)| {
+                let (layer, _) = scene.find_object((*held)?)?;
+                let l = scene.layers().get(layer)?;
+                let name = buzz_ui::rig_panel::slot_label(&self.editor.rig_panel, &pattern.slots.get(i)?.name);
+                (l.objects_at(frame).len() == 1 && l.name != name).then_some((layer, name))
+            })
+            .collect();
+        if renames.is_empty() {
+            return;
+        }
+        let said: Vec<String> = renames.iter().map(|(_, n)| n.clone()).collect();
+        self.editor.doc.edit("Name Tagged Layers", |scene| {
+            for (layer, name) in renames {
+                scene.update_layer(layer, |l| l.name = name);
+            }
+        });
+        self.editor.status = Some(format!("Layer named {}", said.join(", ")));
+    }
+
     fn pick_part_for_slot(&mut self, slot: usize, screen: buzz_geom::Point) {
         let at = self.editor.screen_to_edit(screen);
         let frame = self.editor.frame();
 
-        match rigging::part_at(self.editor.scene(), frame, at) {
+        // What a click there would select, exactly (through instances,
+        // parenting and depth), when it is a loose part; else the topmost part
+        // whose drawing's box holds the point.
+        let hit = self.editor.object_at(at, self.editor.pick_tolerance());
+        let picked = hit
+            .and_then(|id| rigging::loose_parts(self.editor.scene(), frame).into_iter().find(|p| p.object == id))
+            .or_else(|| rigging::part_at(self.editor.scene(), frame, at));
+        match picked {
             Some(part) => {
                 let name = part.name.clone();
                 self.editor.rig_panel.assign(slot, part.object);
@@ -8042,6 +8282,13 @@ impl App {
             // from; a plain click already moved it through `select_layer`
             // above, so this only matters for the toggle case.
             self.editor.set_range_anchor(anchor);
+        }
+        if let Some((layer, name)) = response.rename_layer.clone() {
+            self.editor.doc.edit("Rename Layer", |scene| {
+                scene.update_layer(layer, |l| l.name = name.clone());
+            });
+            self.editor.doc.end_gesture();
+            self.editor.status = Some(format!("Renamed the layer {name}"));
         }
         if let Some(layer) = response.toggle_collapsed {
             // I2: the disclosure triangle — undoable, matching how the
@@ -8736,8 +8983,16 @@ impl App {
         // against the Layers panel with no gap and in almost the same grey, and
         // what a user sees then is the panel wearing a scrollbar. The stage's
         // furniture has to look like the stage's.
-        let track_colour = egui::Color32::from_black_alpha(70);
-        let thumb_colour = buzz_ui::Palette::text_dim().gamma_multiply(0.85);
+        //
+        // **Two-tone, so they read on any background.** Inside a symbol the
+        // faded stage behind them is often white, where a grey thumb on a faint
+        // dark track all but vanished. A light thumb with a dark edge, on a
+        // dark track with a light edge, stands out on white and on the dark
+        // pasteboard alike — the way the system's own overlay scrollbars do.
+        let track_colour = egui::Color32::from_black_alpha(110);
+        let track_edge = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70));
+        let thumb_colour = egui::Color32::from_gray(225);
+        let thumb_edge = egui::Stroke::new(1.0, egui::Color32::from_black_alpha(190));
         let thumb_hot = buzz_ui::Palette::active();
         // Clear of the panel edge, and clear of the corner where the two bars
         // would otherwise meet.
@@ -8760,9 +9015,8 @@ impl App {
             );
             let (thumb, fraction) =
                 thumb_of(track, extent.x0, extent.x1, visible.x0, visible.x1, true);
-            ui.painter()
-                .rect_filled(track, THICKNESS / 2.0, track_colour);
-            ui.painter().rect_filled(
+            ui.painter().rect(track, THICKNESS / 2.0, track_colour, track_edge, egui::StrokeKind::Inside);
+            ui.painter().rect(
                 thumb,
                 THICKNESS / 2.0,
                 if response.hovered() || response.dragged() {
@@ -8770,6 +9024,8 @@ impl App {
                 } else {
                     thumb_colour
                 },
+                thumb_edge,
+                egui::StrokeKind::Inside,
             );
 
             // Dragging the thumb, or clicking anywhere on the track, puts the
@@ -8799,9 +9055,8 @@ impl App {
                 egui::Sense::click_and_drag(),
             );
             let (thumb, _) = thumb_of(track, extent.y0, extent.y1, visible.y0, visible.y1, false);
-            ui.painter()
-                .rect_filled(track, THICKNESS / 2.0, track_colour);
-            ui.painter().rect_filled(
+            ui.painter().rect(track, THICKNESS / 2.0, track_colour, track_edge, egui::StrokeKind::Inside);
+            ui.painter().rect(
                 thumb,
                 THICKNESS / 2.0,
                 if response.hovered() || response.dragged() {
@@ -8809,6 +9064,8 @@ impl App {
                 } else {
                     thumb_colour
                 },
+                thumb_edge,
+                egui::StrokeKind::Inside,
             );
 
             if (response.dragged() || response.clicked())
@@ -9115,7 +9372,7 @@ impl App {
                             .selectable_label(false, format!("{preset:.0}%"))
                             .clicked()
                         {
-                            self.editor.camera.set_zoom_percent(preset);
+                            self.editor.set_zoom_centred(preset);
                         }
                     }
                     ui.separator();
@@ -9139,7 +9396,7 @@ impl App {
                     .suffix(" %"),
             );
             if response.changed() {
-                self.editor.camera.set_zoom_percent(percent);
+                self.editor.set_zoom_centred(percent);
             }
             ui.label("Zoom");
         });
@@ -9203,6 +9460,16 @@ impl App {
             }
         }
         let has_selection = has_selection || !self.editor.selection.is_empty();
+        // A mouth, or a head (or body) with one inside: lip sync reaches it.
+        let mouth = self.selected_mouth().map(|_| ()).or_else(|| {
+            let scene = self.editor.doc.scene();
+            self.editor.selection.iter().find_map(|id| {
+                let (_, object) = scene.find_object(id)?;
+                let symbol = scene.library().get(object.instance()?.symbol)?;
+                mouth_holder(scene, symbol).map(|_| ())
+            })
+        });
+        let mut lip_sync_mouth = false;
         response.context_menu(|ui| {
             let mut item = |ui: &mut egui::Ui, command: Command, enabled: bool| {
                 if ui
@@ -9214,6 +9481,11 @@ impl App {
                 }
             };
 
+            // A mouth right-clicked: lip-sync it, here and now.
+            if mouth.is_some() && ui.button("Lip Sync This Mouth\u{2026}").clicked() {
+                lip_sync_mouth = true;
+                ui.close();
+            }
             item(ui, Command::Cut, has_selection);
             item(ui, Command::Copy, has_selection);
             item(ui, Command::Paste, true);
@@ -9247,6 +9519,9 @@ impl App {
                     .find_object(id)
                     .is_some_and(|(_, o)| o.instance().is_some())
             });
+            // Animate's right-click ▸ Duplicate Symbol: a copy to change on its
+            // own, and this instance switched to it.
+            item(ui, Command::DuplicateSymbol, has_instance);
             item(ui, Command::ClearAllKeyframes, has_instance);
             // Pose > list, for a Cast character (CAST_POSES_PLAN C2): switches it
             // from the playhead on.
@@ -9299,6 +9574,9 @@ impl App {
             item(ui, Command::SelectAll, true);
         });
 
+        if lip_sync_mouth && self.user_command_allowed(Command::LipSync) {
+            self.dispatch(Command::LipSync);
+        }
         if let Some(command) = raised
             && self.user_command_allowed(command)
         {
@@ -9492,9 +9770,12 @@ impl App {
             let (zoom, scroll) = ctx.input(|i| (i.zoom_delta() as f64, i.smooth_scroll_delta));
 
             if zoom != 1.0 {
-                // About the stage, as the zoom commands are: the stage stays
-                // in the middle of the view however far in it goes.
-                self.editor.zoom_by(zoom);
+                // About the selection when it is in view, else about the
+                // pointer: what is in focus stays where it is.
+                match ctx.input(|i| i.pointer.hover_pos()) {
+                    Some(pos) => self.editor.zoom_by_at(zoom, local(pos)),
+                    None => self.editor.zoom_by(zoom),
+                }
             } else if scroll != egui::Vec2::ZERO {
                 // Taken as it comes: egui has already applied Shift for
                 // horizontal and Alt for vertical, which is where the old
@@ -10656,10 +10937,9 @@ impl App {
             config_dir,
             // The Assets panel's own folder. A script filing a cast there
             // is filing it where the panel will show it, which is the
-            // whole point of an asset outliving its document.
-            asset_root: buzz_doc::AssetLibrary::user()
-                .root()
-                .map(|p| p.to_path_buf()),
+            // whole point of an asset outliving its document. The editor's
+            // library, already scanned (see `Editor::run_script_source`).
+            asset_root: self.editor.assets.root().map(|p| p.to_path_buf()),
             // Questions are put to the person in a dialog (the hooks below);
             // these are only for a run with no hook.
             prompt_answers: Vec::new(),
@@ -10723,7 +11003,21 @@ impl App {
         let wants_save = outcome.save_requested;
 
         // Computed before the outcome is taken apart below.
-        let summary = outcome.summary();
+        let mut summary = outcome.summary();
+        // **A command that found nothing to work on says so.** The eye, brow
+        // and limb commands look for their layers by name on the timeline that
+        // is open (`leftEyebrow`, `eyeBall`, `leftArm`…) and quietly do nothing
+        // when they are not there — run at the root, say, rather than inside
+        // the head. Name the timeline, so the reason is not a mystery.
+        if !outcome.changed && outcome.error.is_none() {
+            let place = match self.editor.doc.scene().editing_symbol().and_then(|s| self.editor.doc.scene().library().get(s)) {
+                Some(symbol) => format!("inside {}", symbol.name),
+                None => "on the main timeline".to_string(),
+            };
+            summary = format!(
+                "{label} changed nothing {place} \u{2014} it looks for its layers by name; open the symbol that has them (the head for eyes and brows, the body for limbs), or run Shift+R / Ctrl+R to name them"
+            );
+        }
 
         // The script's view of the editor becomes the editor's, so
         // `t.currentFrame = 5` moves the playhead and `d.selectAll()` leaves
@@ -11471,10 +11765,19 @@ impl App {
         };
         state.confidence = plan.confidence;
         state.low_confidence = plan.low_confidence;
+        // The user's names for the parts (`leftArm`, `leftWrist` — their
+        // Ctrl+R convention), the generic one beside it.
+        let profile = crate::rigging::naming_profile(None).ok();
         state.slots = pattern
             .slots
             .iter()
-            .map(|s| buzz_rig::pattern::display_slot_name(&s.name).to_string())
+            .map(|s| {
+                let generic = buzz_rig::pattern::display_slot_name(&s.name).to_string();
+                match buzz_ui::rig_panel::profile_name(profile.as_ref(), &s.name) {
+                    Some(mine) if mine != generic => format!("{mine} ({generic})"),
+                    _ => generic,
+                }
+            })
             .collect();
         state.rows = plan
             .pieces
@@ -11722,6 +12025,12 @@ impl App {
                     transcript.segments.len(),
                     (transcript.load_ms + transcript.run_ms) as f64 / 1000.0
                 ));
+            }
+            AiResult::LipSyncHeard { keys, length, start, mouth, layer, placement, secs } => {
+                self.editor.apply_lip_sync_keys(&keys, length, start, mouth, layer, placement);
+                if let Some(status) = self.editor.status.as_mut() {
+                    status.push_str(&format!(" \u{2014} heard by Rhubarb in {secs:.1} s"));
+                }
             }
             AiResult::LipSyncAllHeard { lines, visemes, start, notes, secs, model } => {
                 match self.editor.lip_sync_all_apply(&lines, &visemes, start) {
@@ -12889,7 +13198,7 @@ impl App {
                     progress.set(step, 4);
                     progress.detail(what);
                 };
-                let opts = crate::bg_objects::ObjectOptions { trace: crate::backdrop::BackdropOptions::default(), max_objects: 16, small_objects: true, redetect };
+                let opts = crate::bg_objects::ObjectOptions { trace: crate::backdrop::BackdropOptions::default(), max_objects: 16, small_objects: true, redetect, ..Default::default() };
                 match crate::split_artwork::plan_split(&scene, layer, frame, ids.as_deref(), &opts, &mut note) {
                     Ok(plan) => {
                         let _ = send.send(AiResult::SplitArtwork(Box::new(plan)));
@@ -13145,6 +13454,7 @@ impl App {
                     cuts: o.cuts.iter().filter(|c| present.contains(&c.id)).cloned().collect(),
                     filler: o.filler.clone(),
                     filler_at: o.filler_at,
+                    outline: o.outline.clone(),
                 });
             }
         }
@@ -14239,6 +14549,8 @@ impl App {
     /// applying a result is an ordinary edit at an ordinary moment rather than
     /// another thread reaching into the document.
     fn poll_tasks(&mut self) {
+        self.guide_with_master_audio();
+        self.note_cast_prints();
         let mut ai_done = false;
         for (id, kind, outcome) in self.tasks.poll() {
             ai_done |= matches!(kind, crate::tasks::TaskKind::Ai | crate::tasks::TaskKind::Trace);
@@ -15173,15 +15485,132 @@ impl App {
     /// Open the Lip Sync dialog.
     fn open_lip_sync(&mut self) {
         self.editor.lip_sync = buzz_ui::LipSyncState::opened();
-        // Pre-select the layer being worked on: nine times in ten that is the
-        // mouth layer, because it is the one the animator just clicked.
-        self.editor.lip_sync.layer = self.editor.selection.active_layer().map(|l| l.0);
+        // A mouth selected on the stage: that mouth, on its own layer. A head
+        // (or a body) selected instead is opened in place down to its mouth,
+        // so the keys go on the mouth's layer inside the head. Nothing picked:
+        // the "mouth" layer of the timeline open, and the chart on it — never
+        // whatever layer happened to be active (an eyebrow, the base).
+        if let Some((mouth, layer)) = self.reach_mouth() {
+            self.editor.lip_sync.mouth = Some(mouth.0);
+            self.editor.lip_sync.layer = Some(layer.0);
+            self.editor.lip_sync.only_layer = true;
+        } else if let Some((layer, chart)) = self.editor.mouth_layer_here() {
+            self.editor.lip_sync.mouth = chart.map(|c| c.0);
+            self.editor.lip_sync.layer = Some(layer.0);
+            self.editor.lip_sync.only_layer = true;
+        }
+    }
+
+    /// The **mouth** selected on the stage: an instance whose symbol or layer
+    /// is named for a mouth or lips, or whose symbol holds the mouth shapes
+    /// lip sync needs. Its symbol and its layer.
+    fn selected_mouth(&self) -> Option<(buzz_scene::SymbolId, buzz_scene::LayerId)> {
+        let scene = self.editor.doc.scene();
+        self.editor.selection.iter().find_map(|id| {
+            let (layer, object) = scene.find_object(id)?;
+            let symbol = object.instance()?.symbol;
+            let layer_name = scene.layers().get(layer).map(|l| l.name.as_str()).unwrap_or_default();
+            is_mouth(scene, symbol, layer_name).then_some((symbol, layer))
+        })
+    }
+
+    /// [`Self::selected_mouth`], or — when what is selected is a head, or a
+    /// body with a head in it — **the mouth inside**, reached by opening each
+    /// in place in turn and selecting the mouth there.
+    fn reach_mouth(&mut self) -> Option<(buzz_scene::SymbolId, buzz_scene::LayerId)> {
+        for _ in 0..4 {
+            if let Some(found) = self.selected_mouth() {
+                return Some(found);
+            }
+            let scene = self.editor.doc.scene();
+            let (id, inner_layer) = self.editor.selection.iter().find_map(|id| {
+                let (_, object) = scene.find_object(id)?;
+                let symbol = scene.library().get(object.instance()?.symbol)?;
+                let layer = mouth_holder(scene, symbol)?;
+                Some((id, layer))
+            })?;
+            if !self.editor.enter_instance_in_place(id) {
+                return None;
+            }
+            let frame = self.editor.current_frame;
+            let scene = self.editor.doc.scene();
+            let inner = scene.layers().get(inner_layer).and_then(|l| {
+                l.objects_at(frame).iter().chain(l.all_objects()).find(|o| o.instance().is_some()).map(|o| o.id)
+            })?;
+            self.editor.selection.select_one(inner);
+            self.editor.selection.set_active_layer(Some(inner_layer));
+        }
+        None
+    }
+
+    /// **The animator's Animate viseme mapping**: `MOUTH_MAP_STRING` of their
+    /// `autoLipSyncImporter` shelf command (as changed in the Commands panel,
+    /// else as written) — twelve 1-based frames in Animate's viseme order —
+    /// made 0-based. `None` when the shelf has no such command.
+    fn my_animate_mapping(&mut self) -> Option<[u32; 12]> {
+        // The Commands panel's shelf first (where an Animate Configuration
+        // folder is brought over), then the Commands menu's.
+        self.jsfl.rescan_if_stale();
+        let shelf = buzz_script::default_config_dir().map(|d| d.join("Commands").join("autoLipSyncImporter.jsfl")).filter(|p| p.is_file());
+        let entry = self.jsfl.entry("autoLipSyncImporter").cloned();
+        let path = shelf.or_else(|| entry.as_ref().map(|e| e.path.clone()))?;
+        let changed = entry.as_ref().and_then(|e| self.jsfl.store.value(&e.name, "MOUTH_MAP_STRING").cloned());
+        let literal = match changed {
+            Some(v) => v,
+            None => {
+                let text = std::fs::read_to_string(&path).ok()?;
+                let at = text.find("MOUTH_MAP_STRING")?;
+                let rest = &text[at..];
+                let open = rest.find('"')?;
+                let close = rest[open + 1..].find('"')?;
+                rest[open + 1..open + 1 + close].to_string()
+            }
+        };
+        let frames: Vec<u32> = literal
+            .trim_matches(|c| c == '"' || c == '\'' || c == ' ')
+            .split(',')
+            .filter_map(|n| n.trim().parse::<u32>().ok())
+            .map(|n| n.max(1) - 1)
+            .collect();
+        <[u32; 12]>::try_from(frames).ok()
+    }
+
+    /// The visemes the Lip Sync window shows for `mouth`: those set on it, else
+    /// the animator's Animate mapping, else read from its drawings.
+    fn visemes_for(&mut self, mouth: buzz_scene::SymbolId) -> [u32; 12] {
+        if let Some(set) = buzz_act::face::animate_chart_of(self.editor.doc.scene(), mouth) {
+            return set;
+        }
+        // The animator's own Animate mapping before any map this program
+        // guessed from the drawings and left on the chart.
+        if let Some(mine) = self.my_animate_mapping() {
+            return mine;
+        }
+        let scene = self.editor.doc.scene();
+        if let Some(map) = buzz_act::face::stored_viseme_map(scene, mouth) {
+            return buzz_act::face::animate_from_map(&map);
+        }
+        buzz_act::face::animate_from_map(&buzz_act::face::analyse_mouth_chart(scene, mouth))
     }
 
     /// Draw the Lip Sync dialog and act on it.
     fn lip_sync_dialog(&mut self, ctx: &egui::Context) {
         if !self.editor.lip_sync.open {
             return;
+        }
+        // The chosen mouth's visemes, filled when the mouth changes.
+        let mouth = self.editor.lip_sync.mouth;
+        if mouth != self.editor.lip_sync.visemes_for {
+            self.editor.lip_sync.visemes_for = mouth;
+            match mouth.map(buzz_scene::SymbolId) {
+                Some(id) => {
+                    let frames = self.editor.doc.scene().library().get(id).map_or(1, |s| s.length());
+                    let visemes = self.visemes_for(id).map(|f| f.min(frames.saturating_sub(1)));
+                    self.editor.lip_sync.visemes = Some(visemes);
+                    self.editor.lip_sync.chart_frames = frames;
+                }
+                None => self.editor.lip_sync.visemes = None,
+            }
         }
 
         let (track, mouths, layers) = self.editor.lip_sync_choices();
@@ -15197,9 +15626,54 @@ impl App {
             let symbol = self.editor.new_mouth_symbol();
             self.editor.lip_sync.mouth = Some(symbol.0);
         }
-        if response.confirmed {
-            self.editor.run_lip_sync();
+        let last = self.editor.lip_sync.chart_frames.saturating_sub(1);
+        if response.visemes_mine {
+            match self.my_animate_mapping() {
+                Some(mine) => self.editor.lip_sync.visemes = Some(mine.map(|f| f.min(last))),
+                None => self.editor.lip_sync.result = Some("No autoLipSyncImporter command on the shelf to read your mapping from".into()),
+            }
         }
+        if response.visemes_drawings
+            && let Some(id) = self.editor.lip_sync.mouth.map(buzz_scene::SymbolId)
+        {
+            let map = buzz_act::face::analyse_mouth_chart(self.editor.doc.scene(), id);
+            self.editor.lip_sync.visemes = Some(buzz_act::face::animate_from_map(&map));
+        }
+        if response.confirmed {
+            if crate::rhubarb::binary().is_some() {
+                self.lip_sync_with_rhubarb();
+            } else {
+                self.editor.run_lip_sync();
+            }
+        }
+    }
+
+    /// **Sync with Rhubarb**, off the UI thread: the soundtrack is heard by the
+    /// speech recogniser (as Animate's Auto Lip-Sync hears it with its own),
+    /// and the keys land on the mouth when it answers.
+    fn lip_sync_with_rhubarb(&mut self) {
+        let Some((clip, start, mouth, layer, placement)) = self.editor.lip_sync_inputs() else {
+            return;
+        };
+        let fps = self.editor.doc.scene().stage().frame_rate.max(1.0);
+        let length = clip.duration_frames(fps);
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "Lip Sync (Rhubarb)", move |ctx| {
+            let cancel = ctx.cancel.clone();
+            let began = std::time::Instant::now();
+            match crate::rhubarb::cues(&clip, &|| cancel.is_cancelled()) {
+                Ok(cues) => {
+                    let keys = crate::rhubarb::keys_closing_silence(&cues, fps, &clip.frame_levels(fps));
+                    let secs = began.elapsed().as_secs_f64();
+                    let _ = send.send(AiResult::LipSyncHeard { keys, length, start, mouth, layer, placement, secs });
+                    crate::tasks::TaskOutcome::Finished(String::new())
+                }
+                Err(e) => crate::tasks::TaskOutcome::Failed(format!("Lip Sync: {e}")),
+            }
+        });
+        self.track_ai(id, receive);
+        self.editor.lip_sync.result = Some("Listening to the dialogue with Rhubarb\u{2026}".into());
+        self.editor.status = Some("Lip Sync: listening to the dialogue with Rhubarb\u{2026}".into());
     }
 
     /// Somebody asked to close the window.
@@ -16443,15 +16917,113 @@ impl App {
         self.save_to(path);
     }
 
+    /// **A document with a master audio has it in every head and body**: the
+    /// first time a document (or a master set on it) is seen, every character
+    /// and head symbol missing the locked master layer on top gets it — one
+    /// undo step, nothing removed. Casting and placing keep it so after.
+    fn guide_with_master_audio(&mut self) {
+        let Some(master) = self.editor.doc.master_audio() else {
+            return;
+        };
+        let key = (self.editor.doc.uid(), format!("{master:?}"));
+        if !self.master_guided.insert(key) {
+            return;
+        }
+        if let Ok(report) = self.editor.doc.add_master_audio_guides()
+            && report.symbols_given_guide > 0
+        {
+            let scene = self.editor.doc.scene().clone();
+            self.editor.sound.refresh(&scene);
+            self.editor.status = Some(format!("Master audio set on top (locked) in {} head and body symbol(s)", report.symbols_given_guide));
+        }
+    }
+
+    /// The Cast characters lifted into `scene`'s stage: `(folder, Cast/<Series>/<Name>)`.
+    fn lifted_characters(scene: &buzz_scene::Scene) -> Vec<(buzz_scene::LayerId, String)> {
+        scene
+            .stage_layers()
+            .iter()
+            .filter(|l| l.kind == buzz_scene::LayerKind::Folder)
+            .filter_map(|l| Some((l.id, l.cast_source.clone().filter(|s| !s.contains('|'))?)))
+            .collect()
+    }
+
+    /// The main symbol's name in the Cast asset `key`, which the write-back keeps.
+    fn cast_main_name(&self, key: &str) -> Option<(buzz_doc::Asset, String)> {
+        let asset = self.editor.assets.assets().iter().find(|a| format!("{}/{}", a.folder, a.name) == key)?.clone();
+        let loaded = self.editor.assets.load(&asset).ok()?;
+        let main = crate::cast_combine::main_symbol(&loaded)?;
+        let name = loaded.library().get(main)?.name.clone();
+        Some((asset, name))
+    }
+
+    /// Take the print of every Cast character of the active scene not yet seen
+    /// (just cast, or the shot just opened). Cheap when there is none new.
+    fn note_cast_prints(&mut self) {
+        let uid = self.editor.doc.uid();
+        let index = self.editor.doc.active_scene();
+        let fresh: Vec<(buzz_scene::LayerId, String)> = Self::lifted_characters(self.editor.doc.scene())
+            .into_iter()
+            .filter(|(folder, _)| !self.cast_prints.contains_key(&(uid, index, *folder)))
+            .collect();
+        for (folder, key) in fresh {
+            let print = self
+                .cast_main_name(&key)
+                .and_then(|(_, main)| crate::cast_pose_edit::lifted_character_print(self.editor.doc.scene(), folder, &main));
+            // A character whose asset is gone, or that cannot be read back, is
+            // remembered as unprintable and never written.
+            self.cast_prints.insert((uid, index, folder), print.unwrap_or(0));
+        }
+    }
+
+    /// **⌘S also saves the Cast**: every Cast character a shot of this
+    /// document changed — everything as it is in the shot — is written back
+    /// over its asset (the old file goes to `_cast_backup`). Returns the names.
+    fn save_cast_changes(&mut self) -> Vec<String> {
+        let uid = self.editor.doc.uid();
+        let stamp = crate::cast_fresh::backup_stamp();
+        let mut saved = Vec::new();
+        for (index, scene) in self.editor.doc.film().iter().enumerate() {
+            for (folder, key) in Self::lifted_characters(scene) {
+                let Some(&before) = self.cast_prints.get(&(uid, index, folder)) else { continue };
+                if before == 0 {
+                    continue;
+                }
+                let Some((asset, main)) = self.cast_main_name(&key) else { continue };
+                let Some(now) = crate::cast_pose_edit::lifted_character_print(scene, folder, &main) else { continue };
+                if now == before {
+                    continue;
+                }
+                match crate::cast_pose_edit::save_lifted_character(&mut self.editor.assets, scene, folder, &asset, &stamp) {
+                    Ok(()) => {
+                        self.cast_prints.insert((uid, index, folder), now);
+                        saved.push(asset.name.clone());
+                    }
+                    Err(e) => saved.push(format!("{} (not saved: {e})", asset.name)),
+                }
+            }
+        }
+        if !saved.is_empty() {
+            self.cast_sheet = None;
+            self.asset_thumbnails.forget();
+        }
+        saved
+    }
+
     /// Write the document where the user said.
     fn save_to(&mut self, path: std::path::PathBuf) {
         match self.editor.doc.save_as(&path) {
             Ok(()) => {
+                let cast = self.save_cast_changes();
                 // Saved: there is nothing left to recover, and the crash
                 // snapshot must not offer to restore what is now on disk.
                 buzz_doc::autosave::forget_crash_snapshot();
                 self.remember_document_directory(&path);
-                self.editor.status = Some(format!("Saved {}", path.display()));
+                self.editor.status = Some(if cast.is_empty() {
+                    format!("Saved {}", path.display())
+                } else {
+                    format!("Saved {} \u{2014} and the Cast: {}", path.display(), cast.join(", "))
+                });
             }
             Err(e) => self.editor.status = Some(format!("Could not save: {e}")),
         }
@@ -17277,6 +17849,12 @@ impl App {
             // frame after release from reusing it.
             lights: rig ^ u64::from(drafting) ^ (u64::from(self.lights.draft_on()) << 1),
             painted_preview: paints_into_scene,
+            mask_drawn_on: self
+                .editor
+                .selection
+                .active_layer()
+                .filter(|id| self.editor.scene().layers().get(*id).is_some_and(|l| l.kind.is_mask() && !l.locked))
+                .map(|id| id.0),
         };
         // **Only a preview that is painted into the scene invalidates it.**
         //
@@ -20746,9 +21324,104 @@ mod idle_tests {
         assert_eq!(press(egui::Key::S, none).0, vec![Command::InsertKeyframe], "S inserts a keyframe, not the Ink Bottle");
     }
 
-    /// Play/Pause from the keyboard: Enter (Animate's key), a tap of Space
-    /// (a held Space still pans), and whatever key the user bound in the
-    /// shortcut editor.
+    /// **Lip Sync from the mouth**: with a mouth selected on the stage, Lip
+    /// Sync opens on that mouth and its layer — nothing to pick again.
+    #[test]
+    fn lip_sync_opens_on_the_selected_mouth() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let mut made = None;
+        app.editor.doc.edit("Mouth", |scene| {
+            let mouth = scene.add_symbol("manMouthFront", buzz_scene::SymbolKind::Graphic, None);
+            let layer = scene.add_layer("mouth", buzz_scene::LayerKind::Normal);
+            let id = scene.add_instance_at(layer, 0, mouth, buzz_geom::Affine::translate((40.0, 60.0))).unwrap();
+            made = Some((mouth, layer, id));
+        });
+        let (mouth, layer, id) = made.unwrap();
+        app.editor.selection.select_one(id);
+        assert_eq!(app.selected_mouth(), Some((mouth, layer)));
+        app.open_lip_sync();
+        assert_eq!((app.editor.lip_sync.mouth, app.editor.lip_sync.layer), (Some(mouth.0), Some(layer.0)));
+    }
+
+    /// **Lip Sync offers mouths only.** The whole library was offered, a fog
+    /// first, and a fog picked by mistake went onto every key in place of the
+    /// mouth. With nothing selected it opens on the "mouth" layer and the
+    /// chart on it, offers no other layer and no other symbol; a picked mouth
+    /// on a layer of another name is synced onto a layer renamed "mouth".
+    #[test]
+    fn lip_sync_offers_the_mouth_and_its_layer_alone() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let mut made = None;
+        app.editor.doc.edit("Head", |scene| {
+            let fog = scene.add_symbol("fog2", buzz_scene::SymbolKind::Graphic, None);
+            let brow = scene.add_layer("rightEyebrow", buzz_scene::LayerKind::Normal);
+            scene.add_instance_at(brow, 0, fog, buzz_geom::Affine::IDENTITY);
+            let chart = scene.add_symbol("man3MouthFront", buzz_scene::SymbolKind::Graphic, None);
+            let layer = scene.add_layer("mouth", buzz_scene::LayerKind::Normal);
+            let id = scene.add_instance_at(layer, 0, chart, buzz_geom::Affine::translate((40.0, 60.0))).unwrap();
+            made = Some((chart, layer, brow, id));
+        });
+        let (chart, layer, brow, id) = made.unwrap();
+        app.editor.selection.set_active_layer(Some(brow));
+        app.editor.selection.clear();
+
+        app.open_lip_sync();
+        assert_eq!((app.editor.lip_sync.mouth, app.editor.lip_sync.layer), (Some(chart.0), Some(layer.0)));
+        let (_, mouths, layers) = app.editor.lip_sync_choices();
+        assert_eq!(mouths.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["man3MouthFront"]);
+        assert_eq!(layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["mouth"]);
+
+        // A mouth on a layer called something else: synced, the layer is "mouth".
+        app.editor.doc.edit("Rename", |scene| {
+            scene.update_layer(layer, |l| l.name = "SideMouthBest".into());
+        });
+        app.editor.selection.select_one(id);
+        app.open_lip_sync();
+        app.editor.apply_lip_sync_keys(&[(0, 1), (3, 6)], 6, 0, chart.0, layer.0, buzz_geom::Affine::IDENTITY);
+        let synced = app.editor.scene().layers().get(layer).expect("the layer");
+        assert_eq!(synced.name, "mouth");
+        assert!(synced.all_objects().all(|o| o.instance().is_some_and(|i| i.symbol == chart)), "only the chart on it");
+    }
+
+    /// **A head clicked at the root is not a mouth**, however many frames it
+    /// has: lip sync opens the head in place and works on the mouth layer
+    /// inside it, not on a layer of the root.
+    #[test]
+    fn lip_sync_on_a_head_goes_into_the_head() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let mut made = None;
+        app.editor.doc.edit("Head", |scene| {
+            let mouth = scene.add_symbol("man3MouthFront", buzz_scene::SymbolKind::Graphic, None);
+            let head = scene.add_symbol("frontHead", buzz_scene::SymbolKind::Graphic, None);
+            let mouth_layer = buzz_scene::LayerId(9001);
+            scene.library_mut().update(head, |s| {
+                let mut layer = buzz_scene::Layer::new(mouth_layer, "mouth", buzz_scene::LayerKind::Normal);
+                layer.frames.insert_frame(299);
+                let mut instance = buzz_scene::Object::instance_of(buzz_scene::ObjectId(9002), mouth);
+                instance.transform = buzz_geom::Affine::translate((5.0, 5.0));
+                layer.frames.set_objects(0, vec![std::sync::Arc::new(instance)]);
+                s.layers.insert(0, layer);
+            });
+            let root = scene.add_layer("Character", buzz_scene::LayerKind::Normal);
+            let id = scene.add_instance_at(root, 0, head, buzz_geom::Affine::translate((40.0, 60.0))).unwrap();
+            made = Some((mouth, head, mouth_layer, id));
+        });
+        let (mouth, head, mouth_layer, id) = made.unwrap();
+        app.editor.selection.select_one(id);
+        assert_eq!(app.selected_mouth(), None, "a 300-frame head is not a mouth chart");
+        app.open_lip_sync();
+        assert_eq!(app.editor.doc.scene().editing_symbol(), Some(head), "the head was opened");
+        assert_eq!((app.editor.lip_sync.mouth, app.editor.lip_sync.layer), (Some(mouth.0), Some(mouth_layer.0)));
+        let (_, _, layers) = app.editor.lip_sync_choices();
+        assert_eq!(layers.iter().map(|c| c.id).collect::<Vec<_>>(), vec![mouth_layer.0], "only the mouth's own layer is offered");
+    }
+
+    /// Play/Pause from the keyboard: Enter (Animate's key), ⌘Space, and
+    /// whatever key the user bound in the shortcut editor. Space alone is the
+    /// hand: tapped it plays nothing, held it pans.
     #[test]
     fn play_and_pause_from_the_keyboard() {
         let mut app = App::new(GpuPreference::Automatic);
@@ -20784,9 +21457,11 @@ mod idle_tests {
         assert!(!app.editor.playback.playing, "Enter pauses");
 
         tap(&mut app, egui::Key::Space, none);
-        assert!(app.editor.playback.playing, "a Space tap plays");
-        tap(&mut app, egui::Key::Space, none);
-        assert!(!app.editor.playback.playing, "a Space tap pauses");
+        assert!(!app.editor.playback.playing, "a Space tap plays nothing");
+        tap(&mut app, egui::Key::Space, egui::Modifiers::COMMAND);
+        assert!(app.editor.playback.playing, "⌘Space plays");
+        tap(&mut app, egui::Key::Space, egui::Modifiers::COMMAND);
+        assert!(!app.editor.playback.playing, "⌘Space pauses");
 
         // A held Space that pans is not a tap.
         let mid = egui::pos2(700.0, 430.0);
@@ -20809,8 +21484,10 @@ mod idle_tests {
         tap(&mut app, egui::Key::P, egui::Modifiers::COMMAND);
         assert!(app.editor.playback.playing, "the user's own key plays");
 
-        tap(&mut app, egui::Key::Space, none);
-        assert!(!app.editor.playback.playing, "and a Space tap still pauses");
+        tap(&mut app, egui::Key::P, egui::Modifiers::COMMAND);
+        assert!(!app.editor.playback.playing, "and pauses");
+        tap(&mut app, egui::Key::Space, egui::Modifiers::COMMAND);
+        assert!(app.editor.playback.playing, "⌘Space still plays beside it");
     }
 
     /// Drive the timeline's layer-name menu the way a user does: right-click
@@ -23793,6 +24470,7 @@ mod idle_tests {
             lights_generation: 0,
             lights: 0,
             painted_preview: false,
+            mask_drawn_on: None,
         }
     }
 
@@ -25686,6 +26364,7 @@ mod encode_ahead_tests {
             lights_generation: app.lights_generation,
             lights: 0,
             painted_preview: false,
+            mask_drawn_on: None,
         }
     }
 
@@ -26645,6 +27324,112 @@ mod layer_rig_ui_tests {
         app.editor.doc.history().undo_depth()
     }
 
+    /// **Tagging a part names its layer**, with the user's name for the slot;
+    /// and a part the user adds, connected to another, is rigged to follow it.
+    #[test]
+    fn tagging_names_the_layer_and_an_added_part_follows_its_part() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        let pattern = buzz_rig::RigPattern::biped();
+        let mut ids = Vec::new();
+        for (layer_name, bar) in [
+            ("shirtTorso", buzz_geom::Rect::new(200.0, 0.0, 260.0, 120.0)),
+            ("dupatta", buzz_geom::Rect::new(260.0, 0.0, 300.0, 120.0)),
+        ] {
+            let mut id = None;
+            app.editor.doc.edit("Draw", |scene| {
+                let layer = scene.add_layer(layer_name, buzz_scene::LayerKind::Normal);
+                id = scene.add_shape(layer, buzz_scene::ShapeData::filled(bar.to_path(1e-9), LIMB));
+            });
+            ids.push(id.unwrap());
+        }
+        let _ = painted_text(&mut app);
+        let chest = pattern.slot_named("Chest").expect("a chest");
+        assert!(app.editor.rig_panel.add_part("Dupatta", chest));
+        let dupatta = app.editor.rig_panel.pattern().slots.len() - 1;
+        let _ = painted_text(&mut app);
+        app.editor.rig_panel.assign(chest, ids[0]);
+        app.editor.rig_panel.assign(dupatta, ids[1]);
+        let _ = painted_text(&mut app);
+        let name_of = |app: &App, id| {
+            let (layer, _) = app.editor.scene().find_object(id).unwrap();
+            app.editor.scene().layers().get(layer).unwrap().name.clone()
+        };
+        let chest_name = buzz_ui::rig_panel::slot_label(&app.editor.rig_panel, "Chest");
+        assert_eq!(name_of(&app, ids[0]), chest_name, "the tagged layer takes the tag");
+        assert_eq!(name_of(&app, ids[1]), "Dupatta");
+
+        app.editor.rig_panel.kind = buzz_rig::RigKind::Layers;
+        let slots = app.editor.rig_panel.slots.clone();
+        app.rig_character(&pattern.name, &slots);
+        let followed = links(&app).into_iter().find(|(n, _)| n == "Dupatta").and_then(|(_, f)| f);
+        assert_eq!(followed.as_deref(), Some(chest_name.as_str()), "the added part follows the part it is on: {:?}", links(&app));
+    }
+
+    /// **The Rig panel keeps what was put in it**: opening the head inside
+    /// the character (to rig it) leaves the body's slots filled and named; a
+    /// symbol elsewhere has its own list, and coming back finds the body's as
+    /// it was. Clicking something that is not a head keeps the Rig Head
+    /// section on the head it was on.
+    #[test]
+    fn rig_slots_and_head_survive_going_elsewhere() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let slots = three_parts(&mut app);
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        app.editor.rig_panel.slots = slots.clone();
+        let _ = painted_text(&mut app);
+        assert_eq!(app.editor.rig_panel.slots, slots, "drawn once, the slots stay");
+
+        let mut head = None;
+        app.editor.doc.edit("Head", |scene| {
+            head = Some(scene.add_symbol("Head", buzz_scene::SymbolKind::Graphic, None));
+        });
+        let head = head.unwrap();
+        app.editor.doc.edit_view(|scene| {
+            scene.enter_symbol(head);
+        });
+        let text = painted_text(&mut app);
+        assert_eq!(app.editor.rig_panel.slots, slots, "opening the head keeps the body's slots");
+        let kept = app.editor.rig_panel.kept_names.clone();
+        assert_eq!(kept.len(), slots.iter().flatten().count(), "every kept part has a name: {kept:?}");
+        for (_, name) in &kept {
+            assert!(text.iter().any(|t| t == name), "{name} is not shown with the head open: {text:?}");
+        }
+        app.editor.doc.edit_view(|scene| {
+            scene.exit_symbol();
+        });
+        let _ = painted_text(&mut app);
+        assert_eq!(app.editor.rig_panel.slots, slots, "back out, the body's slots are as they were");
+
+        // Filled inside one symbol, a symbol beside it starts with its own list.
+        let mut other = None;
+        app.editor.doc.edit("Other", |scene| {
+            other = Some(scene.add_symbol("Other", buzz_scene::SymbolKind::Graphic, None));
+        });
+        app.editor.doc.edit_view(|scene| {
+            scene.enter_symbol(head);
+        });
+        let _ = painted_text(&mut app);
+        app.editor.rig_panel.slots = vec![None; slots.len()];
+        let _ = painted_text(&mut app);
+        app.editor.doc.edit_view(|scene| {
+            scene.exit_symbol();
+            scene.enter_symbol(other.unwrap());
+        });
+        let _ = painted_text(&mut app);
+        assert!(app.editor.rig_panel.slots.iter().all(Option::is_none), "a symbol elsewhere starts empty");
+        app.editor.doc.edit_view(|scene| {
+            scene.exit_symbol();
+        });
+        let _ = painted_text(&mut app);
+
+        // The head chosen stays when a plain drawing is clicked.
+        app.editor.rig_panel.head = Some(buzz_ui::rig_panel::HeadSection { symbol: head, name: "Head".into(), layers: Vec::new() });
+        app.editor.selection.select_one(slots.iter().flatten().next().copied().unwrap());
+        let _ = painted_text(&mut app);
+        assert_eq!(app.editor.rig_panel.head.as_ref().map(|h| h.symbol), Some(head));
+    }
+
     /// The radio decides what **Rig Character** builds: an armature with
     /// Bones, three followed layers and no armature with Layers — each one
     /// undo step.
@@ -26681,14 +27466,15 @@ mod layer_rig_ui_tests {
         app.rig_character("Biped", &slots);
         assert_eq!(depth(&app), before + 1, "a layer rig is not one undo step");
         assert!(armatures(&app).is_empty(), "Layers built an armature");
-        assert_eq!(
-            links(&app),
-            vec![
-                ("Chest".to_string(), None),
-                ("Elbow L".to_string(), Some("Shoulder L".to_string())),
-                ("Shoulder L".to_string(), Some("Chest".to_string())),
-            ]
-        );
+        // Each layer is named as its part was tagged: the user's own names.
+        let label = |slot: &str| buzz_ui::rig_panel::slot_label(&app.editor.rig_panel, slot);
+        let mut want = vec![
+            (label("Chest"), None),
+            (label("Elbow L"), Some(label("Shoulder L"))),
+            (label("Shoulder L"), Some(label("Chest"))),
+        ];
+        want.sort();
+        assert_eq!(links(&app), want);
         app.editor.doc.undo();
         assert!(links(&app).is_empty(), "undo left layer links");
         assert_eq!(app.editor.scene().shape_count(), 3);
@@ -27977,6 +28763,20 @@ mod panel_follow_tests {
         assert!(!app.editor.workspace.is_collapsed(PanelId::Layers), "and comes back with nothing selected");
     }
 
+    /// **A closed Properties panel reopens** when a symbol is picked, so its
+    /// Looping, First frame and Frame Picker show up without the Window menu.
+    #[test]
+    fn picking_an_object_reopens_a_closed_properties_panel() {
+        let (mut app, ctx, id) = app();
+        app.editor.workspace.toggle(PanelId::Properties);
+        assert!(!app.editor.workspace.is_open(PanelId::Properties));
+
+        app.editor.selection.select_one(id);
+        frame(&mut app, &ctx);
+        assert!(app.editor.workspace.is_open(PanelId::Properties), "Properties is back");
+        assert!(front(&app, PanelId::Properties) && !app.editor.workspace.is_collapsed(PanelId::Properties));
+    }
+
     #[test]
     fn layers_opened_by_hand_stay_open() {
         let (mut app, ctx, id) = app();
@@ -28039,4 +28839,3 @@ mod panel_follow_tests {
         assert!(front(&app, PanelId::Filters));
     }
 }
-

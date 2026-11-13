@@ -105,6 +105,9 @@ pub struct Document {
     /// symbol opened in place forks the path for the clicked keyframe. View
     /// state, set by the editor from the workspace; never saved.
     protect_keyframes: Option<ProtectScope>,
+    /// **Equal Layer Lengths**: after each edit every layer of the timeline
+    /// being edited is extended to the longest, in the same undo step.
+    equal_layer_lengths: bool,
     /// What the last protected edit copied, until the editor takes it.
     last_fork: Option<ForkReport>,
 }
@@ -140,6 +143,7 @@ impl Document {
             master_audio: None,
             master_audio_mode: false,
             protect_keyframes: None,
+            equal_layer_lengths: false,
             last_fork: None,
         }
     }
@@ -1025,6 +1029,11 @@ impl Document {
         if slot.scene.revision() == before.revision() {
             return;
         }
+        // Equal Layer Lengths, inside this same undo step: undoing the edit
+        // undoes the extension with it.
+        if self.equal_layer_lengths {
+            slot.scene.equalize_layer_lengths();
+        }
         // Protect Other Keyframes: an edit inside a shared symbol opened in
         // place forks the path, inside this same undo step.
         if let Some(scope) = self.protect_keyframes
@@ -1034,6 +1043,11 @@ impl Document {
             self.last_fork = Some(report);
         }
         slot.history.record(before, label);
+    }
+
+    /// Turn **Equal Layer Lengths** on or off for this document's edits.
+    pub fn set_equal_layer_lengths(&mut self, on: bool) {
+        self.equal_layer_lengths = on;
     }
 
     /// **Protect Other Keyframes** scope, or `None` when it is off.
@@ -1102,6 +1116,13 @@ impl Document {
 
     pub fn can_undo(&self) -> bool {
         self.active_slot().history.can_undo()
+    }
+
+    /// This document's process-unique identity: two open documents never share
+    /// one, and a document keeps its own however it is edited (Paste Frames
+    /// tells "where these frames were copied" from it).
+    pub fn uid(&self) -> u64 {
+        self.uid
     }
 
     /// Remember where the active scene's history stands, to collapse a run of
@@ -2052,6 +2073,105 @@ mod tests {
         let layer_id = layer_id.unwrap();
         doc.set_master_audio(scene_key, layer_id);
         layer_id
+    }
+
+    /// **Master Audio reaches every pose of a cast character.** The character
+    /// filed under Cast gets the master's guide layer, and so does each other
+    /// pose in its set, wherever that pose is filed; a symbol that is no
+    /// character gets none.
+    #[test]
+    fn master_audio_guides_every_pose_of_a_character() {
+        let mut doc = Document::default();
+        stub_master_audio(&mut doc, 240);
+        let mut ids = None;
+        doc.edit("Cast", |scene| {
+            let main = scene.add_symbol("Ana", buzz_scene::SymbolKind::Graphic, Some("Cast"));
+            let back = scene.add_symbol("Ana Back", buzz_scene::SymbolKind::Graphic, Some("Poses"));
+            let tree = scene.add_symbol("Tree", buzz_scene::SymbolKind::Graphic, None);
+            assert!(scene.library_mut().include_in_set(main, back));
+            ids = Some((main, back, tree));
+        });
+        let (main, back, tree) = ids.unwrap();
+        doc.set_master_audio_mode(true);
+        doc.enforce_master_audio().expect("enforced");
+        let guided = |id| doc.scene().library().get(id).is_some_and(|s| s.layers.iter().any(|l| l.audio_guide));
+        assert!(guided(main), "the character");
+        assert!(guided(back), "its other pose, filed elsewhere");
+        assert!(!guided(tree), "not a character");
+    }
+
+    /// **A head named "Face" and a body found by its limbs get the master too**,
+    /// on top of their timelines and locked.
+    #[test]
+    fn master_audio_guides_heads_and_bodies_by_what_is_in_them() {
+        let mut doc = Document::default();
+        stub_master_audio(&mut doc, 240);
+        let mut ids = None;
+        doc.edit("Parts", |scene| {
+            let face = scene.add_symbol("rajuFaceFront", buzz_scene::SymbolKind::Graphic, None);
+            let body = scene.add_symbol("shirtFront", buzz_scene::SymbolKind::Graphic, None);
+            let prop = scene.add_symbol("Tree", buzz_scene::SymbolKind::Graphic, None);
+            scene.library_mut().update(face, |s| {
+                for name in ["eyeLid", "eyeBall", "mouth", "base"] {
+                    let id = LayerId(1100 + s.layers.len() as u64);
+                    s.layers.insert(0, buzz_scene::Layer::new(id, name, LayerKind::Normal));
+                }
+            });
+            scene.library_mut().update(body, |s| {
+                for name in ["leftArm", "leftWrist", "body"] {
+                    let id = LayerId(1000 + s.layers.len() as u64);
+                    s.layers.insert(0, buzz_scene::Layer::new(id, name, LayerKind::Normal));
+                }
+            });
+            ids = Some((face, body, prop));
+        });
+        let (face, body, prop) = ids.unwrap();
+        doc.add_master_audio_guides().expect("a master is set");
+        let top_guide = |id| {
+            doc.scene().library().get(id).and_then(|s| s.layers.iter().next().cloned()).is_some_and(|l| l.audio_guide && l.locked)
+        };
+        assert!(top_guide(face), "the face: guide on top, locked");
+        assert!(top_guide(body), "the body found by its limbs");
+        assert!(!doc.scene().library().get(prop).unwrap().layers.iter().any(|l| l.audio_guide), "not a prop");
+
+        // A head's base drawing — one layer, "head" in its name — gets none,
+        // and one it was given before is taken out.
+        let mut base = None;
+        doc.edit("Base", |scene| {
+            let id = scene.add_symbol("frontHeadbase", buzz_scene::SymbolKind::Graphic, None);
+            scene.library_mut().update(id, |s| {
+                let mut guide = buzz_scene::Layer::new(LayerId(2000), "Master Audio", LayerKind::Normal);
+                guide.audio_guide = true;
+                s.layers.insert(0, guide);
+            });
+            base = Some(id);
+        });
+        let base = base.unwrap();
+        doc.add_master_audio_guides().expect("a master is set");
+        assert!(!doc.scene().library().get(base).unwrap().layers.iter().any(|l| l.audio_guide), "a base drawing carries no master");
+    }
+
+    /// With Master Audio mode off, a master set still guides every pose of a
+    /// character — and leaves every other sound alone.
+    #[test]
+    fn master_audio_guides_without_the_mode() {
+        let mut doc = Document::default();
+        stub_master_audio(&mut doc, 240);
+        let mut ids = None;
+        doc.edit("Cast", |scene| {
+            let main = scene.add_symbol("Ana", buzz_scene::SymbolKind::Graphic, Some("Cast"));
+            let back = scene.add_symbol("Ana Back", buzz_scene::SymbolKind::Graphic, Some("Poses"));
+            assert!(scene.library_mut().include_in_set(main, back));
+            ids = Some((main, back));
+        });
+        let (main, back) = ids.unwrap();
+        let stage_before = doc.scene().stage_layers().len();
+        let report = doc.add_master_audio_guides().expect("a master is set");
+        assert_eq!(report.symbols_given_guide, 2);
+        let guided = |id| doc.scene().library().get(id).is_some_and(|s| s.layers.iter().any(|l| l.audio_guide));
+        assert!(guided(main) && guided(back));
+        assert_eq!(doc.scene().stage_layers().len(), stage_before, "the stage is left alone");
+        assert_eq!(doc.add_master_audio_guides().unwrap().symbols_given_guide, 0, "only once");
     }
 
     /// **A stamped shot's Dialogue plays the master audio from `audio_in`** —

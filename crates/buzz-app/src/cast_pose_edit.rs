@@ -267,6 +267,131 @@ pub fn save_changes(library: &mut AssetLibrary, doc: &Scene, asset: &Asset, stam
     Ok(layers.len())
 }
 
+/// Every layer filed (at any depth) under `folder`, front first.
+fn filed_under(scene: &Scene, folder: LayerId) -> Vec<LayerId> {
+    let layers = scene.stage_layers();
+    let under = |mut id: LayerId| {
+        for _ in 0..64 {
+            match layers.get(id).and_then(|l| l.parent) {
+                Some(p) if p == folder => return true,
+                Some(p) => id = p,
+                None => return false,
+            }
+        }
+        false
+    };
+    layers.iter().map(|l| l.id).filter(|id| under(*id)).collect()
+}
+
+/// **A lifted Cast character as a combined Cast asset, everything as it is in
+/// the shot**: the pose showing takes the layers under `folder` — their
+/// artwork, keys and parenting — moved back to start on frame 1 if the shot
+/// cast it later; every other pose and every symbol they use comes from the
+/// document. The shot's master-audio guides are left out (each shot gets its
+/// own slice), as is the stage's link to the asset. `main_name` renames the
+/// main symbol back if the document had to call it something else.
+pub fn lifted_character_scene(doc: &Scene, folder: LayerId, main_name: &str) -> Result<Scene, String> {
+    let children = filed_under(doc, folder);
+    let pose_name = children
+        .iter()
+        .find_map(|id| doc.stage_layers().get(*id)?.cast_source.as_deref()?.split_once('|').map(|(_, p)| p.to_string()))
+        .ok_or("the character's layers do not say which pose they are")?;
+    let pose = doc.library().find_by_name(&pose_name).map(|s| s.id).ok_or_else(|| format!("no symbol called {pose_name}"))?;
+    let main = doc.library().symbol_set(pose).first().copied().unwrap_or(pose);
+
+    // Where the shot cast it: the first frame any of its layers draws on.
+    let lead = children
+        .iter()
+        .filter_map(|id| doc.stage_layers().get(*id))
+        .filter_map(|l| l.frames.keyframes().iter().find(|k| !k.objects.is_empty()).map(|k| k.start))
+        .min()
+        .unwrap_or(0);
+    let mut stack = buzz_scene::LayerStack::new();
+    for id in &children {
+        let Some(layer) = doc.stage_layers().get(*id) else { continue };
+        if layer.audio_guide {
+            continue;
+        }
+        let mut layer = (**layer).clone();
+        if layer.parent == Some(folder) {
+            layer.parent = None;
+        }
+        layer.cast_source = None;
+        layer.frames.advance(lead);
+        stack.insert(stack.len(), layer);
+    }
+
+    let mut out = doc.clone();
+    out.edit_document();
+    for id in out.stage_layers().iter().map(|l| l.id).collect::<Vec<_>>() {
+        out.remove_layer(id);
+    }
+    out.library_mut().update(pose, |s| s.layers = stack);
+    let ids: Vec<SymbolId> = out.library().iter().map(|s| s.id).collect();
+    for id in ids {
+        if out.library().get(id).is_some_and(|s| s.layers.iter().any(|l| l.audio_guide)) {
+            out.library_mut().update(id, |s| {
+                let mut kept = buzz_scene::LayerStack::new();
+                for l in s.layers.iter().filter(|l| !l.audio_guide) {
+                    kept.insert(kept.len(), (**l).clone());
+                }
+                s.layers = kept;
+            });
+        }
+    }
+    if !main_name.is_empty() && out.library().get(main).is_some_and(|s| s.name != main_name) {
+        out.library_mut().update(main, |s| s.name = main_name.to_string());
+    }
+    let layer = out.add_stage_layer("Asset", buzz_scene::LayerKind::Normal);
+    let id = out.next_object_id();
+    out.add_object(layer, buzz_scene::Object::instance_of(id, main));
+    crate::asset_index::prune_library(&mut out);
+    Ok(out)
+}
+
+/// A fingerprint of what [`lifted_character_scene`] would write, to tell
+/// whether a shot changed the character since it was opened or cast.
+pub fn lifted_character_print(doc: &Scene, folder: LayerId, main_name: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut scene = lifted_character_scene(doc, folder, main_name).ok()?;
+    // How long the layers run is left out: Equal Layer Lengths stretches every
+    // layer as the shot grows, and a shot that only got longer has not changed
+    // the character.
+    let ids: Vec<SymbolId> = scene.library().iter().map(|s| s.id).collect();
+    for id in ids {
+        scene.library_mut().update(id, |s| {
+            let mut stack = buzz_scene::LayerStack::new();
+            for l in s.layers.iter() {
+                let mut l = (**l).clone();
+                l.frames = buzz_scene::LayerTimeline::from_parts(l.frames.keyframes().to_vec(), 0);
+                stack.insert(stack.len(), l);
+            }
+            s.layers = stack;
+        });
+    }
+    // The symbols alone, in id order: the stage holding the main instance,
+    // and the file's id counter, move with every unrelated edit to the shot.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut symbols: Vec<_> = scene.library().iter().collect();
+    symbols.sort_by_key(|s| s.id);
+    for symbol in symbols {
+        format!("{symbol:?}").hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+/// **Write a lifted character back over its Cast asset** (backup first).
+pub fn save_lifted_character(library: &mut AssetLibrary, doc: &Scene, folder: LayerId, asset: &Asset, stamp: &str) -> Result<(), String> {
+    let main_name = library
+        .load(asset)
+        .ok()
+        .and_then(|s| main_symbol(&s).map(|m| name_of(&s, m)))
+        .unwrap_or_default();
+    let scene = lifted_character_scene(doc, folder, &main_name)?;
+    write_back(library, asset, &scene, stamp, "shot")?;
+    Ok(())
+}
+
 /// The Cast asset the stage selection was placed from (its layer's `cast_source`).
 pub fn source_of(doc: &Scene, library: &AssetLibrary, selected: Option<ObjectId>) -> Option<Asset> {
     let (layer, _) = doc.find_object(selected?)?;
@@ -334,6 +459,53 @@ mod tests {
     /// the user adds a pose to its set (Include...) "Save changes" writes it back
     /// over the asset, backup first, and the set comes with it; Add to Cast of a
     /// selection carries the set.
+    #[test]
+    fn a_cast_character_edited_in_a_shot_goes_back_to_its_cast() {
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = AssetLibrary::at(dir.path());
+        let asset = saved(&mut library, "Raju");
+        let mut doc = Scene::default();
+        doc.add_symbol("Alt", SymbolKind::Graphic, None);
+        add_pose(&mut library, &asset, "Alt", PoseInput::LibrarySymbol(&doc, "Alt"), "2026-11-03_030301").expect("added");
+        let asset = library.assets().iter().find(|a| a.name == "Raju").cloned().unwrap();
+
+        // Cast into a shot at frame 10, the way the Cast panel does.
+        let mut shot = Scene::default();
+        let (_, folder) = crate::episode::place_cast(&mut shot, &library, &asset).expect("cast");
+        let folder = folder.expect("a combined character is lifted into a folder");
+        let parts = filed_under(&shot, folder);
+        assert!(!parts.is_empty());
+        for id in &parts {
+            shot.update_layer(*id, |l| l.frames.delay(10));
+        }
+        let before = lifted_character_print(&shot, folder, "Raju").expect("a print");
+        assert_eq!(lifted_character_print(&shot, folder, "Raju"), Some(before), "the print is stable");
+
+        for id in &parts {
+            shot.update_layer(*id, |l| { let n = l.frames.length() + 50; l.frames.insert_frame(n - 1); });
+        }
+        assert_eq!(lifted_character_print(&shot, folder, "Raju"), Some(before), "a longer shot is not an edit");
+        let elsewhere = shot.add_stage_layer("Background", buzz_scene::LayerKind::Normal);
+        shot.add_shape(elsewhere, buzz_scene::ShapeData::filled(kurbo::Rect::new(0.0, 0.0, 5.0, 5.0).to_path(1e-9), peniko::Color::WHITE));
+        assert_eq!(lifted_character_print(&shot, folder, "Raju"), Some(before), "drawing elsewhere is not an edit of the character");
+
+        // The animator redraws a part in the shot.
+        let body = parts[0];
+        shot.add_shape_at(body, 10, buzz_scene::ShapeData::filled(kurbo::Rect::new(0.0, 0.0, 99.0, 9.0).to_path(1e-9), peniko::Color::BLACK));
+        assert_ne!(lifted_character_print(&shot, folder, "Raju"), Some(before), "an edit changes the print");
+
+        save_lifted_character(&mut library, &shot, folder, &asset, "2026-11-03_030302").expect("saved back");
+        let asset = library.assets().iter().find(|a| a.name == "Raju").cloned().unwrap();
+        let back = library.load(&asset).expect("reads");
+        assert_eq!(pose_names(&back), vec!["Raju".to_string(), "Raju Alt".to_string()], "every pose kept");
+        let main = main_symbol(&back).expect("still a combined character");
+        let pose = back.library().get(main).expect("the main pose");
+        let shapes_at_0: usize = pose.layers.iter().map(|l| l.objects_at(0).len()).sum();
+        assert_eq!(shapes_at_0, 2, "the redrawn part is in the cast, from frame 1");
+        assert!(pose.layers.iter().all(|l| l.cast_source.is_none() && l.parent.is_none_or(|p| p != folder)));
+        assert!(dir.path().join(crate::cast_fresh::BACKUP_FOLDER).exists(), "the old file was kept");
+    }
+
     #[test]
     fn a_placed_character_saves_back_with_its_set_and_add_to_cast_carries_the_set() {
         let dir = tempfile::tempdir().expect("temp asset folder");

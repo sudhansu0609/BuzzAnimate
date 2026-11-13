@@ -132,6 +132,12 @@ pub struct RigResponse {
     pub convert_to_layers: bool,
     /// **Convert to bone rig**: rebuild the selected layer rig as an armature.
     pub convert_to_bones: bool,
+
+    // -- the head ------------------------------------------------------------
+    /// **Name Layers**: give these layers of this head their picked names.
+    pub name_head_layers: Option<(buzz_scene::SymbolId, Vec<(buzz_scene::LayerId, String)>)>,
+    /// **Rig Head** on this head.
+    pub rig_head: Option<buzz_scene::SymbolId>,
 }
 
 /// State the panel keeps between frames. All of it is about what is on screen
@@ -158,7 +164,65 @@ pub struct RigPanelState {
     /// Whether the selection is part of a layer rig, so **Convert to bone
     /// rig** is offered. Set by the app before the panel is drawn.
     pub layer_rig: bool,
+    /// The user's **naming profile** (the names their Ctrl+R / Shift+R
+    /// commands give: `leftArm`, `leftWrist`, `leftPalm`, `body`…): what each
+    /// slot is called in the list, and the names a layer is matched by first.
+    /// Set by the app; `None` shows the slots' own names.
+    pub profile: Option<buzz_rig::pattern::NamingProfile>,
+    /// The head the **Rig Head** section works on (the selected instance's,
+    /// or the open symbol's), its layers and the name each would get. Set by
+    /// the app; `None` when there is no head here.
+    pub head: Option<HeadSection>,
+    /// The name picked for each of the head's layers, by layer: what **Name
+    /// Layers** gives them. Filled from the suggestions when the head changes.
+    pub head_tags: Vec<(buzz_scene::LayerId, String)>,
+    /// The head `head_tags` were filled for.
+    pub head_tags_for: Option<buzz_scene::SymbolId>,
+    /// The names picked for heads worked on before, so going back to one
+    /// finds them as they were left.
+    pub head_tags_kept: Vec<(buzz_scene::SymbolId, Vec<(buzz_scene::LayerId, String)>)>,
+    /// Slot drawings that still exist on this timeline though not on the
+    /// frame shown — kept rather than forgotten. Set by the app.
+    pub alive: Vec<ObjectId>,
+    /// The names of slot drawings that are not loose on this timeline — on
+    /// another keyframe, or on the body while the head inside it is open —
+    /// so a kept slot still says what is in it. Set by the app.
+    pub kept_names: Vec<(ObjectId, String)>,
+    /// **The user's own parts**, added to a built-in skeleton: a tail, a
+    /// dupatta, a bag — each connected to a part already in the list, so
+    /// Rig Character parents it there. Kept per pattern.
+    pub extra_parts: Vec<ExtraPart>,
+    /// The **Add part** row being filled in: its name and what it hangs off.
+    pub new_part_name: String,
+    pub new_part_parent: usize,
 }
+
+/// One part the user added to a pattern (see [`RigPanelState::extra_parts`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtraPart {
+    /// Which built-in pattern it was added to.
+    pub pattern: usize,
+    pub name: String,
+    /// The slot it is connected to, in the pattern's own list (always earlier).
+    pub parent: usize,
+}
+
+/// A head symbol, as the Rig Head section shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeadSection {
+    pub symbol: buzz_scene::SymbolId,
+    pub name: String,
+    /// Its layers, top first: the layer, its name now, and the name the
+    /// user's Shift+R command (else Rig Head's reading of it) would give it.
+    pub layers: Vec<(buzz_scene::LayerId, String, Option<String>)>,
+}
+
+/// The names a head layer can be given: the user's Shift+R command's
+/// (`renameHeadLayers.jsfl`), then Rig Head's other parts.
+pub const HEAD_NAMES: &[&str] = &[
+    "eyeWhite", "leftEyeWhite", "rightEyeWhite", "eyeBall", "eyebrow", "leftEyebrow", "rightEyebrow",
+    "eyeLid", "mouth", "nose", "hair", "base", "moustacheFront",
+];
 
 impl Default for RigPanelState {
     /// **Rig Character** builds a layer rig unless the user picks Bones
@@ -173,6 +237,16 @@ impl Default for RigPanelState {
             default_limits: None,
             kind: RigKind::Layers,
             layer_rig: false,
+            profile: None,
+            head: None,
+            head_tags: Vec::new(),
+            head_tags_for: None,
+            head_tags_kept: Vec::new(),
+            alive: Vec::new(),
+            kept_names: Vec::new(),
+            extra_parts: Vec::new(),
+            new_part_name: String::new(),
+            new_part_parent: 0,
         }
     }
 }
@@ -182,10 +256,89 @@ impl RigPanelState {
     pub fn pattern(&self) -> RigPattern {
         let patterns = RigPattern::builtin();
         let index = self.pattern.min(patterns.len().saturating_sub(1));
-        patterns
+        self.with_extras(patterns.into_iter().nth(index).unwrap_or_else(RigPattern::biped))
+    }
+
+    /// `pattern` (the one on show) with the user's own parts added after its
+    /// slots, each a free joint hanging off the part it was connected to.
+    pub fn with_extras(&self, mut pattern: RigPattern) -> RigPattern {
+        for extra in self.extra_parts.iter().filter(|e| e.pattern == self.pattern) {
+            let parent = extra.parent.min(pattern.slots.len().saturating_sub(1));
+            let lower = extra.name.to_lowercase();
+            let side = if lower.contains("left") {
+                buzz_rig::pattern::Side::Left
+            } else if lower.contains("right") {
+                buzz_rig::pattern::Side::Right
+            } else {
+                buzz_rig::pattern::Side::Either
+            };
+            pattern.slots.push(buzz_rig::pattern::Slot {
+                name: extra.name.clone(),
+                parent: (!pattern.slots.is_empty()).then_some(parent),
+                rest_angle: 0.0,
+                rest_len: 0.08,
+                limits: None,
+                side,
+                required: false,
+                aliases: vec![extra.name.to_lowercase()],
+            });
+        }
+        pattern
+    }
+
+    /// Add a part called `name`, connected to slot `parent` of the pattern
+    /// on show. Its slot starts empty.
+    pub fn add_part(&mut self, name: &str, parent: usize) -> bool {
+        let name = name.trim();
+        let pattern = self.pattern();
+        if name.is_empty() || parent >= pattern.slots.len() || pattern.slots.iter().any(|s| s.name.eq_ignore_ascii_case(name)) {
+            return false;
+        }
+        if self.slots.len() != pattern.slots.len() {
+            self.slots = vec![None; pattern.slots.len()];
+        }
+        self.extra_parts.push(ExtraPart { pattern: self.pattern, name: name.to_string(), parent });
+        self.slots.push(None);
+        true
+    }
+
+    /// Take out the user's part in slot `slot`, and every part of theirs
+    /// connected to it.
+    pub fn remove_part(&mut self, slot: usize) {
+        let base = RigPattern::builtin()
             .into_iter()
-            .nth(index)
-            .unwrap_or_else(RigPattern::biped)
+            .nth(self.pattern)
+            .map(|p| p.slots.len())
+            .unwrap_or(0);
+        let mut doomed = vec![slot];
+        let mut index = base;
+        let mut kept = Vec::new();
+        let mut remap: Vec<Option<usize>> = (0..base).map(Some).collect();
+        for extra in self.extra_parts.iter() {
+            if extra.pattern != self.pattern {
+                kept.push(extra.clone());
+                continue;
+            }
+            if doomed.contains(&index) || doomed.contains(&extra.parent) {
+                doomed.push(index);
+                remap.push(None);
+            } else {
+                let mut e = extra.clone();
+                e.parent = remap.get(extra.parent).copied().flatten().unwrap_or(0);
+                remap.push(Some(remap.iter().flatten().count()));
+                kept.push(e);
+            }
+            index += 1;
+        }
+        self.extra_parts = kept;
+        let old = std::mem::take(&mut self.slots);
+        self.slots = old
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| remap.get(*i).is_none_or(|r| r.is_some()))
+            .map(|(_, held)| held)
+            .collect();
+        self.armed = None;
     }
 
     /// Put a drawing in a slot, taking it out of whatever slot it was in.
@@ -214,8 +367,9 @@ impl RigPanelState {
             self.slots = vec![None; pattern.slots.len()];
             self.armed = None;
         }
+        let alive = std::mem::take(&mut self.alive);
         for held in self.slots.iter_mut() {
-            if held.is_some_and(|id| !parts.iter().any(|p| p.object == id)) {
+            if held.is_some_and(|id| !parts.iter().any(|p| p.object == id) && !alive.contains(&id)) {
                 *held = None;
             }
         }
@@ -308,6 +462,8 @@ pub fn rig_panel(
         });
     }
 
+    head_section(ui, state, &mut response);
+
     // The table is for the pattern on screen: the selected rig's own, or the
     // one being assembled.
     let pattern = bound
@@ -318,6 +474,88 @@ pub fn rig_panel(
     ui.separator();
     armature_section(ui, armature, poses, state, &mut response);
     response
+}
+
+/// **Rig Head**, beside Rig Character: the head's layers, each with the name
+/// it is tagged as (the user's Shift+R names), **Name Layers** to give them
+/// those names, and **Rig Head** to build the head's structure from them.
+fn head_section(ui: &mut Ui, state: &mut RigPanelState, out: &mut RigResponse) {
+    ui.separator();
+    ui.heading("Rig Head");
+    let Some(head) = state.head.clone() else {
+        ui.label(
+            RichText::new("Select a head instance on the stage, or open the head symbol.")
+                .small()
+                .weak()
+                .italics(),
+        );
+        return;
+    };
+    // A new head: start from the names its layers would get.
+    if state.head_tags_for != Some(head.symbol) {
+        // The names picked for the head being left are kept for coming back.
+        if let Some(old) = state.head_tags_for {
+            let tags = std::mem::take(&mut state.head_tags);
+            state.head_tags_kept.retain(|(s, _)| *s != old);
+            state.head_tags_kept.push((old, tags));
+        }
+        let kept = state.head_tags_kept.iter().find(|(s, _)| *s == head.symbol).map(|(_, t)| t.clone());
+        state.head_tags = head
+            .layers
+            .iter()
+            .map(|(id, now, suggested)| {
+                let picked = kept.as_ref().and_then(|k| k.iter().find(|(l, _)| l == id).map(|(_, t)| t.clone()));
+                (*id, picked.unwrap_or_else(|| suggested.clone().unwrap_or_else(|| now.clone())))
+            })
+            .collect();
+        state.head_tags_for = Some(head.symbol);
+    }
+    ui.label(RichText::new(format!("Head: {}", head.name)).small());
+    egui::Grid::new("rig-head-layers").num_columns(3).spacing([6.0, 2.0]).show(ui, |ui| {
+        for (id, now, _) in &head.layers {
+            let Some(tag) = state.head_tags.iter_mut().find(|(l, _)| l == id).map(|(_, t)| t) else {
+                continue;
+            };
+            ui.label(RichText::new(now).small());
+            ui.label(RichText::new("\u{2192}").small().weak());
+            egui::ComboBox::from_id_salt(("rig-head-tag", id.0))
+                .selected_text(RichText::new(tag.as_str()).small())
+                .width(130.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(tag, now.clone(), format!("{now} (keep)"));
+                    for name in HEAD_NAMES {
+                        ui.selectable_value(tag, (*name).to_string(), *name);
+                    }
+                });
+            ui.end_row();
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        let renames: Vec<(buzz_scene::LayerId, String)> = state
+            .head_tags
+            .iter()
+            .filter(|(id, tag)| head.layers.iter().any(|(l, now, _)| l == id && now != tag))
+            .cloned()
+            .collect();
+        if ui
+            .add_enabled(!renames.is_empty(), egui::Button::new("Name Layers"))
+            .on_hover_text("Give the head's layers these names (your Shift+R names). One undo step")
+            .on_disabled_hover_text("Every layer already has the name picked for it")
+            .clicked()
+        {
+            out.name_head_layers = Some((head.symbol, renames));
+        }
+        if ui
+            .button(RichText::new("Rig Head").strong())
+            .on_hover_text(
+                "Build the head's structure from its layers: eye lid (blink), eye mask, eye ball, eye white, \
+                 brows, mouth symbol, nose, hair, base. One undo step",
+            )
+            .clicked()
+        {
+            out.rig_head = Some(head.symbol);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -494,7 +732,10 @@ fn assembly(ui: &mut Ui, parts: &[LoosePart], state: &mut RigPanelState, out: &m
         }
     });
 
-    if parts.is_empty() {
+    // Only when nothing is in the list either: with the head open inside the
+    // body there are no loose drawings here, but the body's parts are still
+    // in their slots and the list is what says so.
+    if parts.is_empty() && state.slots.iter().all(Option::is_none) {
         ui.label(
             RichText::new(
                 "Nothing on the stage to rig yet. Draw the character's parts, or import \
@@ -508,9 +749,47 @@ fn assembly(ui: &mut Ui, parts: &[LoosePart], state: &mut RigPanelState, out: &m
     }
 
     ui.add_space(2.0);
+    let builtin_len = RigPattern::builtin().into_iter().nth(state.pattern).map(|p| p.slots.len()).unwrap_or(0);
+    let mut remove = None;
     for index in 0..pattern.slots.len() {
+        if index >= builtin_len {
+            ui.horizontal(|ui| {
+                let parent = pattern.slots[index].parent.and_then(|p| pattern.slots.get(p)).map(|p| slot_label(state, &p.name)).unwrap_or_default();
+                ui.label(RichText::new(format!("your part, on {parent}")).small().weak());
+                if ui.small_button("\u{2715}").on_hover_text("Take this part out of the list").clicked() {
+                    remove = Some(index);
+                }
+            });
+        }
         slot_row(ui, &pattern, index, parts, state, out);
     }
+    if let Some(index) = remove {
+        state.remove_part(index);
+    }
+    // **Add a part of your own**, connected to one already in the list.
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut state.new_part_name).hint_text("New part (tail, bag\u{2026})").desired_width(110.0));
+        let names: Vec<String> = pattern.slots.iter().map(|s| slot_label(state, &s.name)).collect();
+        let at = state.new_part_parent.min(names.len().saturating_sub(1));
+        egui::ComboBox::from_id_salt("rig-new-part-parent")
+            .selected_text(RichText::new(format!("on {}", names.get(at).cloned().unwrap_or_default())).small())
+            .width(90.0)
+            .show_ui(ui, |ui| {
+                for (i, name) in names.iter().enumerate() {
+                    ui.selectable_value(&mut state.new_part_parent, i, name);
+                }
+            })
+            .response
+            .on_hover_text("The part it is connected to: it moves with that part");
+        if ui.small_button("Add part").clicked() {
+            let name = state.new_part_name.clone();
+            if state.add_part(&name, at) {
+                state.new_part_name.clear();
+            } else {
+                state.note = Some("Give the part a name no other part has".into());
+            }
+        }
+    });
 
     // -- what is still missing, and the button ------------------------------
 
@@ -598,10 +877,14 @@ fn slot_row(
                 };
                 ui.label(RichText::new(mark).small().color(colour));
 
+                // The user's name for the part (`leftArm`), the slot's own
+                // ("Shoulder L") in the tooltip.
+                let label = profile_name(state.profile.as_ref(), &slot.name).unwrap_or_else(|| slot.name.clone());
                 ui.add_sized(
                     egui::vec2(64.0, ui.spacing().interact_size.y),
-                    egui::Label::new(RichText::new(&slot.name).small()).truncate(),
-                );
+                    egui::Label::new(RichText::new(&label).small()).truncate(),
+                )
+                .on_hover_text(format!("{label} \u{2014} the {} slot", slot.name));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if held.is_some()
@@ -619,7 +902,9 @@ fn slot_row(
                             Some(id) => parts
                                 .iter()
                                 .find(|p| p.object == id)
-                                .map_or_else(|| "\u{2014}".to_string(), |p| p.name.clone()),
+                                .map(|p| p.name.clone())
+                                .or_else(|| state.kept_names.iter().find(|(k, _)| *k == id).map(|(_, n)| n.clone()))
+                                .unwrap_or_else(|| "\u{2014}".to_string()),
                             None if armed => "click it on the stage".to_string(),
                             None => "empty".to_string(),
                         };
@@ -767,12 +1052,55 @@ fn resolve(dragged: DraggedPart, parts: &[LoosePart]) -> Option<ObjectId> {
 }
 
 /// Fill every slot the drawings' own names account for.
+/// The naming profile's name for a slot ("Elbow L" -> `leftWrist` in the user's
+/// convention, where the wrist layer is the forearm); `None` when the profile
+/// has no such part.
+/// What a slot is called on screen and what its layer gets named when it is
+/// tagged: the user's own name for it (`leftArm`), else the slot's.
+pub fn slot_label(state: &RigPanelState, slot: &str) -> String {
+    profile_name(state.profile.as_ref(), slot).unwrap_or_else(|| slot.to_string())
+}
+
+pub fn profile_name(profile: Option<&buzz_rig::pattern::NamingProfile>, slot: &str) -> Option<String> {
+    let profile = profile?;
+    let (stem, right) = match (slot.strip_suffix(" L"), slot.strip_suffix(" R")) {
+        (Some(stem), _) => (stem, false),
+        (_, Some(stem)) => (stem, true),
+        _ => (slot, false),
+    };
+    let part = profile.parts.iter().find(|p| p.part == stem)?;
+    Some(if right { part.right.clone() } else { part.left.clone() })
+}
+
+/// Fill the slots from the layer names: first a layer named exactly as the
+/// naming profile names a slot (`leftWrist` is the forearm, not the wrist),
+/// then by what the remaining names say (`L_upperArm`, `torso`).
 fn auto_assign(pattern: &RigPattern, parts: &[LoosePart], state: &mut RigPanelState) {
     let names: Vec<String> = parts.iter().map(|p| p.name.clone()).collect();
+    let mut taken = vec![false; parts.len()];
+    let mut chosen: Vec<Option<usize>> = pattern
+        .slots
+        .iter()
+        .map(|slot| {
+            let wanted = profile_name(state.profile.as_ref(), &slot.name)?;
+            let index = (0..parts.len()).find(|&i| !taken[i] && names[i].trim().eq_ignore_ascii_case(&wanted))?;
+            taken[index] = true;
+            Some(index)
+        })
+        .collect();
     let matched = buzz_rig::match_parts(pattern, &names);
+    for (slot, found) in matched.iter().enumerate() {
+        if let Some(index) = *found
+            && chosen[slot].is_none()
+            && !taken[index]
+        {
+            taken[index] = true;
+            chosen[slot] = Some(index);
+        }
+    }
 
     let mut filled = 0;
-    state.slots = matched
+    state.slots = chosen
         .iter()
         .map(|found| {
             found.and_then(|index| {
@@ -1182,6 +1510,27 @@ mod tests {
 
     /// The button that does most of the work, checked without a screen: the
     /// names go in, the slots come out filled.
+    /// With the user's naming profile, the slots are called by their names
+    /// and their names fill them: `leftWrist` is the forearm (Elbow L) and
+    /// `leftPalm` the hand (Wrist L), not what the words alone would say.
+    #[test]
+    fn the_users_names_tag_the_parts() {
+        let pattern = RigPattern::biped_full();
+        let profile = buzz_rig::pattern::NamingProfile::animate_convention();
+        assert_eq!(profile_name(Some(&profile), "Elbow L").as_deref(), Some("leftWrist"));
+        assert_eq!(profile_name(Some(&profile), "Shoulder R").as_deref(), Some("rightArm"));
+        let parts = vec![part(1, "body"), part(2, "head"), part(3, "leftArm"), part(4, "leftWrist"), part(5, "leftPalm")];
+        let mut state = RigPanelState { profile: Some(profile), ..RigPanelState::default() };
+        state.slots = vec![None; pattern.slots.len()];
+        auto_assign(&pattern, &parts, &mut state);
+        let at = |name: &str| state.slots[pattern.slot_named(name).unwrap()];
+        assert_eq!(at("Chest"), Some(ObjectId(1)));
+        assert_eq!(at("Head"), Some(ObjectId(2)));
+        assert_eq!(at("Shoulder L"), Some(ObjectId(3)));
+        assert_eq!(at("Elbow L"), Some(ObjectId(4)), "leftWrist is the forearm");
+        assert_eq!(at("Wrist L"), Some(ObjectId(5)), "leftPalm is the hand");
+    }
+
     #[test]
     fn auto_assign_fills_the_slots_from_the_layer_names() {
         let pattern = RigPattern::biped();
@@ -1295,6 +1644,45 @@ mod tests {
             Some(ObjectId(1))
         );
         assert_eq!(resolve(DraggedPart::Object(ObjectId(2)), &parts), None);
+    }
+
+    #[test]
+    /// **Rig Head**: the head's layers start on their suggested names, and
+    /// Name Layers asks for exactly the ones that change.
+    #[test]
+    fn the_head_section_names_the_layers() {
+        let ctx = egui::Context::default();
+        let head = buzz_scene::SymbolId(9);
+        let (white, ball, nose) = (buzz_scene::LayerId(1), buzz_scene::LayerId(2), buzz_scene::LayerId(3));
+        let mut state = RigPanelState {
+            head: Some(HeadSection {
+                symbol: head,
+                name: "frontHead".into(),
+                layers: vec![
+                    (white, "EyeWhite".into(), Some("eyeWhite".into())),
+                    (ball, "eyeBall".into(), Some("eyeBall".into())),
+                    (nose, "Layer_7".into(), None),
+                ],
+            }),
+            ..RigPanelState::default()
+        };
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let _ = rig_panel(ui, None, &[], &[], None, &mut state, &mut Default::default());
+        });
+        assert_eq!(state.head_tags_for, Some(head));
+        assert_eq!(
+            state.head_tags,
+            vec![(white, "eyeWhite".to_string()), (ball, "eyeBall".to_string()), (nose, "Layer_7".to_string())],
+            "suggested names, else the name it has"
+        );
+        // What Name Layers would send: only the layer whose name changes.
+        let renames: Vec<_> = state
+            .head_tags
+            .iter()
+            .filter(|(id, tag)| state.head.as_ref().unwrap().layers.iter().any(|(l, now, _)| l == id && now != tag))
+            .cloned()
+            .collect();
+        assert_eq!(renames, vec![(white, "eyeWhite".to_string())]);
     }
 
     #[test]

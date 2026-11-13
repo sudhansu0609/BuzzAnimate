@@ -103,6 +103,44 @@ pub(crate) fn classify(name: &str) -> Option<Part> {
     })
 }
 
+/// **The name the user's Shift+R command gives a head layer**
+/// (`renameHeadLayers.jsfl`, rule for rule): eye whites `eyeWhite` (or
+/// `leftEyeWhite` / `rightEyeWhite` when the name has a side), any "ball"
+/// `eyeBall`, brows `eyebrow` (or `leftEyebrow` / `rightEyebrow`). Layers it
+/// skips — inside a folder, named "Layer…", sound, blank — and names it leaves
+/// alone get Rig Head's reading instead (`eyeLid`, `mouth`, `nose`, `hair`,
+/// `base`, `moustacheFront`); `None` when neither says anything.
+pub fn head_layer_name(layer: &Layer) -> Option<String> {
+    let n = layer.name.to_lowercase();
+    let skipped = layer.parent.is_some() || n.starts_with("layer") || n.contains("sound") || n.trim().is_empty();
+    if !skipped {
+        let left = n.contains("left") || n.contains("l_") || n.contains("_l");
+        let right = n.contains("right") || n.contains("r_") || n.contains("_r");
+        let sided = |plain: &str, l: &str, r: &str| Some(if left { l } else if right { r } else { plain }.to_string());
+        if n.contains("eyewhite") || (n.contains("eye") && n.contains("white")) {
+            return sided("eyeWhite", "leftEyeWhite", "rightEyeWhite");
+        }
+        if n.contains("ball") {
+            return Some("eyeBall".into());
+        }
+        if n.contains("brow") {
+            return sided("eyebrow", "leftEyebrow", "rightEyebrow");
+        }
+    }
+    Some(
+        match classify(&layer.name)? {
+            Part::Lid => "eyeLid",
+            Part::Mouth => "mouth",
+            Part::Nose => "nose",
+            Part::Hair => "hair",
+            Part::Base => "base",
+            Part::Moustache => "moustacheFront",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
 /// A layer, or some of the objects on one, going to one part.
 #[derive(Clone)]
 struct Unit {

@@ -316,13 +316,73 @@ pub fn analyse_mouth_chart(scene: &Scene, chart: SymbolId) -> VisemeMap {
 
 /// The chart's map: the one stored on it, else read from its drawings ([`analyse_mouth_chart`]).
 pub fn viseme_map_of(scene: &Scene, chart: SymbolId) -> VisemeMap {
-    let stored = scene.library().get(chart).and_then(|s| {
+    stored_viseme_map(scene, chart).unwrap_or_else(|| analyse_mouth_chart(scene, chart))
+}
+
+/// **The animator's own mapping** of Adobe Animate's twelve visemes
+/// ([`buzz_audio::ANIMATE_VISEMES`]) to the chart's frames, 0-based — what
+/// Animate's Lip Syncing dialog stores on a mouth symbol, set here in the Lip
+/// Sync window's Set Visemes. Stored on the chart symbol as a tag.
+pub type AnimateChart = [u32; 12];
+
+/// The tag an Animate-style viseme mapping is stored under (`animate-visemes:3,0,6,...`).
+const ANIMATE_TAG: &str = "animate-visemes:";
+
+/// The chart's Animate-style mapping, when one was set on it.
+pub fn animate_chart_of(scene: &Scene, chart: SymbolId) -> Option<AnimateChart> {
+    scene.library().get(chart).and_then(|s| {
+        s.tags.iter().find_map(|t| t.strip_prefix(ANIMATE_TAG)).and_then(|list| {
+            let v: Vec<u32> = list.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+            <AnimateChart>::try_from(v).ok()
+        })
+    })
+}
+
+/// The map a stored mapping gives: the Animate-style one when set, else the
+/// older per-shape one; `None` when the chart carries neither.
+pub fn stored_viseme_map(scene: &Scene, chart: SymbolId) -> Option<VisemeMap> {
+    if let Some(animate) = animate_chart_of(scene, chart) {
+        return Some(map_from_animate(&animate));
+    }
+    scene.library().get(chart).and_then(|s| {
         s.tags.iter().find_map(|t| t.strip_prefix(MAP_TAG)).and_then(|list| {
             let v: Vec<u32> = list.split(',').filter_map(|n| n.trim().parse().ok()).collect();
             <VisemeMap>::try_from(v).ok()
         })
+    })
+}
+
+const SHAPES: [Viseme; 10] = [Viseme::Rest, Viseme::Ai, Viseme::E, Viseme::O, Viseme::U, Viseme::L, Viseme::WQ, Viseme::MBP, Viseme::FV, Viseme::Etc];
+
+/// Each shape's chart frame, from an Animate-style mapping.
+pub fn map_from_animate(chart: &AnimateChart) -> VisemeMap {
+    let mut map: VisemeMap = std::array::from_fn(|i| i as u32);
+    for shape in SHAPES {
+        map[shape.frame() as usize] = chart[shape.animate_slot()];
+    }
+    map
+}
+
+/// The Animate-style mapping a per-shape map amounts to (D, R and S all on
+/// the consonant frame, L and Uh on the neutral one).
+pub fn animate_from_map(map: &VisemeMap) -> AnimateChart {
+    let shape_of_slot = [
+        Viseme::Rest, Viseme::Ai, Viseme::Etc, Viseme::E, Viseme::FV, Viseme::L,
+        Viseme::MBP, Viseme::O, Viseme::Etc, Viseme::Etc, Viseme::L, Viseme::U,
+    ];
+    std::array::from_fn(|slot| map[shape_of_slot[slot].frame() as usize])
+}
+
+/// **Set the chart's visemes**, Animate's way: the mapping is stored on the
+/// chart symbol and every lip sync onto it uses it from then on.
+pub fn set_animate_chart(scene: &mut Scene, chart: SymbolId, mapping: AnimateChart) {
+    let list = mapping.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let derived = map_from_animate(&mapping).iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    scene.library_mut().update(chart, |s| {
+        s.tags.retain(|t| !t.starts_with(ANIMATE_TAG) && !t.starts_with(MAP_TAG));
+        s.tags.push(format!("{ANIMATE_TAG}{list}"));
+        s.tags.push(format!("{MAP_TAG}{derived}"));
     });
-    stored.unwrap_or_else(|| analyse_mouth_chart(scene, chart))
 }
 
 /// Store the chart's map on the chart symbol (a tag), unless it already has one. Used on the copy a

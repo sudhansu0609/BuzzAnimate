@@ -180,10 +180,14 @@ pub fn cast_into_shot(scene: &mut Scene, assets: &AssetLibrary, asset: &Asset, l
     let feet = stage.y1 - stage.height() * 0.08;
     let (t, _) = crate::episode::stand_on(bounds, height, x, feet);
     crate::episode::transform_layers(scene, &placed.top, t);
-    // Every layer that arrived lasts to the scene's end (a placed layer is as long as its symbol).
+    // On its own new layers **from the playhead**, empty before it, and lasting to the scene's
+    // end (a placed layer is as long as its symbol).
     let to = scene.frame_count().max(from + 24);
     for id in placed.all.iter().copied().chain(folder) {
         scene.update_layer(id, |l| {
+            if from > 0 {
+                l.frames.delay(from);
+            }
             if l.frames.length() < to {
                 l.frames.insert_frame(to - 1);
             }

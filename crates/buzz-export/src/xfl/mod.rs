@@ -1047,11 +1047,7 @@ fn object_xml(
             // instance on a chosen frame, and writing every one as a loop from
             // frame 0 opened each character with the same default face.
             let playing = if matches!(symbol.kind, SymbolKind::Graphic) {
-                let mode = match instance.loop_mode {
-                    buzz_scene::LoopMode::Loop => "loop",
-                    buzz_scene::LoopMode::PlayOnce => "play once",
-                    buzz_scene::LoopMode::SingleFrame => "single frame",
-                };
+                let mode = instance.loop_mode.animate_name();
                 let first = if instance.first_frame > 0 {
                     format!(" firstFrame=\"{}\"", instance.first_frame)
                 } else {

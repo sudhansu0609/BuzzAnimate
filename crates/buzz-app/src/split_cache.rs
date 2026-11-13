@@ -61,6 +61,10 @@ struct Entry {
     model: String,
     prompt_version: u32,
     small_objects: bool,
+    /// Whether the picture was found to be indoors (its list then made with the indoor
+    /// prompt). Entries saved before this was asked hold `None` and count as outdoor.
+    #[serde(default)]
+    indoor: Option<bool>,
     /// The picture the list was made for, in pixels.
     picture: [u32; 2],
     /// `THUMB_W` x `THUMB_H` RGB, hex.
@@ -77,6 +81,8 @@ pub struct Saved {
     pub path: PathBuf,
     pub objects: Vec<DetectedSceneObject>,
     pub ground_y: f64,
+    /// Whether the picture was found to be indoors; `None` when it was not asked.
+    pub indoor: Option<bool>,
 }
 
 /// The picture as a 64x36 RGB thumbnail.
@@ -105,8 +111,9 @@ fn from_hex(text: &str) -> Option<Vec<u8>> {
 }
 
 /// The saved list for `picture` made by `model` with this prompt version, if any: the
-/// closest thumbnail within [`THUMB_MAX_DIFF`] (the lowest file name on a tie).
-pub fn find(picture: &RgbaImage, model: &str, small_objects: bool) -> Option<Saved> {
+/// closest thumbnail within [`THUMB_MAX_DIFF`] (the lowest file name on a tie). With
+/// `indoor`, only a list made for that kind of scene.
+pub fn find(picture: &RgbaImage, model: &str, small_objects: bool, indoor: Option<bool>) -> Option<Saved> {
     let thumb = thumbnail(picture);
     let mut files: Vec<PathBuf> = std::fs::read_dir(cache_dir())
         .ok()?
@@ -122,13 +129,14 @@ pub fn find(picture: &RgbaImage, model: &str, small_objects: bool) -> Option<Sav
             || entry.model != model
             || entry.prompt_version != buzz_ai::scene_builder::BACKGROUND_OBJECTS_PROMPT_VERSION
             || entry.small_objects != small_objects
+            || indoor.is_some_and(|want| entry.indoor.unwrap_or(false) != want)
         {
             continue;
         }
         let Some(saved_thumb) = from_hex(&entry.thumb) else { continue };
         let diff = thumb_diff(&thumb, &saved_thumb);
         if diff <= THUMB_MAX_DIFF && best.as_ref().is_none_or(|(d, _)| diff < *d) {
-            best = Some((diff, Saved { path, objects: entry.objects, ground_y: entry.ground_y }));
+            best = Some((diff, Saved { path, objects: entry.objects, ground_y: entry.ground_y, indoor: entry.indoor }));
         }
     }
     best.map(|(_, s)| s)
@@ -140,6 +148,7 @@ pub fn save(
     picture: &RgbaImage,
     model: &str,
     small_objects: bool,
+    indoor: bool,
     objects: &[DetectedSceneObject],
     ground_y: f64,
     replace: Option<&Path>,
@@ -163,6 +172,7 @@ pub fn save(
         model: model.to_string(),
         prompt_version: buzz_ai::scene_builder::BACKGROUND_OBJECTS_PROMPT_VERSION,
         small_objects,
+        indoor: Some(indoor),
         picture: [picture.width(), picture.height()],
         thumb: to_hex(&thumbnail(picture)),
         objects: objects.to_vec(),

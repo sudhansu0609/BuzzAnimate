@@ -71,6 +71,11 @@ fn conversation() -> (Editor, tempfile::TempDir) {
     std::fs::write(&srt, SRT).expect("write srt");
 
     let mut editor = Editor::default();
+    // Each line ends where its caption does: Equal Layer Lengths would run the
+    // last caption on to the end of the timeline, and the last speaker's mouth
+    // with it.
+    editor.workspace.equal_layer_lengths = false;
+    editor.doc.set_equal_layer_lengths(false);
     editor.import_sound(&wav).expect("the dialogue imports");
 
     // A mouth for each character, named after them — which is how they are

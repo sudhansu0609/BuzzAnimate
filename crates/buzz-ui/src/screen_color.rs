@@ -181,18 +181,20 @@ mod tests {
     fn a_screen_pick_reaches_only_the_swatch_that_asked() {
         let ctx = egui::Context::default();
         let red = Color::from_rgba8(0xE5, 0x12, 0x34, 0xFF);
-        *PICKED.lock().unwrap() = Some((Id::new(("color-row", "brush-fill")), red));
+        // Swatch names no panel uses: tests run side by side, and a real panel's
+        // swatch drawn by another test would take the pick first.
+        *PICKED.lock().unwrap() = Some((Id::new(("color-row", "screen-pick-test-fill")), red));
 
         let mut other = Color::BLACK;
         let mut fill = Color::BLACK;
         let mut changed = (false, false);
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            changed.0 = crate::panels::color_row(ui, "line-stroke", &mut other);
-            changed.1 = crate::panels::color_row(ui, "brush-fill", &mut fill);
+            changed.0 = crate::panels::color_row(ui, "screen-pick-test-line", &mut other);
+            changed.1 = crate::panels::color_row(ui, "screen-pick-test-fill", &mut fill);
         });
         assert_eq!(changed, (false, true));
         assert_eq!(other, Color::BLACK);
         assert_eq!(fill.to_rgba8(), red.to_rgba8(), "exactly the sampled bytes");
-        assert!(take(Id::new(("color-row", "brush-fill"))).is_none(), "taken once");
+        assert!(take(Id::new(("color-row", "screen-pick-test-fill"))).is_none(), "taken once");
     }
 }

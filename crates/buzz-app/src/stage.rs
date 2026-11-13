@@ -177,6 +177,9 @@ pub struct StageInputs {
     pub area_px: Rect,
     pub scale: f64,
     pub buffer_scale: u32,
+    /// The layer being drawn on — the one mask the stage leaves unclipped
+    /// (see [`MaskDisplay::Editing`]).
+    pub active_layer: Option<buzz_scene::LayerId>,
 }
 
 impl StageInputs {
@@ -191,6 +194,7 @@ impl StageInputs {
             area_px: area,
             scale,
             buffer_scale: buzz_render::vello_encoding::buffer_scale(),
+            active_layer: editor.selection.active_layer(),
         }
     }
 }
@@ -269,8 +273,9 @@ pub fn encode_plain(
     let frame = inputs.frame;
     let camera = scene.edit_camera(frame);
     let live = FrameOptions {
-        masks: MaskDisplay::WhenLocked,
-        lit: true,
+        masks: MaskDisplay::Always,
+        // Lights belong to the main timeline: an open symbol is drawn unlit.
+        lit: scene.edit_path().is_empty(),
         layer_alpha: true,
         place: scene.edit_place(),
         cull,
@@ -385,7 +390,7 @@ fn encode(
     // edge a part is being extended under (TRACE_SPILL_AND_OUTPAINT_PLAN C2).
     if !scene.edit_path().is_empty() && editor.view.show_neighbours {
         let context = FrameOptions {
-            masks: MaskDisplay::WhenLocked,
+            masks: MaskDisplay::Always,
             // Not lit: shading and cast shadows on artwork that is only there
             // for reference read as dirt on the stage.
             lit: false,
@@ -418,8 +423,8 @@ fn encode(
     let place = scene.edit_place();
     for other in editor.multi_frames() {
         let options = FrameOptions {
-            masks: MaskDisplay::WhenLocked,
-            lit: true,
+            masks: MaskDisplay::Always,
+            lit: scene.edit_path().is_empty(),
             // The lamps' pools belong to the frame, and the live frame below
             // lays them. Letting every keyframe under Edit Multiple Frames lay
             // its own would stack six copies of the same light on one picture.
@@ -439,7 +444,7 @@ fn encode(
         let options = FrameOptions {
             ghost: Some(strength),
             ghost_outlines: editor.onion.outlines,
-            masks: MaskDisplay::WhenLocked,
+            masks: MaskDisplay::Always,
             place,
             effect: Default::default(),
             // Ghosts are reference, not picture: shading and cast shadows on a
@@ -460,12 +465,17 @@ fn encode(
         draw_frame_within(&mut builder, scene, ghost_frame, camera, &options, cache);
     }
 
-    // Animate shows the mask effect only once the mask layer is locked,
-    // because you cannot draw inside a region you cannot see. An export
-    // always masks; this is the stage.
+    // **Masks clip on the stage exactly as in the film**, locked or not and
+    // whichever layer is active: a pupil stays inside its eye while the head
+    // is being worked on. Showing the active mask layer's raw shape instead
+    // (`MaskDisplay::Editing`) covered the pupils the moment a click in the
+    // eye made `eyeMask` the active layer. A selected mask shape still shows
+    // by its selection outline.
     let live = FrameOptions {
-        masks: MaskDisplay::WhenLocked,
-        lit: true,
+        masks: MaskDisplay::Always,
+        // Lights belong to the main timeline: inside a symbol the artwork is
+        // drawn in its own colours, unlit, with no light handles over it.
+        lit: scene.edit_path().is_empty(),
         // The working view, and the only place a dimmed layer is dimmed.
         layer_alpha: true,
         place,
@@ -1347,6 +1357,11 @@ fn draw_lights(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poin
     if !editor.scene().lights().enabled {
         // Handles for a rig that is switched off would promise an effect the
         // document is not applying.
+        return;
+    }
+    // Lights are the main timeline's alone: inside a symbol they neither light
+    // the artwork nor show their handles.
+    if !editor.scene().edit_path().is_empty() {
         return;
     }
 

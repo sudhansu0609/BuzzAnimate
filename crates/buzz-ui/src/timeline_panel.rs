@@ -42,6 +42,9 @@ pub struct TimelineResponse {
     /// I2: a folder's disclosure triangle was clicked — collapse it if it was
     /// expanded, expand it if it was collapsed.
     pub toggle_collapsed: Option<LayerId>,
+    /// **Rename a layer**: double-click its name (or Rename Layer in its menu),
+    /// type, Enter or click away.
+    pub rename_layer: Option<(LayerId, String)>,
     /// The exact rectangular region selected in the frame grid.
     pub select_cells: Option<crate::TimelineSelection>,
     /// The frame selection was dragged somewhere new: move it there (or copy
@@ -816,6 +819,10 @@ pub struct TimelineState {
     pub protect_keyframes: Option<buzz_scene::ProtectScope>,
     /// Edit Frames on Locked Layers (`Workspace::frames_on_locked_layers`).
     pub frames_on_locked_layers: bool,
+    /// The keys that raise each transport command, as the user's keymap has
+    /// them (`"Enter or W"`), for the buttons' tooltips; a command missing from
+    /// it has no key.
+    pub key_names: std::collections::HashMap<crate::Command, String>,
     /// L1: which rows the layer filter keeps (`Workspace::layer_filter`).
     pub layer_filter: LayerFilter,
     /// L1: the layer search text. Not saved.
@@ -891,6 +898,8 @@ pub const WAVE_PEAKS_PER_FRAME: usize = 8;
 /// Wider than it was by the width of the three switch columns, so that adding
 /// them took the room from the window rather than from the layer names.
 const LAYER_COLUMN: f32 = 210.0;
+/// The ruler's height: the frame numbers on top, the seconds under them.
+pub const RULER_HEIGHT: f32 = 28.0;
 
 /// H2: the width of a highlighted layer's left-edge bar, in both the
 /// timeline's name column and the Layers panel's rows.
@@ -1166,6 +1175,28 @@ mod parenting {
         });
     }
 
+    /// A node let go of this frame, and where: resolved once every row has
+    /// recorded its node. Read on the dragged row itself, the drop only knew
+    /// the rows drawn above it — so a head dragged down onto the body below
+    /// it landed on "nothing" and detached instead of linking.
+    pub fn set_dropped(ctx: &egui::Context, layer: LayerId, at: egui::Pos2) {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("timeline-parent-dropped"), (layer, at)));
+    }
+
+    pub fn take_dropped(ctx: &egui::Context) -> Option<(LayerId, egui::Pos2)> {
+        let id = egui::Id::new("timeline-parent-dropped");
+        ctx.data_mut(|d| {
+            let dropped = d.get_temp::<(LayerId, egui::Pos2)>(id);
+            d.remove::<(LayerId, egui::Pos2)>(id);
+            dropped
+        })
+    }
+
+    /// The node within reach of `at`, if any.
+    pub fn node_at(nodes: &[(LayerId, egui::Pos2)], at: egui::Pos2) -> Option<LayerId> {
+        nodes.iter().find(|(_, p)| p.distance(at) <= 11.0).map(|(id, _)| *id)
+    }
+
     pub fn clear_nodes(ctx: &egui::Context) {
         ctx.data_mut(|d| {
             d.insert_temp::<Vec<(LayerId, egui::Pos2)>>(
@@ -1313,9 +1344,14 @@ pub fn timeline_panel_with_tools_slot(
     let theme_scroll = ui.spacing().scroll;
     ui.spacing_mut().scroll.bar_width = 10.0;
     ui.spacing_mut().scroll.foreground_color = true;
+    // The horizontal bar runs under the frames only, from the first frame
+    // column, not under the layer names (which never scroll sideways).
+    let mut bars = ui.available_rect_before_wrap();
+    bars.min.x = (bars.min.x + LAYER_COLUMN).min(bars.max.x);
     egui::ScrollArea::both()
         .id_salt("timeline-grid")
         .auto_shrink([false, false])
+        .scroll_bar_rect(bars)
         // Rows scroll rather than being silently clipped when a short
         // timeline (Essentials' 220 px default among them) cannot show every
         // layer at once — the bar stays on screen rather than only on hover,
@@ -1435,6 +1471,11 @@ pub fn timeline_panel_with_tools_slot(
             // whichever row was drawn next.
             if state.parenting_view {
                 let nodes = parenting::nodes(ui.ctx());
+                if let Some((dragged, at)) = parenting::take_dropped(ui.ctx()) {
+                    let dropped_on = parenting::node_at(&nodes, at);
+                    response.set_follows = parenting::drop_decision(scene.layers(), dragged, dropped_on)
+                        .map(|parent| (dragged, parent));
+                }
                 let at = |id: LayerId| nodes.iter().find(|(l, _)| *l == id).map(|(_, p)| *p);
                 let painter = ui.painter_at(ui.clip_rect());
                 for (id, from) in &nodes {
@@ -1509,7 +1550,8 @@ pub fn timeline_panel_with_tools_slot(
     response
 }
 
-/// New Layer, New Folder and Delete, under the layer names.
+/// New Folder, Camera and the rest of the layer tools, under the layer names
+/// (New Layer and Delete Layer are on the headings' row, see `ruler`).
 ///
 /// The same three commands the Insert menu and the Layers panel raise — the
 /// buttons are a third door onto one room, not a third implementation. Delete
@@ -1529,15 +1571,8 @@ fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Time
         // dense inline text, wrong for the row's clickable buttons, which the
         // hit-target audit walks like any other. `LAYER_TOOLS_HEIGHT` above
         // already reserves the room for them at full size.
-        if crate::widgets::sheet_icon_button(
-            ui,
-            crate::icon_sheet::SheetIcon::NewLayer,
-            crate::Command::NewLayer.label(),
-        )
-        .clicked()
-        {
-            out.command = Some(crate::Command::NewLayer);
-        }
+        // New Layer and Delete Layer are on the headings' row above the
+        // layer names (see `ruler`), beside hide/lock/outline all.
         // F1: spelled out — "Fld" read as a typo or an abbreviation nobody
         // had agreed on, on a button that makes the one thing a folder
         // button ought to say plainly.
@@ -1549,25 +1584,6 @@ fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Time
             out.command = Some(crate::Command::NewLayerFolder);
         }
 
-        let can_delete = scene.layers().len() > 1 && state.active_layer.is_some();
-        if ui
-            .add_enabled_ui(can_delete, |ui| {
-                crate::widgets::sheet_icon_button(
-                    ui,
-                    crate::icon_sheet::SheetIcon::DeleteLayer,
-                    crate::Command::DeleteLayer.label(),
-                )
-            })
-            .inner
-            .on_disabled_hover_text(if state.active_layer.is_some() {
-                "The last layer cannot be deleted"
-            } else {
-                "Select a layer first"
-            })
-            .clicked()
-        {
-            out.command = Some(crate::Command::DeleteLayer);
-        }
 
         // **C1**: the camera row's own on/off, reachable from the layer
         // tools the same way a layer's own eye is reachable from its row —
@@ -2058,40 +2074,49 @@ fn transport_controls(
     out: &mut TimelineResponse,
 ) {
     {
-        if icon_button(ui, false, "Go to first frame", Glyph::First) {
+        // Each button names the keys that do the same, from the user's keymap.
+        let tip = |label: &str, command: crate::Command| match state.key_names.get(&command).filter(|k| !k.is_empty()) {
+            Some(keys) => format!("{label} ({keys})"),
+            None => label.to_string(),
+        };
+        if icon_button(ui, false, &tip("Go to first frame", crate::Command::FirstFrame), Glyph::First) {
             out.go_to_start = true;
         }
-        if icon_button(ui, false, "Previous frame (,)", Glyph::PreviousFrame) {
+        if icon_button(ui, false, &tip("Previous frame", crate::Command::PreviousFrame), Glyph::PreviousFrame) {
             out.step -= 1;
         }
         // Play and Pause share one button, switching face with `playing` —
         // both painted glyphs now, the same as every other transport icon.
+        let play_tip = tip("Play or pause", crate::Command::PlayPause);
         let play_clicked = if state.playing {
-            icon_button(ui, true, "Play or pause (Enter)", Glyph::Pause)
+            icon_button(ui, true, &play_tip, Glyph::Pause)
         } else {
-            icon_button(ui, false, "Play or pause (Enter)", Glyph::Play)
+            icon_button(ui, false, &play_tip, Glyph::Play)
         };
         if play_clicked {
             out.toggle_play = true;
         }
-        if icon_button(ui, false, "Next frame (.)", Glyph::NextFrame) {
+        if icon_button(ui, false, &tip("Next frame", crate::Command::NextFrame), Glyph::NextFrame) {
             out.step += 1;
         }
-        if icon_button(ui, false, "Go to last frame", Glyph::Last) {
+        if icon_button(ui, false, &tip("Go to last frame", crate::Command::LastFrame), Glyph::Last) {
             out.go_to_end = true;
         }
 
         ui.separator();
 
-        if icon_button(ui, state.onion_enabled, "Onion skinning", Glyph::OnionSkin) {
+        if icon_button(ui, state.onion_enabled, &tip("Onion skinning", crate::Command::ToggleOnionSkin), Glyph::OnionSkin) {
             out.toggle_onion = true;
         }
         if icon_button(
             ui,
             state.auto_keyframe,
-            "Auto Keyframe \u{2014} changing anything at a frame that is not a \
-             keyframe makes one first, so the change starts here rather than \
-             reaching back to the start of the span",
+            &tip(
+                "Auto Keyframe \u{2014} changing anything at a frame that is not a \
+                 keyframe makes one first, so the change starts here rather than \
+                 reaching back to the start of the span",
+                crate::Command::ToggleAutoKeyframe,
+            ),
             Glyph::AutoKey,
         ) {
             out.toggle_auto_keyframe = true;
@@ -2099,8 +2124,11 @@ fn transport_controls(
         if icon_button(
             ui,
             state.edit_multiple,
-            "Edit Multiple Frames \u{2014} every keyframe inside the onion markers \
-             is drawn solid, can be clicked, and moves together",
+            &tip(
+                "Edit Multiple Frames \u{2014} every keyframe inside the onion markers \
+                 is drawn solid, can be clicked, and moves together",
+                crate::Command::ToggleEditMultipleFrames,
+            ),
             Glyph::EditMultiple,
         ) {
             out.toggle_edit_multiple = true;
@@ -2284,7 +2312,7 @@ fn ruler(
     let cell_width = state.frame_width;
     let width = columns as f32 * cell_width;
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(LAYER_COLUMN + width, 16.0),
+        egui::vec2(LAYER_COLUMN + width, RULER_HEIGHT),
         Sense::click_and_drag(),
     );
     let grid_left = rect.min.x + LAYER_COLUMN;
@@ -2326,6 +2354,40 @@ fn ruler(
             font.clone(),
             Palette::ruler_text(),
         );
+    }
+
+    // **Seconds**, under the numbers: a tick at each whole second and its
+    // label — 1s, 2s, 3s — so a line of dialogue or a beat can be timed by eye.
+    // The tick sits on the boundary where that second ends (between frames 24
+    // and 25 at 24 fps) and runs the ruler's height; a fractional rate (29.97)
+    // puts it between cells, where the second really falls. Labelled as often
+    // as there is room for, the way the frame numbers are.
+    let fps = scene.stage().frame_rate;
+    if fps.is_finite() && fps > 0.0 {
+        let per_second = fps as f32 * cell_width;
+        let every = [1u32, 2, 5, 10, 15, 30, 60].into_iter().find(|n| *n as f32 * per_second >= 26.0).unwrap_or(120);
+        let first = ((visible.start as f64) / fps).floor().max(1.0) as u32;
+        let last = ((visible.end as f64) / fps).ceil() as u32;
+        let seconds_font = FontId::proportional(9.0);
+        // The theme's accent, so the seconds read apart from the grey frame numbers.
+        let seconds_colour = Palette::active();
+        for second in first..=last {
+            let x = grid_left + (second as f64 * fps) as f32 * cell_width;
+            let labelled = second % every == 0;
+            painter.line_segment(
+                [egui::pos2(x, if labelled { rect.min.y + 13.0 } else { rect.max.y - 4.0 }), egui::pos2(x, rect.max.y)],
+                egui::Stroke::new(1.0, seconds_colour),
+            );
+            if labelled {
+                painter.text(
+                    egui::pos2(x + 2.0, rect.max.y - 1.0),
+                    Align2::LEFT_BOTTOM,
+                    format!("{second}s"),
+                    seconds_font.clone(),
+                    seconds_colour,
+                );
+            }
+        }
     }
 
     // Beat ticks, under the numbers: a small mark at each detected beat so
@@ -2447,6 +2509,36 @@ fn ruler(
             out.toggle_all = Some(icon);
         }
     }
+
+    // **New Layer and Delete Layer on the headings' row**, left of the
+    // hide/lock/outline-all switches: the layer buttons beside the switches
+    // that act on every layer. Added after the ruler, so a click on them is
+    // theirs, not a scrub.
+    let side = crate::theme::Tokens::CONTROL_H;
+    let buttons = egui::Rect::from_min_size(
+        egui::pos2(name_row.min.x + 4.0, name_row.center().y - side / 2.0),
+        egui::vec2(2.0 * side + 4.0, side),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(buttons).layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if crate::widgets::sheet_icon_button(ui, crate::icon_sheet::SheetIcon::NewLayer, crate::Command::NewLayer.label()).clicked() {
+                out.command = Some(crate::Command::NewLayer);
+            }
+            let can_delete = scene.layers().len() > 1 && state.active_layer.is_some();
+            if ui
+                .add_enabled_ui(can_delete, |ui| {
+                    crate::widgets::sheet_icon_button(ui, crate::icon_sheet::SheetIcon::DeleteLayer, crate::Command::DeleteLayer.label())
+                })
+                .inner
+                .on_disabled_hover_text(if state.active_layer.is_some() { "The last layer cannot be deleted" } else { "Select a layer first" })
+                .clicked()
+            {
+                out.command = Some(crate::Command::DeleteLayer);
+            }
+        },
+    );
 
     // Initiating drag downward from the ruler begins vertical column frame selection.
     if response.drag_started()
@@ -3405,6 +3497,9 @@ fn layer_row(
                 out.select_layer = Some(layer.id);
             }
         }
+        if name_resp.double_clicked() {
+            start_layer_rename(ui.ctx(), layer);
+        }
         name_resp.context_menu(|ui| {
             // Right-clicking one of several selected layers keeps them all
             // selected — the menu then offers "Highlight Selected Layers"
@@ -3416,9 +3511,32 @@ fn layer_row(
             layer_context_menu(ui, scene, layer, state, out);
         });
 
+        // Being renamed: a text field where the name is.
+        let renaming = layer_rename(ui.ctx()).filter(|(id, ..)| *id == layer.id);
+        if let Some((_, mut text, focused)) = renaming {
+            let field = egui::Rect::from_min_max(egui::pos2(text_x, name_rect.min.y + 1.0), egui::pos2(name_rect.max.x, name_rect.max.y - 1.0));
+            let edit = ui.put(field, egui::TextEdit::singleline(&mut text).font(FontId::proportional(11.0)).margin(egui::vec2(2.0, 0.0)));
+            if !focused {
+                edit.request_focus();
+            }
+            let (enter, escape) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+            if escape {
+                end_layer_rename(ui.ctx());
+            } else if focused && edit.lost_focus() || enter {
+                // Enter, or a click anywhere else, keeps it — an empty name does not.
+                let name = text.trim().to_string();
+                if !name.is_empty() && name != layer.name {
+                    out.rename_layer = Some((layer.id, name));
+                }
+                end_layer_rename(ui.ctx());
+            } else {
+                set_layer_rename(ui.ctx(), layer.id, text, true);
+            }
+        } else
         // **Clipped to the name area.** A painted string does not wrap or
         // truncate itself, and a long layer name would otherwise be drawn
         // straight through the three switches to its right.
+        {
         painter.with_clip_rect(name_rect).text(
             egui::pos2(text_x + 2.0, name_row.center().y),
             Align2::LEFT_CENTER,
@@ -3433,6 +3551,7 @@ fn layer_row(
                 (false, false) => Palette::text_dim(),
             },
         );
+        }
     }
 
     // **Animate's three columns, beside the name** — eye, lock and outline,
@@ -3958,15 +4077,13 @@ fn parenting_node(
     // **The drop.** Read on the *source* node's response, because that is the
     // widget egui gives the drag to for its whole life — the node under the
     // pointer at the end never sees a release of its own.
+    // Only noted here: which node it landed on is decided after the last
+    // row, when every node on screen is known (`parenting::take_dropped`).
     if response.drag_stopped() {
-        let dropped_on = ui.ctx().input(|i| i.pointer.interact_pos()).and_then(|p| {
-            parenting::nodes(&ctx)
-                .into_iter()
-                .find(|(_, at)| at.distance(p) <= 11.0)
-                .map(|(id, _)| id)
-        });
-        out.set_follows = parenting::drop_decision(scene.layers(), layer.id, dropped_on)
-            .map(|parent| (layer.id, parent));
+        match ui.ctx().input(|i| i.pointer.interact_pos()) {
+            Some(at) => parenting::set_dropped(&ctx, layer.id, at),
+            None => out.set_follows = parenting::drop_decision(scene.layers(), layer.id, None).map(|parent| (layer.id, parent)),
+        }
         parenting::set_dragging(&ctx, None);
     }
 
@@ -4006,6 +4123,24 @@ fn parenting_node(
     }
 }
 
+/// The layer being renamed in the timeline, the text typed so far, and
+/// whether its field has had focus yet; kept in egui's memory between frames.
+fn layer_rename(ctx: &egui::Context) -> Option<(LayerId, String, bool)> {
+    ctx.data(|d| d.get_temp(egui::Id::new("timeline-layer-rename")))
+}
+
+fn set_layer_rename(ctx: &egui::Context, layer: LayerId, text: String, focused: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("timeline-layer-rename"), (layer, text, focused)));
+}
+
+fn start_layer_rename(ctx: &egui::Context, layer: &buzz_scene::Layer) {
+    set_layer_rename(ctx, layer.id, layer.name.clone(), false);
+}
+
+fn end_layer_rename(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<(LayerId, String, bool)>(egui::Id::new("timeline-layer-rename")));
+}
+
 fn layer_context_menu(
     ui: &mut Ui,
     scene: &Scene,
@@ -4014,6 +4149,10 @@ fn layer_context_menu(
     out: &mut TimelineResponse,
 ) {
     ui.label(egui::RichText::new(&layer.name).small().weak());
+    if ui.button("Rename Layer").clicked() {
+        start_layer_rename(ui.ctx(), layer);
+        ui.close();
+    }
     ui.separator();
 
     for (icon, label) in [
@@ -4796,6 +4935,7 @@ mod tests {
             focus_folders: false,
             protect_keyframes: None,
             frames_on_locked_layers: true,
+            key_names: Default::default(),
             layer_filter: Default::default(),
             layer_search: String::new(),
             row_filter: Default::default(),
@@ -5090,6 +5230,125 @@ mod tests {
             underline,
             "the layer's colour runs along the bottom of its frames"
         );
+    }
+
+    /// **Parenting by dragging a node, downwards as well as up.** The drop
+    /// was read while the dragged row was drawn, when only the rows above it
+    /// had placed their nodes: a head dragged down onto the body below it
+    /// found nothing there and was detached instead of linked.
+    #[test]
+    fn a_node_dragged_onto_a_layer_below_it_links_them() {
+        let mut scene = Scene::empty();
+        let body = scene.add_layer("body", LayerKind::Normal);
+        let head = scene.add_layer("head", LayerKind::Normal);
+        let rows: Vec<LayerId> = scene.layers().iter().map(|l| l.id).collect();
+        assert_eq!(rows, [head, body], "the fixture puts the head above the body");
+
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut st = state();
+        st.parenting_view = true;
+        let mut time = 1.0;
+        let mut frame = |events: Vec<egui::Event>| -> TimelineResponse {
+            time += 0.05;
+            let mut response = TimelineResponse::default();
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    time: Some(time),
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0))),
+                    ..Default::default()
+                },
+                |ui| response = timeline_panel(ui, &scene, &st),
+            );
+            response
+        };
+        frame(vec![]);
+        let nodes = parenting::nodes(&ctx);
+        let node = |id: LayerId| nodes.iter().find(|(l, _)| *l == id).map(|(_, p)| *p).expect("a node");
+        let mut drag = |from: egui::Pos2, to: egui::Pos2| -> Option<(LayerId, Option<LayerId>)> {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let mut linked = None;
+            frame(vec![egui::Event::PointerMoved(from)]);
+            frame(vec![button(from, true)]);
+            for step in 1..=6 {
+                let at = from + (to - from) * (step as f32 / 6.0);
+                linked = linked.or(frame(vec![egui::Event::PointerMoved(at)]).set_follows);
+            }
+            linked = linked.or(frame(vec![button(to, false)]).set_follows);
+            linked.or(frame(vec![]).set_follows)
+        };
+
+        assert_eq!(drag(node(head), node(body)), Some((head, Some(body))), "down: the head follows the body");
+        assert_eq!(drag(node(body), node(head)), Some((body, Some(head))), "up still links");
+    }
+
+    /// **Renaming a layer**: double-click its name, type, Enter. Esc leaves it.
+    #[test]
+    fn a_layer_is_renamed_by_double_clicking_its_name() {
+        let mut scene = Scene::empty();
+        scene.add_layer("arm", LayerKind::Normal);
+        let id = scene.layers().iter().next().unwrap().id;
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let st = state();
+        let mut time = 1.0;
+        let mut frame = |events: Vec<egui::Event>| -> TimelineResponse {
+            time += 0.05;
+            let mut response = TimelineResponse::default();
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    time: Some(time),
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0))),
+                    ..Default::default()
+                },
+                |ui| response = timeline_panel(ui, &scene, &st),
+            );
+            response
+        };
+        let names_bg = names_bg();
+        let out = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0))), ..Default::default() },
+            |ui| {
+                let _ = timeline_panel(ui, &scene, &st);
+            },
+        );
+        let row = out
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if r.fill == names_bg && (r.rect.width() - LAYER_COLUMN).abs() < 0.5 => Some(r.rect),
+                _ => None,
+            })
+            .expect("the layer's row");
+        let at = egui::pos2(row.min.x + 40.0, row.center().y);
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let key = |key, pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Default::default() };
+        frame(vec![egui::Event::PointerMoved(at)]);
+        for _ in 0..2 {
+            frame(vec![button(true)]);
+            frame(vec![button(false)]);
+        }
+        frame(vec![]);
+        frame(vec![egui::Event::Text("Left".into())]);
+        let out = frame(vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)]);
+        assert_eq!(out.rename_layer, Some((id, "armLeft".to_string())));
+
+        // Esc: nothing renamed.
+        for _ in 0..2 {
+            frame(vec![button(true)]);
+            frame(vec![button(false)]);
+        }
+        frame(vec![]);
+        frame(vec![egui::Event::Text("X".into())]);
+        let out = frame(vec![key(egui::Key::Escape, true), key(egui::Key::Escape, false)]);
+        assert_eq!(out.rename_layer, None);
     }
 
     #[test]

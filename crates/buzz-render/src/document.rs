@@ -194,6 +194,15 @@ pub enum MaskDisplay {
     Always,
     /// Clip only where the mask layer is locked, as Animate's stage does.
     WhenLocked,
+    /// **The stage**: clip everywhere — an eye's pupil stays inside the eye
+    /// whether or not someone left its `eyeMask` unlocked — except the mask
+    /// layer being drawn on (the active layer, while unlocked), whose own
+    /// artwork shows so its shape can be seen and drawn.
+    ///
+    /// Animate's lock rule turned every unlocked mask off on the stage, and an
+    /// imported character's unlocked eye masks drew the pupils as solid discs
+    /// over the whole eye as soon as the character was opened.
+    Editing(Option<buzz_scene::LayerId>),
 }
 
 /// Draw a document's artwork for one frame, with its camera: no onion skins,
@@ -3725,7 +3734,13 @@ fn draw_layers(
         // contents are visible so they can be drawn. That is `WhenLocked`, and
         // it is the only reason this is not an unconditional skip.
         let is_stencil = layer.kind.is_mask()
-            && (options.masks == MaskDisplay::Always || masks.values().any(|m| *m == layer.id));
+            && match options.masks {
+                MaskDisplay::Always => true,
+                MaskDisplay::WhenLocked => masks.values().any(|m| *m == layer.id),
+                MaskDisplay::Editing(drawing) => {
+                    masks.values().any(|m| *m == layer.id) || drawing != Some(layer.id) || layer.locked
+                }
+            };
         if is_stencil {
             continue;
         }
@@ -3762,13 +3777,24 @@ fn draw_layers(
                     mask_id,
                     time,
                     Affine::IDENTITY,
-                    &scene
-                        .camera_projection_at_depth(time, 0.0)
-                        .unwrap_or_else(|| Projection::from_affine(camera))
-                        // The mask travels with the stack it belongs to, or it
-                        // would clip the wrong part of the stage.
-                        .pre_affine(options.place),
+                    // **Through the same camera as the layers it clips** —
+                    // `camera`, exactly as `draw_layer` takes it for a flat
+                    // shot. Inside a symbol opened in place that is the shot it
+                    // was opened through; asking the document's camera at the
+                    // symbol's own frame instead put an eye's mask somewhere
+                    // else entirely, and the pupils it should have framed were
+                    // clipped away the moment the head was opened.
+                    &(if scene.camera_has_tilt() {
+                        scene.camera_projection_at_depth(time, 0.0).unwrap_or_else(|| Projection::from_affine(camera))
+                    } else {
+                        Projection::from_affine(camera)
+                    })
+                    // The mask travels with the stack it belongs to, or it
+                    // would clip the wrong part of the stage.
+                    .pre_affine(options.place),
                     builder.tolerance(),
+                    // A stage layer belongs to no breathing object.
+                    None,
                 )
             {
                 open = open_mask(builder, layers, mask_id, &masks, time, path);
@@ -3852,7 +3878,7 @@ fn draw_gloom_bands(
     options: &FrameOptions,
     lights: &buzz_scene::LightRig,
 ) {
-    if !options.lit || !options.pools || !lights.is_active() {
+    if !options.lit || !options.pools || !lights.is_active() || lights.shadows_only {
         return;
     }
 
@@ -3908,7 +3934,7 @@ fn draw_light_pools(
     options: &FrameOptions,
     lights: &buzz_scene::LightRig,
 ) {
-    if !options.lit || !options.pools || !lights.is_active() {
+    if !options.lit || !options.pools || !lights.is_active() || lights.shadows_only {
         return;
     }
 
@@ -4100,6 +4126,9 @@ fn active_masks(
         let in_force = match display {
             MaskDisplay::Always => true,
             MaskDisplay::WhenLocked => layers.get(group.mask).is_some_and(|l| l.locked),
+            MaskDisplay::Editing(drawing) => {
+                drawing != Some(group.mask) || layers.get(group.mask).is_some_and(|l| l.locked)
+            }
         };
         if !in_force {
             continue;
@@ -4127,6 +4156,16 @@ fn active_masks(
 /// instances — it has no library to resolve them with — so those masks came
 /// out empty, no clip was opened, and the eyeballs were drawn whole over the
 /// face. [`mask_shapes`] goes through the library.
+///
+/// **Breathed with what it clips.** Inside a character that breathes, the
+/// eyeballs rise and fall with the breath; a clip left where the eye was drawn
+/// at rest let the pupils slide up and down inside it. `breath` is the
+/// enclosing object's, applied to the document-space outline exactly as
+/// `draw_shape` applies it to the artwork.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one more than the lint allows; a struct would only move them"
+)]
 fn mask_geometry(
     scene: &Scene,
     layers: &buzz_scene::LayerStack,
@@ -4135,6 +4174,7 @@ fn mask_geometry(
     place: Affine,
     projection: &Projection,
     tolerance: f64,
+    breath: Option<&buzz_scene::Deform>,
 ) -> Option<buzz_geom::BezPath> {
     let layer = layers.get(mask)?;
     let mut combined = buzz_geom::BezPath::new();
@@ -4161,6 +4201,10 @@ fn mask_geometry(
     if combined.elements().is_empty() {
         return None;
     }
+    let combined = match breath {
+        Some(breath) => breath.path(&combined),
+        None => combined,
+    };
     let mapped = projection.map_path(&combined, tolerance);
     (!mapped.elements().is_empty()).then_some(mapped)
 }
@@ -4435,7 +4479,9 @@ fn draw_layer(
         // character is that it varies across the stage. Deciding it once per
         // layer made two squares either side of a lamp exactly as bright as
         // each other, which is a sun pretending to be a lamp.
-        let lighting = lit.then_some((stage_height, layer.depth));
+        // Shadows only: the layer still throws its shadow (below, on `lit`),
+        // but its own colours are left exactly as drawn.
+        let lighting = (lit && !rig.shadows_only).then_some((stage_height, layer.depth));
         // Where this stack sits — identity unless a symbol is open in place —
         // and then layer parenting, both in the plane, before the lens.
         // A layer rig's one shadow is thrown in the plane, before any part's
@@ -4601,8 +4647,13 @@ fn draw_layer(
             shape_edges: lights.shape_edges(),
             layer_depth: layer.depth,
             projection,
-            // No stamped child above this ctx yet; see `DrawCtx::stroke_scale`.
-            stroke_scale: 1.0,
+            // **The place a symbol was opened at scales its outlines**, as the
+            // instance's own transform does at the root. The place rides in
+            // the projection, which never widens a pen, so without this a head
+            // placed at 0.3 drew its outlines 3× too wide once opened, and
+            // each level opened inside it compounded that. No stamped child
+            // above this ctx yet; see `DrawCtx::stroke_scale`.
+            stroke_scale: stroke_placement_scale(options.place),
             in_stamp_build: false,
         };
         // Phase A3: a layer with a rig parent tweens in that parent's rest
@@ -6670,6 +6721,7 @@ fn draw_symbol_contents(
                     doc,
                     &inner_ctx.projection,
                     builder.tolerance(),
+                    inner_ctx.breath.as_ref(),
                 )
             {
                 open = open_mask(builder, &symbol.layers, mask_id, &masks, inner, path);
@@ -9622,6 +9674,30 @@ mod tests {
     use buzz_geom::{Camera, Point, Rect, Shape, Size};
     use buzz_scene::{LightKind, ShapeData};
 
+    /// **The stage clips with an unlocked mask** — an eye's pupil stays in
+    /// the eye — except the mask being drawn on, which shows its own shape.
+    #[test]
+    fn the_stage_clips_every_mask_but_the_one_drawn_on() {
+        let mut scene = Scene::default();
+        let a = scene.add_layer("Pupil", buzz_scene::LayerKind::Masked);
+        let b = scene.add_layer("eyeMask", buzz_scene::LayerKind::Mask);
+        let groups = scene.layers().mask_groups();
+        let (mask, pupil) = if groups.iter().any(|g| g.mask == b && g.masked.contains(&a)) {
+            (b, a)
+        } else {
+            scene.update_layer(a, |l| l.kind = buzz_scene::LayerKind::Mask);
+            scene.update_layer(b, |l| l.kind = buzz_scene::LayerKind::Masked);
+            (a, b)
+        };
+        assert_eq!(scene.layers().mask_for(pupil), Some(mask), "the pupil is masked");
+        scene.update_layer(mask, |l| l.locked = false);
+        let layers = scene.layers();
+        assert!(active_masks(layers, MaskDisplay::WhenLocked).is_empty(), "Animate's rule: off while unlocked");
+        assert_eq!(active_masks(layers, MaskDisplay::Editing(None)).get(&pupil), Some(&mask));
+        assert_eq!(active_masks(layers, MaskDisplay::Editing(Some(pupil))).get(&pupil), Some(&mask), "animating the pupil");
+        assert!(active_masks(layers, MaskDisplay::Editing(Some(mask))).is_empty(), "drawing the mask itself");
+    }
+
     fn lit_scene() -> Scene {
         let mut scene = Scene::default();
         let layer = scene.add_layer("Art", buzz_scene::LayerKind::Normal);
@@ -10983,6 +11059,197 @@ mod symbol_scene {
             &[(1.0, 64), (4.0, 128), (16.0, 512), (40.0, 1280)],
             "0.4x projection",
         );
+    }
+
+    /// **Shadows only leaves the artwork's own colours alone**: under a sun
+    /// that does change them when lit normally, the square stays the white it
+    /// was drawn, and no lighting geometry is built for it.
+    #[test]
+    fn shadows_only_leaves_the_artwork_unlit() {
+        let Some(mut gpu) = GpuHarness::new() else {
+            return;
+        };
+        let camera = Camera::new(Point::new(55.0, 55.0), 2.0, Size::new(128.0, 128.0));
+        let draw = |scene: &Scene| {
+            let mut cache = DrawCache::new();
+            cache.symbol_scenes.enabled = false;
+            let mut vs = crate::vello::Scene::new();
+            let mut builder = SceneBuilder::new(&mut vs, &camera);
+            cache.begin();
+            draw_frame_within(&mut builder, scene, 0, Affine::IDENTITY, &FrameOptions { lit: true, ..FrameOptions::default() }, &mut cache);
+            cache.end();
+            vs
+        };
+        let centre = |px: &[u8]| {
+            let i = (64 * 128 + 64) * 4;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+        let mut lit = Scene::default();
+        let layer = lit.add_layer("Art", buzz_scene::LayerKind::Normal);
+        lit.add_shape(layer, ShapeData::filled(Rect::new(10.0, 10.0, 100.0, 100.0).to_path(1e-9), Color::WHITE));
+        lit.add_light(buzz_scene::LightKind::Sun { azimuth: 0.4, elevation: 0.3 });
+        assert!(lit.lights().is_active());
+        let mut flat = lit.clone();
+        flat.lights_mut().shadows_only = true;
+        let lit_px = gpu.render_rgba(&draw(&lit), 128, 128);
+        let flat_px = gpu.render_rgba(&draw(&flat), 128, 128);
+        assert_ne!(centre(&lit_px), [255, 255, 255], "the sun does shade the square when lit");
+        assert_eq!(centre(&flat_px), [255, 255, 255], "shadows only: the square keeps its white");
+    }
+
+    /// **A mask inside a symbol opened in place clips where it does at the
+    /// root**, under an animated scene camera and with the symbol showing a
+    /// different inner frame than the document's: the eye's mask once went
+    /// through the document camera at the symbol's own frame, landed
+    /// elsewhere, and the pupils vanished as soon as the head was opened.
+    #[test]
+    fn a_mask_in_a_symbol_opened_in_place_clips_where_it_does_at_the_root() {
+        let Some(mut gpu) = GpuHarness::new() else {
+            return;
+        };
+        let mut root = Scene::default();
+        let eye = root.add_symbol("eye", SymbolKind::Graphic, None);
+        root.enter_symbol(eye);
+        let a = root.add_layer("pupil", buzz_scene::LayerKind::Masked);
+        let b = root.add_layer("eyeMask", buzz_scene::LayerKind::Mask);
+        if root.layers().mask_for(a) != Some(b) {
+            root.update_layer(a, |l| l.kind = buzz_scene::LayerKind::Mask);
+            root.update_layer(b, |l| l.kind = buzz_scene::LayerKind::Masked);
+        }
+        let (mask, pupil) = if root.layers().mask_for(a) == Some(b) { (b, a) } else { (a, b) };
+        root.add_shape(pupil, ShapeData::filled(Rect::new(-40.0, -40.0, 40.0, 40.0).to_path(1e-9), Color::from_rgb8(0xC0, 0x20, 0x20)));
+        root.add_shape(mask, ShapeData::filled(Rect::new(-10.0, -10.0, 10.0, 10.0).to_path(1e-9), Color::WHITE));
+        for id in [mask, pupil] {
+            root.update_layer(id, |l| {
+                l.frames.insert_frame(39);
+            });
+        }
+        assert_eq!(root.layers().mask_for(pupil), Some(mask));
+        root.exit_symbol();
+        let stage = root.add_layer("Stage", buzz_scene::LayerKind::Normal);
+        let place = Affine::translate((275.0, 200.0));
+        let mut object = Object::instance_of(ObjectId(500), eye).with_transform(place);
+        if let buzz_scene::ObjectKind::Instance(i) = &mut object.kind {
+            i.first_frame = 30;
+            i.loop_mode = buzz_scene::LoopMode::SingleFrame;
+        }
+        root.add_object_at(stage, 0, object).expect("placed");
+        // A camera that moves a long way between frame 0 and frame 39.
+        root.camera_mut().enabled = true;
+        root.camera_mut().set_key(buzz_scene::CameraKey::new(0, Point::new(275.0, 200.0)));
+        root.camera_mut().set_key(buzz_scene::CameraKey::new(39, Point::new(575.0, 200.0)));
+
+        let mut opened = root.clone();
+        assert!(opened.enter_symbol_in_place(eye, place));
+        opened.set_edit_shot(0, 0.0);
+        let camera = Camera::new(Point::new(275.0, 200.0), 4.0, Size::new(256.0, 256.0));
+        let draw = |scene: &Scene, frame: u32, view: Affine, options: &FrameOptions| {
+            let mut cache = DrawCache::new();
+            cache.symbol_scenes.enabled = false;
+            let mut vs = crate::vello::Scene::new();
+            let mut builder = SceneBuilder::new(&mut vs, &camera);
+            cache.begin();
+            draw_frame_within(&mut builder, scene, frame, view, options, &mut cache);
+            cache.end();
+            vs
+        };
+        let at_root = gpu.render_rgba(&draw(&root, 0, root.camera_transform(0), &FrameOptions::default()), 256, 256);
+        let inside = FrameOptions { place: opened.edit_place(), ..FrameOptions::default() };
+        let in_place = gpu.render_rgba(&draw(&opened, 30, opened.edit_camera(30), &inside), 256, 256);
+        assert!(at_root.chunks(4).any(|p| p[0] > 150 && p[1] < 80), "the masked pupil shows at the root");
+        assert_pixels_match(&at_root, &in_place, 256, 256, "mask opened in place");
+    }
+
+    /// **An eye's mask breathes with the eye.** A character given a breath
+    /// rises and falls above the shoulders; the eyeballs inside its head rose
+    /// with it but the eye's mask was measured unbreathed, so the pupils slid
+    /// up and down inside a still window. The masked colour must now move
+    /// exactly as far as an unmasked marker at the same height.
+    #[test]
+    fn a_mask_inside_a_breathing_character_moves_with_what_it_clips() {
+        let Some(mut gpu) = GpuHarness::new() else {
+            return;
+        };
+        let red = Color::from_rgb8(0xC0, 0x20, 0x20);
+        let dark = Color::from_rgb8(0x40, 0x40, 0x40);
+        let mut root = Scene::default();
+        let body = root.add_symbol("body", SymbolKind::Graphic, None);
+        root.enter_symbol(body);
+        let torso = root.add_layer("torso", buzz_scene::LayerKind::Normal);
+        root.add_shape(torso, ShapeData::filled(Rect::new(-30.0, 60.0, 30.0, 200.0).to_path(1e-9), Color::from_rgb8(0x80, 0x80, 0x80)));
+        let marker = root.add_layer("marker", buzz_scene::LayerKind::Normal);
+        root.add_shape(marker, ShapeData::filled(Rect::new(20.0, 0.0, 30.0, 10.0).to_path(1e-9), dark));
+        let a = root.add_layer("eyeBall", buzz_scene::LayerKind::Masked);
+        let b = root.add_layer("eyeMask", buzz_scene::LayerKind::Mask);
+        if root.layers().mask_for(a) != Some(b) {
+            root.update_layer(a, |l| l.kind = buzz_scene::LayerKind::Mask);
+            root.update_layer(b, |l| l.kind = buzz_scene::LayerKind::Masked);
+        }
+        let (mask, pupil) = if root.layers().mask_for(a) == Some(b) { (b, a) } else { (a, b) };
+        root.add_shape(pupil, ShapeData::filled(Rect::new(-40.0, -20.0, 10.0, 40.0).to_path(1e-9), red));
+        root.add_shape(mask, ShapeData::filled(Rect::new(-20.0, 0.0, 0.0, 10.0).to_path(1e-9), Color::WHITE));
+        root.exit_symbol();
+        let stage = root.add_layer("Stage", buzz_scene::LayerKind::Normal);
+        let mut object = Object::instance_of(ObjectId(500), body);
+        object.modifiers.push(buzz_scene::Modifier::Breathe { rate: 20.0, depth: 4.0 });
+        root.add_object_at(stage, 0, object).expect("placed");
+        root.update_layer(stage, |l| {
+            l.frames.insert_frame(72);
+        });
+
+        let camera = Camera::new(Point::new(0.0, 100.0), 2.0, Size::new(256.0, 512.0));
+        let top_of = |px: &[u8], x: usize, want: [u8; 3]| {
+            (0..512).find(|y| {
+                let i = (y * 256 + x) * 4;
+                px[i..i + 3].iter().zip(want).all(|(p, w)| p.abs_diff(w) < 24)
+            })
+        };
+        let mut rows: Vec<(usize, usize)> = Vec::new();
+        for frame in (0..72).step_by(6) {
+            let mut cache = DrawCache::new();
+            cache.symbol_scenes.enabled = false;
+            let mut vs = crate::vello::Scene::new();
+            let mut builder = SceneBuilder::new(&mut vs, &camera);
+            cache.begin();
+            draw_frame_within(&mut builder, &root, frame, Affine::IDENTITY, &FrameOptions::default(), &mut cache);
+            cache.end();
+            let px = gpu.render_rgba(&vs, 256, 512);
+            let marker_top = top_of(&px, 178, [0x40, 0x40, 0x40]).expect("the marker is drawn");
+            let red_top = top_of(&px, 108, [0xC0, 0x20, 0x20]).expect("the pupil shows through the mask");
+            rows.push((marker_top, red_top));
+        }
+        let high = rows.iter().min_by_key(|r| r.0).unwrap();
+        let low = rows.iter().max_by_key(|r| r.0).unwrap();
+        assert!(low.0 - high.0 >= 3, "the breath moves the head: {rows:?}");
+        assert!(
+            (low.1 as i64 - high.1 as i64 - (low.0 as i64 - high.0 as i64)).abs() <= 1,
+            "the pupil's window moves with the head: {rows:?}"
+        );
+    }
+
+    /// **A symbol opened in place draws its outlines as wide as the root
+    /// does.** The place rides in the projection, which never widens a pen;
+    /// before the place's scale reached the stroke, a head placed at 0.3 drew
+    /// 3.3× thicker outlines the moment it was opened.
+    #[test]
+    fn a_symbol_opened_in_place_keeps_its_outline_width() {
+        let Some(mut gpu) = GpuHarness::new() else {
+            return;
+        };
+        let place = Affine::scale(0.3);
+        let (root, bar) = stroked_bar_scene(place, 40.0);
+        let mut opened = root.clone();
+        assert!(opened.enter_symbol_in_place(bar, place));
+        let camera = Camera::new(Point::new(0.0, 0.0), 8.0, Size::new(256.0, 256.0));
+        let draw = |scene: &Scene, options: &FrameOptions| {
+            let mut cache = DrawCache::new();
+            cache.symbol_scenes.enabled = false;
+            render_with_cache_under(scene, &camera, options, &mut cache, Affine::IDENTITY)
+        };
+        let at_root = gpu.render_rgba(&draw(&root, &FrameOptions::default()), 256, 256);
+        let inside = FrameOptions { place: opened.edit_place(), ..FrameOptions::default() };
+        let in_place = gpu.render_rgba(&draw(&opened, &inside), 256, 256);
+        assert_pixels_match(&at_root, &in_place, 256, 256, "opened in place");
     }
 
     /// The same at a projection that *magnifies* (a zoomed-in camera, 2.2x),

@@ -439,7 +439,11 @@ fn pick_lmstudio_model(backend: &buzz_ai::llm::Backend) -> Option<(String, &'sta
         })
         .unwrap_or_default();
     let gemma = |id: &&String| id.to_lowercase().contains("gemma");
-    if let Some(m) = loaded.iter().filter(|id| chat.contains(id)).find(gemma) {
+    // Google's own Gemma (what Split Picture was tuned with) before a retrained copy of it.
+    let google = |id: &&String| gemma(id) && id.to_lowercase().starts_with("google/");
+    if let Some(m) = chat.iter().find(google) {
+        Some((m.clone(), "Google's Gemma"))
+    } else if let Some(m) = loaded.iter().filter(|id| chat.contains(id)).find(gemma) {
         Some((m.clone(), "a loaded Gemma"))
     } else if let Some(m) = chat.iter().find(gemma) {
         Some((m.clone(), "the first Gemma listed"))
@@ -531,7 +535,8 @@ pub fn produce(req: &ProduceRequest, progress: &mut dyn FnMut(Step, &str), cance
     crate::comfy_profile::set_series(&req.series);
     let assets_root: PathBuf = match &req.assets {
         Some(dir) => dir.clone(),
-        None => AssetLibrary::user().root().map(Path::to_path_buf).ok_or_else(|| anyhow!("there is no asset library folder on this machine"))?,
+        // The folder, not a scan of it (`AssetLibrary::user` opens every asset).
+        None => buzz_doc::assets::default_root(),
     };
     let mut comfy = Comfy { launch: req.launch_comfy, tried: false, client: None, error: None };
 

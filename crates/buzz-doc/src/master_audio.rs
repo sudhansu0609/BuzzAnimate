@@ -120,7 +120,23 @@ fn scene_fps(scene: &Scene) -> f64 {
 
 /// Does this symbol get a Master Audio guide layer: a character (tag, or
 /// filed under `Cast`) or a head (tag, or "head" in its name)?
+///
+/// **Every part of a character a dialogue is animated in**, found by what is
+/// in it too, since imported characters are named anything: a head (a
+/// `mouth` layer, or "head" / "face" in its name — `rajuFaceFront`) and a body
+/// (two or more limb layers: arm, wrist, palm, thigh, shin…).
 fn wants_guide(symbol: &Symbol) -> bool {
+    let name = symbol.name.to_lowercase();
+    let layer_names: Vec<String> = symbol.layers.iter().filter(|l| !l.audio_guide).map(|l| l.name.to_lowercase()).collect();
+    let limbs = ["arm", "wrist", "palm", "plam", "hand", "thigh", "shin", "leg", "feet", "foot"];
+    let face_parts = ["mouth", "eye", "brow", "lip"];
+    // **The character's working levels only**: the body (its limbs are
+    // layers here) and the head (its eyes and mouth are layers here). A
+    // part drawn as a symbol of its own — a head's base, a single eye, a
+    // sleeve — has one or two layers and gets none, however it is named.
+    let is_body = layer_names.iter().filter(|n| limbs.iter().any(|w| n.contains(w))).count() >= 2;
+    let is_head = layer_names.iter().filter(|n| face_parts.iter().any(|w| n.contains(w))).count() >= 2
+        || ((name.contains("head") || name.contains("face")) && layer_names.len() >= 3);
     symbol
         .tags
         .iter()
@@ -129,7 +145,8 @@ fn wants_guide(symbol: &Symbol) -> bool {
             .folder
             .as_deref()
             .is_some_and(|f| f == "Cast" || f.starts_with("Cast/"))
-        || symbol.name.to_lowercase().contains("head")
+        || is_body
+        || is_head
 }
 
 /// ~100 Hz RMS envelope of a clip's mono mix, or `None` if it can't be decoded.
@@ -399,7 +416,7 @@ impl Document {
         for index in 0..self.scenes.len() {
             let target = self.master_target(index, &ctx);
             let source = &self.scenes[index].scene;
-            let planned = plan_scene(index, source, &ctx, target, &mut aligner);
+            let planned = plan_scene(index, source, &ctx, target, &mut aligner, false);
             if scenes_differ(&planned.work, source) {
                 report.scenes_touched += 1;
             }
@@ -409,6 +426,28 @@ impl Document {
             report.notes.extend(planned.notes);
         }
         report
+    }
+
+    /// **The master's guide layers only**, in the active scene: every character
+    /// and head symbol (every pose of a character) without one gets the silent
+    /// guide carrying its slice of the master. Nothing is removed and the
+    /// stage's sound is left alone — what casting a character does when a
+    /// master audio is set but Master Audio mode is off. One undo step.
+    pub fn add_master_audio_guides(&mut self) -> Result<MasterAudioReport, String> {
+        let ctx = self
+            .master_context()
+            .ok_or_else(|| "No master audio is set (Sequence ▸ Set Master Audio…)".to_string())?;
+        let index = self.active_scene();
+        let target = self.master_target(index, &ctx);
+        let mut aligner = Aligner::default();
+        let planned = plan_scene(index, &self.scenes[index].scene, &ctx, target, &mut aligner, true);
+        let mut report = MasterAudioReport { symbols_given_guide: planned.symbols_given_guide, notes: planned.notes, ..Default::default() };
+        if scenes_differ(&planned.work, &self.scenes[index].scene) {
+            report.scenes_touched = 1;
+            let work = planned.work;
+            self.edit_scene_at(index, MASTER_AUDIO_LABEL, move |scene| *scene = work);
+        }
+        Ok(report)
     }
 
     /// **Enforce Master Audio mode**: give every scene its slice of the master
@@ -435,7 +474,7 @@ impl Document {
             let target = self.master_target(index, &ctx);
             let planned = {
                 let source = retrimmed.as_ref().unwrap_or(&self.scenes[index].scene);
-                plan_scene(index, source, &ctx, target, &mut aligner)
+                plan_scene(index, source, &ctx, target, &mut aligner, false)
             };
             report.sounds_removed += planned.sounds_removed;
             report.layers_removed += planned.layers_removed;
@@ -581,6 +620,7 @@ fn plan_scene(
     ctx: &MasterContext,
     target: Target,
     aligner: &mut Aligner,
+    guides_only: bool,
 ) -> PlannedScene {
     let master = ctx.asset.clone();
     let mut notes = Vec::new();
@@ -609,7 +649,11 @@ fn plan_scene(
 
     let mut sounds_removed = 0;
     let mut layers_removed = 0;
+    let symbol_ids: Vec<SymbolId> = work.library().iter().map(|s| s.id).collect();
 
+    // Guides only (a character cast while Master Audio mode is off): nothing
+    // is removed and the stage's own sound is left as it is.
+    if !guides_only {
     // Stage: only the target's frame-0 master survives (rewritten below).
     let mut stage = work.stage_layers().clone();
     let (removed, touched) = clear_sounds(&mut stage, |layer, start, sound| {
@@ -644,7 +688,6 @@ fn plan_scene(
     }
 
     // Symbols: only master clips on guide layers survive.
-    let symbol_ids: Vec<SymbolId> = work.library().iter().map(|s| s.id).collect();
     for id in &symbol_ids {
         let Some(symbol) = work.library().get(*id) else {
             continue;
@@ -672,21 +715,22 @@ fn plan_scene(
         }
         work.library_mut().update(*id, |s| s.layers = stack);
     }
+    }
 
     // -- 3. One stage layer carrying the master. ---------------------------
     let target_id = match existing_target {
-        Some(id) => id,
+        Some(id) => Some(id),
+        None if guides_only => None,
         None => {
             let name = match target {
                 Target::Shot { .. } => "Dialogue",
                 _ => MASTER_AUDIO_LAYER,
             };
-            work.add_stage_layer(name, LayerKind::Normal)
+            Some(work.add_stage_layer(name, LayerKind::Normal))
         }
     };
-    let current = work
-        .stage_layers()
-        .get(target_id)
+    let current = target_id
+        .and_then(|id| work.stage_layers().get(id))
         .and_then(|l| l.frames.keyframe_at(0).and_then(|k| k.sound));
     let sound_id = match current.filter(|s| master_ids.contains(&s.sound)) {
         Some(s) => s.sound,
@@ -714,12 +758,14 @@ fn plan_scene(
         trim_end: slice.end.map(|e| e as f32),
     };
     let frames = slice.frames;
-    work.update_stage_layer(target_id, |l| {
-        set_length(l, frames);
-        if let Some(keyframe) = l.frames.keyframe_at_mut(0) {
-            keyframe.sound = Some(reference);
-        }
-    });
+    if let Some(target_id) = target_id.filter(|_| !guides_only) {
+        work.update_stage_layer(target_id, |l| {
+            set_length(l, frames);
+            if let Some(keyframe) = l.frames.keyframe_at_mut(0) {
+                keyframe.sound = Some(reference);
+            }
+        });
+    }
 
     // -- 4. Guide layers inside characters and heads. ----------------------
     // Measured from the trim actually written, so a re-run lands on the same
@@ -728,11 +774,35 @@ fn plan_scene(
     let anchors = symbol_anchors(&work);
     let master_seconds = master.duration_seconds();
     let mut symbols_given_guide = 0;
+    // **Every pose of a character**: a symbol in a character's pose set gets
+    // the guide too, wherever in the Library it is filed, so every pose shows
+    // the dialogue it is animated against.
+    let guided: std::collections::HashSet<SymbolId> = symbol_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            let library = work.library();
+            let set = library.symbol_set(*id);
+            let members = if set.is_empty() { vec![*id] } else { set };
+            members.iter().any(|m| library.get(*m).is_some_and(|s| wants_guide(s)))
+        })
+        .collect();
     for id in &symbol_ids {
         let Some(symbol) = work.library().get(*id).cloned() else {
             continue;
         };
-        if !wants_guide(&symbol) {
+        if !guided.contains(id) {
+            // A part that is no character level (a head's base drawing, an
+            // eye) carries no master: one put there by an earlier, wider
+            // rule is taken out again.
+            if symbol.layers.iter().any(|l| l.audio_guide) {
+                let mut stack = symbol.layers.clone();
+                for g in stack.iter().filter(|l| l.audio_guide).map(|l| l.id).collect::<Vec<_>>() {
+                    stack.remove(g);
+                    layers_removed += 1;
+                }
+                work.library_mut().update(*id, |s| s.layers = stack);
+            }
             continue;
         }
         let anchor = anchors.get(id).map_or(0, |&(_, a)| a);
@@ -785,8 +855,9 @@ fn plan_scene(
             l.follows = None;
             l.frames = timeline;
         });
-        let bottom = stack.len().saturating_sub(1);
-        stack.reorder(guide_id, bottom);
+        // On top of the timeline, locked: the dialogue is the first thing seen
+        // in every part, and nothing drawn lands on it by accident.
+        stack.reorder(guide_id, 0);
         if stack != symbol.layers {
             symbols_given_guide += 1;
             work.library_mut().update(*id, |s| s.layers = stack);

@@ -32,6 +32,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::Clip;
 
+/// **Adobe Animate's twelve visemes**, in the order its Lip Syncing dialog lists
+/// them — the slots an animator maps the frames of a mouth chart to.
+pub const ANIMATE_VISEMES: [&str; 12] = ["Neutral", "Ah", "D", "Ee", "F", "L", "M", "Oh", "R", "S", "Uh", "W-Oo"];
+
 /// Preston Blair's mouth shapes, in the order Animate's lip-sync mapping uses.
 ///
 /// The numbering matters: a mouth symbol holds one shape per frame, and a
@@ -83,6 +87,24 @@ impl Viseme {
 
     /// How many frames a mouth symbol needs to cover every shape.
     pub const COUNT: u32 = 10;
+
+    /// Which of **Adobe Animate's twelve visemes** ([`ANIMATE_VISEMES`]) this
+    /// shape is: the slot of Animate's Lip Syncing dialog an animator maps a
+    /// frame of their mouth chart to. `Etc` (d, t, n at a syllable's edge) is
+    /// Animate's D; the neutral "uh" (`L` here) is its Uh.
+    pub fn animate_slot(self) -> usize {
+        match self {
+            Viseme::Rest => 0,
+            Viseme::Ai => 1,
+            Viseme::Etc => 2,
+            Viseme::E => 3,
+            Viseme::FV => 4,
+            Viseme::MBP => 6,
+            Viseme::O => 7,
+            Viseme::L => 10,
+            Viseme::U | Viseme::WQ => 11,
+        }
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -387,12 +409,16 @@ pub fn analyse_visemes(clip: &Clip, fps: f64, options: &LipSyncOptions) -> Visem
 
     let levels = clip.frame_levels(fps);
     // Loudness is judged against this clip rather than against an absolute:
-    // dialogue recorded quietly should still open the mouth.
-    let loudest = levels.iter().copied().fold(0.0f32, f32::max).max(1e-6);
-    let silence = options.silence * loudest.max(0.05);
+    // dialogue recorded quietly should still open the mouth. And against how
+    // loud it *speaks*, not its single loudest moment: one shout in three
+    // minutes used to make every quieter line read as near-silence.
+    let reference = speaking_level(&levels).max(1e-6);
+    let silence = options.silence * reference.max(0.05);
 
     let mono = clip.mono();
     let per_frame = (clip.sample_rate as f64 / fps).max(1.0);
+    // The dips between syllables, where the mouth closes or narrows.
+    let dips = syllable_dips(&levels, silence);
 
     let mut frames: Vec<Viseme> = levels
         .iter()
@@ -400,6 +426,9 @@ pub fn analyse_visemes(clip: &Clip, fps: f64, options: &LipSyncOptions) -> Visem
         .map(|(i, level)| {
             if *level <= silence {
                 return Viseme::Rest;
+            }
+            if let Some(shape) = dips[i] {
+                return shape;
             }
 
             let start = (i as f64 * per_frame) as usize;
@@ -409,14 +438,120 @@ pub fn analyse_visemes(clip: &Clip, fps: f64, options: &LipSyncOptions) -> Visem
             }
 
             let features = Features::measure(&mono[start..end], clip.sample_rate);
-            features.viseme(*level / loudest)
+            features.viseme(*level / reference)
         })
         .collect();
 
     close_the_mouth_between_words(&mut frames, &levels, silence, options.hold);
+    one_shape_per_syllable(&mut frames, &levels);
     hold(&mut frames, options.hold.max(1));
 
     VisemeTrack { frames, fps }
+}
+
+/// **How loud this clip speaks**: the 90th percentile of its audible frames.
+/// High enough to be the voice rather than room tone, low enough that a single
+/// shout or slam does not set it.
+fn speaking_level(levels: &[f32]) -> f32 {
+    let mut audible: Vec<f32> = levels.iter().copied().filter(|l| *l > 1e-4).collect();
+    if audible.is_empty() {
+        return levels.iter().copied().fold(0.0f32, f32::max);
+    }
+    audible.sort_by(|a, b| a.total_cmp(b));
+    audible[((audible.len() - 1) as f64 * 0.9) as usize]
+}
+
+/// **The dips between syllables.** Speech is a train of loud vowels with
+/// quieter consonants between them, and that rhythm — the mouth opening on
+/// every syllable and narrowing between — is most of what makes lip sync read
+/// as matching the voice. A frame that is a local minimum well below the
+/// syllables either side of it becomes a closure (`MBP`) when it falls very
+/// low, or a narrow consonant shape (`Etc`: d, t, n, s) when it only dips.
+fn syllable_dips(levels: &[f32], silence: f32) -> Vec<Option<Viseme>> {
+    let n = levels.len();
+    let mut out = vec![None; n];
+    for i in 1..n.saturating_sub(1) {
+        let level = levels[i];
+        if level <= silence || level > levels[i - 1] || level > levels[i + 1] {
+            continue;
+        }
+        let left = levels[i.saturating_sub(5)..i].iter().copied().fold(0.0f32, f32::max);
+        let right = levels[i + 1..(i + 6).min(n)].iter().copied().fold(0.0f32, f32::max);
+        let peak = left.min(right);
+        if peak <= silence * 2.0 {
+            continue;
+        }
+        let ratio = level / peak;
+        if ratio < 0.5 {
+            out[i] = Some(if ratio < 0.15 || level < silence * 2.0 { Viseme::MBP } else { Viseme::Etc });
+        }
+    }
+    out
+}
+
+/// The first two **formants** of a voiced window — the resonances that tell an
+/// "aa" from an "ee" from an "oo" — by linear prediction: the window, cut to
+/// about 11 kHz, pre-emphasised and tapered, is fitted with a 12-pole filter
+/// whose response peaks sit on the vocal tract's resonances. `(0, 0)` when the
+/// window is too short or silent; `F2` is 0 when only one resonance shows.
+fn formants(window: &[f32], sample_rate: u32) -> (f32, f32) {
+    use std::f64::consts::PI;
+    let factor = ((sample_rate as f32 / 11_025.0).round() as usize).max(1);
+    let rate = sample_rate as f64 / factor as f64;
+    let mut x: Vec<f64> = window.chunks(factor).map(|c| c.iter().map(|s| *s as f64).sum::<f64>() / c.len() as f64).collect();
+    let n = x.len();
+    if n < 64 {
+        return (0.0, 0.0);
+    }
+    for i in (1..n).rev() {
+        x[i] -= 0.97 * x[i - 1];
+    }
+    for (i, s) in x.iter_mut().enumerate() {
+        *s *= 0.54 - 0.46 * (2.0 * PI * i as f64 / (n - 1) as f64).cos();
+    }
+    const ORDER: usize = 12;
+    let r: Vec<f64> = (0..=ORDER).map(|lag| (lag..n).map(|i| x[i] * x[i - lag]).sum()).collect();
+    if r[0] <= 1e-12 {
+        return (0.0, 0.0);
+    }
+    // Levinson-Durbin, A(z) = 1 + a1 z^-1 + ... + ap z^-p.
+    let mut a = vec![0.0f64; ORDER + 1];
+    a[0] = 1.0;
+    let mut error = r[0] * (1.0 + 1e-9);
+    for i in 1..=ORDER {
+        let acc: f64 = r[i] + (1..i).map(|j| a[j] * r[i - j]).sum::<f64>();
+        let k = -acc / error;
+        let previous = a.clone();
+        for j in 1..i {
+            a[j] = previous[j] + k * previous[i - j];
+        }
+        a[i] = k;
+        error *= 1.0 - k * k;
+        if error <= 0.0 {
+            break;
+        }
+    }
+    const BINS: usize = 256;
+    let envelope: Vec<f64> = (0..BINS)
+        .map(|b| {
+            let w = PI * b as f64 / BINS as f64;
+            let (mut re, mut im) = (0.0, 0.0);
+            for (j, aj) in a.iter().enumerate() {
+                re += aj * (w * j as f64).cos();
+                im -= aj * (w * j as f64).sin();
+            }
+            1.0 / (re * re + im * im).max(1e-12)
+        })
+        .collect();
+    let hz = |b: usize| (b as f64 * rate / 2.0 / BINS as f64) as f32;
+    let peaks: Vec<f32> = (1..BINS - 1)
+        .filter(|&b| envelope[b] > envelope[b - 1] && envelope[b] >= envelope[b + 1])
+        .map(hz)
+        .filter(|f| *f > 200.0 && *f < 4_000.0)
+        .collect();
+    let f1 = peaks.first().copied().unwrap_or(0.0);
+    let f2 = peaks.iter().copied().find(|f| *f > f1 + 250.0).unwrap_or(0.0);
+    (f1, f2)
 }
 
 /// What one frame of sound looks like.
@@ -428,6 +563,9 @@ struct Features {
     noisiness: f32,
     /// Where the energy's centre of mass sits, in hertz.
     centroid: f32,
+    /// The first two formants, in hertz (see [`formants`]); 0 where none.
+    f1: f32,
+    f2: f32,
 }
 
 impl Features {
@@ -452,10 +590,13 @@ impl Features {
             .filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0))
             .count();
 
+        let (f1, f2) = formants(window, sample_rate);
         Self {
             brightness: if total > 0.0 { high / total } else { 0.0 },
             noisiness: crossings as f32 / window.len().max(1) as f32,
             centroid: if total > 0.0 { weighted / total } else { 0.0 },
+            f1,
+            f2,
         }
     }
 
@@ -475,10 +616,26 @@ impl Features {
             };
         }
 
-        // Voiced, so the shape follows where the energy sits. These bands are
-        // the vowel formants an amplitude spectrum can actually separate:
-        // rounded vowels are dark, spread vowels are bright, open vowels are
-        // loud and broad.
+        // **Voiced: the vowel, from its formants.** F1 rises as the jaw
+        // opens; F2 rises as the lips spread and falls as they round. The
+        // bands are the ordinary adult ones: "aa" has a high F1, "ee" a high
+        // F2, "oh" and "oo" a low F2 with "oh" the more open; between them is
+        // the neutral "uh".
+        if self.f1 > 0.0 {
+            if self.f1 >= 680.0 {
+                return if loudness < 0.3 { Viseme::L } else { Viseme::Ai };
+            }
+            if self.f2 >= 1_750.0 {
+                return Viseme::E;
+            }
+            if self.f2 <= 1_150.0 {
+                return if self.f1 >= 480.0 { Viseme::O } else { Viseme::U };
+            }
+            return Viseme::L;
+        }
+
+        // No formants to read: where the energy sits instead. Rounded vowels
+        // are dark, spread vowels are bright, open vowels are loud and broad.
         match self.centroid {
             hz if hz < 600.0 => {
                 if loudness > 0.55 {
@@ -494,9 +651,121 @@ impl Features {
                     Viseme::L
                 }
             }
-            hz if hz < 1_900.0 => Viseme::E,
-            _ => Viseme::WQ,
+            _ => Viseme::E,
         }
+    }
+}
+
+/// **One mouth per syllable**, as an animator draws it: every syllable takes
+/// the vowel it holds most (the loudest frame's on a tie). Frame-by-frame
+/// vowel readings flicker; the syllable is what the eye follows.
+///
+/// A syllable is *not* everything between two closures, though. Connected
+/// speech often runs a second or more without a dip deep enough to read as a
+/// consonant, and voting over the whole stretch held one mouth for twenty-odd
+/// frames while the words went by. So a voiced stretch is cut at every
+/// shallow valley in the loudness (the syllable beats), and anything still
+/// longer than [`LONGEST_SYLLABLE`] frames is cut into pieces of about four.
+/// Where a valley separates two syllables that read as the same vowel, the
+/// valley narrows the mouth ([`narrower`]), so "ba-na-na" opens three times
+/// rather than once.
+fn one_shape_per_syllable(frames: &mut [Viseme], levels: &[f32]) {
+    let boundary = |v: Viseme| matches!(v, Viseme::Rest | Viseme::MBP | Viseme::Etc | Viseme::FV);
+    let n = frames.len();
+    let level = |f: usize| levels.get(f).copied().unwrap_or(0.0);
+    let mut i = 0;
+    while i < n {
+        if boundary(frames[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && !boundary(frames[i]) {
+            i += 1;
+        }
+        let end = i;
+
+        // The syllable beats: frames quieter than the loudest a few frames
+        // either side of them. A valley is its own one-frame piece.
+        let mut valleys: Vec<usize> = Vec::new();
+        for f in start + 1..end.saturating_sub(1) {
+            let here = level(f);
+            if here > level(f - 1) || here > level(f + 1) {
+                continue;
+            }
+            let left = (f.saturating_sub(3).max(start)..f).map(level).fold(0.0f32, f32::max);
+            let right = (f + 1..(f + 4).min(end)).map(level).fold(0.0f32, f32::max);
+            if here < 0.85 * left.min(right) && valleys.last().is_none_or(|v| f >= v + 3) {
+                valleys.push(f);
+            }
+        }
+
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        let mut from = start;
+        for v in valleys.iter().copied().chain(std::iter::once(end)) {
+            let length = v - from;
+            if length > LONGEST_SYLLABLE {
+                let count = length.div_ceil(4);
+                for k in 0..count {
+                    pieces.push((from + length * k / count, from + length * (k + 1) / count));
+                }
+            } else if length > 0 {
+                pieces.push((from, v));
+            }
+            from = v;
+        }
+
+        let mut previous: Option<Viseme> = None;
+        for (a, b) in pieces {
+            let mut counts: Vec<(Viseme, usize, f32)> = Vec::new();
+            for f in a..b {
+                match counts.iter_mut().find(|(v, _, _)| *v == frames[f]) {
+                    Some(entry) => {
+                        entry.1 += 1;
+                        entry.2 = entry.2.max(level(f));
+                    }
+                    None => counts.push((frames[f], 1, level(f))),
+                }
+            }
+            counts.sort_by(|x, y| y.1.cmp(&x.1).then(y.2.total_cmp(&x.2)));
+            let Some(&(mut shape, _, _)) = counts.first() else {
+                continue;
+            };
+            // A piece cut only for length that reads the same as the one
+            // before takes its runner-up vowel when there is a real one.
+            if previous == Some(shape)
+                && let Some(&(second, count, _)) = counts.get(1)
+                && count * 4 >= b - a
+            {
+                shape = second;
+            }
+            // The same vowel either side of a syllable beat, or of a cut: the
+            // mouth narrows between them rather than holding.
+            if previous == Some(shape) && b - a >= 2 {
+                frames[a] = narrower(shape);
+                for slot in &mut frames[a + 1..b] {
+                    *slot = shape;
+                }
+            } else {
+                for slot in &mut frames[a..b] {
+                    *slot = shape;
+                }
+            }
+            previous = Some(shape);
+        }
+    }
+}
+
+/// The most frames one vowel is held before it is split, at any frame rate
+/// near 24: a syllable is rarely longer than a quarter of a second.
+const LONGEST_SYLLABLE: usize = 6;
+
+/// The shape the mouth passes through between two syllables of one vowel.
+fn narrower(shape: Viseme) -> Viseme {
+    match shape {
+        Viseme::Ai => Viseme::L,
+        Viseme::O => Viseme::U,
+        _ => Viseme::Etc,
     }
 }
 
@@ -543,6 +812,39 @@ fn hold(frames: &mut [Viseme], hold: u32) {
     if frames.is_empty() || hold <= 1 {
         return;
     }
+    // **A short closure borrows frames rather than vanishing.** The dip between
+    // two syllables is often a single frame; merging it into the vowel before
+    // it — as every other short run is — deleted exactly the open-and-close
+    // rhythm that makes a mouth read as speaking. It takes what it lacks from
+    // whichever neighbour can spare it.
+    let n = frames.len();
+    let want = hold as usize;
+    let mut i = 1;
+    while i < n {
+        let start = i;
+        while i < n && frames[i] == frames[start] {
+            i += 1;
+        }
+        let length = i - start;
+        let shape = frames[start];
+        if length >= want || !matches!(shape, Viseme::Rest | Viseme::MBP | Viseme::Etc) {
+            continue;
+        }
+        let need = want - length;
+        let next_length = if i < n { (i..n).take_while(|&j| frames[j] == frames[i]).count() } else { 0 };
+        let previous_length = (0..start).rev().take_while(|&j| frames[j] == frames[start - 1]).count();
+        if next_length >= need + want {
+            for slot in &mut frames[i..i + need] {
+                *slot = shape;
+            }
+            i += need;
+        } else if previous_length >= need + want {
+            for slot in &mut frames[start - need..start] {
+                *slot = shape;
+            }
+        }
+    }
+
     let mut i = 1;
     while i < frames.len() {
         let start = i;
@@ -552,8 +854,20 @@ fn hold(frames: &mut [Viseme], hold: u32) {
         let length = (i - start) as u32;
         if length < hold {
             let previous = frames[start - 1];
-            for slot in &mut frames[start..i] {
-                *slot = previous;
+            // A syllable after a closure opens late rather than not at all:
+            // it takes what it lacks from the closure, if the closure can
+            // spare it, instead of the mouth staying shut through it.
+            let need = (hold - length) as usize;
+            let closed_before = (0..start).rev().take_while(|&j| frames[j] == previous).count();
+            if previous.is_closed() && !frames[start].is_closed() && closed_before >= need + hold as usize {
+                let shape = frames[start];
+                for slot in &mut frames[start - need..start] {
+                    *slot = shape;
+                }
+            } else {
+                for slot in &mut frames[start..i] {
+                    *slot = previous;
+                }
             }
         }
     }

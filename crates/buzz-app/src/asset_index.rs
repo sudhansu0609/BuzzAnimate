@@ -299,7 +299,7 @@ fn symbols_of(object: &Object, out: &mut Vec<SymbolId>) {
 
 /// Drop every library symbol nothing on the stage needs (directly, nested in
 /// another symbol on any frame, or in the set of one that is).
-fn prune_library(scene: &mut Scene) {
+pub(crate) fn prune_library(scene: &mut Scene) {
     let mut keep: HashSet<SymbolId> = HashSet::new();
     let mut todo: Vec<SymbolId> = Vec::new();
     for layer in scene.stage_layers().iter() {

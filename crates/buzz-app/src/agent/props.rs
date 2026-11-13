@@ -114,7 +114,7 @@ pub const PROPERTY_FIELDS: &[(&str, &str, &str, &str)] = &[
     ("element", "z", "number -800..800", "Properties/3D"),
     ("element", "symbol", "library symbol name (swap)", "Properties/Instance"),
     ("element", "first_frame", "integer, 1-based", "Properties/Instance"),
-    ("element", "loop_mode", "loop|play_once|single_frame (graphics only)", "Properties/Instance"),
+    ("element", "loop_mode", "loop|play_once|single_frame|play_once_reverse|loop_reverse (graphics only)", "Properties/Instance"),
     ("element", "sync_to_root", "bool", "Properties/Instance"),
     ("element", "color_effect", "none|brightness|tint|alpha", "Properties/Instance"),
     ("element", "brightness", "percent -100..100 (colour effect brightness)", "Properties/Instance"),
@@ -1501,7 +1501,7 @@ fn instance_field(
             if !symbol_kind.follows_parent_timeline() {
                 return Err("only a graphic loops; this symbol is a movie clip or button".into());
             }
-            en(&mut inst.loop_mode, &[LoopMode::Loop, LoopMode::PlayOnce, LoopMode::SingleFrame], op, field)
+            en(&mut inst.loop_mode, &LoopMode::ALL, op, field)
         }
         "sync_to_root" => b(&mut inst.sync_to_root, op, field),
         "color_effect" => match op {

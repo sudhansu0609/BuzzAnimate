@@ -167,6 +167,9 @@ pub struct LibraryState {
     /// Clear All Keyframes was raised from this panel's menu, so it targets
     /// `selected` rather than a selected stage instance. Taken by the editor.
     pub clear_keys_from_library: bool,
+    /// Duplicate Symbol was raised from this panel, so it copies `selected`
+    /// rather than a selected stage instance's symbol. Taken by the editor.
+    pub duplicate_from_library: bool,
     /// The picture or sound highlighted in the list. Exclusive with `selected`
     /// and `selected_folder`: the strip along the bottom acts on one thing.
     pub selected_media: Option<LibraryMedia>,
@@ -868,6 +871,7 @@ fn draw_symbol_row(
                 if ui.button(c.label()).clicked() {
                     state.selected = Some(id);
                     state.clear_keys_from_library = c == Command::ClearAllKeyframes;
+                    state.duplicate_from_library = c == Command::DuplicateSymbol;
                     *command = Some(c);
                     ui.close();
                 }
@@ -1149,6 +1153,7 @@ fn draw_footer(
             .on_hover_text(Command::DuplicateSymbol.label())
             .clicked()
         {
+            state.duplicate_from_library = true;
             *command = Some(Command::DuplicateSymbol);
         }
         // **Out of the document and onto the shelf.** A symbol could be kept as

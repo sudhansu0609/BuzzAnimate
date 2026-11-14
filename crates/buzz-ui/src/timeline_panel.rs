@@ -3459,10 +3459,10 @@ fn layer_row(
         let (text_x, click_left, mark) = if state.parenting_view {
             // **The parenting view draws the graph where the names go, and the
             // names after it** — still the layer's name, so it still selects,
-            // renames and opens the layer menu as it does in the plain view.
-            // Its zone starts past the node's own 18 px hit box (the node
-            // keeps its drag-to-parent), and carries no drag payload: a drag
-            // here is a parenting gesture's neighbour, not a layer move.
+            // renames, opens the layer menu and **drags to reorder** as it does
+            // in the plain view. Its zone starts past the node's own 18 px hit
+            // box, so the node keeps its drag-to-parent and the two gestures
+            // never share a pixel.
             let text_left = parenting_node(ui, scene, layer, name_row, &painter, out).min(name_rect.max.x);
             (text_left - 2.0, text_left, "")
         } else {
@@ -3502,9 +3502,10 @@ fn layer_row(
             egui::Rect::from_min_max(egui::pos2(click_left, name_rect.min.y), name_rect.max);
         let name_id = ui.id().with(("timeline-layer-name", layer.id.0));
         let name_resp = ui.interact(name_click_rect, name_id, Sense::click_and_drag());
-        if !state.parenting_view {
-            name_resp.dnd_set_drag_payload(crate::rig_panel::DraggedPart::Layer(layer.id));
-        }
+        // In the parenting view too: once it showed the names, a view that
+        // looked like the plain one but would not let a layer be dragged read
+        // as reordering being broken.
+        name_resp.dnd_set_drag_payload(crate::rig_panel::DraggedPart::Layer(layer.id));
         if name_resp.clicked() {
             let shift = ui.input(|i| i.modifiers.shift);
             let toggle = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);

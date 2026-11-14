@@ -219,7 +219,10 @@ use serde::{Deserialize, Serialize};
 ///   every layer that casts, which is every layer of every older document,
 ///   so a document with every layer casting is written exactly as version 48
 ///   wrote it.
-pub const FORMAT_VERSION: u32 = 49;
+/// * **50** — a brush stroke carries `brush`: the samples and profile it was
+///   drawn from, so it can be re-widthed and re-smoothed later. Absent for
+///   everything else, which is every object of every older document.
+pub const FORMAT_VERSION: u32 = 50;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -369,6 +372,9 @@ pub struct LightRigDto {
     /// Cast shadows without the light's shading and tint. Absent → off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shadows_only: bool,
+    /// The built-in character shadows turned off. Absent → on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_character_shadows: bool,
     pub lights: Vec<LightDto>,
 }
 
@@ -1289,6 +1295,9 @@ pub struct LayerDto {
     /// an ordinary layer, which is every layer of every older document.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub audio_guide: bool,
+    /// A puppet folder (see `Layer::puppet`). Absent means not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub puppet: bool,
     /// The main sound layer of its timeline (see `Layer::main_sound`). Absent
     /// means not, which is every layer of every older document.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1965,7 +1974,51 @@ pub struct ObjectDto {
     /// means merge paint, which is every object written before it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub drawing_object: bool,
+    /// The spine of a brush stroke. Version 50; absent means none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brush: Option<BrushSpineDto>,
     pub kind: ObjectKindDto,
+}
+
+/// A brush stroke's spine: its samples as `[x, y, pressure, time]` rows, and
+/// the profile that outlines them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrushSpineDto {
+    pub samples: Vec<[f64; 4]>,
+    pub profile: buzz_geom::BrushProfile,
+}
+
+impl BrushSpineDto {
+    fn from_spine(spine: &buzz_geom::BrushSpine) -> Self {
+        Self {
+            samples: spine
+                .samples
+                .iter()
+                .map(|s| [s.point.x, s.point.y, s.pressure, s.time])
+                .collect(),
+            profile: spine.profile,
+        }
+    }
+
+    /// The spine, vouching for `path`: it was written only while it still
+    /// described the artwork (see `from_object`), so it is trusted to describe
+    /// the path read back with it rather than rebuilt to check — which would
+    /// cost an outline per stroke on every open.
+    fn to_spine(&self, path: &BezPath) -> buzz_geom::BrushSpine {
+        buzz_geom::BrushSpine {
+            samples: self
+                .samples
+                .iter()
+                .map(|r| buzz_geom::StrokeSample {
+                    point: buzz_geom::Point::new(r[0], r[1]),
+                    pressure: r[2],
+                    time: r[3],
+                })
+                .collect(),
+            profile: self.profile,
+            fingerprint: buzz_geom::brush::path_fingerprint(path),
+        }
+    }
 }
 
 fn identity_coeffs() -> [f64; 6] {
@@ -2684,6 +2737,7 @@ impl LayerDto {
             depth: layer.depth,
             collapsed: layer.collapsed,
             audio_guide: layer.audio_guide,
+            puppet: layer.puppet,
             main_sound: layer.main_sound,
             cast_source: layer.cast_source.clone(),
             filters: layer.filters.iter().map(FilterDto::from_filter).collect(),
@@ -2755,6 +2809,7 @@ impl LayerDto {
         };
         layer.collapsed = self.collapsed;
         layer.audio_guide = self.audio_guide;
+        layer.puppet = self.puppet;
         layer.main_sound = self.main_sound;
         layer.cast_source = self.cast_source.clone();
         layer.brightness = self.brightness;
@@ -2973,13 +3028,14 @@ impl DocumentDto {
                 end: scene.looping().end,
                 repeats: scene.looping().repeats,
             }),
-            lights: (!scene.lights().lights.is_empty()).then(|| LightRigDto {
+            lights: (!scene.lights().lights.is_empty() || scene.lights().no_character_shadows).then(|| LightRigDto {
                 enabled: scene.lights().enabled,
                 base: color_to_hex(scene.lights().base),
                 modelling: scene.lights().modelling,
                 edges: scene.lights().edges,
                 model: scene.lights().model,
                 shadows_only: scene.lights().shadows_only,
+                no_character_shadows: scene.lights().no_character_shadows,
                 lights: scene
                     .lights()
                     .lights
@@ -3247,6 +3303,7 @@ impl DocumentDto {
             lights.edges = rig.edges;
             lights.model = rig.model;
             lights.shadows_only = rig.shadows_only;
+            lights.no_character_shadows = rig.no_character_shadows;
 
             for dto in &rig.lights {
                 // An unknown kind loads as a sky rather than being dropped: a
@@ -3463,6 +3520,8 @@ impl ObjectDto {
                 })
                 .collect(),
             drawing_object: object.drawing_object,
+            // Only a spine that still describes the artwork is worth keeping.
+            brush: object.brush_spine().map(BrushSpineDto::from_spine),
             kind,
         }
     }
@@ -3608,6 +3667,10 @@ impl ObjectDto {
         for filter in &self.filters {
             filters.push(filter.to_filter()?);
         }
+        let brush = match (&self.brush, &kind) {
+            (Some(b), ObjectKind::Shape(s)) => Some(std::sync::Arc::new(b.to_spine(&s.path))),
+            _ => None,
+        };
 
         Ok(Object {
             id: ObjectId(self.id),
@@ -3689,6 +3752,7 @@ impl ObjectDto {
                 turnaround
             },
             drawing_object: self.drawing_object,
+            brush,
         })
     }
 }
@@ -5193,6 +5257,7 @@ mod tests {
                 text: None,
                 turnaround: Default::default(),
                 drawing_object: false,
+                brush: None,
             },
         );
         scene
@@ -5510,6 +5575,7 @@ mod tests {
                 text: None,
                 turnaround: Default::default(),
                 drawing_object: false,
+                brush: None,
             },
         );
 
@@ -6590,6 +6656,7 @@ pub(crate) mod test_support {
                 text: None,
                 turnaround: Default::default(),
                 drawing_object: false,
+                brush: None,
             },
         );
 
@@ -6896,6 +6963,7 @@ mod rig_part_table_tests {
             text: None,
             turnaround: Default::default(),
             drawing_object: false,
+            brush: None,
         };
         scene.library_mut().update(symbol, |s| {
             s.layers.update(symbol_layer, |l| {

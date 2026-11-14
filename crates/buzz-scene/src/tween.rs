@@ -2596,6 +2596,7 @@ mod tests {
             text: None,
             turnaround: Default::default(),
             drawing_object: false,
+            brush: None,
         }
     }
 
@@ -2667,6 +2668,7 @@ mod tests {
                 text: None,
                 turnaround: Default::default(),
                 drawing_object: false,
+                brush: None,
             }
         };
         let mid = interpolate_object(
@@ -2707,6 +2709,7 @@ mod tests {
             text: None,
             turnaround: Default::default(),
             drawing_object: false,
+            brush: None,
         };
 
         let mid = interpolate_object(

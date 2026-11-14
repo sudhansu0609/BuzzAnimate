@@ -538,7 +538,14 @@ fn encode(
                         }
                     }
                     if let Some(stroke) = &shape.stroke {
-                        builder.stroke_shape_paint(&path, &stroke.paint, stroke.width, to_doc);
+                        // A hairline is one screen pixel at any zoom, as it is
+                        // once committed.
+                        let width = if stroke.hairline {
+                            1.0 / editor.camera.zoom.max(f64::MIN_POSITIVE)
+                        } else {
+                            stroke.width
+                        };
+                        builder.stroke_shape_paint(&path, &stroke.paint, width, to_doc);
                     }
                 }
             }
@@ -1651,7 +1658,17 @@ fn draw_preview(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poi
 
     let stroke = Stroke::new(1.0, Palette::selection());
 
-    match editor.preview() {
+    let preview = editor.preview();
+    // **The eraser shows the band it rubs**, as wide as it really is, under
+    // the 1 px centreline — a hairline for a 20-unit eraser said nothing about
+    // what was about to go.
+    let band = match &preview {
+        Preview::Stroke { width, .. } if editor.tool() == buzz_ui::ToolId::Eraser => {
+            Some((*width * editor.camera.zoom) as f32)
+        }
+        _ => None,
+    };
+    match preview {
         Preview::None => {}
         // Painted into the Vello scene by `build_scene`, in its real colour.
         Preview::Artwork(_) | Preview::Painted { .. } => {}
@@ -1702,6 +1719,13 @@ fn draw_preview(painter: &egui::Painter, editor: &Editor, to_screen: impl Fn(Poi
                     _ => {}
                 });
                 if points.len() >= 2 {
+                    if let Some(band) = band {
+                        let wash = Color32::from_rgba_unmultiplied(0, 168, 255, 50);
+                        painter.add(egui::Shape::line(points.clone(), Stroke::new(band, wash)));
+                        for end in [points[0], points[points.len() - 1]] {
+                            painter.circle_filled(end, band / 2.0, wash);
+                        }
+                    }
                     painter.add(egui::Shape::line(points, stroke));
                 }
             }

@@ -862,6 +862,9 @@ pub struct TimelineState {
     /// so the timeline still shows them, greyed, past an end marker at this
     /// frame, and playback stops or loops here rather than running on.
     pub shot_end: Option<u32>,
+    /// **Copy / Paste Stage** is holding the stage copied at this frame, so
+    /// its button reads Paste Stage. `None`: the button reads Copy Stage.
+    pub stage_copied: Option<u32>,
 }
 
 /// A sound's envelope, positioned on the timeline.
@@ -2517,7 +2520,7 @@ fn ruler(
     let side = crate::theme::Tokens::CONTROL_H;
     let buttons = egui::Rect::from_min_size(
         egui::pos2(name_row.min.x + 4.0, name_row.center().y - side / 2.0),
-        egui::vec2(2.0 * side + 4.0, side),
+        egui::vec2(2.0 * side + 4.0 + 92.0, side),
     );
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(buttons).layout(egui::Layout::left_to_right(egui::Align::Center)),
@@ -2536,6 +2539,19 @@ fn ruler(
                 .clicked()
             {
                 out.command = Some(crate::Command::DeleteLayer);
+            }
+            // **Copy / Paste Stage**: one button, two presses — here, then on
+            // the frame to paste at.
+            let (label, tip) = match state.stage_copied {
+                None => ("Copy Stage".to_string(), "Copy everything on the stage at this frame, every layer. Then go to another frame and press again to paste it there.".to_string()),
+                Some(from) => (
+                    format!("Paste Stage \u{00b7} {}", from + 1),
+                    format!("Paste the stage copied at frame {} here, every symbol set to this frame's number. Press on frame {} to let go of it.", from + 1, from + 1),
+                ),
+            };
+            let button = egui::Button::new(egui::RichText::new(label).small()).selected(state.stage_copied.is_some());
+            if ui.add(button).on_hover_text(tip).clicked() {
+                out.command = Some(crate::Command::CopyPasteStage);
             }
         },
     );
@@ -3331,6 +3347,16 @@ fn layer_row(
             matches!(layer.frame_kind(frame + 1), FrameKind::Empty),
         );
     }
+    // **A puppet's one row carries every part's keys**: a dot on each frame
+    // where any part is keyed, so its poses read as one strip.
+    if layer.puppet {
+        let keys = puppet_row_keys(scene, layer.id);
+        let ink = Palette::text();
+        for frame in visible.clone().filter(|f| keys.binary_search(f).is_ok()) {
+            let centre = egui::pos2(grid_left + (frame as f32 + 0.5) * cell_width, rect.center().y);
+            grid.circle_filled(centre, (cell_width * 0.3).clamp(2.0, 4.5), ink);
+        }
+    }
     // A sound layer draws its waveform across the frames the sound covers, over
     // the cells and translucently, so an animator finds the accents by looking.
     // It stops where the sound does — at the next keyframe on the layer, so a
@@ -3426,44 +3452,57 @@ fn layer_row(
     // rather than a different set of layers.
     if state.depth_view {
         depth_cell(ui, layer, name_row, &painter, state, out);
-    } else if state.parenting_view {
-        parenting_node(ui, scene, layer, name_row, &painter, out);
     } else {
-        // Defects brief item 3c: a flat 12 px for "has any parent at all"
-        // drew a folder's grandchild at the same indent as its child — one
-        // step per folder, so nesting reads as nesting.
-        let indent = folder_depth(scene, layer.id) as f32 * 12.0;
-        let mark = match layer.kind {
-            LayerKind::Folder => "F ",
-            LayerKind::Mask => "M ",
-            LayerKind::InverseMask => "iM ",
-            LayerKind::Guide => "G ",
-            LayerKind::Masked | LayerKind::Guided => ". ",
-            LayerKind::Normal => "",
-        };
         let name_rect = name_area(name_row).intersect(name_row);
+        // Where the name's text starts (it is painted 2 px in from here), and
+        // where its own click zone starts.
+        let (text_x, click_left, mark) = if state.parenting_view {
+            // **The parenting view draws the graph where the names go, and the
+            // names after it** — still the layer's name, so it still selects,
+            // renames and opens the layer menu as it does in the plain view.
+            // Its zone starts past the node's own 18 px hit box (the node
+            // keeps its drag-to-parent), and carries no drag payload: a drag
+            // here is a parenting gesture's neighbour, not a layer move.
+            let text_left = parenting_node(ui, scene, layer, name_row, &painter, out).min(name_rect.max.x);
+            (text_left - 2.0, text_left, "")
+        } else {
+            // Defects brief item 3c: a flat 12 px for "has any parent at all"
+            // drew a folder's grandchild at the same indent as its child — one
+            // step per folder, so nesting reads as nesting.
+            let indent = folder_depth(scene, layer.id) as f32 * 12.0;
+            let mark = match layer.kind {
+                LayerKind::Folder if layer.puppet => "P ",
+                LayerKind::Folder => "F ",
+                LayerKind::Mask => "M ",
+                LayerKind::InverseMask => "iM ",
+                LayerKind::Guide => "G ",
+                LayerKind::Masked | LayerKind::Guided => ". ",
+                LayerKind::Normal => "",
+            };
 
-        // I2: the disclosure triangle, one column reserved on every row so a
-        // folder's name and a plain layer's name still line up.
-        let triangle_rect = egui::Rect::from_min_size(
-            egui::pos2(name_row.min.x + 2.0 + indent, name_row.center().y - 5.0),
-            egui::vec2((DISCLOSURE_WIDTH - 2.0).max(1.0), 10.0),
-        );
-        if layer.kind == LayerKind::Folder {
-            let triangle_id = ui.id().with(("timeline-folder-triangle", layer.id.0));
-            if disclosure_triangle(ui, &painter, triangle_rect, triangle_id, layer.collapsed) {
-                out.toggle_collapsed = Some(layer.id);
+            // I2: the disclosure triangle, one column reserved on every row so a
+            // folder's name and a plain layer's name still line up.
+            let triangle_rect = egui::Rect::from_min_size(
+                egui::pos2(name_row.min.x + 2.0 + indent, name_row.center().y - 5.0),
+                egui::vec2((DISCLOSURE_WIDTH - 2.0).max(1.0), 10.0),
+            );
+            if layer.kind == LayerKind::Folder {
+                let triangle_id = ui.id().with(("timeline-folder-triangle", layer.id.0));
+                if disclosure_triangle(ui, &painter, triangle_rect, triangle_id, layer.collapsed) {
+                    out.toggle_collapsed = Some(layer.id);
+                }
             }
-        }
 
-        // The name's own click/drag zone starts past the triangle column, so
-        // clicking the triangle never also selects or drags the row.
-        let text_x = (name_row.min.x + indent + DISCLOSURE_WIDTH).min(name_rect.max.x);
+            // The name's own click/drag zone starts past the triangle column, so
+            // clicking the triangle never also selects or drags the row.
+            let text_x = (name_row.min.x + indent + DISCLOSURE_WIDTH).min(name_rect.max.x);
+            (text_x, text_x, mark)
+        };
         let name_click_rect =
-            egui::Rect::from_min_max(egui::pos2(text_x, name_rect.min.y), name_rect.max);
+            egui::Rect::from_min_max(egui::pos2(click_left, name_rect.min.y), name_rect.max);
         let name_id = ui.id().with(("timeline-layer-name", layer.id.0));
         let name_resp = ui.interact(name_click_rect, name_id, Sense::click_and_drag());
-        if !state.depth_view && !state.parenting_view {
+        if !state.parenting_view {
             name_resp.dnd_set_drag_payload(crate::rig_panel::DraggedPart::Layer(layer.id));
         }
         if name_resp.clicked() {
@@ -3512,25 +3551,14 @@ fn layer_row(
         });
 
         // Being renamed: a text field where the name is.
-        let renaming = layer_rename(ui.ctx()).filter(|(id, ..)| *id == layer.id);
-        if let Some((_, mut text, focused)) = renaming {
+        let renaming = layer_rename(ui.ctx()).is_some_and(|(id, ..)| id == layer.id);
+        if renaming {
             let field = egui::Rect::from_min_max(egui::pos2(text_x, name_rect.min.y + 1.0), egui::pos2(name_rect.max.x, name_rect.max.y - 1.0));
-            let edit = ui.put(field, egui::TextEdit::singleline(&mut text).font(FontId::proportional(11.0)).margin(egui::vec2(2.0, 0.0)));
-            if !focused {
-                edit.request_focus();
-            }
-            let (enter, escape) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
-            if escape {
-                end_layer_rename(ui.ctx());
-            } else if focused && edit.lost_focus() || enter {
-                // Enter, or a click anywhere else, keeps it — an empty name does not.
-                let name = text.trim().to_string();
-                if !name.is_empty() && name != layer.name {
-                    out.rename_layer = Some((layer.id, name));
-                }
-                end_layer_rename(ui.ctx());
-            } else {
-                set_layer_rename(ui.ctx(), layer.id, text, true);
+            let renamed = layer_rename_field(ui, timeline_rename_key(), layer.id, &layer.name, |ui, edit| {
+                ui.put(field, edit.font(FontId::proportional(11.0)).margin(egui::vec2(2.0, 0.0)))
+            });
+            if let Some(name) = renamed {
+                out.rename_layer = Some((layer.id, name));
             }
         } else
         // **Clipped to the name area.** A painted string does not wrap or
@@ -3996,7 +4024,7 @@ fn parenting_node(
     name_row: egui::Rect,
     painter: &egui::Painter,
     out: &mut TimelineResponse,
-) {
+) -> f32 {
     let ctx = ui.ctx().clone();
     let generation = parenting::generation(scene, layer.id);
     let centre = parenting::node_centre(name_row, generation);
@@ -4006,21 +4034,9 @@ fn parenting_node(
 
     // The name still has to be readable — a graph of anonymous dots says which
     // layers are linked but not which layers they are — so it runs from just
-    // right of the node to where the switches begin.
+    // right of the node to where the switches begin. `layer_row` paints it
+    // (and lets it be clicked and renamed) from the x handed back.
     let text_left = centre.x + parenting::RADIUS + 5.0;
-    painter
-        .with_clip_rect(name_area(name_row).intersect(name_row))
-        .text(
-            egui::pos2(text_left, name_row.center().y),
-            Align2::LEFT_CENTER,
-            layer.name.clone(),
-            FontId::proportional(11.0),
-            if layer.visible {
-                Palette::text()
-            } else {
-                Palette::text_dim()
-            },
-        );
 
     let hit = egui::Rect::from_center_size(centre, egui::vec2(18.0, 18.0));
     let response = ui.interact(
@@ -4121,24 +4137,100 @@ fn parenting_node(
         };
         response.clone().on_hover_text(tip);
     }
+    text_left
 }
 
-/// The layer being renamed in the timeline, the text typed so far, and
-/// whether its field has had focus yet; kept in egui's memory between frames.
+/// Every keyframe start on the layers filed under a puppet folder, sorted.
+fn puppet_row_keys(scene: &Scene, folder: LayerId) -> Vec<u32> {
+    let layers = scene.layers();
+    let under = |id: LayerId| {
+        let mut at = layers.get(id).and_then(|l| l.parent);
+        for _ in 0..layers.len() + 1 {
+            match at {
+                Some(p) if p == folder => return true,
+                Some(p) => at = layers.get(p).and_then(|l| l.parent),
+                None => return false,
+            }
+        }
+        false
+    };
+    let mut keys: Vec<u32> = layers
+        .iter()
+        .filter(|l| under(l.id))
+        .flat_map(|l| l.frames.keyframes().iter().map(|k| k.start).collect::<Vec<_>>())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// Where the timeline keeps the layer it is renaming; the Layers panel has a
+/// key of its own, so a name is edited in one place at a time.
+fn timeline_rename_key() -> egui::Id {
+    egui::Id::new("timeline-layer-rename")
+}
+
+/// The layer being renamed in the panel keyed `panel`, the text typed so far,
+/// and whether its field has had focus yet; kept in egui's memory between
+/// frames.
+pub(crate) fn layer_rename_in(ctx: &egui::Context, panel: egui::Id) -> Option<(LayerId, String, bool)> {
+    ctx.data(|d| d.get_temp(panel))
+}
+
+pub(crate) fn set_layer_rename_in(ctx: &egui::Context, panel: egui::Id, layer: LayerId, text: String, focused: bool) {
+    ctx.data_mut(|d| d.insert_temp(panel, (layer, text, focused)));
+}
+
+/// Begin renaming `layer` in `panel`, starting from `name` as it stands.
+pub(crate) fn start_layer_rename_in(ctx: &egui::Context, panel: egui::Id, layer: LayerId, name: &str) {
+    set_layer_rename_in(ctx, panel, layer, name.to_string(), false);
+}
+
+pub(crate) fn end_layer_rename_in(ctx: &egui::Context, panel: egui::Id) {
+    ctx.data_mut(|d| d.remove::<(LayerId, String, bool)>(panel));
+}
+
+/// **A layer's name being edited in place**, when `layer` is the one `panel`
+/// is renaming: the text field holding what has been typed so far, placed by
+/// `place` where the name would otherwise be drawn, and focused on its first
+/// frame. Enter, or focus leaving, keeps the name — an empty or unchanged one
+/// does not — and Escape leaves it as it was; either ends the rename. The
+/// new name, on the frame it is kept. `None` when `layer` is not being
+/// renamed here, so the caller draws the name as usual.
+pub(crate) fn layer_rename_field(
+    ui: &mut Ui,
+    panel: egui::Id,
+    layer: LayerId,
+    current: &str,
+    place: impl FnOnce(&mut Ui, egui::TextEdit<'_>) -> egui::Response,
+) -> Option<String> {
+    let (_, mut text, focused) = layer_rename_in(ui.ctx(), panel).filter(|(id, ..)| *id == layer)?;
+    let edit = place(ui, egui::TextEdit::singleline(&mut text));
+    if !focused {
+        edit.request_focus();
+    }
+    let (enter, escape) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+    if escape {
+        end_layer_rename_in(ui.ctx(), panel);
+        None
+    } else if focused && edit.lost_focus() || enter {
+        // Enter, or a click anywhere else, keeps it — an empty name does not.
+        end_layer_rename_in(ui.ctx(), panel);
+        let name = text.trim().to_string();
+        (!name.is_empty() && name != current).then_some(name)
+    } else {
+        set_layer_rename_in(ui.ctx(), panel, layer, text, true);
+        None
+    }
+}
+
+/// The layer being renamed in the timeline; see [`layer_rename_in`].
 fn layer_rename(ctx: &egui::Context) -> Option<(LayerId, String, bool)> {
-    ctx.data(|d| d.get_temp(egui::Id::new("timeline-layer-rename")))
-}
-
-fn set_layer_rename(ctx: &egui::Context, layer: LayerId, text: String, focused: bool) {
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new("timeline-layer-rename"), (layer, text, focused)));
+    layer_rename_in(ctx, timeline_rename_key())
 }
 
 fn start_layer_rename(ctx: &egui::Context, layer: &buzz_scene::Layer) {
-    set_layer_rename(ctx, layer.id, layer.name.clone(), false);
-}
-
-fn end_layer_rename(ctx: &egui::Context) {
-    ctx.data_mut(|d| d.remove::<(LayerId, String, bool)>(egui::Id::new("timeline-layer-rename")));
+    start_layer_rename_in(ctx, timeline_rename_key(), layer.id, &layer.name);
 }
 
 fn layer_context_menu(
@@ -4944,6 +5036,7 @@ mod tests {
             focal_distance: 1000.0,
             nearest_depth: -900.0,
             shot_end: None,
+            stage_copied: None,
         }
     }
 
@@ -5349,6 +5442,55 @@ mod tests {
         frame(vec![egui::Event::Text("X".into())]);
         let out = frame(vec![key(egui::Key::Escape, true), key(egui::Key::Escape, false)]);
         assert_eq!(out.rename_layer, None);
+    }
+
+    /// **Renaming a layer with the parenting view on**, where the graph's
+    /// nodes sit beside the names: the name was only painted there, so a
+    /// double-click on it fell through to the row and never opened the field.
+    #[test]
+    fn a_layer_is_renamed_in_the_parenting_view() {
+        let mut scene = Scene::empty();
+        scene.add_layer("arm", LayerKind::Normal);
+        let id = scene.layers().iter().next().unwrap().id;
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut st = state();
+        st.parenting_view = true;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let mut time = 1.0;
+        let mut frame = |events: Vec<egui::Event>| -> (TimelineResponse, egui::FullOutput) {
+            time += 0.05;
+            let mut response = TimelineResponse::default();
+            let out = ctx.run_ui(
+                egui::RawInput { events, time: Some(time), screen_rect: Some(screen), ..Default::default() },
+                |ui| response = timeline_panel(ui, &scene, &st),
+            );
+            (response, out)
+        };
+        let (_, out) = frame(vec![]);
+        let at = out
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "arm" => Some(t.visual_bounding_rect().center()),
+                _ => None,
+            })
+            .expect("the layer's name, painted after its node");
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let key = |key, pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Default::default() };
+        frame(vec![egui::Event::PointerMoved(at)]);
+        let (first, _) = frame(vec![button(true)]);
+        let (released, _) = frame(vec![button(false)]);
+        assert!(
+            first.select_layer == Some(id) || released.select_layer == Some(id),
+            "a click on the name still selects the layer"
+        );
+        frame(vec![button(true)]);
+        frame(vec![button(false)]);
+        frame(vec![]);
+        frame(vec![egui::Event::Text("Left".into())]);
+        let (out, _) = frame(vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)]);
+        assert_eq!(out.rename_layer, Some((id, "armLeft".to_string())));
     }
 
     #[test]

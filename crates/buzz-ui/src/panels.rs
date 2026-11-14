@@ -608,6 +608,8 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 Command::ClearFrames,
                 Command::SelectAllFrames,
                 Command::ReverseFrames,
+                Command::CopyPasteStage,
+                Command::MoveStageFrames,
                 Command::ExposeOnTwos,
                 Command::ExposeOnThrees,
                 Command::PaintThrough,
@@ -874,6 +876,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 item(ui, Command::RenameBodyLayers, true, &mut raised);
                 item(ui, Command::RenameFaceLayers, true, &mut raised);
                 item(ui, Command::RigHead, true, &mut raised);
+                item(ui, Command::PuppetMode, true, &mut raised);
             });
             ui.separator();
             item(ui, Command::GroupSelection, has_selection, &mut raised);
@@ -2991,6 +2994,21 @@ fn brush_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
             });
         ui.end_row();
 
+        if style.brush.kind.has_paint_modes() {
+            ui.label("Paint");
+            egui::ComboBox::from_id_salt("brush-paint-mode")
+                .selected_text(style.brush.paint_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in crate::PaintMode::ALL {
+                        ui.selectable_value(&mut style.brush.paint_mode, mode, mode.label())
+                            .on_hover_text(mode.description());
+                    }
+                })
+                .response
+                .on_hover_text(style.brush.paint_mode.description());
+            ui.end_row();
+        }
+
         if style.brush.kind == BrushKind::Effect {
             ui.label("Effect");
             egui::ComboBox::from_id_salt("brush-effect")
@@ -3186,9 +3204,41 @@ fn brush_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
             ui.checkbox(&mut style.brush.use_pressure, "")
                 .on_hover_text(
                     "Follow pen pressure instead of speed. A mouse reports no \
-                     pressure, so with this on a mouse paints a constant width.",
+                     pressure, so a mouse stroke is still drawn by its speed.",
                 );
             ui.end_row();
+
+            if style.brush.use_pressure {
+                // Kept a little apart, so the range never collapses into a
+                // switch between the thinnest line and the full width.
+                ui.label("Min pressure");
+                if ui
+                    .add(egui::Slider::new(&mut style.brush.pressure_min, 0.0..=0.95))
+                    .on_hover_text(
+                        "The lightest press that counts: at or under it the line \
+                         is its thinnest. Raise it if resting the pen already draws.",
+                    )
+                    .changed()
+                {
+                    style.brush.pressure_max =
+                        style.brush.pressure_max.max(style.brush.pressure_min + 0.05);
+                }
+                ui.end_row();
+
+                ui.label("Max pressure");
+                if ui
+                    .add(egui::Slider::new(&mut style.brush.pressure_max, 0.05..=1.0))
+                    .on_hover_text(
+                        "The press that reaches full size. Lower it for a light \
+                         hand, so the whole width comes without bearing down.",
+                    )
+                    .changed()
+                {
+                    style.brush.pressure_min =
+                        style.brush.pressure_min.min(style.brush.pressure_max - 0.05);
+                }
+                ui.end_row();
+            }
 
             if !style.brush.use_pressure {
                 ui.label("Fastest at");
@@ -4093,6 +4143,12 @@ pub fn properties_panel_with(
         changed |= spatial_properties(ui, scene, id, at);
     }
 
+    // **The selected strokes themselves** — width, and for a brush stroke the
+    // smoothing, taper and nib it was drawn with, all still changeable.
+    if !selection.is_empty() {
+        changed |= drawn_stroke_properties(ui, scene, selection, at);
+    }
+
     // The Brush, Eraser, Magic Wand, Paint Bucket and Symmetry sections used
     // to be here, rolled up. They are the Tool Options panel now — see
     // `tool_options_panel` for why one tool's settings, shown for the tool in
@@ -4156,6 +4212,160 @@ pub fn properties_panel_with(
         ui.checkbox(&mut view.snap.to_pixels, "Pixels");
     });
 
+    changed
+}
+
+/// **The strokes in the selection, as drawn** — changed after the fact.
+///
+/// Two kinds of stroke, because this program has two. A line (pencil, line
+/// tool, ink bottle) is a path with a stroke width, which is simply edited. A
+/// brush stroke is a filled outline; it can be widened, smoothed and re-tapered
+/// only because it keeps the spine it was drawn from (see
+/// [`buzz_geom::BrushSpine`]), and each change builds the outline again from
+/// that, exactly as the brush built it the first time.
+///
+/// Every selected stroke of a kind takes the value shown, which is the first
+/// one's — so a row of strokes drawn at different sizes can be set to one.
+fn drawn_stroke_properties(
+    ui: &mut Ui,
+    scene: &mut Scene,
+    selection: &Selection,
+    at: EditAt,
+) -> bool {
+    let mut brushes: Vec<(buzz_scene::ObjectId, buzz_geom::BrushProfile)> = Vec::new();
+    let mut lines: Vec<(buzz_scene::ObjectId, f64, bool)> = Vec::new();
+    for id in selection.iter() {
+        let Some((_, object)) = scene.find_object(id) else {
+            continue;
+        };
+        if let Some(spine) = object.brush_spine() {
+            brushes.push((id, spine.profile));
+        } else if let buzz_scene::ObjectKind::Shape(s) = &object.kind
+            && let Some(stroke) = &s.stroke
+        {
+            lines.push((id, stroke.width, stroke.hairline));
+        }
+    }
+    if brushes.is_empty() && lines.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    ui.add_space(Tokens::SPACE_2);
+    property_section(ui, "drawn-stroke-section", "Stroke", true, |ui| {
+        if let Some(&(_, first)) = brushes.first() {
+            let mut profile = first;
+            property_row(ui, "Brush size", Some("Width of the selected brush strokes at full pressure"), |ui| {
+                ui.add(
+                    egui::Slider::new(&mut profile.width, 0.5..=200.0)
+                        .logarithmic(true)
+                        .suffix(" px"),
+                );
+            });
+            property_row(ui, "Smoothing", Some("How much the stroke's line is evened out"), |ui| {
+                ui.add(egui::Slider::new(&mut profile.smoothing, 0.0..=1.0));
+            });
+            property_row(ui, "Taper", Some("How much of the stroke narrows to a point"), |ui| {
+                ui.add(egui::Slider::new(&mut profile.taper, 0.0..=0.5));
+            });
+            if profile.taper > 0.0 {
+                property_row(ui, "Taper ends", None, |ui| {
+                    egui::ComboBox::from_id_salt("drawn-taper-ends")
+                        .selected_text(profile.taper_ends.label())
+                        .show_ui(ui, |ui| {
+                            for ends in buzz_geom::TaperEnds::ALL {
+                                ui.selectable_value(&mut profile.taper_ends, ends, ends.label());
+                            }
+                        });
+                });
+            }
+            // A stroke drawn with a pen kept every pressure it was drawn at, so
+            // its range can be re-read afterwards: a line that came out too
+            // thin from a light hand is widened by lowering Max pressure.
+            if let buzz_geom::WidthResponse::Pressure { low, high } = &mut profile.response {
+                property_row(ui, "Min pressure", Some("At or under this press the stroke is its thinnest"), |ui| {
+                    if ui.add(egui::Slider::new(low, 0.0..=0.95)).changed() {
+                        *high = high.max(*low + 0.05);
+                    }
+                });
+                property_row(ui, "Max pressure", Some("At or over this press the stroke is its full size"), |ui| {
+                    if ui.add(egui::Slider::new(high, 0.05..=1.0)).changed() {
+                        *low = low.min(*high - 0.05);
+                    }
+                });
+            }
+            property_row(ui, "Tip", None, |ui| {
+                egui::ComboBox::from_id_salt("drawn-tip")
+                    .selected_text(profile.tip.label())
+                    .show_ui(ui, |ui| {
+                        for kind in buzz_geom::TipShape::KINDS {
+                            ui.selectable_value(&mut profile.tip, kind, kind.label());
+                        }
+                    });
+            });
+            if profile != first {
+                // Only what was touched is carried to the others, so setting
+                // the size of five strokes does not also flatten their tapers
+                // to the first one's.
+                for (id, own) in &brushes {
+                    let mut next = *own;
+                    if profile.width != first.width {
+                        next.width = profile.width;
+                    }
+                    if profile.smoothing != first.smoothing {
+                        next.smoothing = profile.smoothing;
+                    }
+                    if profile.taper != first.taper {
+                        next.taper = profile.taper;
+                    }
+                    if profile.taper_ends != first.taper_ends {
+                        next.taper_ends = profile.taper_ends;
+                    }
+                    if profile.tip != first.tip {
+                        next.tip = profile.tip;
+                    }
+                    // Only onto strokes that were drawn by pressure.
+                    if profile.response != first.response
+                        && matches!(next.response, buzz_geom::WidthResponse::Pressure { .. })
+                    {
+                        next.response = profile.response;
+                    }
+                    scene.update_object_where(at, *id, |o| {
+                        o.rebuild_brush(|spine| spine.with_profile(next));
+                    });
+                }
+                changed = true;
+            }
+        }
+
+        if let Some(&(_, first_width, first_hairline)) = lines.first() {
+            let (mut width, mut hairline) = (first_width, first_hairline);
+            property_row(ui, "Line width", Some("Width of the selected lines"), |ui| {
+                ui.add_enabled(
+                    !hairline,
+                    egui::DragValue::new(&mut width).range(0.05..=200.0).speed(0.1),
+                );
+            });
+            property_row(ui, "Hairline", None, |ui| {
+                ui.checkbox(&mut hairline, "");
+            });
+            if width != first_width || hairline != first_hairline {
+                for (id, _, _) in &lines {
+                    scene.update_object_where(at, *id, |o| {
+                        if let buzz_scene::ObjectKind::Shape(s) = &mut o.kind
+                            && let Some(stroke) = s.stroke.as_mut()
+                        {
+                            if width != first_width {
+                                stroke.width = width;
+                            }
+                            stroke.hairline = hairline;
+                        }
+                    });
+                }
+                changed = true;
+            }
+        }
+    });
     changed
 }
 
@@ -5133,6 +5343,8 @@ pub fn layers_panel_filtered(
 ) -> Option<Command> {
     let mut command = None;
     let can_delete = scene.layers().len() > 1;
+    // The layer being renamed here, if one is; the timeline keeps its own.
+    let rename_key = egui::Id::new("layers-panel-rename");
 
     ui.horizontal(|ui| {
         ui.heading("Layers");
@@ -5294,6 +5506,10 @@ pub fn layers_panel_filtered(
         let mut set_locked = locked;
         let mut set_outline = outline;
         let mut select_this = false;
+        // **Rename a layer**: double-click its name (or Rename Layer in its
+        // menu), type, Enter — here as in the timeline. The name typed, on the
+        // frame it is kept.
+        let mut rename_to: Option<String> = None;
 
         // **The switches sit in a column of their own, hard against the right
         // edge; the name takes what is left.**
@@ -5413,25 +5629,44 @@ pub fn layers_panel_filtered(
                         // animator who has just imported a character is looking.
                         // Dropping anywhere else does nothing at all: only a rig
                         // slot accepts this payload. See `rig_panel::DraggedPart`.
-                        let drag_id = ui.id().with(("layer-drag", id.0));
-                        let response = ui
-                            .dnd_drag_source(
-                                drag_id,
-                                crate::rig_panel::DraggedPart::Layer(id),
-                                |ui| {
-                                    // Stage 5, item 2: rows at `Tokens::ROW_H` (20 px),
-                                    // not the taller general control height.
-                                    ui.add_sized(
-                                        egui::vec2(width, Tokens::ROW_H),
-                                        egui::Button::selectable(
-                                            active == Some(id) || selection.is_layer_selected(id),
-                                            format!("{mark}{name}"),
-                                        )
-                                        .truncate(),
-                                    )
-                                },
+                        // Being renamed: the field takes the name's place, and
+                        // the row answers nothing else until it is done.
+                        let renaming = crate::timeline_panel::layer_rename_in(ui.ctx(), rename_key)
+                            .is_some_and(|(renaming, ..)| renaming == id);
+                        if renaming {
+                            rename_to = crate::timeline_panel::layer_rename_field(
+                                ui,
+                                rename_key,
+                                id,
+                                &name,
+                                |ui, edit| ui.add_sized(egui::vec2(width, Tokens::ROW_H), edit),
+                            );
+                            return;
+                        }
+                        //
+                        // **Not through `dnd_drag_source`.** That wrapper counts a
+                        // press as the start of a drag at once — its own handle
+                        // senses drags alone, so egui has no click to wait for —
+                        // and from the next frame on paints the row in a layer
+                        // nothing can click. A click that lasted longer than one
+                        // frame (every click does) never reached the row's button,
+                        // so a layer could not be selected here, let alone renamed
+                        // by double-clicking it. The timeline's rows carry the same
+                        // payload the other way round: a button that senses drags
+                        // as well as clicks, with the payload set only once the
+                        // press has become a drag.
+                        // Stage 5, item 2: rows at `Tokens::ROW_H` (20 px), not the
+                        // taller general control height.
+                        let response = ui.add_sized(
+                            egui::vec2(width, Tokens::ROW_H),
+                            egui::Button::selectable(
+                                active == Some(id) || selection.is_layer_selected(id),
+                                format!("{mark}{name}"),
                             )
-                            .inner;
+                            .truncate()
+                            .sense(egui::Sense::click_and_drag()),
+                        );
+                        response.dnd_set_drag_payload(crate::rig_panel::DraggedPart::Layer(id));
                         if on_stage
                             && let Some(drop) = crate::timeline_panel::light_drop_target(
                                 ui,
@@ -5474,6 +5709,9 @@ pub fn layers_panel_filtered(
                             } else {
                                 select_this = true;
                             }
+                        }
+                        if response.double_clicked() {
+                            crate::timeline_panel::start_layer_rename_in(ui.ctx(), rename_key, id, &name);
                         }
 
                         if let Some(dragged) =
@@ -5541,6 +5779,10 @@ pub fn layers_panel_filtered(
                         // beside three toggles.
                         response.context_menu(|ui| {
                             ui.label(RichText::new(&name).small().weak());
+                            if ui.button("Rename Layer").clicked() {
+                                crate::timeline_panel::start_layer_rename_in(ui.ctx(), rename_key, id, &name);
+                                ui.close();
+                            }
                             ui.separator();
                             if ui
                                 .button(if visible { "Hide Layer" } else { "Show Layer" })
@@ -5657,6 +5899,9 @@ pub fn layers_panel_filtered(
 
         if select_this {
             selection.select_layer(scene, id, frame);
+        }
+        if let Some(new_name) = rename_to {
+            scene.update_layer(id, |l| l.name = new_name);
         }
 
         if set_visible != visible || set_locked != locked || set_outline != outline {

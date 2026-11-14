@@ -2133,6 +2133,15 @@ impl Scene {
         &mut self.layers
     }
 
+    /// **Change the timeline being authored** as a whole — file layers into a
+    /// folder, take one out — with the revision bumped, so everything derived
+    /// from the document sees the change. For edits [`Self::update_layer`]
+    /// cannot express, being one layer at a time.
+    pub fn edit_open_layers<R>(&mut self, f: impl FnOnce(&mut LayerStack) -> R) -> R {
+        self.bump();
+        f(self.active_layers_mut())
+    }
+
     /// Mutable access to the timeline being authored, without bumping.
     ///
     /// Private because callers that skip the bump would leave derived data

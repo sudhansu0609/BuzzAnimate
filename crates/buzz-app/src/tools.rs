@@ -113,6 +113,20 @@ pub enum ToolAction {
         frames: Vec<Vec<buzz_scene::ArtPiece>>,
         label: &'static str,
     },
+    /// Lay down a brush stroke **by the brush's paint mode** — Animate's Paint
+    /// Normal, Fills, Behind, Selection and Inside.
+    ///
+    /// Not an [`Self::AddShape`]: every mode but Normal clips the stroke
+    /// against what is already drawn, which only the editor can see, and Paint
+    /// Inside needs where the stroke *began*. The spine rides along so the
+    /// stroke can be re-widthed and re-smoothed once it is down.
+    PaintStroke {
+        shape: ShapeData,
+        label: &'static str,
+        spine: Option<std::sync::Arc<buzz_geom::BrushSpine>>,
+        start: Point,
+        mode: buzz_ui::PaintMode,
+    },
     /// Erase within a stroked path.
     Erase { path: BezPath, width: f64 },
     /// Fill whatever is under the point with the current fill colour.
@@ -422,6 +436,11 @@ enum Gesture {
         /// does for a marquee — but it costs nothing to record for all of them
         /// and saves a second gesture variant that differs in one field.
         mods: Mods,
+        /// **Shift-drag with the Brush or Pencil holds the stroke level or
+        /// upright**, as in Animate: `Some(true)` horizontal, `Some(false)`
+        /// vertical, chosen by the first few units of travel; `None` until then
+        /// or when Shift was not held.
+        axis: Option<bool>,
     },
     /// Dragging the selected anchors of a path, by one of them.
     Anchor {
@@ -532,6 +551,9 @@ pub struct ToolMachine {
     /// The transformation point itself can still be dragged, because placing
     /// it on the joint is what makes the turns right.
     rotate_only: bool,
+    /// Where the last Brush or Pencil stroke ended, for Shift-click to draw a
+    /// straight stroke on from. Forgotten when the tool changes.
+    last_stroke_end: Option<Point>,
 }
 
 /// A drag shorter than this is a click, not a drag.
@@ -551,6 +573,7 @@ impl ToolMachine {
             last_screen: Point::ORIGIN,
             clock: Clock::Wall(std::time::Instant::now()),
             rotate_only: false,
+            last_stroke_end: None,
         }
     }
 
@@ -594,6 +617,9 @@ impl ToolMachine {
 
     /// Switch tools, abandoning any gesture in progress.
     pub fn set_tool(&mut self, tool: ToolId) {
+        if tool != self.tool {
+            self.last_stroke_end = None;
+        }
         self.tool = tool;
         self.gesture = Gesture::Idle;
     }
@@ -684,6 +710,7 @@ impl ToolMachine {
                 self.gesture = Gesture::Freehand {
                     samples: vec![sample_at(doc, now, pressure)],
                     mods,
+                    axis: None,
                 };
             }
             // Subselection grabs an anchor if one is close enough; otherwise it
@@ -1035,7 +1062,16 @@ impl ToolMachine {
                     to: *anchor_at + (doc - *origin),
                 }
             }
-            Gesture::Freehand { samples, .. } => {
+            Gesture::Freehand {
+                samples,
+                mods: pressed,
+                axis,
+            } => {
+                let doc = if pressed.shift && matches!(self.tool, ToolId::Brush | ToolId::Pencil) {
+                    constrain_to_axis(samples[0].point, doc, axis)
+                } else {
+                    doc
+                };
                 // Drop samples that add nothing, so a slow drag does not build
                 // a path with thousands of coincident vertices. The brush
                 // decimates properly later; this is only to stop the list
@@ -1226,9 +1262,32 @@ impl ToolMachine {
                     }
                 }
             }
-            Gesture::Freehand { mut samples, mods } => {
+            Gesture::Freehand {
+                mut samples,
+                mods,
+                mut axis,
+            } => {
+                let joins = matches!(self.tool, ToolId::Brush | ToolId::Pencil) && mods.shift;
+                let doc = if joins {
+                    constrain_to_axis(samples[0].point, doc, &mut axis)
+                } else {
+                    doc
+                };
                 if samples.last().is_none_or(|s| s.point != doc) {
                     samples.push(sample_at(doc, now, pressure));
+                }
+                // **Shift-click joins the dots**: a click with Shift held, after
+                // a stroke, draws a straight one from where that stroke ended.
+                let slop = CLICK_SLOP_PX / ctx.zoom.max(f64::MIN_POSITIVE);
+                let clicked = samples.iter().all(|s| (s.point - samples[0].point).hypot() <= slop);
+                if joins
+                    && clicked
+                    && let Some(from) = self.last_stroke_end
+                {
+                    samples = straight_samples(from, samples[0].point, samples[0].time, samples[0].pressure);
+                }
+                if matches!(self.tool, ToolId::Brush | ToolId::Pencil) {
+                    self.last_stroke_end = samples.last().map(|s| s.point);
                 }
                 self.finish_freehand(samples, mods, ctx)
             }
@@ -1249,7 +1308,8 @@ impl ToolMachine {
     /// that only need the yes or no: building a brush preview costs real work
     /// per call, and it is already built once a frame to be drawn.
     pub fn painting_preview(&self) -> bool {
-        matches!(self.gesture, Gesture::Freehand { .. }) && self.tool == ToolId::Brush
+        matches!(self.gesture, Gesture::Freehand { .. })
+            && matches!(self.tool, ToolId::Brush | ToolId::Pencil)
     }
 
     /// The current preview, for drawing feedback on the stage.
@@ -1344,7 +1404,7 @@ impl ToolMachine {
                 // release, which is the wrong trade for a drawing tool.
                 ToolId::Brush => {
                     let budget = buzz_geom::BrushBudget::default();
-                    match vector_brush_shape(samples, ctx.style, &budget) {
+                    match vector_brush_shape(samples, ctx.style, &budget, false) {
                         Some(shape) => Preview::Artwork(vec![shape]),
                         None => Preview::Stroke {
                             path: centreline_of(samples, ctx.style.brush.conditioning()),
@@ -1352,6 +1412,13 @@ impl ToolMachine {
                         },
                     }
                 }
+                // **The pencil previews its own ink**, in its colour and at its
+                // width — the line the release will commit, not a hairline
+                // that turns into something thicker when the pointer lifts.
+                ToolId::Pencil => match pencil_shape(samples, ctx.style, false) {
+                    Some(shape) => Preview::Artwork(vec![shape]),
+                    None => Preview::None,
+                },
                 _ => Preview::Stroke {
                     path: centreline_of(samples, ctx.style.brush.conditioning()),
                     width: brush_width(self.tool, ctx.style),
@@ -1541,12 +1608,25 @@ impl ToolMachine {
                 // pointer move, so what was on screen while drawing is what is
                 // committed — see `Preview::Artwork`.
                 let budget = buzz_geom::BrushBudget::default();
-                match vector_brush_shape(&samples, style, &budget) {
-                    Some(shape) => ToolAction::AddShape {
-                        shape,
-                        label: "Brush",
-                    },
-                    None => ToolAction::None,
+                let Some(shape) = vector_brush_shape(&samples, style, &budget, true) else {
+                    return ToolAction::None;
+                };
+                // The outlined brushes keep what they were built from, checked
+                // against the very outline committed — see `BrushSpine`.
+                let spine = style.brush.kind.is_outlined().then(|| {
+                    let profile = brush_profile_for(&samples, &style.brush);
+                    std::sync::Arc::new(buzz_geom::BrushSpine {
+                        fingerprint: buzz_geom::brush::path_fingerprint(&shape.path),
+                        samples: samples.clone(),
+                        profile,
+                    })
+                });
+                ToolAction::PaintStroke {
+                    shape,
+                    label: "Brush",
+                    spine,
+                    start: samples[0].point,
+                    mode: style.brush.paint_mode,
                 }
             }
             // The motion-path tool hands over the drawn curve, smoothed the same
@@ -1558,26 +1638,13 @@ impl ToolMachine {
                 }
                 ToolAction::DrawMotionPath { path }
             }
-            _ => {
-                let (color, width, hairline) =
-                    ctx.style
-                        .stroke_for_new_shape()
-                        .unwrap_or((Color::BLACK, 1.0, false));
-                ToolAction::AddShape {
-                    shape: ShapeData {
-                        path: centreline_of(&samples, ctx.style.brush.conditioning()),
-                        fill: None,
-                        stroke: Some(buzz_scene::StrokeSpec {
-                            paint: buzz_scene::Paint::Solid(color),
-                            width,
-                            hairline,
-                            swatch: None,
-                        }),
-                        blend: buzz_scene::PaintBlend::Normal,
-                    },
+            _ => match pencil_shape(&samples, ctx.style, true) {
+                Some(shape) => ToolAction::AddShape {
+                    shape,
                     label: "Pencil",
-                }
-            }
+                },
+                None => ToolAction::None,
+            },
         }
     }
 
@@ -1855,6 +1922,79 @@ fn brush_width(tool: ToolId, style: &DrawStyle) -> f64 {
 /// Animate's Pencil has a Smoothing setting for the same reason, and the
 /// pull-string stabiliser rides the same dial. Because the preview and the
 /// commit call this identically, what is drawn on screen is what lands.
+/// The pencil's line: the smoothed centreline, stroked in the current stroke
+/// colour and width. Shared by the preview and the commit so they are the same
+/// line; `finished` says whether the pointer has lifted (see
+/// [`buzz_geom::Conditioning::finished`]).
+fn pencil_shape(
+    samples: &[buzz_geom::StrokeSample],
+    style: &DrawStyle,
+    finished: bool,
+) -> Option<ShapeData> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let (color, width, hairline) = style
+        .stroke_for_new_shape()
+        .unwrap_or((Color::BLACK, 1.0, false));
+    let conditioning = buzz_geom::Conditioning {
+        finished,
+        ..style.brush.conditioning()
+    };
+    Some(ShapeData {
+        path: centreline_of(samples, conditioning),
+        fill: None,
+        stroke: Some(buzz_scene::StrokeSpec {
+            paint: buzz_scene::Paint::Solid(color),
+            width,
+            hairline,
+            swatch: None,
+        }),
+        blend: buzz_scene::PaintBlend::Normal,
+    })
+}
+
+/// `to`, held to the horizontal or vertical through `from` — whichever the
+/// stroke set out along. The choice is made once, when the stroke has gone a
+/// couple of units, and kept, so the line does not flip between the two as it
+/// passes the diagonal.
+fn constrain_to_axis(from: Point, to: Point, axis: &mut Option<bool>) -> Point {
+    let d = to - from;
+    if axis.is_none() && d.hypot() > 2.0 {
+        *axis = Some(d.x.abs() >= d.y.abs());
+    }
+    match axis {
+        Some(true) => Point::new(to.x, from.y),
+        Some(false) => Point::new(from.x, to.y),
+        None => from,
+    }
+}
+
+/// A straight stroke from `from` to `to`, sampled every couple of units at an
+/// even pace, ending at `time` — what Shift-click lays down.
+fn straight_samples(
+    from: Point,
+    to: Point,
+    time: f64,
+    pressure: f64,
+) -> Vec<buzz_geom::StrokeSample> {
+    // A steady, unhurried pace: the width a speed brush gives it is its
+    // ordinary drawn width rather than the thinnest a flick would make.
+    let length = (to - from).hypot();
+    let duration = (length / 300.0).max(0.05);
+    let steps = ((length / 2.0).ceil() as usize).max(1);
+    (0..=steps)
+        .map(|i| {
+            let t = i as f64 / steps as f64;
+            buzz_geom::StrokeSample::with_pressure(
+                from.lerp(to, t),
+                pressure,
+                time - duration * (1.0 - t),
+            )
+        })
+        .collect()
+}
+
 fn centreline_of(
     samples: &[buzz_geom::StrokeSample],
     how: buzz_geom::brush::Conditioning,
@@ -1941,6 +2081,7 @@ fn build_brush_path(
     samples: &[buzz_geom::StrokeSample],
     style: &DrawStyle,
     budget: &buzz_geom::BrushBudget,
+    finished: bool,
 ) -> Option<BezPath> {
     let settings = &style.brush;
 
@@ -1948,7 +2089,13 @@ fn build_brush_path(
         // Both outlined brushes are the same construction; what differs is
         // whether the width answers to anything, which the profile says.
         buzz_ui::BrushKind::Fluid | buzz_ui::BrushKind::Normal => Some(
-            buzz_geom::fluid_outline(samples, &brush_profile_for(samples, settings), budget).path,
+            buzz_geom::brush::fluid_outline_live(
+                samples,
+                &brush_profile_for(samples, settings),
+                budget,
+                finished,
+            )
+            .path,
         ),
         // Not a single path at all: a soft stroke is pixels, built by
         // `paint_soft_stroke`; an effect stroke is a list of pieces, built by
@@ -1959,7 +2106,11 @@ fn build_brush_path(
             let source = settings.pattern_path()?;
             // The stroke is conditioned first, so stamps follow the smoothed
             // curve rather than the jitter of the raw pointer.
-            let conditioned = buzz_geom::brush::condition(samples, settings.conditioning(), budget);
+            let how = buzz_geom::Conditioning {
+                finished,
+                ..settings.conditioning()
+            };
+            let conditioned = buzz_geom::brush::condition(samples, how, budget);
             if conditioned.len() < 2 {
                 // A tap with a pattern brush lays down a single stamp, which
                 // is what a stamp tool should do.
@@ -2003,7 +2154,7 @@ pub(crate) fn brush_profile_for(
 ) -> buzz_geom::BrushProfile {
     let mut profile = settings.profile();
     let saw_pressure = samples.iter().any(|s| s.pressure < 1.0);
-    if matches!(profile.response, buzz_geom::WidthResponse::Pressure) && !saw_pressure {
+    if matches!(profile.response, buzz_geom::WidthResponse::Pressure { .. }) && !saw_pressure {
         profile.response = buzz_geom::WidthResponse::Speed {
             reference_speed: settings.reference_speed.max(1.0),
         };
@@ -2023,8 +2174,9 @@ fn vector_brush_shape(
     samples: &[buzz_geom::StrokeSample],
     style: &DrawStyle,
     budget: &buzz_geom::BrushBudget,
+    finished: bool,
 ) -> Option<ShapeData> {
-    let path = build_brush_path(samples, style, budget)?;
+    let path = build_brush_path(samples, style, budget, finished)?;
     if path.elements().is_empty() {
         return None;
     }
@@ -3711,7 +3863,7 @@ mod tests {
         );
 
         match action {
-            ToolAction::AddShape { shape, label } => {
+            ToolAction::AddShape { shape, label } | ToolAction::PaintStroke { shape, label, .. } => {
                 assert_eq!(label, "Draw Rectangle");
                 let bb = shape.path.bounding_box();
                 assert!((bb.width() - 50.0).abs() < 1e-6, "{bb:?}");
@@ -3768,7 +3920,7 @@ mod tests {
             Point::new(50.0, 50.0),
             &ctx(&style),
         ) {
-            ToolAction::AddShape { shape, .. } => {
+            ToolAction::AddShape { shape, .. } | ToolAction::PaintStroke { shape, .. } => {
                 assert!(shape.stroke.is_some());
                 assert!(shape.fill.is_none(), "a line must not be filled");
             }
@@ -3953,7 +4105,7 @@ mod tests {
             m.pointer_move(p, p, Mods::default());
         }
         match m.pointer_up(Point::new(20.0, 0.0), Point::ORIGIN, &ctx(&style)) {
-            ToolAction::AddShape { shape, label } => {
+            ToolAction::AddShape { shape, label } | ToolAction::PaintStroke { shape, label, .. } => {
                 assert_eq!(label, "Pencil");
                 assert!(shape.path.elements().len() > 10);
                 assert!(shape.stroke.is_some() && shape.fill.is_none());
@@ -3979,7 +4131,7 @@ mod tests {
             m.pointer_move(p, p, Mods::default());
         }
         match m.pointer_up(Point::new(50.0, 0.0), Point::ORIGIN, &ctx(&style)) {
-            ToolAction::AddShape { shape, label } => {
+            ToolAction::AddShape { shape, label } | ToolAction::PaintStroke { shape, label, .. } => {
                 assert_eq!(label, "Brush");
                 assert!(shape.fill.is_some(), "the brush fills");
                 assert!(shape.stroke.is_none(), "the brush does not stroke");
@@ -4007,7 +4159,7 @@ mod tests {
                 m.pointer_move(p, p, mods);
             }
             match m.pointer_up(Point::new(50.0, 0.0), Point::ORIGIN, &ctx(&style)) {
-                ToolAction::AddShape { shape, .. } => shape.blend,
+                ToolAction::AddShape { shape, .. } | ToolAction::PaintStroke { shape, .. } => shape.blend,
                 other => panic!("got {other:?}"),
             }
         };
@@ -4069,7 +4221,7 @@ mod tests {
         let area_for = |seconds: f64| -> f64 {
             let mut m = ToolMachine::new(ToolId::Brush);
             match draw_stroke(&mut m, &style, &points, seconds) {
-                ToolAction::AddShape { shape, .. } => shape.path.area().abs(),
+                ToolAction::AddShape { shape, .. } | ToolAction::PaintStroke { shape, .. } => shape.path.area().abs(),
                 other => panic!("got {other:?}"),
             }
         };
@@ -4094,7 +4246,7 @@ mod tests {
 
         let mut m = ToolMachine::new(ToolId::Brush);
         match draw_stroke(&mut m, &style, &wavy(60, 400.0), 1.0) {
-            ToolAction::AddShape { shape, label } => {
+            ToolAction::AddShape { shape, label } | ToolAction::PaintStroke { shape, label, .. } => {
                 assert_eq!(label, "Brush");
                 assert!(shape.fill.is_some(), "stamps are filled artwork");
 
@@ -4122,7 +4274,7 @@ mod tests {
 
         let mut m = ToolMachine::new(ToolId::Brush);
         match draw_stroke(&mut m, &style, &wavy(40, 300.0), 1.0) {
-            ToolAction::AddShape { shape, .. } => {
+            ToolAction::AddShape { shape, .. } | ToolAction::PaintStroke { shape, .. } => {
                 let stamps = shape
                     .path
                     .elements()
@@ -4164,7 +4316,7 @@ mod tests {
         let mut brush = ToolMachine::new(ToolId::Brush);
         brush.pointer_down(p, p, Mods::default(), &ctx(&style));
         match brush.pointer_up(p, p, &ctx(&style)) {
-            ToolAction::AddShape { shape, .. } => {
+            ToolAction::AddShape { shape, .. } | ToolAction::PaintStroke { shape, .. } => {
                 assert!(shape.path.area().abs() > 0.0, "a tap should leave a mark");
             }
             other => panic!("got {other:?}"),
@@ -4188,10 +4340,10 @@ mod tests {
             let mut style = DrawStyle::default();
             style.brush.kind = kind;
             style.brush.smoothing = 0.8;
-            // With the stabiliser on too: a lagging filter that was not
-            // deterministic would show up here as a stroke that changed on
-            // release, which is exactly what this test exists to catch.
-            style.brush.stabiliser = 0.7;
+            // Stabiliser off: a stabilised stroke catches up to the pointer
+            // when it lifts — the one change a release is allowed to make,
+            // and only to the tail (see `buzz_geom::Conditioning::finished`).
+            style.brush.stabiliser = 0.0;
 
             let mut m = ToolMachine::new(ToolId::Brush);
             let points = wavy(300, 900.0);
@@ -4209,7 +4361,7 @@ mod tests {
             };
             let last = *points.last().unwrap();
             let committed = match m.pointer_up(last, last, &ctx(&style)) {
-                ToolAction::AddShape { shape, .. } => shape,
+                ToolAction::AddShape { shape, .. } | ToolAction::PaintStroke { shape, .. } => shape,
                 other => panic!("{kind:?} committed {other:?}"),
             };
 
@@ -4392,7 +4544,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         match action {
-            ToolAction::AddShape { shape, .. } => {
+            ToolAction::AddShape { shape, .. } | ToolAction::PaintStroke { shape, .. } => {
                 assert!(!shape.path.elements().is_empty());
                 // Bounded, so the document does not grow without limit either.
                 assert!(
@@ -4440,7 +4592,7 @@ mod tests {
             }
             let end = *points.last().unwrap();
             m.set_time(1.0);
-            if let ToolAction::AddShape { .. } = m.pointer_up(end, end, &ctx(&style)) {
+            if let ToolAction::AddShape { .. } | ToolAction::PaintStroke { .. } = m.pointer_up(end, end, &ctx(&style)) {
                 painted += 1;
             }
         }

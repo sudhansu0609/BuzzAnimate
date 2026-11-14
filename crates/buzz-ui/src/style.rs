@@ -131,6 +131,62 @@ impl ToolDrawingModes {
     }
 }
 
+/// **Where a brush stroke is allowed to land** — Animate's brush modes.
+///
+/// A mode changed as often as the eraser's, and for the same reason: colouring
+/// line art with a brush that paints over the lines means every slip costs a
+/// line. Each mode is a clip applied to the finished stroke, so the preview is
+/// the stroke as drawn and the commit is that stroke with the forbidden parts
+/// taken away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaintMode {
+    /// Over everything: lines and fills alike.
+    #[default]
+    Normal,
+    /// Over fills and empty stage, never over a line.
+    Fills,
+    /// Only where nothing is drawn yet: the stroke goes behind everything on
+    /// the layer.
+    Behind,
+    /// Only inside the fills that are selected.
+    Selection,
+    /// Only inside the fill the stroke began on — colour inside the lines.
+    Inside,
+}
+
+impl PaintMode {
+    pub const ALL: [PaintMode; 5] = [
+        Self::Normal,
+        Self::Fills,
+        Self::Behind,
+        Self::Selection,
+        Self::Inside,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Paint normal",
+            Self::Fills => "Paint fills",
+            Self::Behind => "Paint behind",
+            Self::Selection => "Paint selection",
+            Self::Inside => "Paint inside",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Normal => "Paint over lines and fills alike.",
+            Self::Fills => "Paint over fills and empty areas, leaving the lines on top.",
+            Self::Behind => "Paint only where nothing is drawn: the stroke goes behind the artwork.",
+            Self::Selection => "Paint only inside the selected fills.",
+            Self::Inside => {
+                "Paint only inside the fill the stroke starts on \u{2014} never over its lines. \
+                 Starting on empty stage paints behind."
+            }
+        }
+    }
+}
+
 /// Stroke style options offered in the Properties panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum StrokeKind {

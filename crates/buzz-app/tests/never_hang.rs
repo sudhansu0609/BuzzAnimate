@@ -150,6 +150,7 @@ fn the_timeline_panel_is_bounded_on_the_monster() {
         waveforms: std::collections::BTreeMap::new(),
         beats: Vec::new(),
         shot_end: None,
+        stage_copied: None,
     };
 
     let ctx = egui::Context::default();
@@ -258,6 +259,7 @@ fn committing_a_merged_monster_and_drawing_is_bounded() {
         waveforms: std::collections::BTreeMap::new(),
         beats: Vec::new(),
         shot_end: None,
+        stage_copied: None,
     };
     let ctx = egui::Context::default();
     buzz_ui::theme::apply(&ctx);

@@ -52,6 +52,8 @@ pub struct LightResponse {
     pub set_modelling: Option<f32>,
     /// Cast shadows only, with no shading, tint, pools or gloom.
     pub set_shadows_only: Option<bool>,
+    /// The built-in character shadows (no light needed) on or off.
+    pub set_character_shadows: Option<bool>,
     /// What the light draws its bands around: nothing, each shape, or the
     /// whole figure.
     pub set_edges: Option<EdgeMode>,
@@ -222,11 +224,22 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
         }
     });
 
+    // **Character shadows with no light**: on by default, so characters stand
+    // on the ground before any light is set up. A light switched on replaces it.
+    let mut shadows = !rig.no_character_shadows;
+    if ui
+        .checkbox(&mut shadows, "Character shadows (no light needed)")
+        .on_hover_text("Characters throw the shadow a light gives them, with nothing else of the light: no shading, tint or glow. A light you switch on takes over.")
+        .changed()
+    {
+        out.set_character_shadows = Some(shadows);
+    }
+
     if rig.lights.is_empty() {
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "No lights — artwork draws exactly as you painted it.\n\nAdd a sun for one \
+                "No lights — artwork draws exactly as you painted it, characters with their shadows.\n\nAdd a sun for one \
                  direction, a sky to fill the shadows, or a lamp for light that falls off \
                  with distance. A gloom does the opposite: it takes light away, in a wide \
                  band thrown across the stage.",

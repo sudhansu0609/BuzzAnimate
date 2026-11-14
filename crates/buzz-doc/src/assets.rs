@@ -503,7 +503,7 @@ impl AssetLibrary {
 ///
 /// The name is the file's stem, so a slash in it would silently move the asset
 /// into another folder and a colon would fail to save at all on Windows.
-fn sanitise(name: &str) -> String {
+pub fn sanitise(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| match c {

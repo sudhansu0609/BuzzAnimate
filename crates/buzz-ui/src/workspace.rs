@@ -596,6 +596,12 @@ pub struct Workspace {
     /// (`eyeLeft` → `Commands/eyeLeft.jsfl`). See [`crate::animate_keys`].
     #[serde(default)]
     pub script_keys: std::collections::BTreeMap<String, Vec<KeyChord>>,
+    /// **Who's who** for Lip Sync All Characters: a script's speaker name
+    /// (normalised: lower case, words only) and the character on the stage
+    /// who says those lines, as the person answered once. An empty character
+    /// is nobody on screen (narration, off screen).
+    #[serde(default)]
+    pub speaker_cast: std::collections::BTreeMap<String, String>,
     /// Settings for local AI models, vision, and LLM backends.
     #[serde(default)]
     pub ai: AiSettings,
@@ -1464,6 +1470,7 @@ impl Workspace {
             keymap: std::collections::BTreeMap::new(),
             extra_keys: std::collections::BTreeMap::new(),
             script_keys: std::collections::BTreeMap::new(),
+            speaker_cast: std::collections::BTreeMap::new(),
             ai: AiSettings::default(),
             ui_scale: default_ui_scale(),
             reduce_motion: false,

@@ -1245,6 +1245,16 @@
     return host.confirmAsk(message === undefined ? "" : String(message));
   };
 
+  // **BuzzAnimate's own, not Animate's.** A command asks `if (fl.buzzAnimate)`
+  // and Animate, which has no such object, skips the line.
+  fl.buzzAnimate = {
+    // The frame the spoken line at `frame` ends on (the next half second of
+    // quiet in the dialogue), or -1 when nothing is spoken from there on.
+    lineEnd: function (frame) { return host.dialogueLineEnd(Number(frame)); },
+    // Lip sync the selected mouth from `start` to `end` once the command ends.
+    lipSync: function (start, end) { host.requestLipSync(Number(start), Number(end)); },
+  };
+
   globalThis.fl = fl;
   // Newer Animate's name for the same object; some commands use it.
   globalThis.an = fl;

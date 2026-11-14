@@ -280,6 +280,12 @@ pub struct Editor {
     pub frame_clipboard: Option<FrameClip>,
     /// Copy Motion's clipboard (C1).
     pub motion_clip: Option<MotionClip>,
+    /// Copy / Paste Stage's clipboard: the frame it was copied at, and each
+    /// layer's drawing there with how many frames it was held from there.
+    pub stage_clip: Option<(u32, Vec<(LayerId, Vec<Arc<Object>>, u32)>)>,
+    /// Where the pointer last was in edit space, while dragging: what turns a
+    /// puppet's part about its joint (`Self::puppet_turn`).
+    puppet_pointer: Option<Point>,
     /// Copy Pose's clipboard (C2).
     pub pose_clip: Option<PoseClip>,
     /// Paste Motion Special…: the dialog is open, and its choices (kept between uses).
@@ -804,6 +810,8 @@ impl Editor {
             swatch_panel: buzz_ui::SwatchState::default(),
             frame_clipboard: None,
             motion_clip: None,
+            stage_clip: None,
+            puppet_pointer: None,
             pose_clip: None,
             paste_motion_special_open: false,
             motion_paste_options: MotionPasteOptions::default(),
@@ -1954,9 +1962,10 @@ impl Editor {
         lines: &[crate::scene_life::SpokenLine],
         track: &buzz_audio::VisemeTrack,
         sound_start: u32,
+        skip: &std::collections::HashSet<LayerId>,
     ) -> anyhow::Result<crate::scene_life::LipSyncAllReport> {
-        if crate::scene_life::stage_characters(self.doc.scene()).is_empty() {
-            anyhow::bail!("there is no Cast character on the stage (put them in with Cast into the shot)");
+        if crate::scene_life::talkers(self.doc.scene()).is_empty() {
+            anyhow::bail!("there is no character on the stage (cast one in, or place a character symbol)");
         }
         let fps = self.doc.scene().stage().frame_rate.max(1.0);
         let checkpoint = self.doc.run_checkpoint();
@@ -1980,7 +1989,7 @@ impl Editor {
             if let Some(layer) = layer {
                 scene.update_layer(layer, |l| l.name = Self::LIP_SYNC_ALL_LAYER.to_string());
             }
-            report = crate::scene_life::lip_sync_all(scene, track, sound_start, lines);
+            report = crate::scene_life::lip_sync_all_except(scene, track, sound_start, lines, skip);
         });
         self.doc.end_gesture();
         self.doc.collapse_run(checkpoint, "Lip Sync All Characters");
@@ -2558,6 +2567,10 @@ impl Editor {
         if !self.machine.painting_preview() {
             return false;
         }
+        // The pencil always previews its own ink.
+        if self.tool() != ToolId::Brush {
+            return true;
+        }
         // A pattern brush with no source shape falls back to a chrome-drawn
         // centreline — the one brush preview that is *not* painted artwork —
         // and skipping the chrome for it would leave the drag invisible.
@@ -2958,6 +2971,7 @@ impl Editor {
             self.move_shape_gesture(doc, screen, mods);
             return;
         }
+        self.puppet_pointer = Some(self.screen_to_edit(screen));
         let doc = self.snap_for_tool(self.screen_to_edit(screen));
         let action = self
             .machine
@@ -3011,7 +3025,8 @@ impl Editor {
             self.finish_shape_gesture(doc, screen);
             return;
         }
-        let doc = self.snap_for_tool(self.screen_to_edit(screen));
+        let raw = self.screen_to_edit(screen);
+        let doc = self.snap_for_tool(raw);
 
         // Built from disjoint fields rather than via `tool_context`, which
         // would borrow all of `self` and conflict with `&mut self.machine`.
@@ -3037,9 +3052,17 @@ impl Editor {
             pivot,
             gradient,
         };
-        let action = self
-            .machine
-            .pointer_up_at(doc, screen, &ctx, time, pressure);
+        let action = match self.machine.pointer_up_at(doc, screen, &ctx, time, pressure) {
+            // **A click picks what is under the pointer**, not what snapping
+            // pulled the pointer onto. Free Transform and Subselection snap (a
+            // handle or an anchor is lined up against a guide), and a click up
+            // to eight pixels from another object's edge was moved onto that
+            // edge first — so clicking a character's arm picked the background
+            // behind it, and only the Selection tool, which does not snap,
+            // chose what was clicked.
+            ToolAction::PickAt { additive, .. } => ToolAction::PickAt { point: raw, additive },
+            action => action,
+        };
 
         self.apply(action);
         // The copy, if there was one, was made and carried step by step; its
@@ -3247,6 +3270,14 @@ impl Editor {
             ToolAction::None => {}
 
             ToolAction::AddShape { shape, label } => self.add_shape(shape, label),
+
+            ToolAction::PaintStroke {
+                shape,
+                label,
+                spine,
+                start,
+                mode,
+            } => self.paint_brush_stroke(shape, label, spine, start, mode),
 
             ToolAction::PickAt { point, additive } => {
                 let tolerance = self.pick_tolerance();
@@ -3630,6 +3661,114 @@ impl Editor {
         }
     }
 
+    /// **Lay down a brush stroke by its paint mode** — Animate's Paint Normal,
+    /// Fills, Behind, Selection and Inside — keeping the stroke's spine on it
+    /// so it can be re-widthed and re-smoothed afterwards.
+    ///
+    /// Every mode is a clip of the finished stroke against what is already on
+    /// the layer, worked out *before* the edit: a stroke the mode leaves
+    /// nothing of is refused with a word in the status bar rather than leaving
+    /// an empty undo step behind.
+    fn paint_brush_stroke(
+        &mut self,
+        shape: ShapeData,
+        label: &'static str,
+        spine: Option<Arc<buzz_geom::BrushSpine>>,
+        start: Point,
+        mode: buzz_ui::PaintMode,
+    ) {
+        use buzz_ui::PaintMode;
+        let Some(layer) = self.active_layer() else {
+            self.status = Some("No layer available to draw on".into());
+            return;
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            self.status = Some("The active layer is locked".into());
+            return;
+        }
+        if !self.style.can_draw() {
+            self.status = Some("Set a stroke or fill colour first".into());
+            return;
+        }
+
+        let frame = self.current_frame;
+        let mut mode = mode;
+        // **Paint Inside paints the fill the stroke began on**, on this layer.
+        // Starting on empty stage paints behind, as Animate does.
+        let mut target: Option<ObjectId> = None;
+        if mode == PaintMode::Inside {
+            target = self
+                .object_at(start, self.pick_tolerance())
+                .filter(|id| self.shape_has_fill(*id))
+                .filter(|id| self.doc.scene().find_object(*id).map(|(l, _)| l) == Some(layer));
+            if target.is_none() {
+                mode = PaintMode::Behind;
+            }
+        }
+        let selected = self.selection.ids();
+        if mode == PaintMode::Selection && selected.is_empty() {
+            self.status = Some("Select a fill to paint into".into());
+            return;
+        }
+
+        let mirrors = self.symmetry_mirrors();
+        let mut copies: Vec<ShapeData> = mirrors.iter().map(|t| mirror_shape(&shape, *t)).collect();
+        copies.push(shape);
+        let copies: Vec<ShapeData> = copies
+            .into_iter()
+            .filter_map(|s| {
+                clip_for_paint_mode(self.doc.scene(), layer, frame, mode, target, &selected, s)
+            })
+            .collect();
+        if copies.is_empty() {
+            self.status = Some(match mode {
+                PaintMode::Selection => "That stroke missed the selected fills".into(),
+                PaintMode::Inside => "That stroke stayed on the lines".into(),
+                _ => "Nothing to paint there".into(),
+            });
+            return;
+        }
+
+        let merge = self.style.drawing_mode_for(self.tool(), self.style.brush.kind)
+            == DrawingMode::MergeShape;
+        let auto = self.auto_keyframe;
+        let mut created: Option<ObjectId> = None;
+        self.doc.edit(label, |scene| {
+            ensure_keyframe_for_drawing(scene, layer, frame, auto);
+            // The stroke under the pointer is the last copy, so it is the one
+            // left selected — see `add_shape`.
+            for copy in copies {
+                created = if mode == PaintMode::Behind {
+                    // Behind the artwork, and never merged into it: what is
+                    // already drawn stays on top, untouched.
+                    let id = scene.add_shape_behind_at(layer, frame, copy);
+                    if let Some(id) = id.filter(|_| !merge) {
+                        scene.update_object_at(frame, id, |o| o.drawing_object = true);
+                    }
+                    id
+                } else {
+                    lay_shape(scene, layer, frame, merge, copy)
+                };
+            }
+            // The spine is kept only while it still builds the artwork: a stroke
+            // that fused with its neighbours, or was clipped by its mode, is
+            // not the stroke the samples describe any more.
+            if let (Some(id), Some(spine)) = (created, spine) {
+                scene.update_object_at(frame, id, |o| {
+                    if let ObjectKind::Shape(s) = &o.kind
+                        && spine.describes(&s.path)
+                    {
+                        o.brush = Some(spine.clone());
+                    }
+                });
+            }
+        });
+
+        if !merge && let Some(id) = created {
+            self.selection.select_one(id);
+        }
+    }
+
     /// **Use this interface theme**, and remember it.
     ///
     /// Both ways in land here — the Window menu picking one by name, and the
@@ -3888,6 +4027,17 @@ impl Editor {
         if self.selection.is_empty() {
             return;
         }
+        // **A puppet's parts only turn**, about their joints: a drag or a
+        // Free Transform handle on one is read as a turn, and the pose is
+        // keyed with an ease from the one before (see `crate::puppet`).
+        let puppet_layers = self.puppet_selection();
+        let transform = match &puppet_layers {
+            Some(_) => match self.puppet_turn(transform, label) {
+                Some(turn) => turn,
+                None => return,
+            },
+            None => transform,
+        };
 
         // **The transformation point travels with the artwork.**
         //
@@ -3948,10 +4098,18 @@ impl Editor {
         // edit, so the history stamp it keeps is the one the edit leaves.
         let session = self.live_box_session();
 
-        let at = self.edit_at();
+        let mut at = self.edit_at();
+        if puppet_layers.is_some() {
+            // Every pose is a key, Auto Keyframe or not.
+            at.auto_key = true;
+        }
+        let label = if puppet_layers.is_some() { "Pose" } else { label };
         self.doc.edit(label, |scene| {
             for (id, local) in moves {
                 update_object(scene, at, id, |o| o.transform = local * o.transform);
+            }
+            for layer in puppet_layers.iter().flatten() {
+                crate::puppet::ease_around(scene, *layer, at.frame);
             }
         });
 
@@ -4162,6 +4320,14 @@ impl Editor {
                 _ => tolerance,
             };
 
+            // **How long the keyframe under the playhead has been showing**,
+            // which is what a graphic instance on it counts its own frame
+            // from — the renderer's `elapsed` (`buzz_render::document`). Tested
+            // on the raw timeline frame, a body part keyed at frame 24 was hit
+            // against the pose its symbol shows on frame 30, not the one on
+            // screen (frame 6 of the symbol), so the click landed on empty
+            // artwork and nothing was selected.
+            let elapsed = elapsed_on(layer, frame);
             for object in layer.objects_at(frame) {
                 if !object.visible || object.locked {
                     continue;
@@ -4175,7 +4341,7 @@ impl Editor {
                     // Edge-on: nothing on screen to click.
                     None => continue,
                 };
-                if object_contains(scene, object, local, local_tolerance, frame, 0, table) {
+                if object_contains(scene, object, local, local_tolerance, elapsed, 0, table) {
                     hit = Some(object.id);
                 }
             }
@@ -4203,6 +4369,7 @@ impl Editor {
                 Some(back) => back * local,
                 None => local,
             };
+            let elapsed = elapsed_on(layer, frame);
             for object in layer.objects_at(frame) {
                 if !object.visible || object.locked {
                     continue;
@@ -4211,7 +4378,7 @@ impl Editor {
                     continue;
                 };
                 if let Some(paint) =
-                    sampled_paint(scene, object, local, tolerance, frame, 0, &table)
+                    sampled_paint(scene, object, local, tolerance, elapsed, 0, &table)
                 {
                     hit = Some(paint);
                 }
@@ -5808,8 +5975,8 @@ impl Editor {
 
             ConvertLinesToFills => self.convert_lines_to_fills(),
             ExpandFill => self.expand_selection(2.0),
-            ThickenStroke => self.scale_selected_strokes(1.25),
-            ThinStroke => self.scale_selected_strokes(0.8),
+            ThickenStroke => self.thicken_or_grow_tool(1.25),
+            ThinStroke => self.thicken_or_grow_tool(0.8),
             // As many colours as the picture has (the palette stops on its
             // own once a colour is no longer distinct): the six of the
             // defaults merged a night street into black and white.
@@ -5872,6 +6039,8 @@ impl Editor {
             ClearKeyframe => self.frame_op(FrameOp::ClearKeyframe),
             ClearFrames => self.frame_op(FrameOp::ClearFrames),
             ReverseFrames => self.frame_op(FrameOp::ReverseFrames),
+            CopyPasteStage => self.copy_paste_stage(),
+            PuppetMode => self.toggle_puppet(),
             CleanUpLayers => self.cleanup.open_fresh(),
             RepairLayerRigs => self.repair_rigs_open = true,
             RenameBodyLayers => {
@@ -6109,6 +6278,9 @@ impl Editor {
             // Opens a file dialog; the shell intercepts this before it ever
             // reaches here (see `App::dispatch`).
             SetMasterAudio => {}
+            // Asks for the frames in a dialog; the shell intercepts it (see
+            // `App::move_stage_frames_dialog`) and calls `move_stage_frames`.
+            MoveStageFrames => {}
             // Asks first (and may open the Set Master Audio dialog); the
             // shell intercepts this too (see `App::toggle_master_audio_mode`).
             ToggleMasterAudioMode => {}
@@ -6375,6 +6547,8 @@ impl Editor {
             DeleteSymbol => self.delete_library_symbol(),
             SymbolToAsset => self.keep_symbol_as_asset(),
             ClearAllKeyframes => self.open_clear_keys_dialog(),
+            NextPose => self.step_pose(1),
+            PreviousPose => self.step_pose(-1),
             NewLibraryFolder => self.new_library_folder(),
 
             // -- tweens ------------------------------------------------------
@@ -8890,6 +9064,64 @@ impl Editor {
         self.actions.report(outcome.trace, outcome.error, summary);
     }
 
+    /// **Next / Previous Pose**: turn the selected character to the pose
+    /// `step` along its linked poses (wrapping round) from the playhead on —
+    /// what right-click ▸ Pose ▸ does, one key press at a time.
+    fn step_pose(&mut self, step: isize) {
+        let frame = self.edit_at().frame;
+        let Some((target, shown, poses)) =
+            crate::cast_combine::pose_choices(self.doc.scene(), self.selection.iter().next(), frame)
+        else {
+            self.status = Some("Select a character with linked poses (right-click it \u{25b8} Pose \u{25b8} Add Pose)".into());
+            return;
+        };
+        let at = poses.iter().position(|(_, name)| *name == shown).unwrap_or(0) as isize;
+        let (pose, name) = poses[(at + step).rem_euclid(poses.len() as isize) as usize].clone();
+        let mut changed = false;
+        self.doc.edit("Pose", |scene| {
+            changed = crate::cast_combine::pick_pose(scene, target, frame, pose);
+        });
+        self.select_posed(target, frame);
+        self.status = Some(if changed { format!("Pose: {name}") } else { format!("Could not switch to {name}") });
+    }
+
+    /// **Keep the character selected after a pose switch.** An instance keeps
+    /// its own id, but a Cast character unpacked onto the stage swaps parts:
+    /// the old pose's are blanked from the playhead on and the new pose's
+    /// shown, so what was selected is no longer there and the next Next Pose
+    /// found nothing selected. Its parts now on screen are selected instead.
+    pub(crate) fn select_posed(&mut self, target: crate::cast_combine::PoseTarget, frame: u32) {
+        let crate::cast_combine::PoseTarget::Lifted(folder) = target else {
+            return;
+        };
+        let scene = self.doc.scene();
+        let parts: Vec<ObjectId> = scene
+            .layers()
+            .iter()
+            .filter(|l| buzz_act::pose::character_folder_of(scene, l.id) == Some(folder))
+            .flat_map(|l| l.objects_at(frame).iter().map(|o| o.id).collect::<Vec<_>>())
+            .collect();
+        if !parts.is_empty() {
+            self.selection.set(parts);
+        }
+    }
+
+    /// **The master audio layer, when it is on the open scene**: the one layer
+    /// a script may not rename or key (`buzz_script::ScriptContext::master_audio`).
+    pub(crate) fn script_master_audio(&self) -> Option<LayerId> {
+        let (key, layer) = self.doc.master_audio()?;
+        (self.doc.scene_key(self.doc.active_scene()) == Some(key)).then_some(layer)
+    }
+
+    /// **The dialogue under the open timeline**, its loudness frame by frame,
+    /// for a command that times itself to speech (`fl.buzzAnimate.lineEnd`).
+    fn script_dialogue(&self) -> Option<buzz_script::Dialogue> {
+        let scene = self.doc.scene();
+        let (_, start, clip) = self.sound.stage_track_trimmed(scene)?;
+        let levels = clip.frame_levels(scene.stage().frame_rate);
+        Some(buzz_script::Dialogue { start, levels: Arc::new(levels) })
+    }
+
     /// **Run `source` as one undo step** — the Actions panel's Run, and every
     /// JSFL command on the shelf.
     ///
@@ -8924,6 +9156,11 @@ impl Editor {
             prompt_answers: answers,
             hooks: Default::default(),
             overrides: Vec::new(),
+            // Measured only for a command that asks (`fl.buzzAnimate`): the
+            // shelf's one-key commands run on every press of a key.
+            dialogue: source.contains("buzzAnimate").then(|| self.script_dialogue()).flatten(),
+            lip_sync: None,
+            master_audio: self.script_master_audio(),
         };
 
         let mut working = self.doc.scene().clone();
@@ -12378,6 +12615,406 @@ impl Editor {
         ));
     }
 
+    /// **Move Stage Frames**: everything on the stage from `first` to `last`
+    /// (timeline frames, inclusive) — every layer of the open timeline at
+    /// once — moved, or copied with `copy`, to start at `to`.
+    ///
+    /// [`Self::move_frames`] over a selection of every layer, so it moves
+    /// what that does: keyframes whole, tweens, sounds, nested symbols. Two
+    /// things are kept out of it:
+    ///
+    /// - **The master audio** (and Master Audio guides): the dialogue is the
+    ///   timeline every shot is cut against, so it stays where it is.
+    /// - Nothing else is renumbered unless it was **matched to the frame
+    ///   number**. A symbol that showed its own frame 2400 on the stage's frame
+    ///   2400 (what F does) shows the new frame where it lands, all the way
+    ///   down, as F would; one with timing of its own keeps it, since a symbol
+    ///   counts its frames from its keyframe and that moves with it.
+    pub fn move_stage_frames(&mut self, first: u32, last: u32, to: u32, copy: bool) {
+        let (first, last) = (first.min(last), first.max(last));
+        if to == first && !copy {
+            return;
+        }
+        let master = self.script_master_audio();
+        let scene = self.doc.scene();
+        let layers: Vec<LayerId> = scene
+            .layers()
+            .iter()
+            .filter(|l| l.kind != buzz_scene::LayerKind::Folder && !l.audio_guide && Some(l.id) != master)
+            .filter(|l| first < l.frames.length())
+            .map(|l| l.id)
+            .collect();
+        let Some(&anchor) = layers.first() else {
+            self.status = Some(format!("Move Stage Frames: nothing on the stage from frame {} to {}", first + 1, last + 1));
+            return;
+        };
+        // The instances matched to the frame number, by (layer, offset from
+        // `first`, place among the keyframe's objects): read before the move,
+        // since a move blanks where they were.
+        let mut matched: Vec<(LayerId, u32, usize)> = Vec::new();
+        for &id in &layers {
+            let Some(layer) = scene.layers().get(id) else { continue };
+            let mut starts: Vec<u32> = vec![first];
+            starts.extend(layer.frames.keyframes().iter().map(|k| k.start).filter(|s| *s > first && *s <= last));
+            for at in starts {
+                let elapsed = elapsed_on(layer, at);
+                for (index, object) in layer.objects_at(at).iter().enumerate() {
+                    let Some(instance) = object.instance() else { continue };
+                    let Some(symbol) = scene.library().get(instance.symbol) else { continue };
+                    if symbol.kind.follows_parent_timeline()
+                        && !instance.sync_to_root
+                        && at < symbol.length()
+                        && instance.resolve_frame(symbol.kind, elapsed, symbol.length()) == at
+                    {
+                        matched.push((id, at - first, index));
+                    }
+                }
+            }
+        }
+
+        let before = self.doc.scene().revision();
+        self.selection.set_timeline(buzz_ui::TimelineSelection::new(layers, first, last, anchor, first));
+        self.move_frames(to, 0, copy);
+        if self.doc.scene().revision() == before {
+            return;
+        }
+        let moved = self.status.clone().unwrap_or_default();
+
+        let mut renumbered = 0usize;
+        if !matched.is_empty() {
+            self.doc.edit(if copy { "Copy Frames" } else { "Move Frames" }, |scene| {
+                let mut inside: Vec<(buzz_scene::SymbolId, u32)> = Vec::new();
+                for (layer, offset, index) in &matched {
+                    let at = to + offset;
+                    scene.update_layer(*layer, |l| {
+                        let Some(keyframe) = l.frames.keyframe_at_mut(at) else { return };
+                        if keyframe.start != at {
+                            return;
+                        }
+                        let objects = Arc::make_mut(&mut keyframe.objects);
+                        let Some(object) = objects.get_mut(*index) else { return };
+                        if let ObjectKind::Instance(instance) = &mut Arc::make_mut(object).kind {
+                            inside.push((instance.symbol, at));
+                        }
+                    });
+                }
+                let mut sets: Vec<(LayerId, u32, usize, u32)> = Vec::new();
+                for ((layer, offset, index), (symbol, at)) in matched.iter().zip(&inside) {
+                    let Some(def) = scene.library().get(*symbol) else { continue };
+                    if *at >= def.length() {
+                        continue;
+                    }
+                    let first_frame = scene
+                        .layers()
+                        .get(*layer)
+                        .and_then(|l| l.frames.keyframe_at(*at).and_then(|k| k.objects.get(*index)).and_then(|o| o.instance()))
+                        .map(|i| i.first_frame_showing(*at, 0, def.length()));
+                    if let Some(first_frame) = first_frame {
+                        sets.push((*layer, *offset, *index, first_frame));
+                    }
+                }
+                for (layer, offset, index, first_frame) in sets {
+                    let at = to + offset;
+                    scene.update_layer(layer, |l| {
+                        if let Some(keyframe) = l.frames.keyframe_at_mut(at)
+                            && let Some(object) = Arc::make_mut(&mut keyframe.objects).get_mut(index)
+                            && let ObjectKind::Instance(instance) = &mut Arc::make_mut(object).kind
+                            && instance.first_frame != first_frame
+                        {
+                            instance.first_frame = first_frame;
+                            renumbered += 1;
+                        }
+                    });
+                }
+                let mut seen = std::collections::HashSet::new();
+                for (symbol, at) in inside {
+                    seen.clear();
+                    renumbered += match_frames_inside(scene, symbol, at, &mut seen);
+                }
+            });
+        }
+        self.status = Some(format!(
+            "{moved}: frames {}\u{2013}{} now start at {}{}{}",
+            first + 1,
+            last + 1,
+            to + 1,
+            if renumbered > 0 { format!(", {renumbered} symbols renumbered to their new frames") } else { String::new() },
+            if master.is_some() { " (the master audio stays where it is)" } else { "" }
+        ));
+    }
+
+    /// **Copy Stage**: everything on the stage at the playhead — what every
+    /// layer of the open timeline shows here, and how long it holds from
+    /// here — for [`Self::paste_stage`] at another frame. The master audio
+    /// and folders are left out.
+    pub fn copy_stage(&mut self) {
+        let frame = self.current_frame;
+        let master = self.script_master_audio();
+        let scene = self.doc.scene();
+        let clip: Vec<(LayerId, Vec<Arc<Object>>, u32)> = scene
+            .layers()
+            .iter()
+            .filter(|l| l.kind != buzz_scene::LayerKind::Folder && !l.audio_guide && Some(l.id) != master)
+            .filter(|l| frame < l.frames.length())
+            .map(|l| {
+                let next = l.frames.keyframes().iter().map(|k| k.start).filter(|s| *s > frame).min();
+                let hold = next.unwrap_or(l.frames.length()) - frame;
+                (l.id, l.objects_at(frame).to_vec(), hold.max(1))
+            })
+            .collect();
+        let drawn = clip.iter().filter(|(_, objects, _)| !objects.is_empty()).count();
+        self.status = Some(if drawn == 0 {
+            format!("Copy Stage: nothing on the stage at frame {}", frame + 1)
+        } else {
+            format!("Copied the stage at frame {} ({drawn} layers): go to another frame and Paste Stage", frame + 1)
+        });
+        self.stage_clip = (drawn > 0).then_some((frame, clip));
+    }
+
+    /// The layers of the selection when **every** selected object is a part of
+    /// a puppet; `None` otherwise (a selection mixing a puppet's part with
+    /// anything else moves as it always has).
+    fn puppet_selection(&self) -> Option<Vec<LayerId>> {
+        let scene = self.doc.scene();
+        let mut layers = Vec::new();
+        for id in self.selection.ids() {
+            let (layer, _) = scene.find_object(id)?;
+            crate::puppet::puppet_of(scene, layer)?;
+            if !layers.contains(&layer) {
+                layers.push(layer);
+            }
+        }
+        (!layers.is_empty()).then_some(layers)
+    }
+
+    /// **A drag or a transform, read as a turn** about the selection's
+    /// transformation point (the joint). A drag turns by the angle the pointer
+    /// swept round the joint; a Free Transform keeps only its rotation. `None`
+    /// when there is no joint to turn about or nothing to turn.
+    fn puppet_turn(&self, transform: Affine, label: &str) -> Option<Affine> {
+        let pivot = self.pivot()?;
+        let c = transform.as_coeffs();
+        let moved = label == "Move" || label == ALT_COPY_LABEL;
+        let angle = if moved {
+            let now = self.puppet_pointer?;
+            let before = now - kurbo::Vec2::new(c[4], c[5]);
+            let (a, b) = (now - pivot, before - pivot);
+            if a.hypot() < 1e-6 || b.hypot() < 1e-6 {
+                return None;
+            }
+            a.atan2() - b.atan2()
+        } else {
+            c[1].atan2(c[0])
+        };
+        (angle.abs() > 1e-9).then(|| Affine::rotate_about(angle, pivot))
+    }
+
+    /// **Puppet Mode** on what is picked (see [`crate::puppet`]):
+    ///
+    /// - on a puppet (a part of one selected, or its row active): the parts
+    ///   back as layers;
+    /// - on a character on the stage: its parts, inside its symbol (or inside
+    ///   the character a wrapper symbol holds), filed under one puppet, and the
+    ///   character opened in place to be posed;
+    /// - on a Cast character's layers: its folder made the puppet;
+    /// - inside a character's own timeline: its parts made a puppet.
+    pub fn toggle_puppet(&mut self) {
+        let scene = self.doc.scene();
+        let picked = self.selection.ids().first().and_then(|id| scene.find_object(*id)).map(|(l, _)| l);
+        let here = picked.or(self.selection.active_layer());
+        if let Some(folder) = here.and_then(|l| crate::puppet::puppet_of(scene, l)) {
+            self.doc.edit("Puppet Mode Off", |s| {
+                s.edit_open_layers(|stack| crate::puppet::unpuppet(stack, folder));
+            });
+            self.selection.prune(self.doc.scene());
+            self.status = Some("Puppet Mode off: the parts are layers again, as they were".into());
+            return;
+        }
+
+        // A character on the stage: the puppet goes inside it.
+        let instance = self.selection.ids().into_iter().find_map(|id| {
+            let (_, object) = scene.find_object(id)?;
+            let symbol = object.instance()?.symbol;
+            crate::scene_life::is_character_symbol(scene, symbol, 0).then_some((id, symbol))
+        });
+        if let Some((id, symbol)) = instance {
+            // A wrapper (a container holding the character): the character in it.
+            let library = scene.library();
+            let target = if library.get(symbol).is_some_and(|d| crate::puppet::is_character_stack(&d.layers)) {
+                Some(symbol)
+            } else {
+                library.get(symbol).and_then(|d| {
+                    d.layers.iter().flat_map(|l| l.all_objects()).find_map(|o| {
+                        let inner = o.instance()?.symbol;
+                        library.get(inner).filter(|d| crate::puppet::is_character_stack(&d.layers)).map(|_| inner)
+                    })
+                })
+            };
+            let Some(target) = target else {
+                self.status = Some("Puppet Mode: no head, body or arm layers found in that character".into());
+                return;
+            };
+            let name = library.get(target).map(|d| d.name.clone()).unwrap_or_default();
+            let already = library.get(target).is_some_and(|d| d.layers.iter().any(|l| l.puppet));
+            if !already {
+                let mut made = false;
+                self.doc.edit("Puppet Mode", |s| {
+                    let folder = LayerId(s.next_object_id().0);
+                    if let Some(stack) = s.library_mut().layers_mut(target) {
+                        made = crate::puppet::puppetize(stack, folder, "Puppet").is_some();
+                    }
+                });
+                if !made {
+                    self.status = Some(format!("Puppet Mode: {name} has no parts to make a puppet of"));
+                    return;
+                }
+            }
+            // Opened in place, down to the character itself, to be posed.
+            if self.enter_instance_in_place(id) && target != symbol {
+                let frame = self.current_frame;
+                let inner = self.doc.scene().layers().iter().find_map(|l| {
+                    l.objects_at(frame).iter().find(|o| o.instance().is_some_and(|i| i.symbol == target)).map(|o| o.id)
+                });
+                if let Some(inner) = inner {
+                    self.enter_instance_in_place(inner);
+                }
+            }
+            self.status = Some(format!(
+                "{name} is a puppet: one row in the timeline; drag a part to turn it about its joint, and each pose is keyed with an ease. Puppet Mode again shows the layers"
+            ));
+            return;
+        }
+
+        // A Cast character's layers: its own folder.
+        let cast_folder = here.and_then(|l| {
+            let layers = scene.layers();
+            let mut at = layers.get(l)?;
+            for _ in 0..layers.len() + 1 {
+                if at.kind == LayerKind::Folder && at.cast_source.is_some() {
+                    return Some(at.id);
+                }
+                at = layers.get(at.parent?)?;
+            }
+            None
+        });
+        if let Some(folder) = cast_folder {
+            self.doc.edit("Puppet Mode", |s| {
+                s.update_layer(folder, |l| {
+                    l.puppet = true;
+                    l.collapsed = true;
+                });
+            });
+            self.status = Some("A puppet: drag a part to turn it about its joint; each pose is keyed with an ease".into());
+            return;
+        }
+
+        // Inside a character's own timeline.
+        if crate::puppet::is_character_stack(scene.layers()) {
+            let mut made = false;
+            self.doc.edit("Puppet Mode", |s| {
+                let folder = LayerId(s.next_object_id().0);
+                made = s.edit_open_layers(|stack| crate::puppet::puppetize(stack, folder, "Puppet")).is_some();
+            });
+            if made {
+                self.status = Some("A puppet: drag a part to turn it about its joint; each pose is keyed with an ease".into());
+                return;
+            }
+        }
+        self.status = Some("Puppet Mode: select a character on the stage first".into());
+    }
+
+    /// **Copy / Paste Stage**, one button: with nothing held, copies the
+    /// stage at the playhead ([`Self::copy_stage`]); holding a copy, pastes it
+    /// at the playhead ([`Self::paste_stage`]) and lets go, ready for the next
+    /// copy. Pressed on the frame it copied, it lets go without pasting.
+    pub fn copy_paste_stage(&mut self) {
+        match self.stage_clip.as_ref().map(|c| c.0) {
+            None => self.copy_stage(),
+            Some(from) if from == self.current_frame => {
+                self.stage_clip = None;
+                self.status = Some(format!("Copy / Paste Stage: let go of the stage copied at frame {}", from + 1));
+            }
+            Some(from) => {
+                self.paste_stage();
+                self.stage_clip = None;
+                if let Some(status) = &mut self.status {
+                    *status = status.replacen("Pasted the stage", &format!("Pasted the stage from frame {}", from + 1), 1);
+                }
+            }
+        }
+    }
+
+    /// **Paste Stage**: what [`Self::copy_stage`] took, laid down as a
+    /// keyframe on each of its layers at the playhead — replacing what was
+    /// keyed there — as one undo step. **Every symbol is set to show this
+    /// frame's number**, all the way down, as F does: a body pasted on 3000
+    /// shows its own frame 3000, and the head inside it too. Short charts
+    /// (a mouth, an eye) keep the frame they were on, as F leaves them. A
+    /// layer that ends here is lengthened by as long as the copy held.
+    pub fn paste_stage(&mut self) {
+        let Some((_, clip)) = self.stage_clip.clone() else {
+            self.status = Some("Paste Stage: Copy Stage first, on the frame to copy".into());
+            return;
+        };
+        let at = self.current_frame;
+        let mut layers = 0usize;
+        let mut renumbered = 0usize;
+        self.doc.edit("Paste Stage", |scene| {
+            let mut inside: Vec<buzz_scene::SymbolId> = Vec::new();
+            for (layer, objects, hold) in &clip {
+                if scene.layers().get(*layer).is_none() {
+                    continue;
+                }
+                // Each symbol set to show `at` from its first frame here.
+                let objects: Vec<Arc<Object>> = objects
+                    .iter()
+                    .map(|object| {
+                        let mut object = object.clone();
+                        if let ObjectKind::Instance(instance) = &object.kind
+                            && let Some(def) = scene.library().get(instance.symbol)
+                            && def.kind.follows_parent_timeline()
+                            && !instance.sync_to_root
+                            && at < def.length()
+                        {
+                            let first = instance.first_frame_showing(at, 0, def.length());
+                            inside.push(instance.symbol);
+                            if first != instance.first_frame
+                                && let ObjectKind::Instance(i) = &mut Arc::make_mut(&mut object).kind
+                            {
+                                i.first_frame = first;
+                                renumbered += 1;
+                            }
+                        }
+                        object
+                    })
+                    .collect();
+                scene.update_layer(*layer, |l| {
+                    let end = at + hold;
+                    let ends_here = l.frames.length() <= at + 1;
+                    l.frames.insert_blank_keyframe(at);
+                    l.frames.set_objects(at, objects);
+                    if ends_here && l.frames.length() < end {
+                        let length = l.frames.length();
+                        l.frames.insert_frame(end - 1);
+                        debug_assert!(l.frames.length() >= length);
+                    }
+                });
+                layers += 1;
+            }
+            let mut seen = std::collections::HashSet::new();
+            for symbol in inside {
+                renumbered += match_frames_inside(scene, symbol, at, &mut seen);
+            }
+        });
+        self.doc.end_gesture();
+        self.selection.prune(self.doc.scene());
+        self.status = Some(format!(
+            "Pasted the stage at frame {} on {layers} layers{}",
+            at + 1,
+            if renumbered > 0 { format!("; {renumbered} symbols set to frame {}", at + 1) } else { String::new() }
+        ));
+    }
+
     /// **Copy Frames**, and **Cut Frames** when `and_clear`.
     ///
     /// The frames selected in the timeline — those layers, those frames —
@@ -15212,6 +15849,14 @@ impl Editor {
         let mut touched = 0usize;
         self.doc.edit(label, |scene| {
             for id in ids {
+                // A brush stroke with its spine is re-built wider or thinner,
+                // tapers and all, rather than refused for being a fill.
+                if update_brush_stroke(scene, at, id, |spine| {
+                    spine.with_width((spine.profile.width * factor).clamp(0.2, 400.0))
+                }) {
+                    touched += 1;
+                    continue;
+                }
                 update_shape(scene, at, id, |s| {
                     let Some(stroke) = s.stroke.as_mut() else {
                         return;
@@ -15234,11 +15879,35 @@ impl Editor {
         });
 
         self.status = Some(match touched {
-            0 => "Nothing in the selection has an outline \u{2014} brush strokes are fills, \
-                  and Modify \u{25b8} Shape \u{25b8} Expand Fill is what widens those"
+            0 => "Nothing in the selection has a line or brush stroke to widen \u{2014} \
+                  Modify \u{25b8} Shape \u{25b8} Expand Fill is what widens a fill"
                 .to_string(),
-            1 => format!("{label}: one outline"),
-            n => format!("{label}: {n} outlines"),
+            1 => format!("{label}: one stroke"),
+            n => format!("{label}: {n} strokes"),
+        });
+    }
+
+    /// **`[` and `]`**: with a drawing tool in hand they size the tool — the
+    /// brush, the eraser, the pencil's line — as every paint program does, so
+    /// the size changes without a trip to the panel and the cursor ring shows
+    /// it at once. With any other tool they widen or thin the selected strokes.
+    ///
+    /// Decided by the tool rather than by whether something is selected,
+    /// because in Object Drawing the stroke just drawn *is* selected, and `]`
+    /// after a stroke has to mean "bigger brush", not "fatten that stroke".
+    fn thicken_or_grow_tool(&mut self, factor: f64) {
+        let grow = |size: &mut f64, min: f64| {
+            *size = (*size * factor).clamp(min, 200.0);
+            *size
+        };
+        self.status = Some(match self.tool() {
+            ToolId::Brush => format!("Brush size {:.1}", grow(&mut self.style.brush.size, 1.0)),
+            ToolId::Eraser => format!("Eraser size {:.1}", grow(&mut self.style.eraser_size, 1.0)),
+            ToolId::Pencil | ToolId::Line | ToolId::Pen => {
+                self.style.hairline = false;
+                format!("Line width {:.2}", grow(&mut self.style.stroke_width, 0.1))
+            }
+            _ => return self.scale_selected_strokes(factor),
         });
     }
 
@@ -15259,6 +15928,26 @@ impl Editor {
 
         self.doc.edit(label, |scene| {
             for id in ids {
+                // **A brush stroke is reshaped down its middle**, from the
+                // spine it was drawn from, so both edges move together and the
+                // tapers survive. Smoothing the outline instead refits each
+                // edge on its own and rounds the points off the ends.
+                let reshaped = update_brush_stroke(scene, at, id, |spine| {
+                    let bb = spine.centreline().bounding_box();
+                    let amount = (bb.width().hypot(bb.height()) / 200.0).clamp(0.5, 10.0);
+                    match how {
+                        Reshape::Smooth => spine.smoothed(0.8),
+                        Reshape::Straighten => {
+                            match buzz_geom::recognise(&spine.centreline(), tolerance) {
+                                Some((path, _)) => spine.retraced(&path),
+                                None => spine.straightened(amount),
+                            }
+                        }
+                    }
+                });
+                if reshaped {
+                    continue;
+                }
                 update_shape(scene, at, id, |s| {
                     if recognise && let Some((path, _)) = buzz_geom::recognise(&s.path, tolerance) {
                         s.path = path;
@@ -15636,7 +16325,26 @@ fn update_shape(scene: &mut Scene, at: EditAt, id: ObjectId, mut f: impl FnMut(&
         if let ObjectKind::Shape(shape) = &mut o.kind {
             f(shape);
         }
+        // An outline edited any other way is no longer what its spine builds.
+        if o.brush.is_some() && o.brush_spine().is_none() {
+            o.brush = None;
+        }
     });
+}
+
+/// **Rebuild a brush stroke from its spine**, changed by `f` — wider, smoother,
+/// straighter. The outline is replaced and the new spine kept with it, so the
+/// stroke can be changed again. Returns whether `id` was a brush stroke with a
+/// spine to rebuild from; anything else is left alone.
+fn update_brush_stroke(
+    scene: &mut Scene,
+    at: EditAt,
+    id: ObjectId,
+    f: impl Fn(&buzz_geom::BrushSpine) -> (buzz_geom::BrushSpine, BezPath),
+) -> bool {
+    let mut rebuilt = false;
+    update_object(scene, at, id, |o| rebuilt |= o.rebuild_brush(&f));
+    rebuilt
 }
 
 /// **Make this document the home of any bitmap the shape paints with.**
@@ -15824,12 +16532,18 @@ fn resolved_local_bounds(
     }
 }
 
+/// Is `point` (in the object's parent space) on `object`'s artwork?
+///
+/// `elapsed` is how many frames the keyframe holding `object` has been on
+/// screen (`elapsed_on`), not the timeline frame: it is what an instance
+/// resolves its own frame from, exactly as the renderer does, and an
+/// instance's children are tested with their own elapsed count inside it.
 fn object_contains(
     scene: &Scene,
     object: &Object,
     point: Point,
     tolerance: f64,
-    frame: u32,
+    elapsed: u32,
     depth: usize,
     table: &std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>,
 ) -> bool {
@@ -15876,7 +16590,7 @@ fn object_contains(
         }
         ObjectKind::Group(children) => children
             .iter()
-            .any(|c| object_contains(scene, c, local, tolerance, frame, depth, table)),
+            .any(|c| object_contains(scene, c, local, tolerance, elapsed, depth, table)),
 
         ObjectKind::Instance(instance) => {
             // Same cycle guard the renderer uses.
@@ -15886,7 +16600,7 @@ fn object_contains(
             let Some(symbol) = scene.library().get(instance.symbol) else {
                 return false;
             };
-            let inner = instance.resolve_frame(symbol.kind, frame, symbol.length());
+            let inner = instance.resolve_frame(symbol.kind, elapsed, symbol.length());
             // Hit the artwork, not the bounding box: clicking the hole in a
             // ring selects what is behind it, as it does in Animate.
             //
@@ -15906,9 +16620,12 @@ fn object_contains(
                     Some(back) => back * local,
                     None => local,
                 };
+                // A part nested inside counts from *its* keyframe on this
+                // layer, as the renderer's `inner_elapsed` does.
+                let inner_elapsed = elapsed_on(l, inner);
                 l.objects_at(inner)
                     .iter()
-                    .any(|c| object_contains(scene, c, local, tolerance, inner, depth + 1, table))
+                    .any(|c| object_contains(scene, c, local, tolerance, inner_elapsed, depth + 1, table))
             })
         }
 
@@ -15994,9 +16711,10 @@ fn sampled_paint(
                     Some(back) => back * local,
                     None => local,
                 };
+                let inner_elapsed = elapsed_on(layer, inner);
                 for child in layer.objects_at(inner) {
                     if let Some(paint) =
-                        sampled_paint(scene, child, local, tolerance, inner, depth + 1, table)
+                        sampled_paint(scene, child, local, tolerance, inner_elapsed, depth + 1, table)
                     {
                         hit = Some(paint);
                     }
@@ -17733,6 +18451,94 @@ fn lay_shape(
     }
 }
 
+/// **What of a brush stroke its paint mode lets land** — `None` when nothing
+/// does. See [`buzz_ui::PaintMode`].
+///
+/// Paths on the layer are taken through their objects' transforms, so the clip
+/// is worked out in the space the stroke was drawn in.
+fn clip_for_paint_mode(
+    scene: &Scene,
+    layer: LayerId,
+    frame: u32,
+    mode: buzz_ui::PaintMode,
+    target: Option<ObjectId>,
+    selected: &[ObjectId],
+    mut shape: ShapeData,
+) -> Option<ShapeData> {
+    use buzz_ui::PaintMode;
+    let bb = shape.path.bounding_box();
+    let opts = buzz_geom::BooleanOptions::for_shape_size(bb.width().hypot(bb.height()));
+    let shapes_here = || -> Vec<(ObjectId, BezPath, ShapeData)> {
+        scene
+            .layers()
+            .get(layer)
+            .map(|l| {
+                l.objects_at(frame)
+                    .iter()
+                    .filter(|o| o.visible)
+                    .filter_map(|o| match &o.kind {
+                        ObjectKind::Shape(s) => {
+                            let placed = o.transform * s.path.clone();
+                            placed
+                                .bounding_box()
+                                .overlaps(bb)
+                                .then(|| (o.id, placed, s.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let clip_to = |region: Vec<BezPath>, op: buzz_geom::BoolOp, path: &BezPath| {
+        if region.is_empty() {
+            return match op {
+                buzz_geom::BoolOp::Difference => path.clone(),
+                _ => BezPath::new(),
+            };
+        }
+        let region = buzz_geom::union_all(&region, opts);
+        buzz_geom::boolean(path, &region, op, opts)
+    };
+
+    shape.path = match mode {
+        PaintMode::Normal | PaintMode::Behind => return Some(shape),
+        // Everything but the lines: the ink of every stroked shape it crosses
+        // is taken out of it, so the linework stays on top.
+        PaintMode::Fills => {
+            let ink: Vec<BezPath> = shapes_here()
+                .into_iter()
+                .filter_map(|(_, placed, s)| {
+                    let width = s.stroke.as_ref()?.width.max(1.0);
+                    Some(buzz_geom::outline_stroke(
+                        &placed,
+                        buzz_geom::StrokeStyle::new(width),
+                        (width / 40.0).max(1e-4),
+                    ))
+                })
+                .collect();
+            clip_to(ink, buzz_geom::BoolOp::Difference, &shape.path)
+        }
+        PaintMode::Selection => {
+            let fills: Vec<BezPath> = shapes_here()
+                .into_iter()
+                .filter(|(id, _, s)| selected.contains(id) && s.fill.is_some())
+                .map(|(_, placed, _)| placed)
+                .collect();
+            clip_to(fills, buzz_geom::BoolOp::Intersect, &shape.path)
+        }
+        PaintMode::Inside => {
+            let fill: Vec<BezPath> = shapes_here()
+                .into_iter()
+                .filter(|(id, _, _)| Some(*id) == target)
+                .map(|(_, placed, _)| placed)
+                .collect();
+            clip_to(fill, buzz_geom::BoolOp::Intersect, &shape.path)
+        }
+    };
+    (shape.path.area().abs() > 1e-6).then_some(shape)
+}
+
 /// Place a shape drawn in Object Drawing mode, flagged so later Merge strokes
 /// leave it alone.
 fn add_drawing_object(
@@ -18972,6 +19778,33 @@ mod tests {
             .find(|id| !before.contains(id))
     }
 
+    /// **A click picks what is under the pointer, with any selecting tool.**
+    /// Free Transform and Subselection snap the pointer (a handle lines up
+    /// against the grid or a guide), and a click on a small part a few pixels
+    /// from a grid line was moved onto the line first — off the part and onto
+    /// the artwork behind it, which was selected instead. Only the Selection
+    /// tool, which does not snap, chose what was clicked.
+    #[test]
+    fn a_click_picks_the_object_under_the_pointer_with_every_selecting_tool() {
+        let mut e = editor();
+        let behind = draw_square(&mut e, 0.0, 0.0, 300.0, Color::WHITE).expect("the background");
+        let part = draw_square(&mut e, 126.0, 126.0, 2.0, Color::BLACK).expect("a small part on top");
+        e.view.snap.to_grid = true;
+        e.view.grid_spacing = 20.0;
+        let click = Point::new(127.0, 127.0);
+        let snapped = e.snap(click);
+        assert_eq!(e.object_at(snapped, e.pick_tolerance()), Some(behind), "the case: snapping moves the click off the part");
+
+        let screen = e.camera.doc_to_screen(click);
+        for tool in [ToolId::Selection, ToolId::Subselection, ToolId::FreeTransform] {
+            e.set_tool(tool);
+            e.selection.clear();
+            e.pointer_down_at(screen, Mods::default(), Some(0.0), None);
+            e.pointer_up_at(screen, Some(0.05), None);
+            assert_eq!(e.selection.ids(), vec![part], "{tool:?} picks the part that was clicked");
+        }
+    }
+
     #[test]
     fn a_new_editor_has_a_layer_and_frames_the_stage() {
         let e = Editor::default();
@@ -19739,10 +20572,10 @@ mod tests {
         // And a pen's stroke keeps the pressure response.
         let mut pen = mouse.clone();
         pen[10].pressure = 0.4;
-        assert_eq!(
+        assert!(matches!(
             crate::tools::brush_profile_for(&pen, &style.brush).response,
-            buzz_geom::WidthResponse::Pressure
-        );
+            buzz_geom::WidthResponse::Pressure { .. }
+        ));
     }
 
     /// **Copy Frames takes the selected frames' layers.** Selecting frame 0
@@ -28972,6 +29805,269 @@ mod tests {
             .object_at(e.screen_to_edit(screen), 2.0)
             .expect("a part with locked layers inside is still selectable");
         assert!(e.scene().find_object(part).is_some(), "a part of the open symbol");
+    }
+
+    /// **A part keyed partway through the timeline is hit on the pose it is
+    /// showing.** A graphic instance counts its own frame from the keyframe
+    /// it sits on, which is how the renderer draws it; the hit test counted
+    /// from the start of the timeline, so a body part keyed at 10 and clicked
+    /// on 11 was tested against the pose its symbol shows on frame 11 — artwork
+    /// somewhere else entirely — and the click selected nothing.
+    /// **Puppet Mode, end to end**: a character on the stage made a puppet
+    /// opens with its parts under one row; dragging the arm turns it about its
+    /// joint (the joint stays put), keys the pose on the playhead and eases
+    /// into it from the pose before; Puppet Mode again gives the layers back.
+    #[test]
+    fn a_puppet_part_turns_about_its_joint_and_each_pose_is_keyed_and_eased() {
+        let mut e = editor();
+        let mut ids = (buzz_scene::SymbolId(0), ObjectId(0), ObjectId(0));
+        e.doc.edit("Fixture", |scene| {
+            let guy = scene.add_symbol("guy", buzz_scene::SymbolKind::Graphic, None);
+            scene.enter_symbol(guy);
+            let body = scene.layers().iter().next().unwrap().id;
+            scene.update_layer(body, |l| {
+                l.name = "body".into();
+                l.frames.insert_frame(29);
+            });
+            scene.add_shape(body, ShapeData::filled(square(0.0, 0.0, 40.0), Color::WHITE));
+            let arm = scene.add_layer("rightArm", LayerKind::Normal);
+            scene.update_layer(arm, |l| {
+                l.follows = Some(body);
+                l.frames.insert_frame(29);
+            });
+            let arm_id = scene.add_shape(arm, ShapeData::filled(square(40.0, 0.0, 10.0), Color::WHITE)).unwrap();
+            // The joint: the shoulder, at the arm's top-left.
+            scene.update_object_at(0, arm_id, |o| o.pivot = Some(Point::new(40.0, 0.0)));
+            scene.exit_symbol();
+            let stage = scene.layers().iter().next().unwrap().id;
+            scene.update_layer(stage, |l| {
+                l.frames.insert_frame(29);
+            });
+            let id = scene.next_object_id();
+            scene.add_object_at(stage, 0, Object::instance_of(id, guy));
+            ids = (guy, id, arm_id);
+        });
+        let (guy, placed, arm) = ids;
+        e.selection.set([placed]);
+        e.run(Command::PuppetMode);
+        let def = e.scene().library().get(guy).unwrap();
+        let folder = def.layers.iter().find(|l| l.puppet).expect("a puppet folder in the character");
+        assert!(folder.collapsed, "shown as one row");
+        assert_eq!(def.layers.iter().filter(|l| l.parent == Some(folder.id)).count(), 2, "body and arm under it");
+        assert_eq!(e.scene().editing_symbol(), Some(guy), "opened to be posed");
+
+        e.set_frame(12);
+        e.selection.set([arm]);
+        let joint = e.pivot().expect("the arm's joint");
+        // Dragged from below the shoulder round to its right: a quarter turn.
+        let (from, to) = (joint + kurbo::Vec2::new(0.0, 20.0), joint + kurbo::Vec2::new(20.0, 0.0));
+        e.puppet_pointer = Some(to);
+        e.apply(ToolAction::MoveSelection { delta: to - from });
+
+        let scene = e.scene();
+        let layer = scene.layers().iter().find(|l| l.name == "rightArm").unwrap();
+        let key = layer.frames.keyframe_at(12).expect("keyed");
+        assert_eq!(key.start, 12, "the pose is keyed on the playhead");
+        assert_eq!(layer.frames.tween_at(0), crate::puppet::pose_ease(), "eased in from the pose before");
+        let turned = key.objects.iter().find(|o| o.id == arm).unwrap().transform;
+        let c = turned.as_coeffs();
+        assert!((c[1].atan2(c[0]).abs() - std::f64::consts::FRAC_PI_2).abs() < 1e-6, "a quarter turn: {c:?}");
+        let joint_now = turned * Point::new(40.0, 0.0);
+        assert!((joint_now - Point::new(40.0, 0.0)).hypot() < 1e-6, "the joint stays put: {joint_now:?}");
+        assert!(layer.frames.keyframe_at(0).is_some_and(|k| k.objects.iter().any(|o| o.id == arm && o.transform == Affine::IDENTITY)), "the pose before is untouched");
+
+        e.run(Command::PuppetMode);
+        let def = e.scene().library().get(guy).unwrap();
+        assert!(def.layers.iter().all(|l| !l.puppet && l.parent.is_none()), "the layers are back");
+    }
+
+    /// **Copy Stage / Paste Stage**: the stage at one frame, pasted on another
+    /// with one key each. Every symbol, and the symbols inside it, shows the
+    /// new frame's number; the master audio is left alone; one undo takes it
+    /// all back.
+    #[test]
+    fn copy_stage_then_paste_stage_sets_every_symbol_to_the_new_frame() {
+        let mut e = editor();
+        let mut ids = (LayerId(0), LayerId(0), LayerId(0), buzz_scene::SymbolId(0));
+        e.doc.edit("Fixture", |scene| {
+            let long = |scene: &mut Scene, name: &str| {
+                let id = scene.add_symbol(name, buzz_scene::SymbolKind::Graphic, None);
+                scene.library_mut().update(id, |s| {
+                    let l = s.layers.iter().next().expect("a layer").id;
+                    s.layers.update(l, |l| {
+                        l.frames.insert_frame(399);
+                    });
+                });
+                id
+            };
+            let head = long(scene, "Head");
+            let body = long(scene, "Body");
+            let head_id = scene.next_object_id();
+            scene.library_mut().update(body, |s| {
+                let l = s.layers.iter().next().expect("a layer").id;
+                s.layers.update(l, |l| {
+                    l.frames.push_object(0, Arc::new(Object::instance_of(head_id, head)));
+                });
+            });
+            let a = scene.layers().iter().next().expect("a layer").id;
+            let b = scene.add_layer("Arm", buzz_scene::LayerKind::Normal);
+            let audio = scene.add_layer("Dialogue", buzz_scene::LayerKind::Normal);
+            for l in [a, b, audio] {
+                scene.update_layer(l, |l| {
+                    l.frames.insert_frame(19);
+                });
+            }
+            let id = scene.next_object_id();
+            scene.add_object_at(a, 0, Object::instance_of(id, body));
+            scene.add_shape(b, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+            ids = (a, b, audio, head);
+        });
+        let (a, b, audio, head) = ids;
+        let key = e.doc.scene_key(e.doc.active_scene()).expect("a scene key");
+        e.doc.set_master_audio(key, audio);
+
+        e.set_frame(10);
+        e.run(Command::CopyPasteStage);
+        assert_eq!(e.stage_clip.as_ref().map(|c| c.0), Some(10), "the first press copies");
+        e.set_frame(200);
+        e.run(Command::CopyPasteStage);
+        assert!(e.stage_clip.is_none(), "the second press pastes and lets go");
+
+        let scene = e.scene();
+        let pasted = scene.layers().get(a).unwrap().frames.keyframe_at(200).expect("a keyframe at 200");
+        assert_eq!(pasted.start, 200);
+        let body = pasted.objects.iter().find_map(|o| o.instance()).expect("the body");
+        let def = scene.library().get(body.symbol).unwrap();
+        assert_eq!(body.resolve_frame(def.kind, 0, def.length()), 200, "the body shows its own frame 200 on 200");
+        let inner = def.layers.iter().next().unwrap().objects_at(200).iter().find_map(|o| o.instance()).expect("the head");
+        assert_eq!(inner.symbol, head);
+        let head_def = scene.library().get(head).unwrap();
+        assert_eq!(inner.resolve_frame(head_def.kind, 200, head_def.length()), 200, "and the head inside it shows 200 too");
+        assert!(scene.layers().get(b).unwrap().frames.keyframe_at(200).is_some_and(|k| k.start == 200 && !k.objects.is_empty()), "the arm too");
+        assert_eq!(
+            scene.layers().get(audio).unwrap().frames.keyframes().iter().map(|k| k.start).collect::<Vec<_>>(),
+            vec![0],
+            "the master audio is left alone: no keyframe pasted on it"
+        );
+        assert!(scene.layers().get(b).unwrap().frames.length() >= 210, "held as long as the copy was (frames 10 to 19)");
+
+        e.run(Command::Undo);
+        assert!(e.scene().layers().get(a).unwrap().frames.keyframes().iter().all(|k| k.start != 200), "one undo takes it back");
+    }
+
+    /// **Move Stage Frames**: every layer's frames from one place to
+    /// another in one go. A symbol matched to the frame number (F) shows the
+    /// frame where it lands; the master audio stays put; Copy keeps the
+    /// original.
+    #[test]
+    fn move_stage_frames_moves_every_layer_and_renumbers_matched_symbols() {
+        let mut e = editor();
+        let mut ids = (LayerId(0), LayerId(0), LayerId(0));
+        e.doc.edit("Fixture", |scene| {
+            let body = scene.add_symbol("Body", buzz_scene::SymbolKind::Graphic, None);
+            scene.library_mut().update(body, |s| {
+                let l = s.layers.iter().next().expect("a layer").id;
+                s.layers.update(l, |l| {
+                    l.frames.insert_frame(299);
+                });
+            });
+            let a = scene.layers().iter().next().expect("a layer").id;
+            let b = scene.add_layer("Arm", buzz_scene::LayerKind::Normal);
+            let audio = scene.add_layer("Dialogue", buzz_scene::LayerKind::Normal);
+            for l in [a, b, audio] {
+                scene.update_layer(l, |l| {
+                    l.frames.insert_frame(29);
+                });
+            }
+            scene.update_layer(b, |l| {
+                l.frames.insert_blank_keyframe(5);
+            });
+            scene.add_shape(b, ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE));
+            // On layer a from frame 10: a body matched to the frame number.
+            scene.update_layer(a, |l| {
+                l.frames.insert_blank_keyframe(10);
+            });
+            let id = scene.next_object_id();
+            let mut body_instance = Object::instance_of(id, body);
+            if let ObjectKind::Instance(i) = &mut body_instance.kind {
+                i.first_frame = 10;
+            }
+            scene.add_object_at(a, 10, body_instance);
+            ids = (a, b, audio);
+        });
+        let (a, b, audio) = ids;
+        let key = e.doc.scene_key(e.doc.active_scene()).expect("a scene key");
+        e.doc.set_master_audio(key, audio);
+
+        e.move_stage_frames(0, 19, 50, false);
+        let scene = e.scene();
+        let starts = |l: LayerId| -> Vec<u32> { scene.layers().get(l).unwrap().frames.keyframes().iter().map(|k| k.start).collect() };
+        assert!(starts(b).contains(&55), "the arm's key at 5 lands on 55: {:?}", starts(b));
+        assert_eq!(starts(audio), vec![0], "the master audio stays where it is");
+        let moved = scene.layers().get(a).unwrap().frames.keyframe_at(60).expect("the body's key at 60");
+        assert_eq!(moved.start, 60);
+        let instance = moved.objects.iter().find_map(|o| o.instance()).expect("the body");
+        assert_eq!(instance.first_frame, 60, "matched to the frame number, so it shows its own frame 60 on 60");
+        assert!(
+            scene.layers().get(a).unwrap().frames.keyframe_at(10).is_none_or(|k| k.objects.is_empty()),
+            "moved, not copied"
+        );
+
+        // Copy keeps the original.
+        e.move_stage_frames(50, 69, 100, true);
+        let scene = e.scene();
+        assert!(scene.layers().get(a).unwrap().frames.keyframe_at(60).is_some_and(|k| !k.objects.is_empty()), "the original stays");
+        let copy = scene.layers().get(a).unwrap().frames.keyframe_at(110).expect("the copy at 110");
+        assert_eq!(copy.objects.iter().find_map(|o| o.instance()).map(|i| i.first_frame), Some(110));
+    }
+
+    #[test]
+    fn an_instance_keyed_later_is_hit_on_the_pose_it_shows() {
+        let mut e = editor();
+        let layer = e.scene().layers().iter().next().expect("a layer").id;
+        let mut placed = None;
+        e.doc.edit("Fixture", |scene| {
+            // Three poses, one per frame, each a square somewhere else.
+            let poses = scene.add_symbol("Poses", buzz_scene::SymbolKind::Graphic, None);
+            let ids: Vec<ObjectId> = (0..3).map(|_| scene.next_object_id()).collect();
+            scene.library_mut().update(poses, |s| {
+                let inner = s.layers.iter().next().expect("a layer").id;
+                s.layers.update(inner, |l| {
+                    l.frames.insert_frame(2);
+                    for (frame, (id, x)) in ids.iter().zip([0.0, 200.0, 400.0]).enumerate() {
+                        let frame = frame as u32;
+                        if frame > 0 {
+                            l.frames.insert_blank_keyframe(frame);
+                        }
+                        l.frames.push_object(
+                            frame,
+                            Arc::new(Object::shape(*id, ShapeData::filled(square(x, 0.0, 50.0), Color::WHITE))),
+                        );
+                    }
+                });
+            });
+            // On the stage from frame 10, on a keyframe of its own.
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(29);
+                l.frames.insert_blank_keyframe(10);
+            });
+            let id = scene.next_object_id();
+            placed = scene.add_object_at(layer, 10, Object::instance_of(id, poses));
+        });
+        let placed = placed.expect("placed");
+        e.set_frame(11);
+
+        // Frame 11 is the keyframe's second frame: the second pose, at x = 200.
+        assert_eq!(
+            e.object_at(Point::new(225.0, 25.0), 2.0),
+            Some(placed),
+            "the pose on screen is what the click lands on"
+        );
+        assert_eq!(
+            e.object_at(Point::new(425.0, 25.0), 2.0),
+            None,
+            "the pose the symbol would show on timeline frame 11 is not drawn, so not clickable"
+        );
     }
 
     /// **Inside a symbol, with the camera on.** A shot zoomed and moved draws

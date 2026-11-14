@@ -179,6 +179,7 @@ fn build_character(scene: &mut Scene) -> (buzz_scene::SymbolId, buzz_scene::Symb
                         text: None,
                         turnaround: Default::default(),
                         drawing_object: false,
+                        brush: None,
                     }),
                 ],
             );

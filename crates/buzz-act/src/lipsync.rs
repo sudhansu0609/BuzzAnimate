@@ -166,6 +166,7 @@ pub fn write_viseme_keys(
                 text: None,
                 turnaround: Default::default(),
                 drawing_object: false,
+                brush: None,
             };
             target.frames.set_objects(at, vec![Arc::new(object)]);
         }
@@ -252,6 +253,7 @@ pub fn write_track(
                 text: None,
                 turnaround: Default::default(),
                 drawing_object: false,
+                brush: None,
             };
             target.frames.set_objects(frame, vec![Arc::new(object)]);
         }
@@ -350,6 +352,7 @@ pub fn fill_placeholder_mouth(scene: &mut Scene, symbol: SymbolId) {
                     text: None,
                     turnaround: Default::default(),
                     drawing_object: false,
+                    brush: None,
                 };
                 l.frames.set_objects(frame, vec![Arc::new(object)]);
             }

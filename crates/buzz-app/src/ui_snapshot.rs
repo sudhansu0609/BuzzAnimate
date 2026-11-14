@@ -379,6 +379,7 @@ fn draw_icon_contact_sheet(ui: &mut egui::Ui) {
                     waveforms: Default::default(),
                     beats: Vec::new(),
                     shot_end: None,
+        stage_copied: None,
                 };
                 let _ = buzz_ui::timeline_panel::timeline_panel(ui, scene, &state);
             });

@@ -300,6 +300,14 @@ fn build(job: &RenderJob, report: &mut Vec<String>) -> Result<Document> {
             prompt_answers: Vec::new(),
             hooks: Default::default(),
             overrides: Vec::new(),
+            dialogue: None,
+            lip_sync: None,
+            // The run starts on the first scene; the master audio is kept
+            // when that is where it lives.
+            master_audio: doc
+                .master_audio()
+                .filter(|(key, _)| doc.index_of_key(*key) == Some(0))
+                .map(|(_, layer)| layer),
         };
         // **A generous budget, because nobody is waiting on it.** The five
         // seconds a script gets in the editor is right there -- a mistake must

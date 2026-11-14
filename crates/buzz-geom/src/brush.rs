@@ -68,12 +68,17 @@ impl StrokeSample {
 }
 
 /// What drives the width along a stroke.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum WidthResponse {
     /// Constant width, which is what Animate's plain Brush does.
     Uniform,
-    /// Follow the device's pressure.
-    Pressure,
+    /// Follow the device's pressure, read across the range `low`–`high`: a
+    /// press at or under `low` paints the thinnest line, one at or over `high`
+    /// the full width, and the pressures between are spread evenly over the
+    /// widths between. A light hand narrows `high` so it reaches full width
+    /// without bearing down; a heavy one raises `low` so resting the pen does
+    /// not already lay down a line.
+    Pressure { low: f64, high: f64 },
     /// Follow speed: fast strokes thin out, slow ones stay fat. This is the
     /// fallback on a mouse, which has no pressure to report, and it is what
     /// makes a mouse-drawn line look drawn rather than extruded.
@@ -83,12 +88,17 @@ pub enum WidthResponse {
     Speed { reference_speed: f64 },
 }
 
+impl WidthResponse {
+    /// Pressure over the device's whole range.
+    pub const PRESSURE: Self = Self::Pressure { low: 0.0, high: 1.0 };
+}
+
 /// Which ends of a stroke narrow to a point.
 ///
 /// A brush that tapers **one** end is the ordinary calligraphic mark: it
 /// starts where the nib was put down, full width, and lifts away to nothing.
 /// Tapering both is a leaf, and tapering neither is a marker pen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TaperEnds {
     /// Neither end tapers: both get a round cap.
     Neither,
@@ -236,7 +246,7 @@ const POOL_SPEED: f64 = 400.0;
 const MAX_POOL: f64 = 0.6;
 
 /// How a brush turns a stroke into artwork.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BrushProfile {
     /// Width at full pressure, in document units.
     pub width: f64,
@@ -309,7 +319,16 @@ impl BrushProfile {
         let min = self.min_ratio.clamp(0.0, 1.0);
         let factor = match self.response {
             WidthResponse::Uniform => 1.0,
-            WidthResponse::Pressure => pressure.clamp(0.0, 1.0),
+            WidthResponse::Pressure { low, high } => {
+                let (low, high) = (low.clamp(0.0, 1.0), high.clamp(0.0, 1.0));
+                if high - low > 1e-6 {
+                    ((pressure - low) / (high - low)).clamp(0.0, 1.0)
+                } else if pressure >= high {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
             WidthResponse::Speed { reference_speed } => {
                 let reference = reference_speed.max(1e-6);
                 // Fast is thin. Clamped so an implausible speed spike — the
@@ -325,6 +344,7 @@ impl BrushProfile {
         Conditioning {
             smoothing: self.smoothing,
             stabiliser: self.stabiliser,
+            finished: true,
         }
     }
 
@@ -426,6 +446,250 @@ impl BrushOutput {
 }
 
 // ---------------------------------------------------------------------------
+// The spine of a drawn stroke
+// ---------------------------------------------------------------------------
+
+/// **What a brush stroke was drawn from**: the pointer samples and the profile
+/// that turned them into an outline.
+///
+/// A committed brush stroke is a filled outline, and an outline has no
+/// centreline or width left in it — smoothing it refits both edges separately
+/// and rounds off the tapers, and there is no width to change. Keeping the
+/// spine beside the outline is what lets a drawn stroke be made thicker, thinner
+/// or smoother afterwards: change the samples or the profile and build it
+/// again, with the very function that built it the first time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrushSpine {
+    pub samples: Vec<StrokeSample>,
+    pub profile: BrushProfile,
+    /// [`path_fingerprint`] of the outline this spine last produced. Anything
+    /// that edits the outline some other way — an eraser, a lasso cut, an
+    /// anchor drag — leaves the two disagreeing, and the spine is then simply
+    /// not used: see [`Self::describes`].
+    pub fingerprint: u64,
+}
+
+impl BrushSpine {
+    /// A spine, fingerprinted against the outline it builds.
+    pub fn new(samples: Vec<StrokeSample>, profile: BrushProfile) -> Self {
+        let mut spine = Self {
+            samples,
+            profile,
+            fingerprint: 0,
+        };
+        spine.fingerprint = path_fingerprint(&spine.outline());
+        spine
+    }
+
+    /// The outline these samples and this profile build — exactly what
+    /// [`fluid_outline`] gives for a finished stroke.
+    pub fn outline(&self) -> BezPath {
+        fluid_outline(&self.samples, &self.profile, &BrushBudget::default()).path
+    }
+
+    /// Is `path` still the outline this spine built?
+    pub fn describes(&self, path: &BezPath) -> bool {
+        path_fingerprint(path) == self.fingerprint
+    }
+
+    /// The same stroke with new samples or a new profile, re-fingerprinted.
+    pub fn rebuilt(samples: Vec<StrokeSample>, profile: BrushProfile) -> (Self, BezPath) {
+        let spine = Self::new(samples, profile);
+        let path = spine.outline();
+        (spine, path)
+    }
+
+    /// The samples thinned to about one per `width / 2` of travel — dense
+    /// enough to keep the stroke's shape, sparse enough that a neighbour
+    /// average actually moves something. A pointer at 1000 Hz lays samples
+    /// a fraction of a unit apart, and smoothing those is smoothing noise.
+    fn spaced_samples(&self) -> Vec<StrokeSample> {
+        let budget = BrushBudget {
+            min_spacing: (self.profile.width * 0.5).clamp(1.5, 12.0),
+            ..BrushBudget::default()
+        };
+        decimate(&self.samples, &budget)
+    }
+
+    /// **Smoother**: the centreline evened out by `strength` (`0`–`1`), the
+    /// width response and tapers kept. Applying it again smooths further, as
+    /// Animate's Smooth does.
+    pub fn smoothed(&self, strength: f64) -> (Self, BezPath) {
+        let samples = smooth_samples(&self.spaced_samples(), strength);
+        Self::rebuilt(samples, self.profile)
+    }
+
+    /// **Straighter**: runs that are within `tolerance` of a line become one,
+    /// walked at an even pace so the width along them stays settled.
+    pub fn straightened(&self, tolerance: f64) -> (Self, BezPath) {
+        let kept = simplify_samples(&self.spaced_samples(), tolerance);
+        let step = (self.profile.width * 0.5).clamp(1.5, 12.0);
+        Self::rebuilt(resample_samples(&kept, step), self.profile)
+    }
+
+    /// The stroke following `path` instead — a recognised circle or line, say
+    /// — drawn at an even pace over the time the original took.
+    pub fn retraced(&self, path: &BezPath) -> (Self, BezPath) {
+        let mut points = Vec::new();
+        kurbo::flatten(path.iter(), 0.25, |el| match el {
+            kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => points.push(p),
+            _ => {}
+        });
+        let (t0, t1) = (
+            self.samples.first().map_or(0.0, |s| s.time),
+            self.samples.last().map_or(0.0, |s| s.time),
+        );
+        let pressure = if self.samples.is_empty() {
+            1.0
+        } else {
+            self.samples.iter().map(|s| s.pressure).sum::<f64>() / self.samples.len() as f64
+        };
+        let n = points.len().max(2) - 1;
+        let samples: Vec<StrokeSample> = points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| StrokeSample {
+                point: *p,
+                pressure,
+                time: t0 + (t1 - t0) * i as f64 / n as f64,
+            })
+            .collect();
+        let step = (self.profile.width * 0.5).clamp(1.5, 12.0);
+        Self::rebuilt(resample_samples(&samples, step), self.profile)
+    }
+
+    /// The same stroke `width` across at full pressure.
+    pub fn with_width(&self, width: f64) -> (Self, BezPath) {
+        let profile = BrushProfile {
+            width: width.max(0.1),
+            ..self.profile
+        };
+        Self::rebuilt(self.samples.clone(), profile)
+    }
+
+    /// The same samples under another profile — smoothing, taper, tip.
+    pub fn with_profile(&self, profile: BrushProfile) -> (Self, BezPath) {
+        Self::rebuilt(self.samples.clone(), profile)
+    }
+
+    /// The centreline the stroke is built along, for hit-testing and display.
+    pub fn centreline(&self) -> BezPath {
+        centreline(&condition(
+            &self.samples,
+            self.profile.conditioning(),
+            &BrushBudget::default(),
+        ))
+    }
+}
+
+/// Samples laid every `step` along the polyline through `samples`, with
+/// pressure and time carried linearly between the originals.
+pub fn resample_samples(samples: &[StrokeSample], step: f64) -> Vec<StrokeSample> {
+    if samples.len() < 2 || step <= 0.0 {
+        return samples.to_vec();
+    }
+    let mut out = vec![samples[0]];
+    for pair in samples.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let length = (b.point - a.point).hypot();
+        let pieces = (length / step).ceil().max(1.0) as usize;
+        for k in 1..=pieces {
+            let t = k as f64 / pieces as f64;
+            out.push(StrokeSample {
+                point: a.point.lerp(b.point, t),
+                pressure: a.pressure + (b.pressure - a.pressure) * t,
+                time: a.time + (b.time - a.time) * t,
+            });
+        }
+    }
+    out
+}
+
+/// A cheap identity for a path's exact geometry: equal paths give equal
+/// fingerprints, and any edit to an element almost certainly changes it.
+pub fn path_fingerprint(path: &BezPath) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for el in path.elements() {
+        let points: &[Point] = match el {
+            kurbo::PathEl::MoveTo(p) => {
+                0u8.hash(&mut h);
+                std::slice::from_ref(p)
+            }
+            kurbo::PathEl::LineTo(p) => {
+                1u8.hash(&mut h);
+                std::slice::from_ref(p)
+            }
+            kurbo::PathEl::QuadTo(a, b) => {
+                2u8.hash(&mut h);
+                a.x.to_bits().hash(&mut h);
+                a.y.to_bits().hash(&mut h);
+                std::slice::from_ref(b)
+            }
+            kurbo::PathEl::CurveTo(a, b, c) => {
+                3u8.hash(&mut h);
+                for q in [a, b] {
+                    q.x.to_bits().hash(&mut h);
+                    q.y.to_bits().hash(&mut h);
+                }
+                std::slice::from_ref(c)
+            }
+            kurbo::PathEl::ClosePath => {
+                4u8.hash(&mut h);
+                &[]
+            }
+        };
+        for p in points {
+            p.x.to_bits().hash(&mut h);
+            p.y.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// **Drop samples the stroke's shape does not need** — Douglas–Peucker on the
+/// sample points, keeping each survivor's pressure and time so the width it
+/// rebuilds with still answers to how the stroke was drawn.
+pub fn simplify_samples(samples: &[StrokeSample], tolerance: f64) -> Vec<StrokeSample> {
+    if samples.len() < 3 || tolerance <= 0.0 {
+        return samples.to_vec();
+    }
+    let mut keep = vec![false; samples.len()];
+    keep[0] = true;
+    keep[samples.len() - 1] = true;
+    let mut stack = vec![(0usize, samples.len() - 1)];
+    while let Some((a, b)) = stack.pop() {
+        if b <= a + 1 {
+            continue;
+        }
+        let (pa, pb) = (samples[a].point, samples[b].point);
+        let chord = pb - pa;
+        let length = chord.hypot();
+        let mut worst = (0.0, a);
+        for (i, s) in samples.iter().enumerate().take(b).skip(a + 1) {
+            let d = if length > 1e-12 {
+                (chord.cross(s.point - pa) / length).abs()
+            } else {
+                (s.point - pa).hypot()
+            };
+            if d > worst.0 {
+                worst = (d, i);
+            }
+        }
+        if worst.0 > tolerance {
+            keep[worst.1] = true;
+            stack.push((a, worst.1));
+            stack.push((worst.1, b));
+        }
+    }
+    samples
+        .iter()
+        .zip(keep)
+        .filter_map(|(s, k)| k.then_some(*s))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Conditioning
 // ---------------------------------------------------------------------------
 
@@ -451,6 +715,11 @@ pub struct Conditioning {
     pub smoothing: f64,
     /// `0.0` is off; higher drags the ink further behind the pointer.
     pub stabiliser: f64,
+    /// **Has the pointer lifted?** Only a finished stroke has its stabilised
+    /// tail eased back onto the pointer — see [`stabilise`]. While the stroke
+    /// is still being drawn the ink stays behind the pen, so what is already
+    /// on the paper does not crawl back towards the jitter on every move.
+    pub finished: bool,
 }
 
 impl Default for Conditioning {
@@ -458,6 +727,7 @@ impl Default for Conditioning {
         Self {
             smoothing: 0.5,
             stabiliser: 0.0,
+            finished: true,
         }
     }
 }
@@ -469,6 +739,7 @@ impl Conditioning {
         Self {
             smoothing,
             stabiliser: 0.0,
+            finished: true,
         }
     }
 }
@@ -493,7 +764,7 @@ pub fn condition(
     how: Conditioning,
     budget: &BrushBudget,
 ) -> Vec<StrokeSample> {
-    let steadied = stabilise(samples, how.stabiliser);
+    let steadied = stabilise_live(samples, how.stabiliser, how.finished);
     let decimated = decimate(&steadied, budget);
     smooth_samples(&decimated, how.smoothing)
 }
@@ -523,6 +794,16 @@ pub fn condition(
 /// pointer let go. That is the catch-up every stabiliser does when you stop
 /// moving, and it is the reason this cannot simply be a lag.
 pub fn stabilise(samples: &[StrokeSample], strength: f64) -> Vec<StrokeSample> {
+    stabilise_live(samples, strength, true)
+}
+
+/// [`stabilise`], for a stroke that may still be in progress.
+///
+/// With `finished` false the catch-up is left out: the tail would otherwise be
+/// eased onto the raw pointer on every move and then pulled away again by the
+/// next one, so the end of a live stroke wriggled with exactly the jitter the
+/// stabiliser exists to hide. The catch-up belongs to the moment the pen lifts.
+pub fn stabilise_live(samples: &[StrokeSample], strength: f64, finished: bool) -> Vec<StrokeSample> {
     let strength = strength.clamp(0.0, 1.0);
     if strength <= 0.0 || samples.len() < 3 {
         return samples.to_vec();
@@ -538,6 +819,9 @@ pub fn stabilise(samples: &[StrokeSample], strength: f64) -> Vec<StrokeSample> {
     for i in 1..samples.len() {
         position = position.lerp(samples[i].point.to_vec2(), follow);
         out[i].point = position.to_point();
+    }
+    if !finished {
+        return out;
     }
 
     // Ease the tail back onto the real samples, so the stroke ends where the
@@ -731,13 +1015,31 @@ pub fn fluid_outline(
     profile: &BrushProfile,
     budget: &BrushBudget,
 ) -> BrushOutput {
-    let conditioned = condition(samples, profile.conditioning(), budget);
+    fluid_outline_live(samples, profile, budget, true)
+}
+
+/// [`fluid_outline`] for a stroke that may still be in progress — the live
+/// preview passes `finished: false`. See [`Conditioning::finished`].
+pub fn fluid_outline_live(
+    samples: &[StrokeSample],
+    profile: &BrushProfile,
+    budget: &BrushBudget,
+    finished: bool,
+) -> BrushOutput {
+    let conditioned = condition(
+        samples,
+        Conditioning {
+            finished,
+            ..profile.conditioning()
+        },
+        budget,
+    );
     if conditioned.len() < 2 {
-        // A tap, not a drag. Animate paints a dot, so we do too.
+        // A tap, not a drag. Animate paints a dot, so we do too — the size of
+        // the brush, which is what the cursor ring promised. Pooling it as
+        // well made a tap visibly bigger than the brush it came from.
         if let Some(sample) = conditioned.first() {
-            let mut width = profile.width_at(sample.pressure, 0.0);
-            // A stroke that never moved has lingered completely: full pooling.
-            width *= 1.0 + MAX_POOL * profile.spread();
+            let width = profile.width_at(sample.pressure, 0.0);
             if width > 0.0 {
                 return BrushOutput::plain(tap_shape(sample.point, width, profile.tip));
             }
@@ -831,7 +1133,10 @@ fn widths_along(samples: &[StrokeSample], profile: &BrushProfile) -> Vec<f64> {
     }
 
     // Speed from the samples either side, so a single late sample does not
-    // produce a spike.
+    // produce a spike — and then eased from sample to sample, because pointer
+    // timestamps are noisy and a raw two-sample speed turns that noise into
+    // beads along the stroke. Speed is a hand's momentum, and momentum does
+    // not change between two events a few milliseconds apart.
     let mut speeds = Vec::with_capacity(n);
     for i in 0..n {
         let speed = if n < 2 {
@@ -842,8 +1147,19 @@ fn widths_along(samples: &[StrokeSample], profile: &BrushProfile) -> Vec<f64> {
             let dd = (b.point - a.point).hypot();
             if dt > 1e-6 { dd / dt } else { 0.0 }
         };
-        speeds.push(speed);
+        let eased = match speeds.last() {
+            Some(&previous) => previous * 0.7 + speed * 0.3,
+            None => speed,
+        };
+        speeds.push(eased);
     }
+
+    // The width the pressure or speed asks for, averaged over a short stretch
+    // of the stroke so it swells and thins rather than flickering.
+    let base: Vec<f64> = (0..n)
+        .map(|i| profile.width_at(samples[i].pressure, speeds[i]))
+        .collect();
+    let base = box_average(&base, &distances, profile.width.max(1.0) * 0.75);
 
     // **Pooling.** Runny paint spreads where the brush lingers: a slow or
     // stopped stroke gets fatter, exactly as thin paint pools on paper. `spread`
@@ -862,7 +1178,7 @@ fn widths_along(samples: &[StrokeSample], profile: &BrushProfile) -> Vec<f64> {
     };
 
     for i in 0..n {
-        let mut width = profile.width_at(samples[i].pressure, speeds[i]);
+        let mut width = base[i];
 
         // Applied before the taper, so a tapered end still reaches a point
         // instead of pooling into a blob.
@@ -1522,6 +1838,7 @@ mod tests {
             Conditioning {
                 smoothing: 0.0,
                 stabiliser: 0.9,
+                finished: true,
             },
             &budget,
         );
@@ -1656,7 +1973,7 @@ mod tests {
     #[test]
     fn pressure_drives_the_width_when_the_device_reports_it() {
         let profile = BrushProfile {
-            response: WidthResponse::Pressure,
+            response: WidthResponse::PRESSURE,
             taper: 0.0,
             smoothing: 0.0,
             width: 20.0,

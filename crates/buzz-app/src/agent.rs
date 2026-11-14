@@ -131,7 +131,7 @@ pub fn route(command: Command) -> Route {
         | StoryboardExport | DeleteAndFill | AiRemoveObject => Route::Args,
 
         // Needs the user, or has no document effect.
-        Quit | Close | ShortcutEditor | Snapshots | About | AiModels | AiGenerateImage | NextDocument | PreviousDocument | PasteboardColour
+        Quit | Close | MoveStageFrames | ShortcutEditor | Snapshots | About | AiModels | AiGenerateImage | NextDocument | PreviousDocument | PasteboardColour
         | TestMovie | RunScript | VoicePushToTalk | VoiceMute => Route::Excluded,
         // Dialogs over BuzzEdit and Buzzcaf Studio; their tools take args.
         SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => Route::Excluded,
@@ -147,7 +147,7 @@ pub fn route(command: Command) -> Route {
         | DuplicateSelection | ZoomIn | ZoomOut | ZoomActual | ZoomFitInWindow | ZoomShowFrame
         | ZoomShowAll | ToggleRulers | ToggleAutoSave | ToggleGrid | ToggleGuides | ToggleSnapping
         | TogglePasteboard | ToggleNeighbours | GroupSelection | UngroupSelection | BreakApart | BringToFront
-        | BringForward | SendBackward | SendToBack | RetargetPerformance | SwapSymbol
+        | BringForward | SendBackward | SendToBack | RetargetPerformance | SwapSymbol | NextPose | PreviousPose
         | PaintThrough | ExposeOnTwos | ExposeOnThrees | SelectSameColour | ThickenStroke
         | ThinStroke | TraceBitmap | TraceLineArt | ConvertLinesToFills | ExpandFill
         | SmoothSelection | StraightenSelection | RecogniseShape | FlipHorizontal | FlipVertical
@@ -167,7 +167,7 @@ pub fn route(command: Command) -> Route {
         | CreateShapeTween | RemoveTween | InsertFrame | RemoveFrame | InsertKeyframe
         | InsertBlankKeyframe | ClearKeyframe | PlayPause | NextFrame | PreviousFrame
         | FirstFrame | LastFrame | CutFrames | CopyFrames | PasteFrames | SelectAllFrames | CopyMotion | CopyPose | ClearFrames
-        | ReverseFrames | ToggleOnionSkin | ToggleAutoKeyframe | ToggleFramesOnLockedLayers | ToggleEqualLayerLengths | ToggleEditMultipleFrames
+        | ReverseFrames | CopyPasteStage | PuppetMode | ToggleOnionSkin | ToggleAutoKeyframe | ToggleFramesOnLockedLayers | ToggleEqualLayerLengths | ToggleEditMultipleFrames
         | ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere
         | ToggleCamera | AddCameraKeyframe | RemoveCameraKeyframe | ResetCamera
         | AddLightKeyframe | RemoveLightKeyframe | SaveAsTemplate | RenameBodyLayers
@@ -821,6 +821,9 @@ fn script(app: &mut App, args: &Value) -> AgentResult {
         prompt_answers: Vec::new(),
         hooks: Default::default(),
             overrides: Vec::new(),
+            dialogue: None,
+            lip_sync: None,
+            master_audio: editor.script_master_audio(),
     };
     let mut working = editor.doc.scene().clone();
     // Stop reaches the interpreter between bytecodes, like the Script panel's.

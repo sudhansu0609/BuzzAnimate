@@ -219,6 +219,7 @@ impl Remapper<'_> {
             text: source.text.clone(),
             turnaround: source.turnaround.clone(),
             drawing_object: source.drawing_object,
+            brush: source.brush.clone(),
         }
     }
 }

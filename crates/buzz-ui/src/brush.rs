@@ -111,6 +111,11 @@ impl BrushKind {
     pub fn is_outlined(self) -> bool {
         matches!(self, Self::Fluid | Self::Normal)
     }
+
+    /// Does this brush answer to [`BrushSettings::paint_mode`]?
+    pub fn has_paint_modes(self) -> bool {
+        self.is_outlined() || self.uses_pattern()
+    }
 }
 
 /// The built-in shapes a pattern brush can repeat.
@@ -251,11 +256,18 @@ pub struct BrushSettings {
     pub taper: f64,
     /// Follow the device's pressure rather than the stroke's speed.
     ///
-    /// Off by default, and the reason is worth stating: a mouse reports a
-    /// constant pressure of 1.0, so a pressure-driven brush on a mouse paints
-    /// a dead constant width. Speed is the response that makes a *mouse*
-    /// stroke look drawn, so it is the default until a tablet says otherwise.
+    /// **On by default.** A mouse reports no pressure, and a stroke that never
+    /// came in under full pressure is drawn by speed instead (see
+    /// `brush_profile_for` in the app), so a mouse still gets the speed
+    /// response that makes its strokes look drawn — while a pen just works,
+    /// with nothing to find and switch on first.
     pub use_pressure: bool,
+    /// **The lightest press that counts**, `0.0`–`1.0`: anything at or under
+    /// it paints the thinnest line. See [`buzz_geom::WidthResponse::Pressure`].
+    pub pressure_min: f64,
+    /// **The press that reaches full width**, `0.0`–`1.0`: anything at or over
+    /// it paints the brush's whole size.
+    pub pressure_max: f64,
     /// Speed, in document units per second, at which the stroke is narrowest.
     pub reference_speed: f64,
     pub pattern: PatternShape,
@@ -282,6 +294,10 @@ pub struct BrushSettings {
     /// produces, so working over an area deepens it the way ink does.
     /// See [`buzz_scene::PaintBlend::Additive`].
     pub build_up: bool,
+    /// **Where the stroke may land** — Paint Normal, Fills, Behind, Selection
+    /// or Inside. Read by the brushes that draw an outline or a pattern; the
+    /// soft, effect and wave brushes paint where they are put.
+    pub paint_mode: crate::PaintMode,
     /// Where a soft brush's fade begins, as a fraction of its radius.
     ///
     /// `1.0` is a hard edge, `0.0` fades from the very middle. Photoshop's
@@ -319,7 +335,9 @@ impl Default for BrushSettings {
             taper_ends: buzz_geom::TaperEnds::default(),
             min_ratio: 0.35,
             taper: 0.12,
-            use_pressure: false,
+            use_pressure: true,
+            pressure_min: 0.0,
+            pressure_max: 1.0,
             reference_speed: 900.0,
             pattern: PatternShape::default(),
             spacing: 12.0,
@@ -333,6 +351,7 @@ impl Default for BrushSettings {
             // whose overlaps silently deepen would surprise anyone who did
             // not ask for it.
             build_up: false,
+            paint_mode: crate::PaintMode::Normal,
             effect: buzz_scene::EffectKind::default(),
             wave: buzz_scene::WaveKind::default(),
             wave_settings: buzz_scene::WaveSettings::default(),
@@ -350,7 +369,10 @@ impl BrushSettings {
             // exactly what it does not have.
             response: match (self.kind, self.use_pressure) {
                 (BrushKind::Normal, _) => WidthResponse::Uniform,
-                (_, true) => WidthResponse::Pressure,
+                (_, true) => WidthResponse::Pressure {
+                    low: self.pressure_min.clamp(0.0, 1.0),
+                    high: self.pressure_max.clamp(0.0, 1.0),
+                },
                 (_, false) => WidthResponse::Speed {
                     reference_speed: self.reference_speed.max(1.0),
                 },
@@ -391,6 +413,7 @@ impl BrushSettings {
         buzz_geom::Conditioning {
             smoothing: self.smoothing.clamp(0.0, 1.0),
             stabiliser: self.stabiliser.clamp(0.0, 1.0),
+            finished: true,
         }
     }
 
@@ -569,22 +592,22 @@ mod tests {
         assert_eq!(settings.pattern, PatternShape::Custom);
     }
 
-    /// A mouse reports a constant pressure, so a pressure-driven brush on a
-    /// mouse paints a dead constant width. Speed has to be the default.
+    /// Pressure is on by default — a mouse stroke, which has none, falls back
+    /// to speed when it is drawn — and off it is speed outright.
     #[test]
-    fn the_default_brush_responds_to_speed_not_pressure() {
+    fn the_default_brush_responds_to_pressure_and_falls_back_to_speed() {
         let settings = BrushSettings::default();
-        assert!(!settings.use_pressure);
-        assert!(matches!(
-            settings.profile().response,
-            WidthResponse::Speed { .. }
-        ));
+        assert!(settings.use_pressure);
+        assert_eq!(settings.profile().response, WidthResponse::PRESSURE);
 
-        let with_tablet = BrushSettings {
-            use_pressure: true,
+        let without = BrushSettings {
+            use_pressure: false,
             ..Default::default()
         };
-        assert_eq!(with_tablet.profile().response, WidthResponse::Pressure);
+        assert!(matches!(
+            without.profile().response,
+            WidthResponse::Speed { .. }
+        ));
     }
 
     #[test]
@@ -624,6 +647,7 @@ mod tests {
         // And the fluid brush still does.
         let fluid = BrushSettings {
             kind: BrushKind::Fluid,
+            use_pressure: false,
             ..Default::default()
         };
         assert!(matches!(
@@ -692,6 +716,7 @@ mod tests {
             taper: 5.0,
             spacing: 0.0,
             reference_speed: 0.0,
+            use_pressure: false,
             ..Default::default()
         };
         let profile = settings.profile();

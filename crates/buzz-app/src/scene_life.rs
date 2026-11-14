@@ -239,6 +239,10 @@ pub struct Hearing {
     /// The mouth shapes in the recording, from its first frame.
     pub visemes: VisemeTrack,
     pub notes: Vec<String>,
+    /// Rhubarb's keys over the whole recording, `(frame from its start,
+    /// mouth chart slot)`, when Rhubarb ran: what a talking command's lip sync
+    /// is cut from.
+    pub rhubarb: Option<Vec<(u32, usize)>>,
     /// Seconds the hearing took.
     pub secs: f64,
     pub model: String,
@@ -259,10 +263,18 @@ pub fn hear_dialogue(
     let mut notes = Vec::new();
     let mut model = "no transcript".to_string();
     let mut transcript: Vec<Heard> = Vec::new();
-    if buzz_ai::transcribe::installed_whisper().is_ok() {
-        match buzz_ai::transcribe::transcribe_clip(clip, progress, cancel) {
-            Ok(t) => {
-                model = format!("Whisper base.en, {}", t.provider);
+    let multi = buzz_ai::transcribe::multi_ready();
+    if multi || buzz_ai::transcribe::installed_whisper().is_ok() {
+        // **The multilingual model first**: it hears Hindi and Hinglish, where
+        // base.en hears English-looking nonsense.
+        let heard = if multi {
+            buzz_ai::transcribe::transcribe_clip_multi(clip, progress, cancel).map(|(t, langs)| (t, format!("Whisper small multilingual ({langs})")))
+        } else {
+            buzz_ai::transcribe::transcribe_clip(clip, progress, cancel).map(|t| (t, "Whisper base.en".to_string()))
+        };
+        match heard {
+            Ok((t, name)) => {
+                model = format!("{name}, {}", t.provider);
                 transcript = t.segments.into_iter().map(|s| Heard { start: s.start, end: s.end, text: s.text }).collect();
             }
             Err(e) => {
@@ -273,7 +285,7 @@ pub fn hear_dialogue(
             }
         }
     } else {
-        notes.push("Whisper is not installed (AI > Models); the lines are found by their lengths".to_string());
+        notes.push("no speech model is installed (AI > Models > Whisper small multilingual hears Hindi); the lines are found by the pauses in the recording".to_string());
     }
     let scenes: Vec<&ScriptScene> = script.scenes.iter().collect();
     let mut lines: Vec<SpokenLine>;
@@ -293,8 +305,26 @@ pub fn hear_dialogue(
         notes.extend(n);
     }
     lines.sort_by(|a, b| a.start.total_cmp(&b.start));
-    let visemes = buzz_audio::analyse_visemes(clip, fps, &buzz_audio::LipSyncOptions::default());
-    Ok(Hearing { lines, visemes, notes, secs: started.elapsed().as_secs_f64(), model })
+    // **Rhubarb's mouths when it is installed**, the same ones Lip Sync and
+    // Shift+A write; the built-in reader otherwise.
+    let rhubarb = match crate::rhubarb::binary() {
+        Some(_) => match crate::rhubarb::cues(clip, cancel) {
+            Ok(cues) => Some(crate::rhubarb::keys_closing_silence(&cues, fps, &clip.frame_levels(fps))),
+            Err(e) => {
+                notes.push(format!("Rhubarb did not run ({e}); the built-in mouth reader was used"));
+                None
+            }
+        },
+        None => {
+            notes.push("Rhubarb is not installed; the built-in mouth reader was used".to_string());
+            None
+        }
+    };
+    let visemes = match &rhubarb {
+        Some(keys) => track_from_rhubarb(keys, clip.duration_frames(fps), fps),
+        None => buzz_audio::analyse_visemes(clip, fps, &buzz_audio::LipSyncOptions::default()),
+    };
+    Ok(Hearing { lines, visemes, rhubarb, notes, secs: started.elapsed().as_secs_f64(), model })
 }
 
 /// What Lip Sync All Characters did.
@@ -328,6 +358,12 @@ fn even(frame: u32) -> u32 {
 /// `track` is the shapes heard in the recording from its first frame at `sound_start`. One scene edit:
 /// the caller wraps it in one undo step. Writing again replaces what was written.
 pub fn lip_sync_all(scene: &mut Scene, track: &VisemeTrack, sound_start: u32, lines: &[SpokenLine]) -> LipSyncAllReport {
+    lip_sync_all_except(scene, track, sound_start, lines, &HashSet::new())
+}
+
+/// [`lip_sync_all`], leaving alone the characters in `skip` (by folder):
+/// the ones the person's own talking command performs instead.
+pub fn lip_sync_all_except(scene: &mut Scene, track: &VisemeTrack, sound_start: u32, lines: &[SpokenLine], skip: &HashSet<LayerId>) -> LipSyncAllReport {
     let fps = scene.stage().frame_rate.max(1.0);
     let mut report = LipSyncAllReport { lines: lines.len(), ..Default::default() };
     let chars = stage_characters(scene);
@@ -341,6 +377,10 @@ pub fn lip_sync_all(scene: &mut Scene, track: &VisemeTrack, sound_start: u32, li
         }
         let who = l.speaker.clone().unwrap_or_default();
         let words: Vec<&str> = l.text.split_whitespace().take(5).collect();
+        if chars.iter().any(|c| skip.contains(&c.folder) && c.is_speaker(&who)) {
+            report.matched += 1;
+            continue;
+        }
         match chars.iter().position(|c| c.is_speaker(&who)) {
             Some(i) => {
                 spans[i].push(span_of(l, sound_start, fps));
@@ -351,8 +391,13 @@ pub fn lip_sync_all(scene: &mut Scene, track: &VisemeTrack, sound_start: u32, li
         }
     }
     for (i, ch) in chars.iter().enumerate() {
+        if skip.contains(&ch.folder) {
+            continue;
+        }
         let Some(view) = rig_of(scene, ch, 0) else {
-            report.warnings.push(format!("{}: not a rig, so it does not perform", ch.name));
+            if !spans[i].is_empty() {
+                report.warnings.push(format!("{}: not a rig, so it does not perform", ch.name));
+            }
             continue;
         };
         let body = view.body;
@@ -416,6 +461,232 @@ fn write_mouth(scene: &mut Scene, view: &LayerRigView, track: &VisemeTrack, soun
     false
 }
 
+/// The mouth shapes Rhubarb's keys stand for, frame by frame over `length`
+/// frames: the slots of `rhubarb::animate_slot` read back as visemes, so the
+/// character writer can put them on any mouth chart.
+pub fn track_from_rhubarb(keys: &[(u32, usize)], length: u32, fps: f64) -> VisemeTrack {
+    let viseme = |slot: usize| match slot {
+        6 => Viseme::MBP,
+        9 => Viseme::Etc,
+        10 => Viseme::E,
+        1 => Viseme::Ai,
+        7 => Viseme::O,
+        11 => Viseme::U,
+        4 => Viseme::FV,
+        5 => Viseme::L,
+        _ => Viseme::Rest,
+    };
+    let mut frames = vec![Viseme::Rest; length.max(1) as usize];
+    let mut k = 0;
+    for (f, slot) in frames.iter_mut().enumerate() {
+        while k + 1 < keys.len() && keys[k + 1].0 as usize <= f {
+            k += 1;
+        }
+        if let Some(&(at, s)) = keys.get(k)
+            && at as usize <= f
+        {
+            *slot = viseme(s);
+        }
+    }
+    VisemeTrack { frames, fps }
+}
+
+/// The Rhubarb keys over `from..to` (timeline frames), re-based to `from`, for
+/// a recording that starts on `sound_start`: what Lip Sync writes on one line.
+/// Opens on the shape showing at `from`.
+pub fn rhubarb_slice(keys: &[(u32, usize)], sound_start: u32, from: u32, to: u32) -> Vec<(u32, usize)> {
+    let (a, b) = (from.saturating_sub(sound_start), to.saturating_sub(sound_start));
+    let mut out = Vec::new();
+    let opening = keys.iter().take_while(|(f, _)| *f <= a).last().map(|(_, s)| *s).unwrap_or(0);
+    out.push((0, opening));
+    for &(f, s) in keys.iter().filter(|(f, _)| *f > a && *f < b) {
+        out.push((f - a, s));
+    }
+    out
+}
+
+/// **Somebody on the stage who can talk**, for Lip Sync All Characters: a
+/// character from the Cast, or a character symbol straight from Animate (a
+/// symbol with `head`, `body` or arm layers inside, or one holding such a
+/// symbol) on a layer of its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Talker {
+    /// What the Who's who window calls it.
+    pub name: String,
+    /// Every name a script might use for it.
+    pub names: Vec<String>,
+    /// The Cast folder, for a Cast character.
+    pub folder: Option<LayerId>,
+    /// The layers it stands on: the folder's, or its own one.
+    pub layers: Vec<LayerId>,
+}
+
+fn standard_part(name: &str) -> bool {
+    matches!(normal(name).replace(' ', "").as_str(), "head" | "body" | "rightarm" | "leftarm")
+}
+
+/// Is `symbol` a character the talking commands can drive: it has the
+/// standard part layers, or holds a symbol that has them (a container).
+pub fn is_character_symbol(scene: &Scene, symbol: buzz_scene::SymbolId, depth: usize) -> bool {
+    let Some(def) = scene.library().get(symbol) else { return false };
+    if def.layers.iter().any(|l| standard_part(&l.name)) {
+        return true;
+    }
+    depth < 2
+        && def.layers.iter().any(|l| {
+            l.all_objects().any(|o| o.instance().is_some_and(|i| i.symbol != symbol && is_character_symbol(scene, i.symbol, depth + 1)))
+        })
+}
+
+/// The character instance standing on `talker`'s layers at `frame`, for a
+/// talking command to be run on.
+pub fn character_instance_at(scene: &Scene, talker: &Talker, frame: u32) -> Option<ObjectId> {
+    talker.layers.iter().find_map(|l| {
+        scene.layers().get(*l)?.objects_at(frame).iter().find_map(|o| {
+            let i = o.instance()?;
+            is_character_symbol(scene, i.symbol, 0).then_some(o.id)
+        })
+    })
+}
+
+/// **Everybody on the stage who can talk**: the Cast characters, then the
+/// character symbols on other stage layers, in stack order.
+pub fn talkers(scene: &Scene) -> Vec<Talker> {
+    let mut out = Vec::new();
+    let mut taken: HashSet<LayerId> = HashSet::new();
+    for ch in stage_characters(scene) {
+        let layers: Vec<LayerId> = scene.layers().iter().filter(|l| in_folder(scene, l.id, ch.folder)).map(|l| l.id).collect();
+        taken.extend(layers.iter().copied());
+        taken.insert(ch.folder);
+        out.push(Talker { name: ch.name.clone(), names: ch.names(), folder: Some(ch.folder), layers });
+    }
+    for l in scene.layers().iter() {
+        if taken.contains(&l.id) || l.kind == LayerKind::Folder || l.audio_guide {
+            continue;
+        }
+        let found = l.all_objects().find_map(|o| {
+            let i = o.instance()?;
+            is_character_symbol(scene, i.symbol, 0).then(|| scene.library().get(i.symbol).map(|d| d.name.clone()).unwrap_or_default())
+        });
+        if let Some(symbol) = found {
+            // By its symbol: a layer is often called whatever it first held
+            // (a character on a layer named \u{201c}tree\u{201d}).
+            let name = if symbol.is_empty() { l.name.clone() } else { symbol.clone() };
+            let mut names = vec![l.name.clone(), symbol];
+            names.retain(|n| !n.is_empty());
+            out.push(Talker { name, names, folder: None, layers: vec![l.id] });
+        }
+    }
+    // Two with the same name are told apart by where they stand.
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for t in &mut out {
+        let n = seen.entry(normal(&t.name)).or_insert(0);
+        *n += 1;
+        if *n > 1 {
+            t.name = format!("{} ({})", t.name, n);
+        }
+    }
+    out
+}
+
+fn in_folder(scene: &Scene, layer: LayerId, folder: LayerId) -> bool {
+    let layers = scene.layers();
+    let mut at = layers.get(layer).and_then(|l| l.parent);
+    for _ in 0..layers.len() + 1 {
+        match at {
+            Some(p) if p == folder => return true,
+            Some(p) => at = layers.get(p).and_then(|l| l.parent),
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Words a script puts round a name that are not the name: `Sharma ji`,
+/// `Raju bhaiya`, `Mr. Verma` are Sharma, Raju and Verma.
+const HONORIFICS: &[&str] = &[
+    "ji", "jee", "babu", "bhai", "bhaiya", "bhaiyya", "sahab", "saheb", "sahib", "sir", "madam", "mr", "mrs", "ms", "miss", "uncle",
+    "aunty", "auntie", "didi", "dada", "dadi", "chacha", "chachi", "mausi", "mama", "mami", "kaka", "kaki", "seth", "pandit",
+    "master", "the", "vo", "os", "v", "o", "s",
+];
+
+/// The words of a name with the honorifics left out.
+fn name_words(name: &str) -> Vec<String> {
+    let all: Vec<String> = normal(name).split(' ').filter(|w| !w.is_empty()).map(str::to_string).collect();
+    let kept: Vec<String> = all.iter().filter(|w| !HONORIFICS.contains(&w.as_str())).cloned().collect();
+    if kept.is_empty() { all } else { kept }
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for i in 1..=a.len() {
+        let mut prev = row[0];
+        row[0] = i;
+        for j in 1..=b.len() {
+            let here = row[j];
+            row[j] = (row[j] + 1).min(row[j - 1] + 1).min(prev + usize::from(a[i - 1] != b[j - 1]));
+            prev = here;
+        }
+    }
+    row[b.len()]
+}
+
+/// How well a script's speaker name fits one of a character's names: 0 is
+/// no fit. Case, punctuation and honorifics do not count, nor a slip of a
+/// letter in a longer name.
+fn name_fit(speaker: &str, name: &str) -> u32 {
+    let (s, n) = (name_words(speaker), name_words(name));
+    if s.is_empty() || n.is_empty() {
+        return 0;
+    }
+    let (js, jn) = (s.join(" "), n.join(" "));
+    if js == jn {
+        return 100;
+    }
+    if s.join("") == n.join("") {
+        return 90;
+    }
+    if s.iter().all(|w| n.contains(w)) || n.iter().all(|w| s.contains(w)) {
+        return 70;
+    }
+    if s[0] == n[0] {
+        return 60;
+    }
+    let (a, b) = (s.join(""), n.join(""));
+    if a.len().min(b.len()) >= 4 && edit_distance(&a, &b) <= 1 + usize::from(a.len().min(b.len()) >= 8) {
+        return 50;
+    }
+    0
+}
+
+/// The key a speaker's answer is remembered under.
+pub fn speaker_key(speaker: &str) -> String {
+    normal(speaker)
+}
+
+/// **Who says a script's line**: the answer remembered for that speaker
+/// (`cast`, by [`speaker_key`]; an empty answer is nobody), else the one
+/// character whose names fit it best. `Ok(None)` is nobody on screen;
+/// `Err(())` is that it cannot tell (no fit, or a tie) and has to ask.
+pub fn speaker_for(speaker: &str, talkers: &[Talker], cast: &std::collections::BTreeMap<String, String>) -> Result<Option<usize>, ()> {
+    if let Some(answer) = cast.get(&speaker_key(speaker)) {
+        if answer.is_empty() {
+            return Ok(None);
+        }
+        if let Some(i) = talkers.iter().position(|t| t.name == *answer) {
+            return Ok(Some(i));
+        }
+    }
+    let fits: Vec<u32> = talkers.iter().map(|t| t.names.iter().chain(std::iter::once(&t.name)).map(|n| name_fit(speaker, n)).max().unwrap_or(0)).collect();
+    let best = fits.iter().copied().max().unwrap_or(0);
+    if best == 0 || fits.iter().filter(|f| **f == best).count() > 1 {
+        return Err(());
+    }
+    Ok(fits.iter().position(|f| *f == best))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +698,81 @@ mod tests {
         assert!(ch.is_speaker("MISHRA-JI"));
         assert!(!ch.is_speaker("MISHRA"));
         assert!(!ch.is_speaker(""));
+    }
+
+    fn talker(name: &str, more: &[&str]) -> Talker {
+        let mut names = vec![name.to_string()];
+        names.extend(more.iter().map(|n| n.to_string()));
+        Talker { name: name.into(), names, folder: None, layers: Vec::new() }
+    }
+
+    /// **A script rarely writes a character's name the way the Cast does.**
+    /// Case, honorifics and a slipped letter do not stop a match; two that
+    /// fit equally well, or none, are asked about; an answer given once wins.
+    #[test]
+    fn script_speakers_are_matched_loosely_and_asked_about_when_unsure() {
+        let on_stage = vec![talker("Sharma", &["Character 2"]), talker("Raju", &[]), talker("Mishra Babu", &[])];
+        let none = std::collections::BTreeMap::new();
+        assert_eq!(speaker_for("SHARMA JI", &on_stage, &none), Ok(Some(0)));
+        assert_eq!(speaker_for("Raju bhaiya", &on_stage, &none), Ok(Some(1)));
+        assert_eq!(speaker_for("RAAJU", &on_stage, &none), Ok(Some(1)), "a slipped letter");
+        assert_eq!(speaker_for("MISHRA", &on_stage, &none), Ok(Some(2)));
+        assert_eq!(speaker_for("character 2", &on_stage, &none), Ok(Some(0)), "the Cast's own name");
+        assert_eq!(speaker_for("DOODHWALA", &on_stage, &none), Err(()), "nobody fits: ask");
+        let twins = vec![talker("Raju", &[]), talker("Raju Sr", &[])];
+        assert_eq!(speaker_for("RAJU BHAI", &twins, &none), Ok(Some(0)), "the closer one");
+        let twins = vec![talker("Raju Jr", &[]), talker("Raju Sr", &[])];
+        assert_eq!(speaker_for("RAJU", &twins, &none), Err(()), "two fit the same: ask");
+
+        let mut cast = std::collections::BTreeMap::new();
+        cast.insert(speaker_key("DOODHWALA"), "Raju".to_string());
+        cast.insert(speaker_key("NARRATOR"), String::new());
+        assert_eq!(speaker_for("Doodhwala", &on_stage, &cast), Ok(Some(1)), "remembered");
+        assert_eq!(speaker_for("Narrator", &on_stage, &cast), Ok(None), "remembered as nobody");
+    }
+
+    /// **Rhubarb's keys read back as mouths, and cut to one line.**
+    #[test]
+    fn rhubarb_keys_become_a_track_and_a_slice_per_line() {
+        let keys = vec![(0, 0), (5, 6), (8, 1), (12, 0)];
+        let track = track_from_rhubarb(&keys, 15, 24.0);
+        assert_eq!(track.frames[4], Viseme::Rest);
+        assert_eq!(track.frames[5], Viseme::MBP);
+        assert_eq!(track.frames[9], Viseme::Ai);
+        assert_eq!(track.frames[13], Viseme::Rest);
+        // The recording starts on frame 100; a line over 106..111.
+        assert_eq!(rhubarb_slice(&keys, 100, 106, 111), vec![(0, 6), (2, 1)]);
+    }
+
+    /// **A character symbol straight from Animate talks too**: a symbol with
+    /// head and body layers, or one holding such a symbol, on a stage layer.
+    #[test]
+    fn character_symbols_on_the_stage_are_talkers() {
+        let mut scene = Scene::default();
+        let body = scene.add_symbol("ramesh body", buzz_scene::SymbolKind::Graphic, None);
+        scene.library_mut().update(body, |s| {
+            let first = s.layers.iter().next().unwrap().id;
+            s.layers.update(first, |l| l.name = "head".into());
+        });
+        let wrapper = scene.add_symbol("Ramesh", buzz_scene::SymbolKind::Graphic, None);
+        let inner = scene.next_object_id();
+        scene.library_mut().update(wrapper, |s| {
+            let first = s.layers.iter().next().unwrap().id;
+            s.layers.update(first, |l| {
+                l.frames.push_object(0, std::sync::Arc::new(buzz_scene::Object::instance_of(inner, body)));
+            });
+        });
+        let tree = scene.add_symbol("tree", buzz_scene::SymbolKind::Graphic, None);
+        let layer = scene.layers().iter().next().unwrap().id;
+        let id = scene.next_object_id();
+        scene.add_object_at(layer, 0, buzz_scene::Object::instance_of(id, wrapper));
+        let other = scene.add_layer("Trees", LayerKind::Normal);
+        let tid = scene.next_object_id();
+        scene.add_object_at(other, 0, buzz_scene::Object::instance_of(tid, tree));
+
+        let found = talkers(&scene);
+        assert_eq!(found.len(), 1, "the character, not the tree: {found:?}");
+        assert!(found[0].names.contains(&"Ramesh".to_string()));
+        assert_eq!(character_instance_at(&scene, &found[0], 0), Some(id));
     }
 }

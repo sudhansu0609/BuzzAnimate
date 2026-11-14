@@ -6098,6 +6098,7 @@ pub fn assemble_character(
         text: None,
         turnaround: Turnaround::default(),
         drawing_object: false,
+        brush: None,
     };
     scene.add_object(char_layer, armature_obj);
 

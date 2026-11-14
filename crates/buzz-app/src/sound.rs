@@ -443,6 +443,7 @@ mod tests {
                         text: None,
                         turnaround: Default::default(),
                         drawing_object: false,
+                        brush: None,
                     })],
                 );
             });

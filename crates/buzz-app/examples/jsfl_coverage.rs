@@ -226,6 +226,9 @@ fn main() {
                 })
             })),
             overrides: Vec::new(),
+            dialogue: None,
+            lip_sync: None,
+            master_audio: None,
         };
         let limits = buzz_script::Limits {
             time: std::time::Duration::from_secs(60),

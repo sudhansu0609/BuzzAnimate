@@ -411,6 +411,26 @@ fn cast_list(
         });
 }
 
+/// **A name being edited in place** — a character's or a pose's: focused on
+/// its first frame, then left to the user. Enter, or a click anywhere else,
+/// keeps it (`Some(true)`); Escape leaves the name as it was (`Some(false)`);
+/// `None` while still typing. It used to take the focus back every frame, so
+/// a click elsewhere could not end it and Escape did nothing.
+fn rename_field(ui: &mut Ui, text: &mut String) -> Option<bool> {
+    let response = ui.text_edit_singleline(text);
+    let started = egui::Id::new("cast-rename-started").with(response.id);
+    if !ui.data(|d| d.get_temp::<bool>(started).unwrap_or(false)) {
+        response.request_focus();
+        ui.data_mut(|d| d.insert_temp(started, true));
+        return None;
+    }
+    if !response.lost_focus() {
+        return None;
+    }
+    ui.data_mut(|d| d.remove::<bool>(started));
+    Some(!ui.input(|i| i.key_pressed(egui::Key::Escape)))
+}
+
 /// One character in the list: a stamp, the name, and Cast.
 fn character_row(
     ui: &mut Ui,
@@ -433,13 +453,11 @@ fn character_row(
             .as_ref()
             .is_some_and(|(path, _)| *path == asset.path);
         if renaming {
-            let mut done = false;
-            if let Some((_, text)) = state.renaming.as_mut() {
-                let response = ui.text_edit_singleline(text);
-                done = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                response.request_focus();
-            }
-            if done && let Some((_, text)) = state.renaming.take() {
+            let ended = state.renaming.as_mut().and_then(|(_, text)| rename_field(ui, text));
+            if let Some(keep) = ended
+                && let Some((_, text)) = state.renaming.take()
+                && keep
+            {
                 *action = Some(CastAction::Rename {
                     asset: asset.clone(),
                     name: text,
@@ -795,20 +813,20 @@ fn character_sheet(
         ui.horizontal(|ui| {
             let renaming = state.renaming_pose.as_ref().is_some_and(|(p, _)| p == pose);
             if renaming {
-                let mut done = false;
-                if let Some((_, text)) = state.renaming_pose.as_mut() {
-                    let response = ui.text_edit_singleline(text);
-                    done = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    response.request_focus();
-                }
-                if done && let Some((old, label)) = state.renaming_pose.take() {
+                let ended = state.renaming_pose.as_mut().and_then(|(_, text)| rename_field(ui, text));
+                if let Some(keep) = ended
+                    && let Some((old, label)) = state.renaming_pose.take()
+                    && keep
+                {
                     *action = Some(CastAction::RenamePose { asset: asset.clone(), pose: old, label });
                 }
             } else {
                 ui.label(RichText::new(pose).small());
                 if i > 0 {
                     if ui.small_button("Rename").clicked() {
-                        let label = pose.strip_prefix(&asset.name).unwrap_or(pose).trim().to_string();
+                        // The label is what follows the main pose's name (the
+                        // character's), as the pose was named `<Character> <label>`.
+                        let label = pose.strip_prefix(poses_here[0].as_str()).unwrap_or(pose).trim().to_string();
                         state.renaming_pose = Some((pose.clone(), label));
                     }
                     if ui.small_button("Remove").on_hover_text("Take this pose out of the character").clicked() {
@@ -882,6 +900,48 @@ fn draw_thumbnail(ui: &Ui, rect: egui::Rect, asset: &Asset, thumbnail: CastThumb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The Cast panel's rename field** — a character's or a pose's: focused
+    /// on its first frame, then left alone. Enter or a click elsewhere keeps
+    /// the name, Escape cancels. It used to take the focus back every frame,
+    /// so a click elsewhere could not end it and Escape did nothing.
+    #[test]
+    fn the_rename_field_keeps_on_enter_or_a_click_away_and_cancels_on_escape() {
+        let run = |steps: Vec<Vec<egui::Event>>| -> (Option<bool>, String) {
+            let ctx = egui::Context::default();
+            let mut text = "Raju".to_string();
+            let mut ended = None;
+            let mut time = 0.0;
+            for events in std::iter::once(Vec::new()).chain(steps) {
+                time += 0.05;
+                let input = egui::RawInput {
+                    events,
+                    time: Some(time),
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0))),
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(input, |ui| {
+                    if ended.is_none() {
+                        ended = rename_field(ui, &mut text);
+                    }
+                });
+            }
+            (ended, text)
+        };
+        let key = |key| vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }];
+        let typed = |s: &str| vec![egui::Event::Text(s.into())];
+
+        assert_eq!(run(vec![typed(" 2"), key(egui::Key::Enter)]), (Some(true), "Raju 2".to_string()), "Enter keeps it");
+        assert_eq!(run(vec![typed("X"), key(egui::Key::Escape)]).0, Some(false), "Escape cancels");
+        let away = egui::pos2(390.0, 190.0);
+        let button = |pressed| egui::Event::PointerButton { pos: away, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        assert_eq!(
+            run(vec![typed("!"), vec![egui::Event::PointerMoved(away), button(true)], vec![button(false)], Vec::new()]),
+            (Some(true), "Raju!".to_string()),
+            "a click elsewhere keeps it"
+        );
+        assert_eq!(run(vec![typed("a"), typed("b"), Vec::new(), Vec::new()]).0, None, "still typing: not ended");
+    }
 
     fn a_character() -> Asset {
         Asset {

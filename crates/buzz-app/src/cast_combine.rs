@@ -332,6 +332,44 @@ pub fn pose_choices(scene: &Scene, selected: Option<buzz_scene::ObjectId>, frame
     (poses.len() > 1).then_some((PoseTarget::Instance(object.id), shown_name, poses))
 }
 
+/// The symbol a selected instance shows at `frame`, for linking more poses to
+/// it (right-click ▸ Pose ▸ Add Pose). `None` for anything that is not a
+/// plain instance — a character unpacked onto the stage gets its poses from
+/// the Cast instead.
+pub fn pose_symbol(scene: &Scene, selected: Option<buzz_scene::ObjectId>, frame: u32) -> Option<SymbolId> {
+    let (layer, object) = scene.find_object(selected?)?;
+    if buzz_act::pose::character_folder_of(scene, layer).is_some() {
+        return None;
+    }
+    let here = scene.layers().get(layer)?.frames.objects_at(frame).iter().find(|o| o.id == object.id).cloned();
+    Some(here.as_ref().unwrap_or(object).instance()?.symbol)
+}
+
+/// What right-click ▸ Pose ▸ Add Pose offers for `shown`: every symbol
+/// [`buzz_scene::Library::include_in_set`] would accept, the ones Swap… ranks
+/// as similar first (`similar`), then the rest by name.
+pub fn addable_poses(scene: &Scene, shown: SymbolId) -> (Vec<(SymbolId, String)>, Vec<(SymbolId, String)>) {
+    let library = scene.library();
+    let owner = library.symbol_set(shown).first().copied().unwrap_or(shown);
+    let in_some_set: std::collections::HashSet<SymbolId> = library.iter().flat_map(|s| s.set.iter().copied()).collect();
+    let addable = |id: SymbolId| {
+        id != owner && library.get(id).is_some_and(|s| s.set.is_empty()) && !in_some_set.contains(&id)
+    };
+    let similar: Vec<(SymbolId, String)> = library
+        .similar_symbols(shown, &scene.cached_bounds_table())
+        .into_iter()
+        .filter(|(id, _)| addable(*id))
+        .filter_map(|(id, _)| library.get(id).map(|s| (id, s.name.clone())))
+        .collect();
+    let mut rest: Vec<(SymbolId, String)> = library
+        .iter()
+        .filter(|s| addable(s.id) && !similar.iter().any(|(id, _)| *id == s.id))
+        .map(|s| (s.id, s.name.clone()))
+        .collect();
+    rest.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+    (similar, rest)
+}
+
 /// Turn the target to `pose` from `frame` on (one scene edit).
 pub fn pick_pose(scene: &mut Scene, target: PoseTarget, frame: u32, pose: SymbolId) -> bool {
     match target {

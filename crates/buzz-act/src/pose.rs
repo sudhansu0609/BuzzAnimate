@@ -575,9 +575,31 @@ pub fn switch_lifted_pose(scene: &mut Scene, folder: LayerId, frame: u32, pose: 
     let old_view = rig_of_layer(scene, old_root);
 
     // -- the new pose's layers at rest: a fresh copy, kept or read from
-    let mut target = groups.iter().find(|g| g.pose == pose_name).map(|g| (g.layers.clone(), g.root));
+    //
+    // **Never the master-audio guide.** The film's master audio is put on top
+    // of every head and body symbol, poses included, as a locked guide; the
+    // shot has its own. Copied in with a pose it was one layer more than the
+    // pose had when it was first shown — or one more than it has now — and
+    // the switch back refused ("the pose's layers changed since it was
+    // lifted"). Left out of both sides of that comparison.
+    //
+    // Told by position: unpacking copies a symbol's layers in order but not
+    // their guide flag, so a guide already copied in (by an earlier switch)
+    // is known only by where it stands among the pose's layers.
+    let guides: Vec<bool> = scene.library().get(pose).map(|s| s.layers.iter().map(|l| l.audio_guide).collect()).unwrap_or_default();
+    let without_guides = |layers: Vec<LayerId>| -> (Vec<LayerId>, Vec<LayerId>) {
+        if layers.len() != guides.len() {
+            return (layers, Vec::new());
+        }
+        let (dropped, kept): (Vec<_>, Vec<_>) = layers.into_iter().zip(&guides).partition(|(_, guide)| **guide);
+        (kept.into_iter().map(|(l, _)| l).collect(), dropped.into_iter().map(|(l, _)| l).collect())
+    };
+    let mut target = groups.iter().find(|g| g.pose == pose_name).map(|g| (without_guides(g.layers.clone()).0, g.root));
     let at = scene.layers().index_of(folder).map_or(0, |i| i + 1);
-    let temp = scene.unpack_symbol_layers(pose, at);
+    let (temp, dropped) = without_guides(scene.unpack_symbol_layers(pose, at));
+    for guide in dropped {
+        scene.remove_layer(guide);
+    }
     if temp.is_empty() {
         return Err("the pose has no layers".into());
     }
@@ -927,5 +949,53 @@ mod tests {
         assert!(report.changed);
         assert_eq!(shown_pose(&scene, lifted.folder, 19).as_deref(), Some("Raju Side"));
         assert_eq!(shown_pose(&scene, lifted.folder, 20).as_deref(), Some("Raju"));
+    }
+
+    /// **The master audio guide does not stop a switch back.** The film puts
+    /// its master audio on top of every head and body symbol, poses included,
+    /// as a locked guide layer — after the character was cast. A switch then
+    /// copied the guide in with the pose, and switching back to a pose refused
+    /// because it had one layer more than when it was first shown ("the pose's
+    /// layers changed since it was lifted"). Switched away, back, and away again.
+    #[test]
+    fn a_pose_given_the_master_audio_guide_still_switches_back_and_forth() {
+        let mut asset = Scene::default();
+        let mouth = asset.add_symbol("Raju mouth", SymbolKind::Graphic, None);
+        let front = pose_symbol(&mut asset, "Raju", mouth, 1.0);
+        let side = pose_symbol(&mut asset, "Raju Side", mouth, 1.5);
+        assert!(asset.library_mut().include_in_set(front, side));
+        let mut scene = Scene::default();
+        scene.set_frame_count(30);
+        let lifted = lift_character(&mut scene, &asset, front, front, "Cast/Series/Raju").expect("lifts");
+        for l in &lifted.layers {
+            scene.update_layer(*l, |layer| {
+                while layer.frames.length() < 30 {
+                    let n = layer.frames.length();
+                    layer.frames.insert_frame(n);
+                }
+            });
+        }
+        // The guide arrives on top of both poses, after the cast.
+        for name in ["Raju", "Raju Side"] {
+            let id = scene.library().find_by_name(name).unwrap().id;
+            let guide = buzz_scene::LayerId(scene.next_object_id().0);
+            scene.library_mut().update(id, |s| {
+                let mut layer = buzz_scene::Layer::new(guide, "Master Audio", LayerKind::Normal);
+                layer.audio_guide = true;
+                layer.locked = true;
+                s.layers.insert(0, layer);
+            });
+        }
+        let side_id = scene.library().find_by_name("Raju Side").unwrap().id;
+        let layers_before = scene.layers().len();
+
+        assert!(switch_lifted_pose(&mut scene, lifted.folder, 10, side_id).expect("to the side").changed);
+        assert_eq!(scene.layers().len(), layers_before + 3, "the side's three parts, not its guide");
+        assert!(scene.layers().iter().all(|l| l.name != "Master Audio"), "no guide copied in");
+        assert!(switch_lifted_pose(&mut scene, lifted.folder, 15, lifted.main).expect("back to the front").changed);
+        assert!(switch_lifted_pose(&mut scene, lifted.folder, 20, side_id).expect("to the side again").changed);
+        assert_eq!(shown_pose(&scene, lifted.folder, 14).as_deref(), Some("Raju Side"));
+        assert_eq!(shown_pose(&scene, lifted.folder, 15).as_deref(), Some("Raju"));
+        assert_eq!(shown_pose(&scene, lifted.folder, 20).as_deref(), Some("Raju Side"));
     }
 }

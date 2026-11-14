@@ -256,6 +256,13 @@ pub struct Layer {
     /// and XFL export skip it). `false` for every layer of every older document.
     pub audio_guide: bool,
 
+    /// **A puppet** (folders only): a character's parts, filed under this one
+    /// folder, shown in the timeline as this one row, posed on the stage by
+    /// turning its parts about their joints, each pose keyed with an eased
+    /// tween. Layer parenting inside is untouched. `false` everywhere in an
+    /// older document.
+    pub puppet: bool,
+
     /// **The main sound layer** of its timeline: the one lip sync reads, set on
     /// the layer a sound was last placed or attached on (Import Sound, a sound
     /// dragged from the Library, Attach Sound) and cleared on the others of the
@@ -332,6 +339,7 @@ impl Layer {
             depth: 0.0,
             collapsed: false,
             audio_guide: false,
+            puppet: false,
             main_sound: false,
             cast_source: None,
             filters: Vec::new(),

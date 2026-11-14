@@ -218,6 +218,7 @@ pub fn rig_object(
             text: None,
             turnaround: Default::default(),
             drawing_object: false,
+            brush: None,
         };
 
         let mut rig = ArmatureData::new(armature);
@@ -633,6 +634,7 @@ pub fn rig_character(
             text: None,
             turnaround: Default::default(),
             drawing_object: false,
+            brush: None,
         },
     )
 }
@@ -1519,6 +1521,7 @@ pub fn layers_to_bones(
             text: None,
             turnaround: Default::default(),
             drawing_object: false,
+            brush: None,
         },
     )?;
     for &id in layers {

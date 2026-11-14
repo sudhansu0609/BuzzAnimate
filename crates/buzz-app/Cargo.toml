@@ -86,6 +86,13 @@ ureq = { version = "2.10", features = ["json"] }
 # importer reads with it); nothing new is compiled.
 lopdf.workspace = true
 
+# Pen pressure on macOS: winit 0.30 does not pass a tablet's pressure on, so it
+# is read off the AppKit event being handled (see `app::tablet_pressure_now`).
+# Both are already in the build through wgpu and rfd; nothing new is fetched.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder"] }
+
 [target.'cfg(windows)'.build-dependencies]
 # Embeds the icon into the .exe, so Explorer and the taskbar show it too.
 # The build script tolerates its absence rather than failing.

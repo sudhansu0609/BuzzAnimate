@@ -138,6 +138,28 @@ pub struct ScriptContext {
     /// unattended -- `prompt` answers its default, `confirm` says yes, a
     /// file picker is cancelled, and `traceBitmap` says it is unavailable.
     pub hooks: Hooks,
+
+    /// **The dialogue under the open timeline**, for a script that times itself
+    /// to speech (`fl.buzzAnimate.lineEnd`). `None`: there is none, or the
+    /// host did not measure it.
+    pub dialogue: Option<Dialogue>,
+
+    /// **A lip sync the script asked for** (`fl.buzzAnimate.lipSync(start,
+    /// end)`), in frames of the timeline it left open: the host runs it on
+    /// the selected mouth once the run is committed. Animate has no way for a
+    /// script to do this; its own commands stop and ask for the Lip Syncing
+    /// button instead.
+    pub lip_sync: Option<(u32, u32)>,
+
+    /// **The master audio layer on the scene the script starts on**, when the
+    /// sequence has one (Sequence ▸ Set Master Audio): a layer no script may
+    /// rename or key. The dialogue is the timeline every shot is cut against,
+    /// so a command that keys every layer at the playhead, or renames the
+    /// lot, passes it by — with a line in the trace — and carries on with the
+    /// rest. A Master Audio guide inside a symbol (`Layer::audio_guide`) is
+    /// kept the same way without being named here. `None`: no master audio,
+    /// or it lives on another scene.
+    pub master_audio: Option<LayerId>,
 }
 
 /// A question a script puts to a person (JSFL's `prompt`, `confirm`,
@@ -314,6 +336,41 @@ pub fn dirs_next_config() -> Option<std::path::PathBuf> {
 /// thread while the Stop button is pressed on another.
 pub type StopSignal = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// **The loudness of the dialogue, frame by frame**, from the timeline frame
+/// it starts on (`buzz_audio::Clip::frame_levels`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Dialogue {
+    pub start: u32,
+    pub levels: std::sync::Arc<Vec<f32>>,
+}
+
+/// **Where the line spoken at `from` stops**, in timeline frames: speech is
+/// looked for from `from` on (a playhead parked just before a line finds that
+/// line), and the line runs until the first pause of `pause` frames. A short
+/// breath inside a sentence is not a pause. `None` when nothing is spoken
+/// from `from` on.
+pub fn line_end(dialogue: &Dialogue, from: u32, pause: usize) -> Option<u32> {
+    let levels = &dialogue.levels;
+    let mut audible: Vec<f32> = levels.iter().copied().filter(|l| *l > 1e-4).collect();
+    if audible.is_empty() {
+        return None;
+    }
+    audible.sort_by(|a, b| a.total_cmp(b));
+    let speaking = audible[(audible.len() - 1) * 9 / 10];
+    let quiet = speaking * 0.1;
+    let begin = from.saturating_sub(dialogue.start) as usize;
+    let first = (begin..levels.len()).find(|f| levels[*f] > quiet)?;
+    let mut last_loud = first;
+    for (f, level) in levels.iter().enumerate().skip(first) {
+        if *level > quiet {
+            last_loud = f;
+        } else if f - last_loud >= pause {
+            break;
+        }
+    }
+    Some(dialogue.start + last_loud as u32 + 1)
+}
+
 /// What a run produced.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptOutcome {
@@ -455,6 +512,10 @@ pub(crate) struct State {
     /// Nanoseconds the script spent waiting for a person, which the time limit
     /// does not count.
     pub waited: Arc<std::sync::atomic::AtomicU64>,
+    /// Which scene (by index here) and layer the master audio is
+    /// (`ScriptContext::master_audio`), so a script that switches scenes is
+    /// not stopped on another scene's layer of the same id.
+    pub master_audio: Option<(usize, LayerId)>,
 }
 
 impl State {
@@ -556,12 +617,14 @@ pub fn run_film(
     }
     let before: Vec<u64> = film.scenes.iter().map(|s| s.revision()).collect();
 
+    let current = film.current.min(film.scenes.len() - 1);
+    let master_audio = context.master_audio.map(|layer| (current, layer));
     let state = Rc::new(RefCell::new(State {
         // Cheap: a scene is copy-on-write, so this shares its artwork until
         // the script actually changes something.
         scenes: film.scenes.clone(),
         names: film.names.clone(),
-        current: film.current.min(film.scenes.len() - 1),
+        current,
         context,
         trace: Vec::new(),
         alerts: Vec::new(),
@@ -577,6 +640,7 @@ pub fn run_film(
         frame_stack: Vec::new(),
         layer_fx_base: std::collections::HashMap::new(),
         waited: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        master_audio,
     }));
 
     let (error, stopped) = evaluate(&state, source, limits, stop);
@@ -628,6 +692,7 @@ impl State {
             frame_stack: self.frame_stack.clone(),
             layer_fx_base: self.layer_fx_base.clone(),
             waited: Arc::clone(&self.waited),
+            master_audio: self.master_audio,
         }
     }
 }
@@ -805,6 +870,110 @@ mod tests {
 
     fn run_source(scene: &mut Scene, source: &str) -> ScriptOutcome {
         run(scene, ScriptContext::default(), source, &Limits::default())
+    }
+
+    /// **The master audio layer is never renamed or keyed by a script.** The
+    /// sequence names it in the context; a Master Audio guide inside a symbol
+    /// says what it is itself. Both are passed over with a line in the trace,
+    /// and the command carries on with every other layer.
+    #[test]
+    fn the_master_audio_layer_is_left_alone_by_scripts() {
+        let mut scene = document();
+        let audio = scene.add_layer("Dialogue", LayerKind::Normal);
+        scene.update_layer(audio, |l| {
+            l.frames.insert_frame(29);
+        });
+        let context = ScriptContext { master_audio: Some(audio), ..Default::default() };
+        let out = run(
+            &mut scene,
+            context,
+            r#"
+                var t = fl.getDocumentDOM().getTimeline();
+                for (var i = 0; i < t.layers.length; i++) {
+                    t.layers[i].name = "Part " + i;
+                    t.setSelectedLayers(i);
+                    t.insertKeyframe(5);
+                }
+            "#,
+            &Limits::default(),
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let layers: Vec<_> = scene.layers().iter().collect();
+        assert_eq!(layers[0].name, "Dialogue", "the master audio layer keeps its name");
+        assert_eq!(layers[0].frames.keyframes().len(), 1, "and its one keyframe");
+        assert_eq!(layers[1].name, "Part 1", "every other layer is renamed");
+        assert!(layers[1].frames.keyframe_at(5).is_some_and(|k| k.start == 5), "and keyed");
+        assert_eq!(layers[2].name, "Part 2");
+        assert_eq!(out.trace.len(), 2, "a line per thing not done: {:?}", out.trace);
+        assert!(out.trace[0].contains("Dialogue") && out.trace[0].contains("not renamed"), "{:?}", out.trace);
+        assert!(out.trace[1].contains("not keyed"), "{:?}", out.trace);
+
+        // A guide inside a symbol needs no context: the layer says what it is.
+        let mut scene = Scene::default();
+        let guide = scene.add_layer("Dialogue", LayerKind::Guide);
+        scene.update_layer(guide, |l| l.audio_guide = true);
+        let out = run_source(
+            &mut scene,
+            r#"
+                var t = fl.getDocumentDOM().getTimeline();
+                t.layers[0].name = "x";
+                t.setSelectedLayers(0);
+                t.insertBlankKeyframe(3);
+            "#,
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let layer = scene.layers().get(guide).expect("the guide");
+        assert_eq!(layer.name, "Dialogue");
+        assert_eq!(layer.frames.keyframes().len(), 1);
+    }
+
+    /// Speech from frame 10 to 40 with a 4-frame breath at 25, then quiet
+    /// until 70, then another line to 90: the dialogue starts on frame 100.
+    fn two_lines() -> Dialogue {
+        let mut levels = vec![0.0f32; 100];
+        for f in (10..40).chain(70..90) {
+            levels[f] = 0.5;
+        }
+        for level in &mut levels[25..29] {
+            *level = 0.01;
+        }
+        Dialogue { start: 100, levels: std::sync::Arc::new(levels) }
+    }
+
+    /// **A line ends at the first real pause**: a breath inside it does not
+    /// end it, a playhead parked just before it finds it, and after the last
+    /// line there is nothing to find.
+    #[test]
+    fn a_spoken_line_ends_at_the_first_real_pause() {
+        let d = two_lines();
+        assert_eq!(line_end(&d, 100, 12), Some(140), "from before the line");
+        assert_eq!(line_end(&d, 115, 12), Some(140), "from inside it, over the breath");
+        assert_eq!(line_end(&d, 145, 12), Some(190), "the next line");
+        assert_eq!(line_end(&d, 195, 12), None, "nothing more is said");
+    }
+
+    /// **`fl.buzzAnimate`** reads the line's end and files a lip sync for the
+    /// host; a command written for Animate tests for it first.
+    #[test]
+    fn a_command_can_time_itself_to_the_dialogue_and_ask_for_a_lip_sync() {
+        let mut scene = Scene::default();
+        let context = ScriptContext { current_frame: 112, dialogue: Some(two_lines()), ..Default::default() };
+        let out = run(
+            &mut scene,
+            context,
+            r#"
+                var t = fl.getDocumentDOM().getTimeline();
+                if (fl.buzzAnimate) {
+                    var end = fl.buzzAnimate.lineEnd(t.currentFrame);
+                    fl.trace("ends " + end);
+                    fl.buzzAnimate.lipSync(t.currentFrame, end);
+                }
+            "#,
+            &Limits::default(),
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(out.trace, vec!["ends 140".to_string()]);
+        assert_eq!(out.context.lip_sync, Some((112, 140)));
     }
 
     // -- animation ----------------------------------------------------------

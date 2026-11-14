@@ -365,6 +365,7 @@ pub fn build(spec: &FigureSpec, id: ObjectId, mut next_id: impl FnMut() -> Objec
         text: None,
         turnaround: Default::default(),
         drawing_object: false,
+        brush: None,
     }
 }
 

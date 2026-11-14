@@ -732,6 +732,8 @@ enum AiResult {
     LipSyncAllHeard {
         lines: Vec<crate::scene_life::SpokenLine>,
         visemes: buzz_audio::VisemeTrack,
+        rhubarb: Option<Vec<(u32, usize)>>,
+        scripted: bool,
         start: u32,
         notes: Vec<String>,
         secs: f64,
@@ -1184,6 +1186,19 @@ pub struct App {
     /// on their own and do not always carry a force of their own; `None` is a
     /// device with no sensor, which reads as drawing at full pressure.
     pen_pressure: Option<f64>,
+    /// **The pen's pressure on each pointer move since the last frame**, as the
+    /// OS reported it — one entry per `CursorMoved`, `None` for a move that was
+    /// not a pen's. Only macOS fills it: winit 0.30 drops a tablet's pressure
+    /// there, so it is read off the AppKit event (see [`tablet_pressure_now`]).
+    /// egui turns each `CursorMoved` into one `PointerMoved`, so the two lists
+    /// line up, entry for entry.
+    os_pen_moves: Vec<Option<f64>>,
+    /// [`Self::os_pen_moves`] for the frame being built, taken with egui's input.
+    frame_pen_moves: Vec<Option<f64>>,
+    /// The last pressure the OS reported for a pen press or drag, cleared by
+    /// any mouse event that was not a pen's — what a press takes when egui only
+    /// calls the drag started a frame or two after the button went down.
+    os_pen_last: Option<f64>,
     /// Where a Space-drag or middle-button pan last measured the pointer, in
     /// stage-local screen points (see `local` in `handle_stage_input`).
     ///
@@ -1204,6 +1219,10 @@ pub struct App {
     quit_prompt: bool,
     /// Convert to Symbol / New Symbol, asking for the name and type.
     symbol_dialog: Option<crate::symbol_dialog::SymbolDialog>,
+    /// Move Stage Frames…: the frames to move and where to, while it is open.
+    move_stage: Option<MoveStageFrames>,
+    /// Lip Sync All Characters, heard and waiting on the Who's who window.
+    who_is_who: Option<WhoIsWho>,
     /// The export presets, built-in and the user's own, for the Export dialog.
     presets: crate::presets::PresetLibrary,
     /// Lighting geometry kept between frames.
@@ -1669,9 +1688,14 @@ impl App {
             exports: crate::export_service::ExportQueue::default(),
             export_vram_cap: 2,
             pen_pressure: None,
+            os_pen_moves: Vec::new(),
+            frame_pen_moves: Vec::new(),
+            os_pen_last: None,
             pan_last_screen: None,
             quit_prompt: false,
             symbol_dialog: None,
+            move_stage: None,
+            who_is_who: None,
             presets: crate::presets::PresetLibrary::load(),
             lights: fresh_light_cache(),
             pipeline: crate::encode_ahead::Pipeline::for_app(Arc::clone(&jobs)),
@@ -2970,6 +2994,46 @@ fn script_samples() -> Vec<buzz_ui::SampleEntry> {
             source: s.source,
         })
         .collect()
+}
+
+/// **The pressure of the pen behind the AppKit event being handled**, `0.0`–`1.0`
+/// — `None` for a mouse, a trackpad, or a pen hovering rather than pressing.
+///
+/// winit 0.30 turns a tablet's drags into plain mouse events and drops the
+/// pressure on the way, so on macOS a pen drew every stroke at full pressure.
+/// The event is still AppKit's *current* event while winit dispatches it, and
+/// a pen's mouse events carry the tablet subtype and its pressure, so it is
+/// read from there. Only events that have a subtype are asked for one: AppKit
+/// raises on any other.
+#[cfg(target_os = "macos")]
+fn tablet_pressure_now() -> Option<f64> {
+    use objc2_app_kit::{NSApplication, NSEventSubtype, NSEventType};
+    let mtm = objc2::MainThreadMarker::new()?;
+    let event = NSApplication::sharedApplication(mtm).currentEvent()?;
+    let kind = event.r#type();
+    let pressing = [
+        NSEventType::LeftMouseDown,
+        NSEventType::LeftMouseDragged,
+        NSEventType::RightMouseDown,
+        NSEventType::RightMouseDragged,
+        NSEventType::OtherMouseDown,
+        NSEventType::OtherMouseDragged,
+    ]
+    .contains(&kind);
+    let pen = kind == NSEventType::TabletPoint
+        || (pressing && event.subtype() == NSEventSubtype::TabletPoint);
+    if !pen {
+        return None;
+    }
+    let pressure = f64::from(event.pressure());
+    // A pen that has lifted off reports nothing worth drawing with.
+    (pressure > 0.0).then(|| pressure.clamp(0.0, 1.0))
+}
+
+/// Everywhere else the pen's pressure already arrives on egui's touch events.
+#[cfg(not(target_os = "macos"))]
+fn tablet_pressure_now() -> Option<f64> {
+    None
 }
 
 /// **Give ⌘C, ⌘X and ⌘V back their key press.**
@@ -4491,6 +4555,8 @@ impl App {
         self.quit_prompt_dialog(&ctx);
         self.close_prompt_dialog(&ctx);
         self.symbol_dialog_ui(&ctx);
+        self.move_stage_frames_dialog(&ctx);
+        self.who_is_who_dialog(&ctx);
         self.export_dialog(&ctx);
         self.lip_sync_dialog(&ctx);
         self.staging_dialog(&ctx);
@@ -5033,7 +5099,11 @@ impl App {
             RemovePose { asset, pose } => {
                 let stamp = crate::cast_fresh::backup_stamp();
                 let status = match crate::cast_pose_edit::remove_pose(&mut self.editor.assets, &asset, &pose, &stamp) {
-                    Ok(()) => format!("Removed pose {pose} from {} (the old file is in _cast_backup)", asset.name),
+                    Ok(()) => format!(
+                        "Removed pose {pose} from {}{} (the old file is in _cast_backup)",
+                        asset.name,
+                        if self.sync_shot_with_cast(&asset, None) { ", and from this shot's Pose menu" } else { "" }
+                    ),
                     Err(e) => format!("Could not remove the pose: {e}"),
                 };
                 self.cast_pose_edited();
@@ -5042,7 +5112,10 @@ impl App {
             RenamePose { asset, pose, label } => {
                 let stamp = crate::cast_fresh::backup_stamp();
                 let status = match crate::cast_pose_edit::rename_pose(&mut self.editor.assets, &asset, &pose, &label, &stamp) {
-                    Ok(full) => format!("Renamed {pose} to {full}"),
+                    Ok(full) => format!(
+                        "Renamed {pose} to {full}{}",
+                        if self.sync_shot_with_cast(&asset, Some((&pose, &full))) { ", here in the shot too" } else { "" }
+                    ),
                     Err(e) => format!("Could not rename the pose: {e}"),
                 };
                 self.cast_pose_edited();
@@ -5058,15 +5131,33 @@ impl App {
                 self.editor.status = Some(status);
             }
             Rename { asset, name } => {
-                if let Err(e) = self.editor.assets.rename(&asset, &name) {
-                    self.editor.status = Some(format!("Could not rename: {e}"));
-                } else {
-                    // The file moved, so the path the sheet was keyed on is
-                    // gone; the list still shows the character under its new
-                    // name.
-                    self.editor.cast_panel.open = None;
-                    self.cast_sheet = None;
-                    self.asset_thumbnails.forget();
+                let stamp = crate::cast_fresh::backup_stamp();
+                match crate::cast_pose_edit::rename_character(&mut self.editor.assets, &asset, &name, &stamp) {
+                    Err(e) => self.editor.status = Some(format!("Could not rename {}: {e}", asset.name)),
+                    Ok(new) if new == asset.name => {}
+                    Ok(new) => {
+                        // The open film too, so a character already placed
+                        // keeps its poses and its link to the Cast file.
+                        let (folder, old) = (asset.folder.clone(), asset.name.clone());
+                        let mut placed = false;
+                        if self.editor.doc.scene().layers().iter().any(|l| {
+                            l.cast_source.as_deref().is_some_and(|s| s == format!("{folder}/{old}") || s.starts_with(&format!("{folder}/{old}|")))
+                        }) {
+                            self.editor.doc.edit("Rename Character", |scene| {
+                                placed = crate::cast_pose_edit::rename_character_in(scene, &folder, &old, &new);
+                            });
+                        }
+                        // The file moved, so the path the sheet was keyed on is
+                        // gone; the list still shows the character under its new
+                        // name.
+                        self.editor.cast_panel.open = None;
+                        self.cast_sheet = None;
+                        self.asset_thumbnails.forget();
+                        self.editor.status = Some(format!(
+                            "Renamed {old} to {new}{} (the old file is in _cast_backup)",
+                            if placed { ", here in the film too" } else { "" }
+                        ));
+                    }
                 }
             }
             Delete(asset) => self.delete_from_cast(asset),
@@ -5170,6 +5261,46 @@ impl App {
         self.asset_thumbnails.forget();
     }
 
+    /// **A shot follows its Cast.** After a pose is added, removed or renamed
+    /// in the Cast panel, the copy of that character placed in the open shot
+    /// is brought into line — the Pose menu and Next/Previous Pose read the
+    /// Cast's poses under the Cast's names — as one undo step. `renamed` is
+    /// a pose renamed there, `(old, new)` by full name.
+    fn sync_shot_with_cast(&mut self, asset: &buzz_doc::Asset, renamed: Option<(&str, &str)>) -> bool {
+        if !crate::cast_pose_edit::is_placed(self.editor.doc.scene(), &asset.folder, &asset.name) {
+            return false;
+        }
+        let Some(fresh) = self.editor.assets.assets().iter().find(|a| a.folder == asset.folder && a.name == asset.name).cloned() else {
+            return false;
+        };
+        let Ok(cast) = self.editor.assets.load(&fresh) else {
+            return false;
+        };
+        let (folder, name) = (asset.folder.clone(), asset.name.clone());
+        let mut probe = self.editor.doc.scene().clone();
+        if !crate::cast_pose_edit::sync_placed_character(&mut probe, &cast, &folder, &name, renamed) {
+            return false;
+        }
+        self.editor.doc.edit("Poses from the Cast", |scene| {
+            crate::cast_pose_edit::sync_placed_character(scene, &cast, &folder, &name, renamed);
+        });
+        true
+    }
+
+    /// Every Cast character placed in the document just opened, brought up to
+    /// date with its Cast file: poses set in the Cast panel since the shot was
+    /// last open appear in its Pose menu. The names synced, for the status.
+    fn sync_opened_with_cast(&mut self) -> Vec<String> {
+        let cast = crate::cast_fresh::cast_characters(&self.editor.assets);
+        let mut synced = Vec::new();
+        for asset in cast {
+            if self.sync_shot_with_cast(&asset, None) {
+                synced.push(asset.name.clone());
+            }
+        }
+        synced
+    }
+
     /// **Add Pose** (CAST_POSES_PLAN C2 e1): build the pose from its source, add it
     /// to the character's set and save the asset back, backup first.
     fn cast_add_pose(&mut self, asset: buzz_doc::Asset, label: String, source: buzz_ui::PoseSource) {
@@ -5195,9 +5326,14 @@ impl App {
                 crate::cast_pose_edit::add_pose(&mut self.editor.assets, &asset, &label, crate::cast_pose_edit::PoseInput::Rig(rig), &stamp)
             }),
         };
+        let here = result.is_ok() && self.sync_shot_with_cast(&asset, None);
         self.cast_pose_edited();
         self.editor.status = Some(match result {
-            Ok(full) => format!("Added pose {full} to {} (the old file is in _cast_backup)", asset.name),
+            Ok(full) => format!(
+                "Added pose {full} to {}{} (the old file is in _cast_backup)",
+                asset.name,
+                if here { ", and to this shot's Pose menu" } else { "" }
+            ),
             Err(e) => format!("Could not add the pose: {e}"),
         });
     }
@@ -5886,12 +6022,21 @@ impl App {
                 let selection = &mut editor.selection;
                 let frame = editor.current_frame;
                 let mut raised = None;
+                let before = selection.ids();
                 editor.doc.edit("Layer Properties", |scene| {
                     raised =
                         panels::layers_panel_filtered(ui, scene, selection, frame, &row_filter);
                 });
                 if let Some(command) = raised {
                     commands.push(command);
+                }
+                // A layer clicked here is not an object picked on the stage:
+                // the panels stay as they are (`follow_selection_with_panels`
+                // is for stage picks). Rolling this panel up for the first
+                // click of a double-click on a name took the name out from
+                // under the second.
+                if self.editor.selection.ids() != before {
+                    self.panel_follow.settle(self.editor.selection.ids());
                 }
             }
 
@@ -6552,6 +6697,7 @@ impl App {
                     waveforms: self.editor.waveforms(),
                     beats: self.editor.ruler_marks.clone(),
                     shot_end: self.editor.shot_end_marker(),
+                    stage_copied: self.editor.stage_clip.as_ref().map(|c| c.0),
                 };
                 let response = buzz_ui::timeline_panel_with_tools_slot(
                     ui,
@@ -7172,6 +7318,29 @@ impl App {
         }
         self.commands_ui.status = status.clone();
         self.editor.status = Some(status);
+
+        // The lip sync it asked for (`fl.buzzAnimate.lipSync`), on the mouth
+        // it left selected: what its Animate twin leaves to the Lip Syncing
+        // button.
+        if let Some((start, end)) = outcome.context.lip_sync
+            && outcome.error.is_none()
+        {
+            self.lip_sync_range(start, end);
+        }
+    }
+
+    /// **The lip sync a command asked for**: the mouth it left selected (or
+    /// the "mouth" layer of the timeline it left open), from `start` to `end`
+    /// only, heard by Rhubarb — without opening the Lip Sync window.
+    fn lip_sync_range(&mut self, start: u32, end: u32) {
+        let open = self.editor.lip_sync.open;
+        self.open_lip_sync();
+        self.editor.lip_sync.open = open;
+        if crate::rhubarb::binary().is_none() {
+            self.editor.status = Some("Lip sync skipped: Rhubarb is not installed".into());
+            return;
+        }
+        self.lip_sync_with_rhubarb_over(Some((start, end)));
     }
 
     /// Bring an Animate keymap over: its keys for menus and tools, and for the
@@ -7318,6 +7487,11 @@ impl App {
             });
         }
 
+        if let Some(on) = response.set_character_shadows {
+            editor.doc.edit("Character Shadows", |scene| {
+                scene.lights_mut().no_character_shadows = !on;
+            });
+        }
         if let Some(only) = response.set_shadows_only {
             editor.doc.edit("Shadows Only", |scene| {
                 scene.lights_mut().shadows_only = only;
@@ -8266,6 +8440,7 @@ impl App {
             // ...but you still hear it, so the beat can be found by ear.
             self.editor.scrub_audio(frame);
         }
+        let clicked_a_layer = response.select_layer.is_some() || response.select_layers.is_some();
         if let Some(layer) = response.select_layer {
             // As in the Layers panel: the layer's artwork comes with it.
             self.editor.select_layer(layer);
@@ -8276,6 +8451,15 @@ impl App {
         if let Some(layers) = response.select_layers {
             self.editor.select_layers(&layers);
             self.editor.camera_selected = false;
+        }
+        if clicked_a_layer {
+            // A layer clicked in the timeline is not an object picked on the
+            // stage: the panels stay as they are (`follow_selection_with_panels`
+            // brings Properties forward and rolls the Layers panel up for a
+            // stage pick). Re-arranging them between the two clicks of a
+            // double-click on a layer's name moved the name out from under the
+            // second, so a layer with artwork on it could not be renamed.
+            self.panel_follow.settle(self.editor.selection.ids());
         }
         if let Some(anchor) = response.set_range_anchor {
             // I1: Ctrl/Cmd+click moves the anchor a later Shift+click sweeps
@@ -9429,6 +9613,29 @@ impl App {
         let mut raised: Option<Command> = None;
         let mut save_asset = false;
         let mut pose_pick: Option<(crate::cast_combine::PoseTarget, buzz_scene::SymbolId)> = None;
+        // Right-click ▸ Pose ▸ Add Pose: (the symbol shown, the symbol to link as another pose).
+        let mut pose_add: Option<(buzz_scene::SymbolId, buzz_scene::SymbolId)> = None;
+        // Right-click ▸ Pose ▸ Edit Poses in Cast…: the character's Cast link.
+        let mut pose_in_cast: Option<String> = None;
+        // The keys Next / Previous Pose are on, the user's own if they rebound
+        // them — "Option+]", not egui's spelled-out "Option+CloseBracket".
+        let ctx = response.ctx.clone();
+        let keys = |c: Command| {
+            self.editor
+                .workspace
+                .shortcuts_for(c)
+                .iter()
+                .map(|s| {
+                    let text = ctx.format_shortcut(s);
+                    match text.strip_suffix(s.logical_key.name()) {
+                        Some(mods) => format!("{mods}{}", s.logical_key.symbol_or_name()),
+                        None => text,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" or ")
+        };
+        let pose_keys = format!("{} / {}", keys(Command::NextPose), keys(Command::PreviousPose));
 
         // A probe for the test that drives the real window: the popup egui
         // opens has an id of its own, and this is the honest way to ask the
@@ -9523,23 +9730,82 @@ impl App {
             // own, and this instance switched to it.
             item(ui, Command::DuplicateSymbol, has_instance);
             item(ui, Command::ClearAllKeyframes, has_instance);
-            // Pose > list, for a Cast character (CAST_POSES_PLAN C2): switches it
-            // from the playhead on.
-            if let Some((target, shown, poses)) = crate::cast_combine::pose_choices(
-                self.editor.doc.scene(),
-                self.editor.selection.iter().next(),
-                self.editor.edit_at().frame,
-            ) {
+            // Pose ▸ for a character (CAST_POSES_PLAN C2): its poses, switched
+            // from the playhead on. Shown for **every** symbol instance, not
+            // only one whose poses are already linked — a character brought in
+            // from Animate has each pose as a symbol of its own, and the menu
+            // hiding until they were linked (Properties ▸ Include…) left no
+            // way to find out how. Add Pose ▸ links them here.
+            let pose_frame = self.editor.edit_at().frame;
+            let selected = self.editor.selection.iter().next();
+            let choices = crate::cast_combine::pose_choices(self.editor.doc.scene(), selected, pose_frame);
+            let pose_symbol = crate::cast_combine::pose_symbol(self.editor.doc.scene(), selected, pose_frame);
+            if choices.is_some() || pose_symbol.is_some() {
                 ui.menu_button("Pose", |ui| {
-                    for (id, name) in &poses {
-                        if ui.selectable_label(*name == shown, name).clicked() && *name != shown {
-                            pose_pick = Some((target, *id));
-                            ui.close();
+                    match &choices {
+                        Some((target, shown, poses)) => {
+                            for (id, name) in poses {
+                                if ui.selectable_label(name == shown, name).clicked() && name != shown {
+                                    pose_pick = Some((*target, *id));
+                                    ui.close();
+                                }
+                            }
+                            ui.label(
+                                egui::RichText::new(&pose_keys)
+                                .small()
+                                .weak(),
+                            )
+                            .on_hover_text("Next Pose / Previous Pose");
+                            // A Cast character's poses are set in the Cast
+                            // panel, and every shot follows it.
+                            if let crate::cast_combine::PoseTarget::Lifted(folder) = target
+                                && let Some(link) = self.editor.doc.scene().layers().get(*folder).and_then(|l| l.cast_source.clone())
+                            {
+                                ui.separator();
+                                if ui.button("Edit Poses in Cast\u{2026}").on_hover_text("Add, rename or remove poses; this shot follows").clicked() {
+                                    pose_in_cast = Some(link);
+                                    ui.close();
+                                }
+                            }
                         }
+                        None => {
+                            ui.label(egui::RichText::new("No other poses linked yet").small().weak());
+                        }
+                    }
+                    if let Some(shown) = pose_symbol {
+                        ui.separator();
+                        ui.menu_button("Add Pose", |ui| {
+                            let (similar, rest) = crate::cast_combine::addable_poses(self.editor.doc.scene(), shown);
+                            if similar.is_empty() && rest.is_empty() {
+                                ui.label(egui::RichText::new("No symbol can be added").small().weak());
+                            }
+                            for (id, name) in &similar {
+                                if ui.button(name).clicked() {
+                                    pose_add = Some((shown, *id));
+                                    ui.close();
+                                }
+                            }
+                            if !rest.is_empty() {
+                                if !similar.is_empty() {
+                                    ui.separator();
+                                }
+                                ui.menu_button("All symbols", |ui| {
+                                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                                        for (id, name) in &rest {
+                                            if ui.button(name).clicked() {
+                                                pose_add = Some((shown, *id));
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                });
+                            }
+                        });
                     }
                 });
             }
             item(ui, Command::RigHead, has_instance);
+            item(ui, Command::PuppetMode, true);
             item(ui, Command::EvenLines, has_selection);
             item(ui, Command::OptimizeShapes, has_selection);
             item(ui, Command::RemoveBackgroundSpecks, has_selection);
@@ -9582,6 +9848,37 @@ impl App {
         {
             self.dispatch(command);
         }
+        if let Some(link) = pose_in_cast {
+            // `<folder>/<name>`, as the Cast files it.
+            let asset = self.editor.assets.assets().iter().find(|a| format!("{}/{}", a.folder, a.name) == link).cloned();
+            match asset {
+                Some(asset) => {
+                    self.editor.cast_panel.open = Some(asset.path.clone());
+                    self.cast_sheet = None;
+                    if !self.editor.workspace.is_open(buzz_ui::PanelId::Cast) {
+                        self.editor.workspace.restore_default_place(buzz_ui::PanelId::Cast);
+                    }
+                    self.editor.workspace.select_tab(buzz_ui::PanelId::Cast);
+                    self.editor.workspace.set_collapsed(buzz_ui::PanelId::Cast, false);
+                    self.editor.status = Some(format!("{}: set its poses here, and every shot follows", asset.name));
+                }
+                None => self.editor.status = Some(format!("{link} is not in the Cast any more")),
+            }
+        }
+        if let Some((shown, pose)) = pose_add
+            && !self.agent_active()
+        {
+            let mut linked = false;
+            self.editor.doc.edit("Add Pose", |scene| {
+                linked = scene.library_mut().include_in_set(shown, pose);
+            });
+            let name = |id| self.editor.doc.scene().library().get(id).map(|s| s.name.clone()).unwrap_or_default();
+            self.editor.status = Some(if linked {
+                format!("{} is now a pose of {} \u{b7} switch with right-click \u{25b8} Pose or {pose_keys}", name(pose), name(shown))
+            } else {
+                format!("Could not add {} as a pose", name(pose))
+            });
+        }
         if let Some((target, pose)) = pose_pick
             && !self.agent_active()
         {
@@ -9589,6 +9886,7 @@ impl App {
             self.editor.doc.edit("Pose", |scene| {
                 crate::cast_combine::pick_pose(scene, target, frame, pose);
             });
+            self.editor.select_posed(target, frame);
         }
         if save_asset && !self.agent_active() {
             let folder = self.editor.assets_panel.selected_folder.clone();
@@ -9826,12 +10124,14 @@ impl App {
             } else {
                 // The force on the touch that began this gesture, if it was a
                 // pen. A press is one event and carries its own.
-                self.pen_pressure = ctx.input(|i| {
-                    i.events.iter().rev().find_map(|e| match e {
-                        egui::Event::Touch { force, .. } => force.map(f64::from),
-                        _ => None,
+                self.pen_pressure = ctx
+                    .input(|i| {
+                        i.events.iter().rev().find_map(|e| match e {
+                            egui::Event::Touch { force, .. } => force.map(f64::from),
+                            _ => None,
+                        })
                     })
-                });
+                    .or(self.os_pen_last);
                 self.editor
                     .pointer_down_at(local(pos), mods, stamp, self.pen_pressure);
             }
@@ -9916,11 +10216,29 @@ impl App {
                         })
                         .collect();
                     let moves = if touches.is_empty() {
-                        i.events
+                        let pointer: Vec<egui::Pos2> = i
+                            .events
                             .iter()
                             .filter_map(|e| match e {
-                                egui::Event::PointerMoved(p) => Some((*p, None)),
+                                egui::Event::PointerMoved(p) => Some(*p),
                                 _ => None,
+                            })
+                            .collect();
+                        // A pen on macOS: the pressures the OS reported, move
+                        // for move. Should the two lists ever disagree in
+                        // length, every move takes the latest pressure rather
+                        // than a neighbour's.
+                        let os = &self.frame_pen_moves;
+                        pointer
+                            .iter()
+                            .enumerate()
+                            .map(|(k, p)| {
+                                let force = if os.len() == pointer.len() {
+                                    os[k]
+                                } else {
+                                    os.iter().rev().find_map(|f| *f)
+                                };
+                                (*p, force)
                             })
                             .collect()
                     } else {
@@ -10054,6 +10372,15 @@ impl App {
                 self.import_dialog(buzz_scene::ImportTarget::Stage)
             }
             Command::SetMasterAudio => self.set_master_audio_dialog(),
+            Command::MoveStageFrames => {
+                // The frames selected in the timeline if there are some, else
+                // from the playhead to the end; landing just after them.
+                let (first, last) = match self.editor.selection.timeline() {
+                    Some(t) => (t.first_frame, t.last_frame),
+                    None => (self.editor.current_frame, self.editor.doc.scene().frame_count().saturating_sub(1)),
+                };
+                self.move_stage = Some(MoveStageFrames { first: first + 1, last: last + 1, to: last + 2, copy: false });
+            }
             Command::LipSyncAllCharacters => self.lip_sync_all_start(),
             Command::ToggleMasterAudioMode => self.toggle_master_audio_mode(),
             Command::ImportCaptions => self.ask_for_path(
@@ -10945,6 +11272,9 @@ impl App {
             prompt_answers: Vec::new(),
             hooks: Default::default(),
             overrides,
+            dialogue: None,
+            lip_sync: None,
+            master_audio: self.editor.script_master_audio(),
         };
         let mut working = self.editor.doc.scene().clone();
         let asker = self.script_dialogs.sender();
@@ -11365,7 +11695,14 @@ impl App {
                         }
                         self.remember_document_directory(&path);
                         self.producer_note_opened(&path);
-                        self.editor.status = Some(format!("Opened {}", path.display()));
+                        // Poses set in the Cast panel since this shot was last
+                        // open reach its Pose menu.
+                        let synced = self.sync_opened_with_cast();
+                        self.editor.status = Some(if synced.is_empty() {
+                            format!("Opened {}", path.display())
+                        } else {
+                            format!("Opened {}; poses updated from the Cast for {}", path.display(), synced.join(", "))
+                        });
                     }
                     Err(why) => self.editor.status = Some(why),
                 }
@@ -12032,23 +12369,9 @@ impl App {
                     status.push_str(&format!(" \u{2014} heard by Rhubarb in {secs:.1} s"));
                 }
             }
-            AiResult::LipSyncAllHeard { lines, visemes, start, notes, secs, model } => {
-                match self.editor.lip_sync_all_apply(&lines, &visemes, start) {
-                    Ok(report) => {
-                        let mut say = format!(
-                            "Lip sync all: {} lines heard ({model}, {secs:.1} s), {} to characters on the stage, {} narrator",
-                            report.lines, report.matched, report.narrator_lines
-                        );
-                        if !report.unmatched.is_empty() {
-                            say.push_str(&format!("; no character for: {}", report.unmatched.join(" | ")));
-                        }
-                        for n in notes.iter().chain(report.warnings.iter()) {
-                            say.push_str(&format!("\n{n}"));
-                        }
-                        self.editor.status = Some(say);
-                    }
-                    Err(e) => self.editor.status = Some(format!("Lip Sync All Characters: {e}")),
-                }
+            AiResult::LipSyncAllHeard { lines, visemes, rhubarb, scripted, start, notes, secs, model } => {
+                let pending = PendingLipSyncAll { lines, visemes, rhubarb, start, notes, secs, model, had_script: scripted };
+                self.lip_sync_all_heard(pending);
             }
             AiResult::PoseSheet(images) => {
                 // Uploaded as textures by `draw_ai_panel`, which has a `Ui`.
@@ -12428,6 +12751,7 @@ impl App {
                             text: None,
                             turnaround: Default::default(),
                             drawing_object: false,
+                            brush: None,
                         };
                         match replace {
                             Some(object_id) => {
@@ -12524,7 +12848,13 @@ impl App {
                 }
             })
             .collect();
-        if self.sound_decode.is_some() {
+        // **Not on its own.** The film's audio is decoded by itself every time
+        // a file opens; shown alone that opened the progress window in the
+        // middle of the stage, over the artwork the animator went to click,
+        // and every click there went to the window until the decode ended —
+        // "the first click does not select". It still shows beside work the
+        // user started.
+        if self.sound_decode.is_some() && !rows.is_empty() {
             rows.push(buzz_ui::TaskRow {
                 id: u64::MAX,
                 kind: "Sound".to_string(),
@@ -12722,9 +13052,9 @@ impl App {
             self.editor.status = Some("Lip Sync All Characters: the scene has no dialogue sound (Sequence > Set Master Audio)".into());
             return;
         };
-        let names: Vec<String> = crate::scene_life::stage_characters(scene).iter().map(|c| c.name.clone()).collect();
+        let names: Vec<String> = crate::scene_life::talkers(scene).iter().flat_map(|t| t.names.clone()).collect();
         if names.is_empty() {
-            self.editor.status = Some("Lip Sync All Characters: there is no Cast character on the stage (Cast into the shot)".into());
+            self.editor.status = Some("Lip Sync All Characters: there is no character on the stage (cast one in, or place a character symbol)".into());
             return;
         }
         // The script, from the Episode window, when it holds one: who says what.
@@ -12734,6 +13064,7 @@ impl App {
             self.episode.screenplay_text.clone()
         };
         let script = buzz_act::screenplay::Screenplay::parse(&text);
+        let scripted = !script.scenes.is_empty();
         let fps = self.editor.doc.scene().stage().frame_rate.max(1.0);
         let (send, receive) = crossbeam_channel::bounded(1);
         let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "Lip Sync All Characters", move |ctx| {
@@ -12741,7 +13072,7 @@ impl App {
             let cancel = ctx.cancel.clone();
             match crate::scene_life::hear_dialogue(&clip, &script, &names, fps, &mut |d, t| progress.set(d as u64, t as u64), &|| cancel.is_cancelled()) {
                 Ok(h) => {
-                    let _ = send.send(AiResult::LipSyncAllHeard { lines: h.lines, visemes: h.visemes, start, notes: h.notes, secs: h.secs, model: h.model });
+                    let _ = send.send(AiResult::LipSyncAllHeard { lines: h.lines, visemes: h.visemes, rhubarb: h.rhubarb, scripted, start, notes: h.notes, secs: h.secs, model: h.model });
                     crate::tasks::TaskOutcome::Finished(String::new())
                 }
                 Err(e) => crate::tasks::TaskOutcome::Failed(format!("Lip Sync All Characters: {e}")),
@@ -15652,10 +15983,25 @@ impl App {
     /// speech recogniser (as Animate's Auto Lip-Sync hears it with its own),
     /// and the keys land on the mouth when it answers.
     fn lip_sync_with_rhubarb(&mut self) {
+        self.lip_sync_with_rhubarb_over(None);
+    }
+
+    /// [`Self::lip_sync_with_rhubarb`], over `range` (timeline frames) only when
+    /// one is given: Rhubarb hears just that stretch of the dialogue, and the
+    /// mouth keys outside it — another line's — are kept.
+    fn lip_sync_with_rhubarb_over(&mut self, range: Option<(u32, u32)>) {
         let Some((clip, start, mouth, layer, placement)) = self.editor.lip_sync_inputs() else {
             return;
         };
         let fps = self.editor.doc.scene().stage().frame_rate.max(1.0);
+        let (clip, start) = match range {
+            Some((from, to)) if to > from.max(start) => {
+                let from = from.max(start);
+                let seconds = |frame: u32| ((frame - start) as f64 / fps) as f32;
+                (std::sync::Arc::new(clip.trimmed(seconds(from), Some(seconds(to)))), from)
+            }
+            _ => (clip, start),
+        };
         let length = clip.duration_frames(fps);
         let (send, receive) = crossbeam_channel::bounded(1);
         let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "Lip Sync (Rhubarb)", move |ctx| {
@@ -15745,6 +16091,359 @@ impl App {
                 self.editor.doc.end_gesture();
             }
         }
+    }
+
+    /// **Move Stage Frames…**: everything on the stage from one frame to
+    /// another, moved or copied to start at another frame, with one button.
+    /// Frames are shown counted from 1, as the timeline counts them.
+    fn move_stage_frames_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.move_stage.take() else {
+            return;
+        };
+        let end = self.editor.doc.scene().frame_count().max(1);
+        let mut open = true;
+        let mut run = false;
+        let mut cancel = false;
+        egui::Window::new("Move Stage Frames")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label("Everything on the stage, every layer at once.");
+                egui::Grid::new("move-stage-grid").num_columns(2).show(ui, |ui| {
+                    ui.label("From frame");
+                    ui.add(egui::DragValue::new(&mut state.first).range(1..=end));
+                    ui.end_row();
+                    ui.label("To frame");
+                    ui.add(egui::DragValue::new(&mut state.last).range(state.first..=end));
+                    ui.end_row();
+                    ui.label("Place at frame");
+                    ui.add(egui::DragValue::new(&mut state.to).range(1..=u32::MAX / 2));
+                    ui.end_row();
+                });
+                ui.checkbox(&mut state.copy, "Keep the original (copy instead of move)");
+                let count = state.last.saturating_sub(state.first) + 1;
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{count} frames land on {}\u{2013}{}. Symbols matched to the frame number (F) are renumbered; the master audio stays where it is.",
+                        state.to,
+                        state.to + count - 1
+                    ))
+                    .small()
+                    .weak(),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button(if state.copy { "Copy" } else { "Move" }).clicked()
+                        || ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        run = true;
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        cancel = true;
+                    }
+                });
+            });
+        if run {
+            let (first, last) = (state.first.max(1) - 1, state.last.max(state.first).max(1) - 1);
+            self.editor.move_stage_frames(first, last, state.to.max(1) - 1, state.copy);
+            self.editor.doc.end_gesture();
+        } else if open && !cancel {
+            self.move_stage = Some(state);
+        }
+    }
+
+    /// **The dialogue heard**: each line given to whoever says it — by the
+    /// answer remembered for that speaker, else by name — and any speaker it
+    /// cannot place asked about in the Who's who window first.
+    fn lip_sync_all_heard(&mut self, pending: PendingLipSyncAll) {
+        let talkers = crate::scene_life::talkers(self.editor.doc.scene());
+        if talkers.is_empty() {
+            self.editor.status = Some("Lip Sync All Characters: there is no character on the stage".into());
+            return;
+        }
+        let cast = self.editor.workspace.speaker_cast.clone();
+        let mut rows: Vec<WhoRow> = Vec::new();
+        for l in &pending.lines {
+            let sample = l.text.split_whitespace().take(8).collect::<Vec<_>>().join(" ");
+            let (speaker, key) = match &l.speaker {
+                Some(s) if l.narrator => {
+                    let _ = s;
+                    continue;
+                }
+                Some(s) => (s.clone(), crate::scene_life::speaker_key(s)),
+                // Heard with no script and naming nobody: whose is it?
+                None if !pending.had_script => ("Lines with no speaker named".to_string(), String::new()),
+                None => continue,
+            };
+            if !key.is_empty() && crate::scene_life::speaker_for(&speaker, &talkers, &cast).is_ok() {
+                continue;
+            }
+            match rows.iter_mut().find(|r| r.key == key && r.speaker == speaker) {
+                Some(row) => row.lines += 1,
+                None => rows.push(WhoRow {
+                    speaker,
+                    key,
+                    sample,
+                    lines: 1,
+                    // One character on the stage: most likely theirs.
+                    choice: usize::from(talkers.len() == 1),
+                }),
+            }
+        }
+        if rows.is_empty() {
+            self.lip_sync_all_finish(pending, &talkers, &cast, None);
+        } else {
+            self.editor.status = Some(format!("Lip Sync All Characters: who says these lines? ({} to answer)", rows.len()));
+            self.who_is_who = Some(WhoIsWho { pending, talkers, rows });
+        }
+    }
+
+    /// **Who's who**: each speaker the lines could not be placed by, with the
+    /// characters on the stage to choose from. Answers are remembered.
+    fn who_is_who_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut who) = self.who_is_who.take() else {
+            return;
+        };
+        let mut open = true;
+        let (mut run, mut cancel) = (false, false);
+        egui::Window::new("Who's who")
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label("Who says these lines? Answered once, remembered for next time.");
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    egui::Grid::new("who-is-who").num_columns(2).striped(true).spacing([12.0, 6.0]).show(ui, |ui| {
+                        for (r, row) in who.rows.iter_mut().enumerate() {
+                            ui.vertical(|ui| {
+                                ui.strong(&row.speaker);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} line{} \u{00b7} \u{201c}{}\u{201d}",
+                                        row.lines,
+                                        if row.lines == 1 { "" } else { "s" },
+                                        row.sample
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                            });
+                            let shown = if row.choice == 0 { "Nobody on screen".to_string() } else { who.talkers[row.choice - 1].name.clone() };
+                            egui::ComboBox::from_id_salt(("who", r)).selected_text(shown).width(180.0).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut row.choice, 0, "Nobody on screen");
+                                for (i, t) in who.talkers.iter().enumerate() {
+                                    ui.selectable_value(&mut row.choice, i + 1, &t.name);
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Lip sync").clicked() {
+                        run = true;
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        cancel = true;
+                    }
+                });
+            });
+        if run {
+            let mut cast = self.editor.workspace.speaker_cast.clone();
+            let mut unnamed = None;
+            for row in &who.rows {
+                let name = if row.choice == 0 { String::new() } else { who.talkers[row.choice - 1].name.clone() };
+                if row.key.is_empty() {
+                    unnamed = Some(row.choice.checked_sub(1));
+                } else {
+                    cast.insert(row.key.clone(), name);
+                }
+            }
+            self.editor.workspace.speaker_cast = cast.clone();
+            self.editor.workspace.save();
+            let WhoIsWho { pending, talkers, .. } = who;
+            self.lip_sync_all_finish(pending, &talkers, &cast, unnamed.flatten());
+        } else if open && !cancel {
+            self.who_is_who = Some(who);
+        } else {
+            self.editor.status = Some("Lip Sync All Characters: cancelled, nothing was changed".into());
+        }
+    }
+
+    /// The shelf command that performs a character's line, when there is one:
+    /// `autoTalkingAnimation` (Shift+A), with its name and text.
+    fn talking_command(&mut self) -> Option<(String, String)> {
+        let config = buzz_script::default_config_dir();
+        self.commands_ui.ensure(config.as_deref());
+        let command = self.commands_ui.find("autoTalkingAnimation").cloned()?;
+        let source = std::fs::read_to_string(&command.path).ok()?;
+        Some(("autoTalkingAnimation".to_string(), source))
+    }
+
+    /// **Lip Sync All Characters, written**, as one undo step. Every line goes
+    /// to whoever says it; `unnamed` is who says the lines a script did not
+    /// name (when there was no script).
+    ///
+    /// - A character the talking command can drive (a character symbol, Cast
+    ///   or straight from Animate) has it run on each of its lines — the
+    ///   person's own hands, eyes, brows and blinks — and the mouth Rhubarb
+    ///   heard on that line, nowhere else.
+    /// - A Cast character rigged as layers gets the built-in talking, breath
+    ///   between its lines, blinks, and the mouth on its lines.
+    fn lip_sync_all_finish(
+        &mut self,
+        mut pending: PendingLipSyncAll,
+        talkers: &[crate::scene_life::Talker],
+        cast: &std::collections::BTreeMap<String, String>,
+        unnamed: Option<usize>,
+    ) {
+        // Each line's character, by index; the lines rewritten to name it, so
+        // the built-in writer reads them the same way.
+        let mut owner: Vec<Option<usize>> = Vec::with_capacity(pending.lines.len());
+        for l in &mut pending.lines {
+            let who = match (&l.speaker, l.narrator) {
+                (Some(_), true) => None,
+                (Some(s), false) => crate::scene_life::speaker_for(s, talkers, cast).ok().flatten(),
+                (None, _) if !pending.had_script => unnamed,
+                (None, _) => None,
+            };
+            match who {
+                Some(i) => {
+                    let named = talkers[i].folder.and_then(|f| self.editor.doc.scene().layers().get(f).map(|l| l.name.clone()));
+                    l.speaker = Some(named.unwrap_or_else(|| talkers[i].name.clone()));
+                    l.narrator = false;
+                }
+                None => l.narrator = true,
+            }
+            owner.push(who);
+        }
+        let fps = self.editor.doc.scene().stage().frame_rate.max(1.0);
+        let command = self.talking_command();
+        // Who the command performs: a character symbol stands for them.
+        let performed: Vec<usize> = (0..talkers.len())
+            .filter(|i| {
+                owner.iter().zip(&pending.lines).any(|(o, l)| {
+                    *o == Some(*i) && crate::scene_life::character_instance_at(self.editor.doc.scene(), &talkers[*i], pending.start + (l.start * fps).round() as u32).is_some()
+                })
+            })
+            .collect();
+        let skip: std::collections::HashSet<buzz_scene::LayerId> = performed.iter().filter_map(|i| talkers[*i].folder).collect();
+
+        let frame = self.editor.current_frame;
+        let checkpoint = self.editor.doc.run_checkpoint();
+        let mut warnings: Vec<String> = Vec::new();
+        let report = match self.editor.lip_sync_all_apply(&pending.lines, &pending.visemes, pending.start, &skip) {
+            Ok(r) => r,
+            Err(e) => {
+                self.editor.status = Some(format!("Lip Sync All Characters: {e}"));
+                return;
+            }
+        };
+        warnings.extend(report.warnings.iter().cloned());
+
+        // The command, line by line, on whoever says it.
+        let mut performed_lines = 0usize;
+        let mut mouthed_lines = 0usize;
+        for &i in &performed {
+            let talker = &talkers[i];
+            // Their lines, a breath apart merged into one.
+            let mut spans: Vec<std::ops::Range<u32>> = Vec::new();
+            for (o, l) in owner.iter().zip(&pending.lines) {
+                if *o != Some(i) {
+                    continue;
+                }
+                let a = pending.start + (l.start * fps).round() as u32;
+                let b = (pending.start + (l.end * fps).round() as u32).max(a + 2);
+                match spans.last_mut() {
+                    Some(last) if a <= last.end + 8 => last.end = last.end.max(b),
+                    _ => spans.push(a..b),
+                }
+            }
+            for span in spans {
+                // On the main timeline, the character picked, the playhead
+                // where the line starts.
+                if !self.editor.doc.scene().edit_path().is_empty() {
+                    self.editor.doc.edit_view(|scene| scene.edit_document());
+                    self.editor.after_context_change();
+                }
+                self.editor.set_frame(span.start);
+                let Some(id) = crate::scene_life::character_instance_at(self.editor.doc.scene(), talker, span.start) else {
+                    continue;
+                };
+                self.editor.selection.set([id]);
+                let mut lip = None;
+                if let Some((name, source)) = &command {
+                    let outcome = self.editor.run_script_source(name, source, vec![span.end.to_string()], false);
+                    match &outcome.error {
+                        Some(e) => warnings.push(format!("{}: {name} stopped at frame {}: {}", talker.name, span.start + 1, e.lines().next().unwrap_or(e))),
+                        None => performed_lines += 1,
+                    }
+                    lip = outcome.context.lip_sync;
+                }
+                // The mouth, Rhubarb's, on this line only: where the command
+                // left it, else reached from the character picked.
+                let Some(keys) = &pending.rhubarb else { continue };
+                if lip.is_none() {
+                    if !self.editor.doc.scene().edit_path().is_empty() {
+                        self.editor.doc.edit_view(|scene| scene.edit_document());
+                        self.editor.after_context_change();
+                    }
+                    self.editor.set_frame(span.start);
+                    self.editor.selection.set([id]);
+                }
+                let (from, to) = lip.unwrap_or((span.start, span.end));
+                let open = self.editor.lip_sync.open;
+                self.open_lip_sync();
+                self.editor.lip_sync.open = open;
+                if let Some((_, _, mouth, layer, placement)) = self.editor.lip_sync_inputs() {
+                    let slice = crate::scene_life::rhubarb_slice(keys, pending.start, from, to);
+                    self.editor.apply_lip_sync_keys(&slice, to.saturating_sub(from), from, mouth, layer, placement);
+                    mouthed_lines += 1;
+                } else if !warnings.iter().any(|w| w.starts_with(&format!("{}: no mouth", talker.name))) {
+                    warnings.push(format!("{}: no mouth found, so its lines are not lip-synced", talker.name));
+                }
+            }
+        }
+        if !self.editor.doc.scene().edit_path().is_empty() {
+            self.editor.doc.edit_view(|scene| scene.edit_document());
+            self.editor.after_context_change();
+        }
+        self.editor.doc.collapse_run(checkpoint, "Lip Sync All Characters");
+        self.editor.set_frame(frame);
+        self.editor.selection.clear();
+
+        let given = owner.iter().filter(|o| o.is_some()).count();
+        let mut say = format!(
+            "Lip Sync All Characters: {given} of {} lines given to characters ({}, {:.1} s)",
+            pending.lines.len(),
+            pending.model,
+            pending.secs
+        );
+        if !performed.is_empty() {
+            say.push_str(&format!(
+                "; {} performed {} lines for {}",
+                command.as_ref().map(|c| c.0.as_str()).unwrap_or("nothing"),
+                performed_lines,
+                performed.iter().map(|i| talkers[*i].name.clone()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if mouthed_lines > 0 {
+            say.push_str(&format!("; Rhubarb mouths on {mouthed_lines} lines"));
+        }
+        if !report.mouths.is_empty() {
+            say.push_str(&format!("; built-in talking for {}", report.mouths.join(", ")));
+        }
+        if command.is_none() && !performed.is_empty() {
+            warnings.push("autoTalkingAnimation is not on the shelf, so those characters only got their mouths".into());
+        }
+        for n in pending.notes.iter().chain(warnings.iter()) {
+            say.push_str(&format!("\n{n}"));
+        }
+        self.editor.status = Some(say);
     }
 
     fn quit_prompt_dialog(&mut self, ctx: &egui::Context) {
@@ -17521,6 +18220,8 @@ impl App {
         }
         // Stop a scrub's short audio burst once the drag has paused.
         self.editor.tick_scrub();
+        // The pen pressures that belong to the moves egui is about to hand over.
+        self.frame_pen_moves = std::mem::take(&mut self.os_pen_moves);
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };
@@ -18569,6 +19270,22 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         use crate::title_bar::TitleBar;
+
+        // **The pen's pressure, read while its event is still the one being
+        // handled** — see `os_pen_moves`. A release is left alone: it reports
+        // no pressure, and the stroke ends at the pressure it was drawn at.
+        match &event {
+            WindowEvent::CursorMoved { .. } => {
+                let pressure = tablet_pressure_now();
+                self.os_pen_last = pressure;
+                self.os_pen_moves.push(pressure);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            } => self.os_pen_last = tablet_pressure_now(),
+            _ => {}
+        }
 
         let Some(active) = self.active.as_mut() else {
             return;
@@ -21632,6 +22349,191 @@ mod idle_tests {
         let scene = d.app.editor.doc.scene();
         assert_eq!(scene.layers().get(mask).unwrap().kind, K::Normal);
         assert_eq!(scene.layers().get(masked).unwrap().kind, K::Normal);
+    }
+
+    /// **Renaming a layer in the running window**: double-click its name,
+    /// type, Enter — with the keyboard shortcuts, the stage and every other
+    /// panel in play, not the timeline on its own.
+    #[test]
+    fn renaming_a_layer_by_double_clicking_its_name_in_the_window() {
+        let mut d = MenuDrive::new();
+        let layer = d.app.editor.doc.scene().layers().iter().next().expect("a layer").id;
+        let name = d.app.editor.doc.scene().layers().get(layer).unwrap().name.clone();
+        // Artwork on the layer: the first click of the double-click selects
+        // it, as clicking a layer does, and a selection is what brings the
+        // Properties panel forward and rolls the Layers panel up.
+        d.app.editor.doc.edit("fixture", |s| {
+            s.add_shape(
+                layer,
+                buzz_scene::ShapeData::filled(
+                    buzz_geom::Shape::to_path(&buzz_geom::Rect::new(100.0, 100.0, 50.0, 50.0), 1e-9),
+                    peniko::Color::BLACK,
+                ),
+            );
+        });
+        d.frame(vec![]);
+        let at = d
+            .texts
+            .iter()
+            .find(|(t, r)| *t == name && r.min.y > 500.0)
+            .map(|(_, r)| r.center())
+            .unwrap_or_else(|| panic!("the timeline shows no row named {name:?}"));
+        let m = egui::Modifiers::default();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: m };
+        let key = |key, pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: m };
+        d.frame(vec![egui::Event::PointerMoved(at)]);
+        for _ in 0..2 {
+            d.frame(vec![button(true)]);
+            d.frame(vec![button(false)]);
+        }
+        d.frame(vec![]);
+        d.frame(vec![egui::Event::Text("Left".into())]);
+        d.frame(vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)]);
+        d.frame(vec![]);
+        assert_eq!(
+            d.app.editor.doc.scene().layers().get(layer).unwrap().name,
+            format!("{name}Left"),
+            "typed straight into the layer's name"
+        );
+
+        // And from the name's own menu.
+        d.layer_menu(layer);
+        d.press("Rename Layer");
+        d.frame(vec![egui::Event::Text("2".into())]);
+        d.frame(vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)]);
+        d.frame(vec![]);
+        assert_eq!(
+            d.app.editor.doc.scene().layers().get(layer).unwrap().name,
+            format!("{name}Left2"),
+            "renamed from the menu too"
+        );
+    }
+
+    /// **Who's who**: a speaker the lines could not be placed by is asked
+    /// about, by name, with the characters to choose from; Cancel changes
+    /// nothing.
+    #[test]
+    fn whos_who_asks_about_a_speaker_and_cancel_changes_nothing() {
+        let mut d = MenuDrive::new();
+        let talker = crate::scene_life::Talker { name: "shirtFront".into(), names: vec!["shirtFront".into()], folder: None, layers: Vec::new() };
+        let pending = PendingLipSyncAll {
+            lines: vec![crate::scene_life::SpokenLine { speaker: Some("DOODHWALA".into()), narrator: false, text: "Doodh le lo".into(), start: 0.0, end: 1.0 }],
+            visemes: buzz_audio::VisemeTrack { frames: Vec::new(), fps: 24.0 },
+            rhubarb: None,
+            start: 0,
+            notes: Vec::new(),
+            secs: 0.0,
+            model: String::new(),
+            had_script: true,
+        };
+        d.app.who_is_who = Some(WhoIsWho {
+            pending,
+            talkers: vec![talker],
+            rows: vec![WhoRow { speaker: "DOODHWALA".into(), key: "doodhwala".into(), sample: "Doodh le lo".into(), lines: 1, choice: 1 }],
+        });
+        let before = d.app.editor.doc.scene().revision();
+        d.frame(vec![]);
+        d.frame(vec![]);
+        assert!(d.find("Who's who").is_some(), "the window is up");
+        assert!(d.find("DOODHWALA").is_some(), "asking about the speaker by name");
+        d.press("Cancel");
+        assert!(d.app.who_is_who.is_none(), "closed");
+        assert_eq!(d.app.editor.doc.scene().revision(), before, "nothing changed");
+    }
+
+    /// **The Copy / Paste Stage button on the timeline**: pressed on one frame
+    /// it copies the stage and turns into Paste Stage; pressed on another it
+    /// pastes there and turns back.
+    #[test]
+    fn the_copy_paste_stage_button_copies_then_pastes() {
+        let mut d = MenuDrive::new();
+        let layer = d.app.editor.doc.scene().layers().iter().next().expect("a layer").id;
+        d.app.editor.doc.edit("fixture", |s| {
+            s.set_frame_count(30);
+            s.add_shape(
+                layer,
+                buzz_scene::ShapeData::filled(
+                    buzz_geom::Shape::to_path(&buzz_geom::Rect::new(100.0, 100.0, 50.0, 50.0), 1e-9),
+                    peniko::Color::BLACK,
+                ),
+            );
+        });
+        d.frame(vec![]);
+        d.press("Copy Stage");
+        assert_eq!(d.app.editor.stage_clip.as_ref().map(|c| c.0), Some(0), "copied at frame 1");
+        d.frame(vec![]);
+        assert!(d.find("Paste Stage \u{00b7} 1").is_some(), "the button now says Paste Stage");
+        d.app.editor.set_frame(20);
+        d.frame(vec![]);
+        d.press("Paste Stage \u{00b7} 1");
+        assert!(d.app.editor.stage_clip.is_none(), "pasted and let go");
+        let pasted = d.app.editor.doc.scene().layers().get(layer).unwrap().frames.keyframe_at(20).map(|k| (k.start, k.objects.len()));
+        assert_eq!(pasted, Some((20, 1)), "the drawing is keyed on frame 21");
+        d.frame(vec![]);
+        assert!(d.find("Copy Stage").is_some(), "and the button says Copy Stage again");
+    }
+
+    /// **Renaming a layer in the Layers panel**, which had no way to: double-
+    /// click its name, type, Enter. The first click selects the layer's
+    /// artwork, and a selection used to roll this very panel up (to make room
+    /// for Properties beside it) before the second click could land.
+    #[test]
+    fn renaming_a_layer_in_the_layers_panel() {
+        let mut d = MenuDrive::new();
+        // Shown, in its usual place at the top of the right-hand column.
+        d.app.editor.workspace.restore_default_place(buzz_ui::PanelId::Layers);
+        d.app.editor.workspace.set_collapsed(buzz_ui::PanelId::Layers, false);
+        let layer = d.app.editor.doc.scene().layers().iter().next().expect("a layer").id;
+        let name = d.app.editor.doc.scene().layers().get(layer).unwrap().name.clone();
+        d.app.editor.doc.edit("fixture", |s| {
+            s.add_shape(
+                layer,
+                buzz_scene::ShapeData::filled(
+                    buzz_geom::Shape::to_path(&buzz_geom::Rect::new(100.0, 100.0, 50.0, 50.0), 1e-9),
+                    peniko::Color::BLACK,
+                ),
+            );
+        });
+        d.frame(vec![]);
+        d.frame(vec![]);
+        // The panel's row, not the timeline's (which is along the bottom).
+        let at = d
+            .texts
+            .iter()
+            .find(|(t, r)| *t == name && r.min.y < 500.0)
+            .map(|(_, r)| r.center())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the Layers panel shows no row named {name:?} (open: {}, slot: {:?})",
+                    d.app.editor.workspace.is_open(buzz_ui::PanelId::Layers),
+                    d.app.editor.workspace.slot(buzz_ui::PanelId::Layers)
+                )
+            });
+        let m = egui::Modifiers::default();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: m };
+        let key = |key, pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: m };
+        d.frame(vec![egui::Event::PointerMoved(at)]);
+        for _ in 0..2 {
+            d.frame(vec![button(true)]);
+            d.frame(vec![button(false)]);
+        }
+        assert!(
+            !d.app.editor.workspace.is_collapsed(buzz_ui::PanelId::Layers),
+            "clicking a layer here does not roll the panel up"
+        );
+        assert!(d.app.editor.selection.is_layer_selected(layer), "the first click selected the layer");
+        d.frame(vec![]);
+        let renaming: Option<(buzz_scene::LayerId, String, bool)> =
+            d.ctx.data(|m| m.get_temp(egui::Id::new("layers-panel-rename")));
+        assert!(renaming.is_some(), "the double-click started a rename");
+        d.frame(vec![egui::Event::Text("Arm".into())]);
+        d.frame(vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)]);
+        d.frame(vec![]);
+        assert_eq!(
+            d.app.editor.doc.scene().layers().get(layer).unwrap().name,
+            format!("{name}Arm"),
+            "typed into the layer's name in the Layers panel"
+        );
     }
 
     /// Dragging across the frame grid from one layer down to another selects
@@ -27946,6 +28848,45 @@ mod symbol_set_tests {
         (scene, layer, id, ids)
     }
 
+    /// **Poses linked from the stage, then stepped from the keyboard.** A
+    /// character brought in from Animate has each pose as a symbol of its own
+    /// and no set, so right-click ▸ Pose had nothing to list and did not
+    /// appear. Add Pose offers the other symbols; linking them makes them
+    /// poses, and Next / Previous Pose turn the instance from the playhead on,
+    /// wrapping round, the frames before it untouched.
+    #[test]
+    fn unlinked_poses_are_added_then_stepped_with_next_and_previous_pose() {
+        let mut scene = Scene::default();
+        scene.set_frame_count(30);
+        let layer = scene.layers().iter().next().unwrap().id;
+        let [front, side, back] = ["front", "side", "back"].map(|name| scene.add_symbol(name, SymbolKind::Graphic, None));
+        let id = scene.add_instance_at(layer, 0, front, buzz_geom::Affine::IDENTITY).unwrap();
+        let mut app = App::new(GpuPreference::Automatic);
+        app.editor = Editor::new(Document::new(scene));
+        app.recovery.found.clear();
+        app.editor.set_frame(10);
+        app.editor.selection.set([id]);
+
+        assert!(crate::cast_combine::pose_choices(app.editor.doc.scene(), Some(id), 10).is_none(), "nothing linked yet");
+        let shown = crate::cast_combine::pose_symbol(app.editor.doc.scene(), Some(id), 10).expect("an instance");
+        let (similar, rest) = crate::cast_combine::addable_poses(app.editor.doc.scene(), shown);
+        for pose in [side, back] {
+            assert!(similar.iter().chain(&rest).any(|(s, _)| *s == pose), "Add Pose offers it");
+            app.editor.doc.edit("Add Pose", |s| assert!(s.library_mut().include_in_set(shown, pose)));
+        }
+
+        app.dispatch(Command::NextPose);
+        assert_eq!(symbol_on(&app, layer, 10, id), side, "from the playhead");
+        assert_eq!(symbol_on(&app, layer, 9, id), front, "the frames before it untouched");
+        app.dispatch(Command::NextPose);
+        assert_eq!(symbol_on(&app, layer, 10, id), back);
+        app.dispatch(Command::NextPose);
+        assert_eq!(symbol_on(&app, layer, 10, id), front, "wraps round");
+        app.dispatch(Command::PreviousPose);
+        assert_eq!(symbol_on(&app, layer, 10, id), back, "and back the other way");
+        assert!(app.editor.selection.contains(id), "still selected for the next press");
+    }
+
     fn symbol_on(app: &App, layer: buzz_scene::LayerId, frame: u32, id: ObjectId) -> SymbolId {
         app.editor
             .doc
@@ -28593,6 +29534,65 @@ struct PanelFollow {
     reveal: Option<buzz_scene::LayerId>,
 }
 
+/// **Lip Sync All Characters, heard**: the recording's lines and mouths,
+/// waiting to be given to the characters.
+#[derive(Debug, Clone)]
+struct PendingLipSyncAll {
+    lines: Vec<crate::scene_life::SpokenLine>,
+    visemes: buzz_audio::VisemeTrack,
+    rhubarb: Option<Vec<(u32, usize)>>,
+    start: u32,
+    notes: Vec<String>,
+    secs: f64,
+    model: String,
+    /// The lines came from a script, with speakers; else they are only heard.
+    had_script: bool,
+}
+
+/// One speaker the Who's who window asks about.
+#[derive(Debug, Clone)]
+struct WhoRow {
+    /// As the script writes it; the unnamed lines' row says so.
+    speaker: String,
+    /// What the answer is remembered under; empty for the unnamed lines,
+    /// which are this recording's only.
+    key: String,
+    /// The first words of their first line.
+    sample: String,
+    lines: usize,
+    /// 0 is nobody on screen; `i + 1` is talker `i`.
+    choice: usize,
+}
+
+/// **Who's who**: the speakers Lip Sync All Characters could not match to a
+/// character by name, asked once and remembered.
+#[derive(Debug, Clone)]
+struct WhoIsWho {
+    pending: PendingLipSyncAll,
+    talkers: Vec<crate::scene_life::Talker>,
+    rows: Vec<WhoRow>,
+}
+
+/// What Move Stage Frames… is set to while it is open, in frames counted
+/// from 1 as the timeline shows them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MoveStageFrames {
+    first: u32,
+    last: u32,
+    to: u32,
+    copy: bool,
+}
+
+impl PanelFollow {
+    /// Take the selection as it stands — one made by clicking a layer in the
+    /// timeline or the Layers panel — so `App::follow_selection_with_panels`
+    /// sees nothing new in it and leaves the panels where they are.
+    fn settle(&mut self, mut selected: Vec<buzz_scene::ObjectId>) {
+        selected.sort_unstable();
+        self.last = selected;
+    }
+}
+
 #[cfg(test)]
 mod camera_row_ui_tests {
     use super::*;
@@ -28839,3 +29839,4 @@ mod panel_follow_tests {
         assert!(front(&app, PanelId::Filters));
     }
 }
+

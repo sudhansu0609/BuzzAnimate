@@ -251,6 +251,9 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         "setLayerName",
         |state, index: i32, name: String| {
             let id = layer_id(&state.borrow(), index)?;
+            if hands_off(state, id, "renamed") {
+                return Ok(());
+            }
             state
                 .borrow_mut()
                 .scene_mut()
@@ -344,6 +347,24 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
     host_fn!(ctx, host, state, "currentFrame", |state| {
         Ok(state.borrow().context.current_frame as i32)
     });
+    // -- `fl.buzzAnimate`: what only BuzzAnimate does ---------------------------
+    host_fn!(ctx, host, state, "dialogueLineEnd", |state, frame: i32| {
+        let s = state.borrow();
+        // Half a second of quiet ends a line; a breath inside one is shorter.
+        let pause = (s.scene().stage().frame_rate * 0.5).round().max(1.0) as usize;
+        Ok(s.context
+            .dialogue
+            .as_ref()
+            .and_then(|d| crate::line_end(d, frame.max(0) as u32, pause))
+            .map_or(-1, |f| f as i32))
+    });
+    host_fn!(ctx, host, state, "requestLipSync", |state, start: i32, end: i32| {
+        if start < 0 || end <= start {
+            return Err(throw("lipSync needs a start frame and a later end frame"));
+        }
+        state.borrow_mut().context.lip_sync = Some((start as u32, end as u32));
+        Ok(())
+    });
     host_fn!(ctx, host, state, "setCurrentFrame", |state, frame: i32| {
         if frame < 0 {
             return Err(throw("a frame number cannot be negative"));
@@ -363,6 +384,9 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
     });
     host_fn!(ctx, host, state, "insertKeyframe", |state| {
         let (id, frame) = target(&state.borrow())?;
+        if hands_off(state, id, "keyed") {
+            return Ok(());
+        }
         state.borrow_mut().scene_mut().update_layer(id, |l| {
             l.frames.insert_keyframe(frame);
         });
@@ -370,6 +394,9 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
     });
     host_fn!(ctx, host, state, "insertBlankKeyframe", |state| {
         let (id, frame) = target(&state.borrow())?;
+        if hands_off(state, id, "keyed") {
+            return Ok(());
+        }
         state.borrow_mut().scene_mut().update_layer(id, |l| {
             l.frames.insert_blank_keyframe(frame);
         });
@@ -1213,6 +1240,9 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             };
             (id, f)
         };
+        if hands_off(state, id, "keyed") {
+            return Ok(());
+        }
         state.borrow_mut().scene_mut().update_layer(id, |l| {
             // Past the layer's last frame, the layer is extended first, so the
             // new keyframe carries the last drawing on (F6 there does).
@@ -1239,6 +1269,9 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
                 };
                 (id, f)
             };
+            if hands_off(state, id, "keyed") {
+                return Ok(());
+            }
             state.borrow_mut().scene_mut().update_layer(id, |l| {
                 l.frames.insert_blank_keyframe(f);
             });
@@ -1369,6 +1402,9 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         };
         if clip.is_empty() {
             return Err(throw("there is nothing on the frame clipboard"));
+        }
+        if hands_off(state, target_id, "pasted onto") {
+            return Ok(());
         }
         let mut s = state.borrow_mut();
         for (_src_layer, kfs) in clip.iter() {
@@ -1717,6 +1753,34 @@ fn layer_at(state: &State, index: i32) -> JsResult<&buzz_scene::Layer> {
 
 pub(crate) fn layer_id(state: &State, index: i32) -> JsResult<LayerId> {
     layer_at(state, index).map(|l| l.id)
+}
+
+/// **A layer a script may not rename or key**: the sequence's master audio
+/// layer on the scene the run started on ([`ScriptContext::master_audio`]),
+/// or a Master Audio guide inside a symbol. The dialogue is what every shot
+/// is cut against, and a command that keys every layer at the playhead, or
+/// renames the lot, has to pass it by and carry on with the rest — so this
+/// says `true`, with a line in the trace saying what was not done, rather
+/// than failing the script.
+fn hands_off(state: &Rc<RefCell<State>>, id: LayerId, what: &str) -> bool {
+    let kept = {
+        let s = state.borrow();
+        let Some(layer) = s.scene().layers().get(id) else {
+            return false;
+        };
+        let master = s.scene().editing_symbol().is_none() && s.master_audio == Some((s.current, id));
+        (master || layer.audio_guide).then(|| layer.name.clone())
+    };
+    match kept {
+        Some(name) => {
+            state
+                .borrow_mut()
+                .trace
+                .push(format!("Master audio layer \u{201c}{name}\u{201d} left alone: not {what}"));
+            true
+        }
+        None => false,
+    }
 }
 
 /// Where a drawing or frame operation lands: the active layer, or the front

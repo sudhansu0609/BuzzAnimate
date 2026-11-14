@@ -532,6 +532,12 @@ pub struct Object {
     /// Drawn in Object Drawing mode (Animate's drawing object): Merge strokes
     /// never fuse with it or cut it. Only meaningful on a raw shape.
     pub drawing_object: bool,
+    /// **The spine a brush stroke was drawn from**, so it can be re-widthed and
+    /// re-smoothed after it is drawn. `None` for everything that is not an
+    /// unedited brush stroke; trusted only while
+    /// [`buzz_geom::BrushSpine::describes`] the shape's path. See
+    /// [`Self::brush_spine`].
+    pub brush: Option<Arc<buzz_geom::BrushSpine>>,
 }
 
 /// One drawing of an object, seen from a particular way round.
@@ -886,6 +892,57 @@ pub fn shift_runs_for_edit(old: &str, new: &str, runs: &[TextRun]) -> Vec<TextRu
 }
 
 impl Object {
+    /// **The spine this brush stroke was drawn from**, while it still describes
+    /// the artwork — `None` once the outline has been edited any other way, or
+    /// for anything that was never a brush stroke.
+    pub fn brush_spine(&self) -> Option<&buzz_geom::BrushSpine> {
+        let spine = self.brush.as_deref()?;
+        match &self.kind {
+            ObjectKind::Shape(shape) if spine.describes(&shape.path) => Some(spine),
+            _ => None,
+        }
+    }
+
+    /// **Rebuild this brush stroke from its spine**, changed by `f` — wider,
+    /// smoother, straighter, another taper. The outline is replaced and the new
+    /// spine kept with it, so the stroke can be changed again; a gradient fill
+    /// is carried onto the new bounds. Returns `false`, changing nothing, for
+    /// anything that is not a brush stroke with a spine that still describes it.
+    pub fn rebuild_brush(
+        &mut self,
+        f: impl FnOnce(&buzz_geom::BrushSpine) -> (buzz_geom::BrushSpine, BezPath),
+    ) -> bool {
+        let Some((spine, path)) = self.brush_spine().map(f) else {
+            return false;
+        };
+        if path.elements().is_empty() {
+            return false;
+        }
+        let ObjectKind::Shape(shape) = &mut self.kind else {
+            return false;
+        };
+        if let Some(FillSpec {
+            paint: Paint::Gradient(g),
+            ..
+        }) = shape.fill.as_mut()
+        {
+            let (before, after) = (shape.path.bounding_box(), path.bounding_box());
+            if before.width() > 0.0 && before.height() > 0.0 {
+                let fit = Affine::translate(after.origin().to_vec2())
+                    * Affine::scale_non_uniform(
+                        after.width() / before.width(),
+                        after.height() / before.height(),
+                    )
+                    * Affine::translate(-before.origin().to_vec2());
+                let g = Arc::make_mut(g);
+                g.transform = fit * g.transform;
+            }
+        }
+        shape.path = path;
+        self.brush = Some(Arc::new(spine));
+        true
+    }
+
     pub fn shape(id: ObjectId, shape: ShapeData) -> Self {
         Self {
             id,
@@ -902,6 +959,7 @@ impl Object {
             text: None,
             turnaround: Turnaround::default(),
             drawing_object: false,
+            brush: None,
         }
     }
 
@@ -921,6 +979,7 @@ impl Object {
             text: None,
             turnaround: Turnaround::default(),
             drawing_object: false,
+            brush: None,
         }
     }
 
@@ -1054,6 +1113,7 @@ impl Object {
             text: None,
             turnaround: Turnaround::default(),
             drawing_object: false,
+            brush: None,
         }
     }
 }

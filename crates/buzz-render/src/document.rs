@@ -3666,12 +3666,14 @@ fn draw_layers(
     // The stage's own frame rate, not a nominal one: a strike's envelope is
     // measured in seconds, and a storm must run at the same speed in a 60 fps
     // document as in a 24 fps one. See `LightRig::resolved_at_rate`.
-    let lights = Arc::new(
-        scene
-            .lights()
-            .resolved_at_rate(frame, scene.stage().frame_rate.max(1.0))
-            .into_owned(),
-    );
+    let lights = scene.lights().resolved_at_rate(frame, scene.stage().frame_rate.max(1.0)).into_owned();
+    // **Characters keep their shadows with no light set up**: a built-in sun,
+    // shadows only, characters only (`LightRig::with_character_shadows`). On
+    // the main timeline, where the characters stand on the ground.
+    let lights = Arc::new(match scene.edit_path().is_empty() {
+        true => lights.with_character_shadows().unwrap_or(lights),
+        false => lights,
+    });
 
     // **Where each light sits in this stack.** A light anchored above a layer
     // lights that layer and those below it and nothing above — so a layer is
@@ -4209,6 +4211,39 @@ fn mask_geometry(
     (!mapped.elements().is_empty()).then_some(mapped)
 }
 
+/// **Is this layer a character** for the built-in character shadows: a Cast
+/// character's layer, or one showing a character symbol — one with head, body
+/// or arm layers inside, or holding such a symbol (a container).
+fn is_character_layer(scene: &Scene, layer: &buzz_scene::Layer, frame: u32) -> bool {
+    if layer.cast_source.is_some() {
+        return true;
+    }
+    let mut at = layer.parent;
+    for _ in 0..scene.layers().len() {
+        let Some(parent) = at.and_then(|p| scene.layers().get(p)) else { break };
+        if parent.cast_source.is_some() {
+            return true;
+        }
+        at = parent.parent;
+    }
+    layer.objects_at(frame).iter().any(|o| o.instance().is_some_and(|i| is_character_symbol(scene, i.symbol, 0)))
+}
+
+fn is_character_symbol(scene: &Scene, symbol: buzz_scene::SymbolId, depth: usize) -> bool {
+    let Some(def) = scene.library().get(symbol) else { return false };
+    let part = |name: &str| {
+        let n: String = name.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+        matches!(n.as_str(), "head" | "body" | "rightarm" | "leftarm")
+    };
+    if def.layers.iter().any(|l| part(&l.name)) {
+        return true;
+    }
+    depth < 2
+        && def.layers.iter().any(|l| {
+            l.all_objects().any(|o| o.instance().is_some_and(|i| i.symbol != symbol && is_character_symbol(scene, i.symbol, depth + 1)))
+        })
+}
+
 /// How long the keyframe governing `frame` has been on screen — what a graphic
 /// instance on the layer counts its own playhead from.
 fn elapsed_on(layer: &buzz_scene::Layer, frame: u32) -> u32 {
@@ -4508,7 +4543,7 @@ fn draw_layer(
         // tinted above; it only throws nothing. A layer rig follows its root.
         let casts_shadow = match role {
             ShadowRole::Rig(group) => layers.get(group.root).map_or(true, |root| root.casts_shadow),
-            ShadowRole::Own => layer.casts_shadow,
+            ShadowRole::Own => layer.casts_shadow && (!rig.characters_only || is_character_layer(scene, layer, frame)),
             ShadowRole::Member => false,
         };
         let shadow = (lit && cache.detail().casts() && casts_shadow)
@@ -4866,7 +4901,7 @@ fn draw_layer(
         // Trimmed away with the crescents at `LightDetail::Fill`: a rim is
         // modelling, it costs a silhouette and a stack of strokes, and a frame
         // that will not fit the rasteriser has to give something up.
-        let rim = (lit && cache.models())
+        let rim = (lit && cache.models() && !rig.shadows_only)
             .then(|| rig.key())
             .flatten()
             .and_then(|key| {
@@ -11095,6 +11130,58 @@ mod symbol_scene {
         let flat_px = gpu.render_rgba(&draw(&flat), 128, 128);
         assert_ne!(centre(&lit_px), [255, 255, 255], "the sun does shade the square when lit");
         assert_eq!(centre(&flat_px), [255, 255, 255], "shadows only: the square keeps its white");
+    }
+
+    /// **Characters throw their shadow with no light set up**: a character
+    /// symbol (it has a `body` layer) on a document with no lights throws the
+    /// shadow a sun would; a tree beside it does not; and the switch turns the
+    /// character's off. Its own colour is untouched.
+    #[test]
+    fn characters_throw_shadows_with_no_light_and_nothing_else_does() {
+        let Some(mut gpu) = GpuHarness::new() else {
+            return;
+        };
+        let camera = Camera::new(Point::new(128.0, 128.0), 1.0, Size::new(256.0, 256.0));
+        let mut draw = |scene: &Scene| {
+            let mut cache = DrawCache::new();
+            cache.symbol_scenes.enabled = false;
+            let mut vs = crate::vello::Scene::new();
+            let mut builder = SceneBuilder::new(&mut vs, &camera);
+            cache.begin();
+            draw_frame_within(&mut builder, scene, 0, Affine::IDENTITY, &FrameOptions { lit: true, ..FrameOptions::default() }, &mut cache);
+            cache.end();
+            gpu.render_rgba(&vs, 256, 256)
+        };
+        let figure = |name: &str, part: &str| {
+            let mut scene = Scene::default();
+            let symbol = scene.add_symbol(name, SymbolKind::Graphic, None);
+            scene.enter_symbol(symbol);
+            let layer = scene.layers().iter().next().unwrap().id;
+            scene.update_layer(layer, |l| l.name = part.into());
+            scene.add_shape(layer, ShapeData::filled(Rect::new(-15.0, -60.0, 15.0, 0.0).to_path(1e-9), Color::from_rgb8(0x30, 0x60, 0xC0)));
+            scene.exit_symbol();
+            let stage = scene.add_layer("Stage", buzz_scene::LayerKind::Normal);
+            scene.add_object_at(stage, 0, Object::instance_of(ObjectId(900), symbol).with_transform(Affine::translate((128.0, 170.0)))).expect("placed");
+            scene
+        };
+        let differs = |a: &[u8], b: &[u8]| a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x != y).count();
+
+        let character = figure("guy", "body");
+        assert!(!character.lights().is_active(), "no light set up");
+        let mut off = character.clone();
+        off.lights_mut().no_character_shadows = true;
+        let (with, without) = (draw(&character), draw(&off));
+        assert!(differs(&with, &without) > 200, "the character throws a shadow with no light: {} pixels", differs(&with, &without));
+        let body = |px: &[u8]| {
+            let i = (140 * 256 + 128) * 4;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+        assert_eq!(body(&with), body(&without), "and its own colour is left as painted");
+
+        let tree = figure("tree", "trunk");
+        let mut tree_off = tree.clone();
+        tree_off.lights_mut().no_character_shadows = true;
+        assert_eq!(differs(&draw(&tree), &draw(&tree_off)), 0, "a tree throws none");
     }
 
     /// **A mask inside a symbol opened in place clips where it does at the

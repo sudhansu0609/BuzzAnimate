@@ -1239,6 +1239,18 @@ pub struct LightRig {
     /// flat cartoon look that still has people standing on the ground.
     #[serde(default)]
     pub shadows_only: bool,
+    /// **Character shadows with no light set up** turned off. Off by default
+    /// (so the shadows are on): with no light of its own, a document still
+    /// gives its characters the cast shadow a light would give them, from a
+    /// built-in sun that changes nothing else — see
+    /// [`LightRig::with_character_shadows`]. A light added by hand replaces it.
+    #[serde(default)]
+    pub no_character_shadows: bool,
+    /// Only characters throw shadows from this rig: set on the built-in rig of
+    /// [`LightRig::with_character_shadows`], so a tree or the grass does not
+    /// throw one. Never saved.
+    #[serde(skip)]
+    pub characters_only: bool,
 }
 
 /// **Where a light's terminator comes from.**
@@ -1461,6 +1473,8 @@ impl Default for LightRig {
             // `#[serde(default)]` answers it `Crescent` instead.
             model: ShadeModel::Form,
             shadows_only: false,
+            no_character_shadows: false,
+            characters_only: false,
         }
     }
 }
@@ -1561,7 +1575,38 @@ impl LightRig {
             edges: self.edges,
             model: self.model,
             shadows_only: self.shadows_only,
+            no_character_shadows: self.no_character_shadows,
+            characters_only: self.characters_only,
         }
+    }
+
+    /// **The light the characters' shadows come from when there is none.**
+    /// A sun from the front left, high enough that a shadow falls back and to
+    /// the side about a character's height: the shadow a sun added by hand
+    /// throws, and nothing else of it.
+    pub fn character_shadow_light() -> Light {
+        let mut light = Light::new(LightId(u64::MAX), "Character shadows", LightKind::sun());
+        light.shadows = true;
+        light
+    }
+
+    /// **This rig, or the built-in one that gives characters their shadows.**
+    /// With no light of its own switched on, and the shadows not turned off
+    /// ([`Self::no_character_shadows`]), a rig of one built-in sun set to
+    /// Shadows only, throwing shadows from characters only: the same cast
+    /// shadow a light gives them, and no shading, tint, glow or pools.
+    /// `None` when this rig is what lights the picture.
+    pub fn with_character_shadows(&self) -> Option<LightRig> {
+        if self.is_active() || self.no_character_shadows {
+            return None;
+        }
+        Some(LightRig {
+            lights: vec![Self::character_shadow_light()],
+            enabled: true,
+            shadows_only: true,
+            characters_only: true,
+            ..self.clone_settings()
+        })
     }
 
     pub fn is_active(&self) -> bool {

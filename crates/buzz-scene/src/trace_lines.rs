@@ -2003,7 +2003,7 @@ fn chain_to_shape(
             let profile = BrushProfile {
                 width: w_max.max(1.0),
                 min_ratio: 0.0,
-                response: WidthResponse::Pressure,
+                response: WidthResponse::PRESSURE,
                 smoothing: 0.0,
                 stabiliser: 0.0,
                 taper: 0.0,

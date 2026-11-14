@@ -121,7 +121,7 @@ pub use story_panel::{
     SceneryChoice, SceneryPartChoice, ShotSummary, StoryResponse, StoryState, story_panel,
 };
 pub use style::{
-    DrawStyle, DrawingMode, EraserMode, FillKind, StrokeKind, SymmetryMode, SymmetrySettings,
+    DrawStyle, DrawingMode, EraserMode, FillKind, PaintMode, StrokeKind, SymmetryMode, SymmetrySettings,
     ToolDrawingModes,
 };
 pub use swatch_panel::{SwatchState, swatch_panel};

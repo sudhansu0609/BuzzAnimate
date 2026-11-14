@@ -64,6 +64,7 @@ fn state() -> TimelineState {
         waveforms: std::collections::BTreeMap::new(),
         beats: Vec::new(),
         shot_end: None,
+        stage_copied: None,
     }
 }
 

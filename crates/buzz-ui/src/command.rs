@@ -272,6 +272,11 @@ pub enum Command {
     /// **Clear All Keyframes…** in a symbol or character: every layer keeps
     /// one keyframe (the chosen pose) and the rest become normal frames.
     ClearAllKeyframes,
+    /// **Next Pose** / **Previous Pose**: turn the selected character to the
+    /// next (or previous) of its linked poses from the playhead on — the
+    /// right-click Pose ▸ list, stepped through from the keyboard.
+    NextPose,
+    PreviousPose,
     DeleteSymbol,
     NewLibraryFolder,
 
@@ -571,6 +576,20 @@ pub enum Command {
     ClearFrames,
     /// Play this layer's keyframes back to front.
     ReverseFrames,
+    /// **Move Stage Frames…**: everything on the stage from one frame to
+    /// another — every layer at once — moved or copied to start at another
+    /// frame, in one go. Symbols matched to the frame number (F) follow.
+    MoveStageFrames,
+    /// **Copy / Paste Stage**, one button for both: the first press takes
+    /// everything on the stage at the playhead, every layer; the next, on
+    /// another frame, pastes it there as a keyframe on each layer with every
+    /// symbol set to show that frame's number. Pressed again on the frame it
+    /// copied, it lets go. One command, so one key.
+    CopyPasteStage,
+    /// **Puppet Mode**: a character's parts as one timeline row, posed on the
+    /// stage by turning them about their joints, every pose keyed and eased.
+    /// Run again on the puppet to have the parts back as layers.
+    PuppetMode,
     /// **Clean Up Layers…**: delete empty layers, trim trailing blank
     /// frames, remove empty folders (`docs/LAYER_MANAGEMENT_PLAN.md` L2).
     CleanUpLayers,
@@ -834,6 +853,8 @@ command_table! {
             DuplicateSymbol => "duplicate_symbol",
             SymbolToAsset => "symbol_to_asset",
             ClearAllKeyframes => "clear_symbol_keyframes",
+            NextPose => "next_pose",
+            PreviousPose => "previous_pose",
             DeleteSymbol => "delete_symbol",
             NewLibraryFolder => "new_library_folder",
             BrushFromSelection => "brush_from_selection",
@@ -930,6 +951,9 @@ command_table! {
             PastePerformanceSpecial => "paste_performance_special",
             ClearFrames => "clear_frames",
             ReverseFrames => "reverse_frames",
+            MoveStageFrames => "move_stage_frames",
+            CopyPasteStage => "copy_paste_stage",
+            PuppetMode => "puppet_mode",
             CleanUpLayers => "clean_up_layers",
             ArrangeLayers => "arrange_layers",
             RepairLayerRigs => "repair_layer_rigs",
@@ -1298,6 +1322,8 @@ impl Command {
             DuplicateSymbol => "Duplicate Symbol",
             SymbolToAsset => "Keep Symbol as Asset",
             ClearAllKeyframes => "Clear All Keyframes\u{2026}",
+            NextPose => "Next Pose",
+            PreviousPose => "Previous Pose",
             DeleteSymbol => "Delete Symbol",
             NewLibraryFolder => "New Library Folder",
 
@@ -1414,6 +1440,9 @@ impl Command {
             PastePerformanceSpecial => "Paste Performance Special\u{2026}",
             ClearFrames => "Clear Frames",
             ReverseFrames => "Reverse Frames",
+            MoveStageFrames => "Move Stage Frames\u{2026}",
+            CopyPasteStage => "Copy / Paste Stage",
+            PuppetMode => "Puppet Mode",
             CleanUpLayers => "Clean Up Layers\u{2026}",
             ArrangeLayers => "Arrange Layers",
             RepairLayerRigs => "Repair Layer Rigs\u{2026}",
@@ -1573,6 +1602,10 @@ impl Command {
             EditDocument => sc(ctrl, Key::F4),
             PlaceInstance => None,
             DuplicateSymbol | SymbolToAsset | ClearAllKeyframes => None,
+            // Beside the bracket keys' own stroke weight: Option steps the
+            // character instead. Animate binds neither.
+            NextPose => sc(Modifiers::ALT, Key::CloseBracket),
+            PreviousPose => sc(Modifiers::ALT, Key::OpenBracket),
             DeleteSymbol => None,
             NewLibraryFolder => None,
 
@@ -1689,6 +1722,9 @@ impl Command {
             | PastePerformanceSpecial => None,
             ClearFrames => sc(Modifiers::ALT, Key::Backspace),
             ReverseFrames => None,
+            MoveStageFrames => None,
+            CopyPasteStage => None,
+            PuppetMode => None,
             CleanUpLayers => None,
             ArrangeLayers => None,
             RepairLayerRigs => None,
@@ -1766,6 +1802,8 @@ impl Command {
                 | RecogniseShape
                 | StraightenSelection
                 | ConvertToSymbol
+                | NextPose
+                | PreviousPose
                 | ExtendPart
                 | BrushFromSelection
                 | ClearModifiers
@@ -1891,6 +1929,9 @@ pub fn palette_commands() -> Vec<Command> {
         PastePerformanceSpecial,
         ClearFrames,
         ReverseFrames,
+        MoveStageFrames,
+        CopyPasteStage,
+        PuppetMode,
         CleanUpLayers,
         ArrangeLayers,
         RepairLayerRigs,
@@ -1921,6 +1962,8 @@ pub fn palette_commands() -> Vec<Command> {
         DuplicateSymbol,
         SymbolToAsset,
         ClearAllKeyframes,
+        NextPose,
+        PreviousPose,
         DeleteSymbol,
         NewLibraryFolder,
         CreateClassicTween,
@@ -2149,6 +2192,9 @@ mod tests {
             PastePerformanceSpecial,
             ClearFrames,
             ReverseFrames,
+            MoveStageFrames,
+            CopyPasteStage,
+            PuppetMode,
             CleanUpLayers,
             ArrangeLayers,
             RepairLayerRigs,
@@ -2175,6 +2221,8 @@ mod tests {
             DuplicateSymbol,
             SymbolToAsset,
             ClearAllKeyframes,
+            NextPose,
+            PreviousPose,
             DeleteSymbol,
             NewLibraryFolder,
             CreateClassicTween,
@@ -2341,7 +2389,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            248
+            253
         );
     }
 

@@ -5,6 +5,7 @@
 //! it that could silently drift.
 
 pub mod agent;
+pub mod puppet;
 pub mod agent_bridge;
 pub mod api;
 pub mod animate_assets;

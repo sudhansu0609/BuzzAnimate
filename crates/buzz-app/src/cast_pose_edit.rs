@@ -169,6 +169,165 @@ pub fn rename_pose(library: &mut AssetLibrary, asset: &Asset, pose: &str, label:
     Ok(full)
 }
 
+/// Whether `scene` has the Cast character `<folder>/<name>` placed in it,
+/// unpacked onto the stage as a folder of layers.
+pub fn is_placed(scene: &Scene, folder: &str, name: &str) -> bool {
+    let link = format!("{folder}/{name}");
+    let pose_link = format!("{link}|");
+    scene
+        .layers()
+        .iter()
+        .chain(scene.stage_layers().iter())
+        .any(|l| l.cast_source.as_deref().is_some_and(|s| s == link || s.starts_with(&pose_link)))
+}
+
+/// **The Cast is where a character's poses are set; a shot follows it.**
+///
+/// Makes the copy of `<folder>/<name>` already placed in `scene` match its
+/// Cast file `cast`: the poses the Cast has, in its order, under its names. A
+/// pose added in the Cast arrives here (copied with what it draws); one
+/// removed there leaves the Pose menu (its artwork stays on any frame already
+/// showing it); and `renamed`, a pose renamed in the Cast as `(old, new)` by
+/// full name, is renamed here too, with the layers that show it. Whether
+/// anything changed.
+pub fn sync_placed_character(scene: &mut Scene, cast: &Scene, folder: &str, name: &str, renamed: Option<(&str, &str)>) -> bool {
+    let placed = is_placed(scene, folder, name);
+    let Some(main) = scene.library().find_by_name(name).map(|s| s.id) else {
+        return false;
+    };
+    // A symbol that only shares the name, in a shot that never cast this
+    // character, is left alone.
+    if !placed && scene.library().symbol_set(main).is_empty() {
+        return false;
+    }
+    let mut changed = false;
+
+    if let Some((old, new)) = renamed
+        && old != new
+        && scene.library().find_by_name(new).is_none()
+        && let Some(id) = scene.library().find_by_name(old).map(|s| s.id)
+    {
+        changed |= scene.library_mut().update(id, |s| s.name = new.to_string());
+        let (from, to) = (format!("{folder}/{name}|{old}"), format!("{folder}/{name}|{new}"));
+        let relinked: Vec<LayerId> =
+            scene.layers().iter().filter(|l| l.cast_source.as_deref() == Some(from.as_str())).map(|l| l.id).collect();
+        for id in relinked {
+            changed |= scene.update_layer(id, |l| l.cast_source = Some(to.clone()));
+        }
+    }
+
+    // The Cast's poses, main first.
+    let Some(cast_main) = main_symbol(cast).or_else(|| cast.library().find_by_name(name).map(|s| s.id)) else {
+        return changed;
+    };
+    let wanted: Vec<SymbolId> = cast.library().symbol_set(cast_main).into_iter().filter(|id| *id != cast_main).collect();
+    let mut members: Vec<SymbolId> = Vec::new();
+    for id in wanted {
+        let pose_name = name_of(cast, id);
+        let here = match scene.library().find_by_name(&pose_name).map(|s| s.id) {
+            Some(here) => here,
+            None => match scene.import_symbol(cast, id) {
+                Some((here, _)) => {
+                    changed = true;
+                    here
+                }
+                None => continue,
+            },
+        };
+        // Only a symbol that can be a member: not the character itself, not
+        // the owner of a set, not in some other character's set.
+        let free = here != main
+            && scene.library().get(here).is_some_and(|s| s.set.is_empty())
+            && !scene.library().iter().any(|s| s.id != main && s.set.contains(&here));
+        if free && !members.contains(&here) {
+            members.push(here);
+        }
+    }
+    if scene.library().get(main).is_some_and(|s| s.set != members) {
+        changed |= scene.library_mut().update(main, |s| s.set = members);
+    }
+    changed
+}
+
+/// **Rename a character everywhere `scene` keeps its name**: the main symbol
+/// named `old` and every pose of it named `<old> <pose>`, a character folder
+/// named after it, and the `<folder>/<old>` Cast links of that folder and its
+/// lifted layers (`<folder>/<old>|<pose symbol>`). Used on the Cast file and on
+/// the open document alike, so a character placed before the rename still
+/// finds its poses and its Cast file after it. Whether anything changed.
+pub fn rename_character_in(scene: &mut Scene, folder: &str, old: &str, new: &str) -> bool {
+    let renamed = |name: &str| -> Option<String> {
+        if name == old {
+            Some(new.to_string())
+        } else {
+            name.strip_prefix(old).filter(|rest| rest.starts_with(' ')).map(|rest| format!("{new}{rest}"))
+        }
+    };
+    let mut changed = false;
+    // Only the set of the symbol named `old`: another symbol that merely starts
+    // with the same words ("Character 22") is not this character.
+    if let Some(main) = scene.library().find_by_name(old).map(|s| s.id) {
+        for id in scene.library().symbol_set(main) {
+            if let Some(to) = scene.library().get(id).and_then(|s| renamed(&s.name)) {
+                changed |= scene.library_mut().update(id, |s| s.name = to);
+            }
+        }
+    }
+    let link = format!("{folder}/{old}");
+    let relink = |source: &str| -> Option<String> {
+        if source == link {
+            Some(format!("{folder}/{new}"))
+        } else {
+            let pose = source.strip_prefix(&link)?.strip_prefix('|')?;
+            Some(format!("{folder}/{new}|{}", renamed(pose).unwrap_or_else(|| pose.to_string())))
+        }
+    };
+    let linked: Vec<(LayerId, String, bool)> = scene
+        .layers()
+        .iter()
+        .filter_map(|l| {
+            let source = relink(l.cast_source.as_deref()?)?;
+            Some((l.id, source, l.name == old && l.kind == buzz_scene::LayerKind::Folder))
+        })
+        .collect();
+    for (id, source, is_folder) in linked {
+        changed |= scene.update_layer(id, |l| {
+            l.cast_source = Some(source);
+            if is_folder {
+                l.name = new.to_string();
+            }
+        });
+    }
+    changed
+}
+
+/// **Rename a Cast character** to `name`: the file, and the name inside it
+/// (see [`rename_character_in`]), backup first. Refused when another character
+/// already has that name — a rename never overwrites one. The new name.
+pub fn rename_character(library: &mut AssetLibrary, asset: &Asset, name: &str, stamp: &str) -> Result<String, String> {
+    if name.trim().is_empty() {
+        return Err("the character needs a name".into());
+    }
+    let new = buzz_doc::assets::sanitise(name);
+    if new == asset.name {
+        return Ok(new);
+    }
+    let target = asset.path.with_file_name(format!("{new}.{}", buzz_doc::format::EXTENSION));
+    // A change of case only is this character's own file on a Mac's disk.
+    if target.exists() && !new.eq_ignore_ascii_case(&asset.name) {
+        return Err(format!("there is already a character called {new}"));
+    }
+    let root = root_of(library)?;
+    let mut scene = library.load(asset).map_err(|e| format!("could not read {}: {e}", asset.name))?;
+    rename_character_in(&mut scene, &asset.folder, &asset.name, &new);
+    backup_asset(&root, asset, stamp, "rename")?;
+    // Written in place, then moved: a move also carries a change of case.
+    buzz_doc::format::save(&scene, &asset.path).map_err(|e| format!("could not save {}: {e}", asset.name))?;
+    std::fs::rename(&asset.path, &target).map_err(|e| format!("could not rename {}: {e}", asset.name))?;
+    library.rescan();
+    Ok(new)
+}
+
 /// **A rig from a picture** through the cast build's picture route (judge the
 /// pose, trace the parts, rig by layers), in a scratch folder.
 pub fn rig_from_picture(picture: &Path, scratch: &Path, say: &mut dyn FnMut(&str)) -> Result<Scene, String> {
@@ -319,6 +478,15 @@ pub fn lifted_character_scene(doc: &Scene, folder: LayerId, main_name: &str) -> 
         layer.cast_source = None;
         layer.frames.advance(lead);
         stack.insert(stack.len(), layer);
+    }
+    // **Never an empty pose.** A character whose artwork is all gone in the
+    // shot — every frame blank after pose switches, or its parts cleared — has
+    // nothing to give its Cast file, and writing that back on ⌘S replaced the
+    // pose with an empty layer: the character then could not be cast at all
+    // ("has nothing to draw"). Refused, so the print is "unprintable" and the
+    // Cast file is never touched.
+    if !stack.iter().any(|l| l.frames.keyframes().iter().any(|k| !k.objects.is_empty())) {
+        return Err(format!("the character has nothing left to draw in the shot, so {pose_name} in the Cast is left as it was"));
     }
 
     let mut out = doc.clone();
@@ -504,6 +672,117 @@ mod tests {
         assert_eq!(shapes_at_0, 2, "the redrawn part is in the cast, from frame 1");
         assert!(pose.layers.iter().all(|l| l.cast_source.is_none() && l.parent.is_none_or(|p| p != folder)));
         assert!(dir.path().join(crate::cast_fresh::BACKUP_FOLDER).exists(), "the old file was kept");
+    }
+
+    /// **A shot follows the Cast.** Poses added, renamed and removed in the
+    /// Cast panel after the character was placed reach the shot's Pose menu,
+    /// in the Cast's order and under the Cast's names.
+    #[test]
+    fn a_placed_character_follows_its_cast_poses() {
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = AssetLibrary::at(dir.path());
+        let asset = saved(&mut library, "Raju");
+        let mut doc = Scene::default();
+        for name in ["Alt", "Run", "Sit"] {
+            doc.add_symbol(name, SymbolKind::Graphic, None);
+        }
+        add_pose(&mut library, &asset, "Alt", PoseInput::LibrarySymbol(&doc, "Alt"), "2026-11-03_050401").expect("added");
+        let asset = library.assets().iter().find(|a| a.name == "Raju").cloned().unwrap();
+        let mut shot = Scene::default();
+        let (_, folder) = crate::episode::place_cast(&mut shot, &library, &asset).expect("cast");
+        let folder = folder.expect("lifted into a folder");
+        let names = |shot: &Scene| -> Vec<String> { buzz_act::pose::poses_of(shot, folder).into_iter().map(|(_, n)| n).collect() };
+        assert_eq!(names(&shot), vec!["Raju", "Raju Alt"]);
+
+        // In the Cast: two poses added, one renamed.
+        add_pose(&mut library, &asset, "Run", PoseInput::LibrarySymbol(&doc, "Run"), "2026-11-03_050402").expect("added");
+        add_pose(&mut library, &asset, "Sit", PoseInput::LibrarySymbol(&doc, "Sit"), "2026-11-03_050403").expect("added");
+        let full = rename_pose(&mut library, &asset, "Raju Alt", "Walk", "2026-11-03_050404").expect("renamed");
+        let cast = library.load(&asset).expect("the cast file");
+        assert!(sync_placed_character(&mut shot, &cast, &asset.folder, "Raju", Some(("Raju Alt", &full))));
+        assert_eq!(names(&shot), vec!["Raju", "Raju Walk", "Raju Run", "Raju Sit"], "the Cast's poses, its names, its order");
+        assert!(!sync_placed_character(&mut shot, &cast, &asset.folder, "Raju", None), "already in line: nothing to do");
+
+        // Removed in the Cast: gone from the menu.
+        remove_pose(&mut library, &asset, "Raju Run", "2026-11-03_050405").expect("removed");
+        let cast = library.load(&asset).expect("the cast file");
+        assert!(sync_placed_character(&mut shot, &cast, &asset.folder, "Raju", None));
+        assert_eq!(names(&shot), vec!["Raju", "Raju Walk", "Raju Sit"]);
+
+        // A shot that never cast Raju is left alone.
+        let mut other = Scene::default();
+        other.add_symbol("Raju", SymbolKind::Graphic, None);
+        assert!(!sync_placed_character(&mut other, &cast, &asset.folder, "Raju", None));
+    }
+
+    /// **A character emptied in the shot is not written back.** Every part
+    /// cleared on the stage (here: all its artwork deleted) used to be saved
+    /// on ⌘S over the Cast pose as an empty layer, after which the character
+    /// could not be cast at all. Its Cast file stays exactly as it was.
+    #[test]
+    fn a_character_emptied_in_a_shot_leaves_its_cast_alone() {
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = AssetLibrary::at(dir.path());
+        let asset = saved(&mut library, "Raju");
+        let mut doc = Scene::default();
+        doc.add_symbol("Alt", SymbolKind::Graphic, None);
+        add_pose(&mut library, &asset, "Alt", PoseInput::LibrarySymbol(&doc, "Alt"), "2026-11-03_040401").expect("added");
+        let asset = library.assets().iter().find(|a| a.name == "Raju").cloned().unwrap();
+        let file_before = std::fs::read(&asset.path).expect("the cast file");
+
+        let mut shot = Scene::default();
+        let (_, folder) = crate::episode::place_cast(&mut shot, &library, &asset).expect("cast");
+        let folder = folder.expect("lifted into a folder");
+        assert!(lifted_character_print(&shot, folder, "Raju").is_some(), "printable while it has artwork");
+        for id in filed_under(&shot, folder) {
+            shot.update_layer(id, |l| {
+                let starts: Vec<u32> = l.frames.keyframes().iter().map(|k| k.start).collect();
+                for start in starts {
+                    l.frames.set_objects(start, Vec::new());
+                }
+            });
+        }
+
+        assert_eq!(lifted_character_print(&shot, folder, "Raju"), None, "nothing to print, so ⌘S never writes it");
+        assert!(save_lifted_character(&mut library, &shot, folder, &asset, "2026-11-03_040402").is_err());
+        assert_eq!(std::fs::read(&asset.path).expect("still there"), file_before, "the Cast file is untouched");
+    }
+
+    /// **Renaming a Cast character** renames it inside too — the main pose and
+    /// every `<Character> <pose>` — and in a film it is placed in, so the
+    /// placed character keeps its poses and its link; a name already taken is
+    /// refused rather than overwriting that character.
+    #[test]
+    fn renaming_a_cast_character_renames_its_poses_and_where_it_is_placed() {
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = AssetLibrary::at(dir.path());
+        let asset = saved(&mut library, "Raju");
+        saved(&mut library, "Ravi");
+        let mut doc = Scene::default();
+        doc.add_symbol("Alt", SymbolKind::Graphic, None);
+        add_pose(&mut library, &asset, "Side", PoseInput::LibrarySymbol(&doc, "Alt"), "2026-11-03_050501").expect("added");
+        let asset = library.assets().iter().find(|a| a.name == "Raju").cloned().unwrap();
+        let mut shot = Scene::default();
+        let (_, folder) = crate::episode::place_cast(&mut shot, &library, &asset).expect("cast");
+        let folder = folder.expect("lifted into a folder");
+
+        assert!(rename_character(&mut library, &asset, "Ravi", "2026-11-03_050502").is_err(), "Ravi is taken");
+        assert_eq!(rename_character(&mut library, &asset, "  Raj/u  ", "2026-11-03_050503").unwrap(), "Raj-u", "cleaned like any asset name");
+        let renamed = library.assets().iter().find(|a| a.name == "Raj-u").cloned().expect("listed under the new name");
+        assert!(!asset.path.exists(), "the old file is gone");
+        assert!(library.assets().iter().any(|a| a.name == "Ravi"), "the other character is untouched");
+        let back = library.load(&renamed).unwrap();
+        assert_eq!(pose_names(&back), vec!["Raj-u".to_string(), "Raj-u Side".to_string()]);
+
+        assert!(rename_character_in(&mut shot, &asset.folder, "Raju", "Raj-u"));
+        let layer = shot.layers().get(folder).unwrap();
+        assert_eq!((layer.name.as_str(), layer.cast_source.as_deref()), ("Raj-u", Some("Cast/Series/Raj-u")));
+        assert_eq!(
+            buzz_act::pose::poses_of(&shot, folder).into_iter().map(|p| p.1).collect::<Vec<_>>(),
+            vec!["Raj-u".to_string(), "Raj-u Side".to_string()],
+            "the placed character still has its poses"
+        );
+        assert!(filed_under(&shot, folder).iter().all(|id| shot.layers().get(*id).unwrap().cast_source.as_deref().is_none_or(|s| s.starts_with("Cast/Series/Raj-u|"))));
     }
 
     #[test]

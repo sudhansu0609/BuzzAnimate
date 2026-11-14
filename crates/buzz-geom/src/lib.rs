@@ -20,7 +20,7 @@ pub mod warp;
 
 pub use boolean::{BoolOp, BooleanOptions, FillMode, boolean, boolean_many, union_all};
 pub use brush::{
-    BrushBudget, BrushOutput, BrushProfile, Conditioning, PatternFit, StampPlan, StrokeSample,
+    BrushBudget, BrushOutput, BrushProfile, BrushSpine, Conditioning, PatternFit, StampPlan, StrokeSample,
     TaperEnds, TipShape, WidthResponse, catmull_rom, catmull_rom_tense, centreline, fluid_outline,
     stabilise, stamp_along, stamp_transforms,
 };

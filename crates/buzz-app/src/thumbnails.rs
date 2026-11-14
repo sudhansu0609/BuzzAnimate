@@ -52,6 +52,10 @@ use buzz_scene::{Scene, SymbolId};
 /// Big enough to tell two characters apart at a glance, small enough that a
 /// hundred of them are a few megabytes of texture.
 pub const SIZE: u32 = 96;
+/// An asset's picture, in pixels: the Assets panel draws them up to
+/// [`buzz_ui::assets_panel::MAX_EDGE`] points across, which this keeps sharp
+/// on a Retina screen down to 1.4x.
+pub const ASSET_SIZE: u32 = 192;
 
 /// How many new pictures may be drawn in one frame.
 ///
@@ -344,11 +348,21 @@ struct AssetEntry {
 /// watch: it changes when somebody writes the file, which is what
 /// [`Self::forget`] is for — the panel's Rescan already knows when that has
 /// happened.
+///
+/// **Files are read off the main thread.** Parsing an asset (often most of a
+/// megabyte) took tens of milliseconds, four a frame, on the thread that draws
+/// the window — and with a library larger than the cache, pictures evicted
+/// and asked for again kept it at that forever, so the playhead stuttered
+/// whenever the panel was open. A reader thread parses; [`Self::fulfil`]
+/// only draws what has arrived.
 #[derive(Default)]
 pub struct AssetThumbnails {
     entries: HashMap<std::path::PathBuf, AssetEntry>,
     wanted: Vec<std::path::PathBuf>,
+    /// Asked for and not yet drawn (or failed): waiting in `wanted`, or with
+    /// the reader.
     requested: HashSet<std::path::PathBuf>,
+    reader: Option<AssetReader>,
     /// Files that could not be read or drawn. Held so a broken asset costs one
     /// attempt rather than one per frame forever.
     failed: HashSet<std::path::PathBuf>,
@@ -377,7 +391,7 @@ impl AssetThumbnails {
     /// Is anything waiting to be drawn? The caller repaints while there is, so
     /// the panel fills in without the pointer having to move.
     pub fn pending(&self) -> bool {
-        !self.wanted.is_empty()
+        !self.requested.is_empty()
     }
 
     /// Throw everything away — after a rescan, when the files on disk may no
@@ -412,19 +426,24 @@ impl AssetThumbnails {
             egui_renderer.free_texture(&id);
         }
 
-        let count = PER_FRAME.min(self.wanted.len());
-        let batch: Vec<std::path::PathBuf> = self.wanted.drain(..count).collect();
-        for path in &batch {
-            self.requested.remove(path);
-        }
-
-        for path in batch {
-            let Some(asset) = library.assets().iter().find(|a| a.path == path).cloned() else {
+        // Hand what was asked for to the reader...
+        let reader = self.reader.get_or_insert_with(AssetReader::start);
+        for path in self.wanted.drain(..) {
+            if !library.assets().iter().any(|a| a.path == path) {
                 // Gone since it was asked for: deleted while the panel was
                 // being drawn is not an error, it is just nothing to draw.
+                self.requested.remove(&path);
                 continue;
-            };
-            match library.load(&asset) {
+            }
+            if reader.ask.send(path.clone()).is_err() {
+                self.requested.remove(&path);
+            }
+        }
+        // ...and draw what it has read, a few a frame.
+        let read: Vec<_> = reader.answers.try_iter().take(PER_FRAME).collect();
+        for (path, loaded) in read {
+            self.requested.remove(&path);
+            match loaded {
                 Ok(scene) => match self.draw(gpu, egui_renderer, vello, &scene, cache) {
                     Some(entry) => {
                         self.entries.insert(path, entry);
@@ -476,7 +495,7 @@ impl AssetThumbnails {
             return None;
         }
 
-        let camera = fit(bounds, SIZE);
+        let camera = fit(bounds, ASSET_SIZE);
         vello.reset();
         let mut builder = buzz_render::SceneBuilder::new(vello, &camera);
         // **Not through the asset's own camera.** An asset is a fragment — a
@@ -497,8 +516,8 @@ impl AssetThumbnails {
             .create_texture(&buzz_render::wgpu::TextureDescriptor {
                 label: Some("asset thumbnail"),
                 size: buzz_render::wgpu::Extent3d {
-                    width: SIZE,
-                    height: SIZE,
+                    width: ASSET_SIZE,
+                    height: ASSET_SIZE,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -512,7 +531,7 @@ impl AssetThumbnails {
             });
         let view = texture.create_view(&buzz_render::wgpu::TextureViewDescriptor::default());
 
-        gpu.render(vello, &view, SIZE, SIZE, peniko::Color::TRANSPARENT)
+        gpu.render(vello, &view, ASSET_SIZE, ASSET_SIZE, peniko::Color::TRANSPARENT)
             .ok()?;
 
         let id = egui_renderer.register_native_texture(
@@ -526,6 +545,32 @@ impl AssetThumbnails {
             id,
             used: self.tick,
         })
+    }
+}
+
+/// The thread that reads asset files for [`AssetThumbnails`]: paths in, parsed
+/// scenes out, one at a time. It ends when the thumbnails are dropped.
+struct AssetReader {
+    ask: std::sync::mpsc::Sender<std::path::PathBuf>,
+    answers: std::sync::mpsc::Receiver<(std::path::PathBuf, Result<Scene, buzz_doc::DocError>)>,
+}
+
+impl AssetReader {
+    fn start() -> Self {
+        let (ask, asked) = std::sync::mpsc::channel::<std::path::PathBuf>();
+        let (answer, answers) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("asset-thumbnails".into()).spawn(move || {
+            for path in asked {
+                let loaded = buzz_doc::format::load(&path);
+                if answer.send((path, loaded)).is_err() {
+                    break;
+                }
+            }
+        });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "could not start the asset thumbnail reader");
+        }
+        Self { ask, answers }
     }
 }
 

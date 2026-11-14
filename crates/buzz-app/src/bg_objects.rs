@@ -57,12 +57,39 @@ pub struct ObjectOptions {
     /// An indoor picture (`scene_is_indoor`): its furniture and props are asked for instead of
     /// buildings, and the split makes one Room layer instead of Sky / Far / Land.
     pub indoor: bool,
+    /// What makes the object masks.
+    pub masks: MaskEngine,
+    /// The look the artwork was traced in: it says whether objects get an outline of their own and
+    /// how their hole fillers are traced.
+    pub look: SplitLook,
 }
 
 impl Default for ObjectOptions {
     fn default() -> Self {
-        Self { max_objects: 8, small_objects: false, trace: BackdropOptions::default(), redetect: false, indoor: false }
+        Self { max_objects: 8, small_objects: false, trace: BackdropOptions::default(), redetect: false, indoor: false, masks: MaskEngine::Auto, look: SplitLook::Bold }
     }
+}
+
+/// The look a split's artwork is traced in (S19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SplitLook {
+    /// Trace Bold: thick black outlines, textures kept; each object gets a bold outline round it.
+    #[default]
+    Bold,
+    /// Trace Bitmap's own look: colour regions only; no outline is added round an object.
+    Normal,
+}
+
+/// What makes the object masks (S19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MaskEngine {
+    /// SAM 3 when it is installed, else SAM 2.
+    #[default]
+    Auto,
+    /// SAM 3: the VLM's names (and a fixed list) as text prompts, whole objects.
+    Sam3,
+    /// SAM 2 here, prompted with the VLM's boxes.
+    Sam2,
 }
 
 /// One object cut out of a background.
@@ -114,7 +141,7 @@ pub fn enabled(request: Option<bool>, series: &str) -> bool {
 
 /// `banyan_tree` -> `Tree`, `tea stall` -> `Tea Stall`, anything else Title Case (two words at most).
 pub fn normalise_label(raw: &str) -> String {
-    let l = raw.to_lowercase().replace(['_', '-'], " ");
+    let l = raw.to_lowercase().replace(['_', '-', '/'], " ");
     let table: [(&str, &str); 22] = [
         ("tea", "Tea Stall"),
         ("stall", "Stall"),
@@ -150,7 +177,7 @@ pub fn normalise_label(raw: &str) -> String {
 /// An indoor object's label (`scene_is_indoor`): the VLM's own words, shortened. The street
 /// names of [`normalise_label`] do not apply indoors (a lamp is no pole, a kettle no tea stall).
 pub fn normalise_indoor_label(raw: &str) -> String {
-    short_label(&raw.to_lowercase().replace(['_', '-'], " "))
+    short_label(&raw.to_lowercase().replace(['_', '-', '/'], " "))
 }
 
 /// The first two words of `l` before any joining word ("Door with iron bars" -> "Door"),
@@ -432,16 +459,18 @@ pub fn scene_is_indoor(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Ve
 /// `objects.json`; the split that called adds `result.json` (`split_cache::take_last_run`).
 /// Each box comes with whether it is a **fragment** (S14): a box from a half pass whose inner edge
 /// sits on that half's cut line, so the building behind it may have been cut in two.
-fn candidates(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>) -> Vec<(String, [u32; 4], bool)> {
+/// The VLM's objects: the kept boxes (label, box, cut-line fragment), and every name it gave
+/// that is not a person or an animal, whatever its size (SAM 3 looks for each by name).
+fn candidates(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>) -> (Vec<(String, [u32; 4], bool)>, Vec<String>) {
     use crate::split_cache as cache;
     let (w, h) = picture.dimensions();
     let Some(png) = png_bytes(picture) else {
         notes.push("objects: could not encode the picture for the VLM".into());
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let Some((backend, model)) = vlm() else {
         notes.push("objects: no VLM available; plates only".into());
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let run = cache::start_run(&png);
     cache::set_last_run(run.clone());
@@ -499,7 +528,7 @@ fn candidates(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>
             Err(e) => {
                 notes.push(format!("objects: the VLM failed ({e}); plates only"));
                 record(serde_json::json!({ "route": route, "picture": [w, h], "model": model, "error": e.to_string() }));
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             }
         };
         passes.push(serde_json::json!({ "pass": "whole picture", "objects": layout.objects.len() }));
@@ -526,6 +555,7 @@ fn candidates(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>
     };
     let mut raw_list: Vec<serde_json::Value> = Vec::new();
     let mut scored: Vec<(f64, String, [u32; 4], bool)> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     for o in &objects {
         raw_list.push(serde_json::json!({
             "label": o.label, "kind": o.kind, "bbox_norm": o.bbox,
@@ -534,13 +564,22 @@ fn candidates(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>
         if is_person_or_animal(&o.label, &o.kind) {
             continue;
         }
+        let name = if opts.indoor { normalise_indoor_label(&o.label) } else { normalise_label(&o.label) };
+        if !names.contains(&name) {
+            names.push(name);
+        }
         let b = o.bbox.map(|v| v.clamp(0.0, 1.0));
         let (x0, y0, x1, y1) = ((b[0] * w as f64) as u32, (b[1] * h as f64) as u32, (b[2] * w as f64) as u32, (b[3] * h as f64) as u32);
         if x1 <= x0 + 4 || y1 <= y0 + 4 {
             continue;
         }
         let area = ((x1 - x0) as f64 * (y1 - y0) as f64) / (w as f64 * h as f64);
-        if !(if opts.small_objects { SMALL_BOX_MIN } else { 0.004 }..=0.7).contains(&area) {
+        let floor = match (opts.small_objects, opts.indoor) {
+            (true, true) => SMALL_BOX_MIN_INDOOR,
+            (true, false) => SMALL_BOX_MIN,
+            _ => 0.004,
+        };
+        if !(floor..=0.7).contains(&area) {
             notes.push(format!("objects: {} skipped (box covers {:.1}% of the picture)", o.label, area * 100.0));
             continue;
         }
@@ -612,7 +651,7 @@ fn candidates(picture: &RgbaImage, opts: &ObjectOptions, notes: &mut Vec<String>
         "vlm_objects": raw_list,
         "kept": kept.iter().map(|(label, bbox, fragment)| serde_json::json!({ "label": label, "bbox": bbox, "fragment": fragment })).collect::<Vec<_>>(),
     }));
-    kept
+    (kept, names)
 }
 
 /// The VLM's objects for one vertical slice of `picture` (`span` = its left and right edge as
@@ -653,6 +692,36 @@ const MASK_MIN_OF_BOX: f64 = 0.35;
 /// With `small_objects`: the smallest box and mask (shares of the picture) kept.
 const SMALL_BOX_MIN: f64 = 0.0015;
 const SMALL_MASK_MIN: f64 = 0.0008;
+/// Indoors the props on the furniture count (a book on a table is 0.1 % of the picture).
+const SMALL_BOX_MIN_INDOOR: f64 = 0.0005;
+/// A thin thing's mask (a stick, a pole: under a quarter of its box) may be this small.
+const THIN_MASK_MIN: f64 = 0.0002;
+/// A thin thing is kept when its mask covers this share of its box (a diagonal pole never covers 20 %).
+const THIN_MASK_MIN_OF_BOX: f64 = 0.08;
+/// Indoors a piece of furniture fills its box: SAM 2 is tried with more prompts until it covers this.
+const FURNITURE_MASK_OF_BOX: f64 = 0.45;
+/// The VLM's boxes fall short of the object (S19: ~100 px of a 440 px table); SAM 2 is prompted
+/// with the box grown by this share of its size on each side.
+const BOX_GROW: f32 = 0.06;
+/// Of SAM 2's candidates the largest is kept (the whole, not the cleanest part) while its cover of
+/// the box is at most this many times the best-scoring one's (beyond that it took the neighbour).
+const LARGEST_COVER_MAX: f64 = 1.25;
+/// SAM 3: instances of a phrase the VLM named are kept from this score (sigmoid of the logit times
+/// the presence score); of the fixed list (asked whether or not the VLM saw one) only from the
+/// second, and its small ones (under `SAM3_PROP_AREA` of the picture) from the third: a lamp flame
+/// scores 0.53 as a cup.
+const SAM3_VLM_SCORE: f32 = 0.4;
+const SAM3_EXTRA_SCORE: f32 = 0.65;
+const SAM3_PROP_SCORE: f32 = 0.6;
+const SAM3_PROP_AREA: f64 = 0.003;
+/// Two SAM 3 instances whose masks overlap this much (IoU) are one object.
+const SAM3_SAME_IOU: f64 = 0.7;
+/// The fixed phrases SAM 3 is asked for besides the VLM's names.
+const SAM3_INDOOR: &[&str] = &[
+    "table", "counter", "shelf unit", "cupboard", "chair", "bed", "door", "window", "crate", "box", "lamp", "poster", "picture frame", "book", "cup", "bowl", "pot",
+    "bottle",
+];
+const SAM3_OUTDOOR: &[&str] = &["house", "hut", "shop", "tree", "cart", "pole", "lamp post", "fence", "well", "rock"];
 /// With `small_objects`: the share of its box a mask must cover (the VLM's box of a far
 /// building often includes the neighbour in front).
 const SMALL_MASK_MIN_OF_BOX: f64 = 0.2;
@@ -714,8 +783,9 @@ fn clean(mask: &GrayImage) -> Vec<u8> {
     out
 }
 
-/// A cleaned SAM 2 mask for `boxf`, and the share of the box it covers. Tried
-/// with the box alone first; when that covers under `min_cover`, again
+/// A cleaned SAM 2 mask for `boxf`, and the share of the box it covers. Of each prompt's
+/// candidates the largest that stays near the box is taken, not the best-scoring one (that is
+/// often a part: S19). Tried with the box alone first; when that covers under `min_cover`, again
 /// with the box plus its centre as a positive point, then (still short) with
 /// four more points inside the box; the best one is kept. A mask with more than
 /// `OUTSIDE_MAX` of its pixels outside the box grown by 4 % of its size on each side
@@ -760,15 +830,27 @@ fn mask_for_box(
     let centre = ((boxf[0] + boxf[2]) / 2.0, (boxf[1] + boxf[3]) / 2.0, true);
     let at = |fx: f32, fy: f32| (boxf[0] + (boxf[2] - boxf[0]) * fx, boxf[1] + (boxf[3] - boxf[1]) * fy, true);
     for points in [vec![], vec![centre], vec![centre, at(0.3, 0.3), at(0.7, 0.3), at(0.3, 0.7), at(0.7, 0.7)]] {
-        let mask = match buzz_ai::segment::sam2_mask(emb, &points, Some(boxf)) {
-            Ok(Some((m, _))) if m.dimensions() == (w, h) => m,
+        let all = match buzz_ai::segment::sam2_masks(emb, &points, Some(boxf)) {
+            Ok(Some(all)) if !all.is_empty() && all.iter().all(|(m, _)| m.dimensions() == (w, h)) => all,
             Ok(Some(_)) => return Err("mask has the wrong size".into()),
             Ok(None) => return Ok(None),
             Err(e) => return Err(format!("SAM 2: {e}")),
         };
-        let raw = clean(&mask);
-        let cov = coverage(&raw);
-        let near = outside(&raw) <= OUTSIDE_MAX;
+        let cands: Vec<(Vec<u8>, f32, f64, bool, usize)> = all
+            .iter()
+            .map(|(m, iou)| {
+                let raw = clean(m);
+                let (cov, near, area) = (coverage(&raw), outside(&raw) <= OUTSIDE_MAX, raw.iter().filter(|&&v| v > 0).count());
+                (raw, *iou, cov, near, area)
+            })
+            .collect();
+        let Some(top) = (0..cands.len()).max_by(|&a, &b| cands[a].1.total_cmp(&cands[b].1)) else { continue };
+        // The largest candidate near the box whose cover stays within reach of the best-scoring one's.
+        let pick = (0..cands.len())
+            .filter(|&i| i == top || (cands[i].3 && cands[i].2 <= LARGEST_COVER_MAX * cands[top].2))
+            .max_by(|&a, &b| cands[a].4.cmp(&cands[b].4).then(cands[a].1.total_cmp(&cands[b].1)))
+            .unwrap_or(top);
+        let (raw, _, cov, near, _) = cands.into_iter().nth(pick).expect("picked from the candidates");
         let slot = if near { &mut fit } else { &mut any };
         if slot.as_ref().map_or(true, |b| cov > b.1) {
             *slot = Some((raw, cov));
@@ -814,6 +896,8 @@ pub struct Detected {
     pub bbox: [u32; 4],
     /// Full picture size (0 / 255).
     pub mask: GrayImage,
+    /// The mask is already clean and fine (SAM 3 at 1008 px): it is cut along barely smoothed.
+    pub sharp: bool,
 }
 
 /// **Find the picture's objects**: the VLM's boxes, one SAM 2 mask each (retries and
@@ -835,27 +919,46 @@ pub fn detect_objects_with(
     let mut out = Vec::new();
     // This detection's run record (if it makes one) is what `take_last_run` hands the caller.
     crate::split_cache::set_last_run(None);
-    let found = candidates(picture, opts, notes);
+    let (found, names) = candidates(picture, opts, notes);
+    // SAM 3 (S19): the whole objects by name. SAM 2 is still encoded for the caller (the sky and
+    // ground masks), and makes the masks when SAM 3 is not installed.
+    let sam3 = opts.masks != MaskEngine::Sam2 && {
+        let installed = buzz_ai::sam3::sam3_installed();
+        if !installed {
+            notes.push("objects: SAM 3 is not installed (AI > Models); SAM 2 makes the masks".into());
+        }
+        installed
+    };
+    if sam3 {
+        match detect_sam3(picture, &found, &names, opts, notes) {
+            Ok(list) => {
+                let emb = if always_encode { sam2_encode(picture, notes) } else { None };
+                return (list, emb);
+            }
+            Err(e) => notes.push(format!("objects: SAM 3 failed ({e}); SAM 2 makes the masks")),
+        }
+    }
     if found.is_empty() && !always_encode {
         return (out, None);
     }
-    let emb = match buzz_ai::segment::sam2_encode(picture) {
-        Ok(Some(e)) => e,
-        Ok(None) => {
-            notes.push("objects: the SAM 2 model is not installed; plates only".into());
-            return (out, None);
-        }
-        Err(e) => {
-            notes.push(format!("objects: SAM 2 failed ({e}); plates only"));
-            return (out, None);
-        }
+    let Some(emb) = sam2_encode(picture, notes) else {
+        return (out, None);
     };
     let min_cover = if opts.small_objects { SMALL_MASK_MIN_OF_BOX } else { MASK_MIN_OF_BOX };
     // Per detection in `out`: its VLM box (before SAM) and whether it is a cut-line fragment.
     let mut vlm: Vec<([u32; 4], bool)> = Vec::new();
     for (label, bbox, fragment) in found {
-        let boxf = [bbox[0] as f32, bbox[1] as f32, bbox[2] as f32, bbox[3] as f32];
-        let want = if is_building(&label) { min_cover.max(BUILDING_MASK_OF_BOX) } else { min_cover };
+        let (gx, gy) = (BOX_GROW * (bbox[2] - bbox[0]) as f32, BOX_GROW * (bbox[3] - bbox[1]) as f32);
+        let boxf = [(bbox[0] as f32 - gx).max(0.0), (bbox[1] as f32 - gy).max(0.0), (bbox[2] as f32 + gx).min(w as f32), (bbox[3] as f32 + gy).min(h as f32)];
+        let thin = is_thin_label(&label);
+        let min_cover = if thin { THIN_MASK_MIN_OF_BOX } else { min_cover };
+        let want = if is_building(&label) {
+            min_cover.max(BUILDING_MASK_OF_BOX)
+        } else if opts.indoor && !thin {
+            min_cover.max(FURNITURE_MASK_OF_BOX)
+        } else {
+            min_cover
+        };
         let (raw, cover) = match mask_for_box(&emb, boxf, (w, h), want) {
             Ok(Some(m)) => m,
             Ok(None) => {
@@ -872,7 +975,12 @@ pub fn detect_objects_with(
             continue;
         }
         let area = raw.iter().filter(|&&v| v > 0).count() as f64 / (w as f64 * h as f64);
-        if !(if opts.small_objects { SMALL_MASK_MIN } else { 0.002 }..=0.6).contains(&area) {
+        let floor = match (opts.small_objects, thin) {
+            (true, true) => THIN_MASK_MIN,
+            (true, false) => SMALL_MASK_MIN,
+            _ => 0.002,
+        };
+        if !(floor..=0.6).contains(&area) {
             notes.push(format!("objects: {label} skipped (mask covers {:.2}% of the picture)", area * 100.0));
             continue;
         }
@@ -890,7 +998,7 @@ pub fn detect_objects_with(
         if x1 <= x0 || y1 <= y0 {
             continue;
         }
-        out.push(Detected { label, bbox: [x0, y0, x1, y1], mask });
+        out.push(Detected { label, bbox: [x0, y0, x1, y1], mask, sharp: false });
         vlm.push((bbox, fragment));
     }
     if opts.small_objects {
@@ -902,6 +1010,187 @@ pub fn detect_objects_with(
         merge_parts(&mut out, notes);
     }
     (out, Some(emb))
+}
+
+/// SAM 2's embedding of `picture`, or `None` (and why, in the notes).
+fn sam2_encode(picture: &RgbaImage, notes: &mut Vec<String>) -> Option<buzz_ai::segment::Sam2Embeddings> {
+    match buzz_ai::segment::sam2_encode(picture) {
+        Ok(Some(e)) => Some(e),
+        Ok(None) => {
+            notes.push("objects: the SAM 2 model is not installed; plates only".into());
+            None
+        }
+        Err(e) => {
+            notes.push(format!("objects: SAM 2 failed ({e}); plates only"));
+            None
+        }
+    }
+}
+
+/// A long thin thing (a stick, a pole, a rope): its mask covers little of its box.
+fn is_thin_label(label: &str) -> bool {
+    let l = label.to_lowercase();
+    ["stick", "pole", "staff", "rope", "wire", "bamboo", "rod", "cane", "broom", "ladder", "post", "spear", "flute"].iter().any(|k| l.contains(k))
+}
+
+/// Furniture: what stands on it (a book on a table, the goods on a shelf) is inside its outline.
+fn is_furniture(label: &str) -> bool {
+    let l = label.to_lowercase();
+    ["table", "counter", "shelf", "shelves", "cupboard", "cabinet", "rack", "bed", "cart", "desk", "almirah", "wardrobe", "dresser", "stand", "bench", "stall", "chest"]
+        .iter()
+        .any(|k| l.contains(k))
+}
+
+/// The tight box of a mask, `None` when it is empty.
+fn mask_bbox(mask: &GrayImage) -> Option<[u32; 4]> {
+    let (w, h) = mask.dimensions();
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
+    for (x, y, p) in mask.enumerate_pixels() {
+        if p[0] > 127 {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + 1);
+            y1 = y1.max(y + 1);
+        }
+    }
+    (x1 > x0 && y1 > y0).then_some([x0, y0, x1, y1])
+}
+
+/// A mask covering under a quarter of its box (a stick lying across it): smoothing wears it away.
+pub fn is_thin_mask(mask: &GrayImage, bbox: [u32; 4]) -> bool {
+    let box_area = (bbox[2] - bbox[0]) as f64 * (bbox[3] - bbox[1]) as f64;
+    (mask_area(mask) as f64) < 0.25 * box_area.max(1.0)
+}
+
+fn mask_iou(a: &GrayImage, b: &GrayImage) -> f64 {
+    let (mut both, mut either) = (0u64, 0u64);
+    for (p, q) in a.iter().zip(b.iter()) {
+        both += (*p > 127 && *q > 127) as u64;
+        either += (*p > 127 || *q > 127) as u64;
+    }
+    both as f64 / either.max(1) as f64
+}
+
+/// **The objects by SAM 3** (S19): each name the VLM gave (`names`; `found`, its kept boxes,
+/// says how many of each it saw) and the fixed phrases of the route are text prompts; every instance scoring high enough is one object, its
+/// mask whole. Two instances of one region (two phrases for one table) are one object, the VLM's
+/// name kept. Furniture's enclosed holes are filled (the goods on a shelf are inside it); the
+/// props themselves are objects of their own, which `plan_split` gives their shapes first.
+fn detect_sam3(
+    picture: &RgbaImage,
+    found: &[(String, [u32; 4], bool)],
+    names: &[String],
+    opts: &ObjectOptions,
+    notes: &mut Vec<String>,
+) -> Result<Vec<Detected>, String> {
+    let (w, h) = picture.dimensions();
+    let size = w as f64 * h as f64;
+    // Phrase, label, from the VLM, how many the VLM saw.
+    let mut asks: Vec<(String, String, bool, usize)> = names.iter().map(|n| (n.to_lowercase(), n.clone(), true, 0)).collect();
+    for (label, _, _) in found {
+        let phrase = label.to_lowercase();
+        match asks.iter_mut().find(|a| a.0 == phrase) {
+            Some(a) => a.3 += 1,
+            None => asks.push((phrase, label.clone(), true, 1)),
+        }
+    }
+    let extras = if opts.indoor { SAM3_INDOOR } else { SAM3_OUTDOOR };
+    for phrase in extras {
+        let known = asks.iter().any(|a| a.0 == *phrase || a.0.split_whitespace().any(|w| phrase.split_whitespace().any(|p| p == w)));
+        if !known {
+            let label = if opts.indoor { normalise_indoor_label(phrase) } else { normalise_label(phrase) };
+            asks.push((phrase.to_string(), label, false, 0));
+        }
+    }
+    let began = std::time::Instant::now();
+    let image = buzz_ai::sam3::sam3_encode(picture).map_err(|e| e.to_string())?.ok_or("the SAM 3 image encoder is not installed")?;
+    // (prompt, instance), every phrase's best first.
+    let mut instances: Vec<(usize, buzz_ai::sam3::Sam3Instance)> = Vec::new();
+    for (i, (phrase, label, vlm, n)) in asks.iter().enumerate() {
+        let most = if is_building(label) || label == "Tree" { 12 } else { 8 };
+        let threshold = if *vlm { SAM3_VLM_SCORE } else { SAM3_EXTRA_SCORE };
+        let found = buzz_ai::sam3::sam3_find(&image, phrase, threshold, (*n + 2).clamp(4, most)).map_err(|e| e.to_string())?.ok_or("the SAM 3 text encoder or decoder is not installed")?;
+        instances.extend(found.into_iter().map(|f| (i, f)));
+    }
+    notes.push(format!(
+        "objects: SAM 3 looked for {} ({} instances in {:.0} s)",
+        asks.iter().map(|a| a.0.as_str()).collect::<Vec<_>>().join(", "),
+        instances.len(),
+        began.elapsed().as_secs_f64()
+    ));
+    // (label, from the VLM, score, mask, box), best first.
+    let mut kept: Vec<(String, bool, f32, GrayImage, [u32; 4])> = Vec::new();
+    let mut ranked = instances;
+    ranked.sort_by(|a, b| b.1.score.total_cmp(&a.1.score).then(a.0.cmp(&b.0)));
+    for (prompt, inst) in ranked {
+        let (_, label, vlm, _) = &asks[prompt];
+        if is_person_or_animal(label, "") {
+            continue;
+        }
+        let raw = clean(&inst.mask);
+        let Some(mut mask) = GrayImage::from_raw(w, h, raw) else { continue };
+        let Some(bbox) = mask_bbox(&mask) else { continue };
+        let area = mask_area(&mask) as f64 / size;
+        let thin = is_thin_mask(&mask, bbox) || is_thin_label(label);
+        // A tiny thing (a cup) is kept for now: below, only when it stands on furniture.
+        if area < THIN_MASK_MIN || area > 0.6 {
+            notes.push(format!("objects: {label} {bbox:?} skipped (mask covers {:.2}% of the picture)", area * 100.0));
+            continue;
+        }
+        if !vlm && area < SAM3_PROP_AREA && inst.score < SAM3_PROP_SCORE {
+            notes.push(format!("objects: {label} {bbox:?} skipped (a small find, score {:.2})", inst.score));
+            continue;
+        }
+        if is_furniture(label) {
+            let filled = buzz_ai::segment::fill_small_holes(mask.as_raw(), w, h, 1.0);
+            mask = GrayImage::from_raw(w, h, filled).unwrap_or(mask);
+        }
+        if let Some(k) = kept.iter().position(|k| mask_iou(&k.3, &mask) > SAM3_SAME_IOU) {
+            // The same object under two names: the larger mask, the VLM's name.
+            let other = &mut kept[k];
+            if !other.1 && *vlm {
+                notes.push(format!("objects: {} {:?} is {label}", other.0, other.4));
+                other.0 = label.clone();
+                other.1 = true;
+            }
+            if mask_area(&mask) > mask_area(&other.3) {
+                other.3 = mask;
+                other.4 = bbox;
+            }
+            continue;
+        }
+        kept.push((label.clone(), *vlm, inst.score, mask, bbox));
+    }
+    // A tiny thing counts only on furniture (a cup on the table moves with it); elsewhere (the little
+    // lamps along a back wall) it stays in the picture.
+    let furniture: Vec<[u32; 4]> = kept.iter().filter(|k| is_furniture(&k.0)).map(|k| k.4).collect();
+    kept.retain(|k| {
+        let area = mask_area(&k.3) as f64 / size;
+        if area >= SMALL_MASK_MIN || is_thin_label(&k.0) || is_thin_mask(&k.3, k.4) {
+            return true;
+        }
+        let b = k.4;
+        let own = (b[2] - b[0]) as f64 * (b[3] - b[1]) as f64;
+        let on = furniture.iter().any(|f| {
+            let ix = b[2].min(f[2]).saturating_sub(b[0].max(f[0])) as f64;
+            let iy = b[3].min(f[3]).saturating_sub(b[1].max(f[1])) as f64;
+            ix * iy >= 0.8 * own
+        });
+        if !on {
+            notes.push(format!("objects: {} {:?} skipped (mask covers {:.2}% of the picture, on no furniture)", k.0, k.4, area * 100.0));
+        }
+        on
+    });
+    // The biggest first: a desk found by the fixed list must not lose its place to the VLM's cups.
+    kept.sort_by(|a, b| mask_area(&b.3).cmp(&mask_area(&a.3)).then(a.4.cmp(&b.4)));
+    let most = opts.max_objects * 2;
+    if kept.len() > most {
+        for k in &kept[most..] {
+            notes.push(format!("objects: {} {:?} skipped (more than {most} objects)", k.0, k.4));
+        }
+        kept.truncate(most);
+    }
+    Ok(kept.into_iter().map(|(label, _, _, mask, bbox)| Detected { label, bbox, mask, sharp: true }).collect())
 }
 
 fn mask_area(m: &GrayImage) -> u64 {
@@ -1052,8 +1341,13 @@ fn merge_parts(out: &mut Vec<Detected>, notes: &mut Vec<String>) {
                 if a == b || areas[a] > areas[b] || (areas[a] == areas[b] && a > b) {
                     continue;
                 }
-                // `a` is the smaller one: does it belong to `b`? Two buildings never merge.
+                // `a` is the smaller one: does it belong to `b`? Two buildings never merge, and a
+                // thin thing (a stick leaning on a table) stays itself: the smoothing of the union
+                // would wear it away (S19).
                 if is_building(&out[a].label) && is_building(&out[b].label) {
+                    continue;
+                }
+                if is_thin_label(&out[a].label) || is_thin_mask(&out[a].mask, out[a].bbox) {
                     continue;
                 }
                 let (ma, mb) = (&out[a].mask, &out[b].mask);
@@ -1118,7 +1412,7 @@ pub fn extract_objects(picture: &RgbaImage, plates: &Plates, opts: &ObjectOption
     let detected = detect_objects(picture, opts, &mut notes);
     cut.notes.append(&mut notes);
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-    for Detected { label, bbox: tight, mask } in detected {
+    for Detected { label, bbox: tight, mask, .. } in detected {
         let Some(symbol_scene) = trace_crop(picture, &mask, tight, opts) else {
             cut.notes.push(format!("objects: {label} skipped (nothing to trace)"));
             continue;

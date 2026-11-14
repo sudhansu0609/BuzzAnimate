@@ -1129,10 +1129,7 @@ pub struct App {
     /// an instance's bounds by re-walking the library is exponential in the
     /// nesting; against this table it is a lookup. Rebuilt only on an edit, so it
     /// stays warm across every frame the user scrubs through.
-    bounds_table: Option<(
-        u64,
-        std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>,
-    )>,
+    bounds_table: Option<(u64, std::sync::Arc<buzz_scene::BoundsTable>)>,
     /// Bumped whenever installed lighting geometry changes what the stage would
     /// encode, so a retained stage is invalidated when a light's shading lands.
     lights_generation: u64,
@@ -1305,6 +1302,9 @@ pub struct App {
     /// because an asset is a file on disk rather than a symbol in the open
     /// document, so it is keyed and invalidated differently.
     asset_thumbnails: crate::thumbnails::AssetThumbnails,
+    /// The Assets panel's picture size changed this frame or the last:
+    /// the workspace is saved when it stops.
+    asset_size_changed: bool,
     /// **Assets ▸ Arrange by type & style…** (AS2): the preview dialog, the
     /// task building the index and plan (or applying / undoing), and where
     /// that task reports.
@@ -1456,9 +1456,9 @@ pub struct App {
         crate::editor::TraceJob,
         crossbeam_channel::Receiver<Result<crate::editor::TraceResult, String>>,
     )>,
-    /// Trace Bold + Split into Layers (T16b): the trace in `trace_running` is to
-    /// be followed by Split Picture into Layers on the artwork it makes.
-    split_after_trace: bool,
+    /// Trace (Bold) + Split into Layers (T16b, S19): the trace in `trace_running` is to
+    /// be followed by Split Picture into Layers on the artwork it makes, in this look.
+    split_after_trace: Option<crate::bg_objects::SplitLook>,
     /// The next Split Picture into Layers asks the VLM again instead of reusing the saved
     /// object list (Shift held on the menu command, the agent's `redetect`); the split
     /// that starts takes it.
@@ -1538,6 +1538,21 @@ pub struct App {
     /// were born with. Recording the rects as they are laid out is the only
     /// way to be right about this that does not repeat the layout arithmetic.
     dock_rects: Vec<(buzz_ui::Dock, egui::Rect)>,
+    /// The panel open from the icon strip (`Workspace::icon_strip`), and the
+    /// icon it opened from, which it is drawn beside.
+    strip_flyout: Option<(buzz_ui::PanelId, egui::Rect)>,
+    /// The menus in the macOS menu bar, once built. See `native_menu`.
+    #[cfg(target_os = "macos")]
+    native_menu: Option<crate::native_menu::NativeMenu>,
+    /// When the Commands menu's scripts were last looked for on disk, for
+    /// the menu bar, which is never "shown" the way the window's menu is.
+    #[cfg(target_os = "macos")]
+    native_jsfl_scan: f64,
+    /// The document tabs and the scene/symbol path were drawn in the title
+    /// row this frame (the menus being in the macOS menu bar), so the strip
+    /// above the stage is not drawn — and what was clicked in them, handled
+    /// where that strip's clicks are.
+    tabs_in_title: Option<Option<TabAction>>,
     /// Every section on screen this frame, for a dragged panel to be dropped
     /// on. Filled as the sections are drawn, like `dock_rects`.
     drop_zones: Vec<DropZone>,
@@ -1725,6 +1740,7 @@ impl App {
             remove_pick: None,
             thumbnails: crate::thumbnails::Thumbnails::default(),
             asset_thumbnails: crate::thumbnails::AssetThumbnails::default(),
+            asset_size_changed: false,
             arrange: buzz_ui::ArrangeDialogState::default(),
             arrange_task: None,
             produce: buzz_ui::produce_dialog::ProduceDialogState::default(),
@@ -1769,7 +1785,7 @@ impl App {
             loading: std::collections::HashMap::new(),
             ai_results: std::collections::HashMap::new(),
             trace_running: None,
-            split_after_trace: false,
+            split_after_trace: None,
             split_redetect: false,
             even_lines_running: None,
             optimize_running: None,
@@ -1794,6 +1810,12 @@ impl App {
             import_batch: None,
             tasks: crate::tasks::TaskRegistry::default(),
             dock_rects: Vec::new(),
+            strip_flyout: None,
+            #[cfg(target_os = "macos")]
+            native_menu: None,
+            #[cfg(target_os = "macos")]
+            native_jsfl_scan: f64::NEG_INFINITY,
+            tabs_in_title: None,
             drop_zones: Vec::new(),
             edge_zones: Vec::new(),
             window_carry: None,
@@ -4210,6 +4232,16 @@ impl App {
                 if sections.is_empty() {
                     continue;
                 }
+                // **The Far Right column as Animate's icon strip.**
+                if dock == buzz_ui::Dock::RightOuter && workspace.icon_strip {
+                    let response = egui::Panel::right(id_name)
+                        .resizable(false)
+                        .exact_size(width)
+                        .show(ui, |ui| self.draw_icon_strip(ui, &workspace, &mut requests));
+                    self.dock_rects
+                        .push((dock, response.response.rect.intersect(window_rect)));
+                    continue;
+                }
                 let response = egui::Panel::right(id_name)
                     .resizable(false)
                     .exact_size(width)
@@ -4228,6 +4260,10 @@ impl App {
                 self.dock_rects
                     .push((dock, response.response.rect.intersect(window_rect)));
             }
+
+            // The panel opened from the icon strip, over everything else.
+            let ctx = ui.ctx().clone();
+            self.draw_strip_flyout(&ctx, &workspace, &mut commands);
 
             // **Somewhere to dock on an empty side.** A side with nothing on it
             // draws no column, and with no column there was nothing to drop a
@@ -4423,17 +4459,23 @@ impl App {
             // no height.
             {
                 let mut tab_action = None;
-                egui::Panel::top("breadcrumb")
-                    .frame(egui::Frame::new().fill(Palette::bg()).inner_margin(3))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            tab_action = self.document_tabs(ui);
-                            ui.separator();
-                            if let Some(command) = self.breadcrumb(ui) {
-                                commands.push(command);
-                            }
-                        });
-                    });
+                match self.tabs_in_title.take() {
+                    // Already on the top line this frame.
+                    Some(action) => tab_action = action,
+                    None => {
+                        egui::Panel::top("breadcrumb")
+                            .frame(egui::Frame::new().fill(Palette::bg()).inner_margin(3))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    tab_action = self.document_tabs(ui);
+                                    ui.separator();
+                                    if let Some(command) = self.breadcrumb(ui) {
+                                        commands.push(command);
+                                    }
+                                });
+                            });
+                    }
+                }
                 match tab_action {
                     Some(TabAction::Switch(i)) => self.switch_to_tab(i),
                     Some(TabAction::Close(i)) => self.request_close_tab(i),
@@ -5625,7 +5667,7 @@ impl App {
     /// alone would claim the entire row and the drag zone would never get a
     /// point of it.
     fn bounded_menu(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         commands: &mut Vec<Command>,
         template_names: &[String],
@@ -5638,6 +5680,24 @@ impl App {
         /// name.
         const DRAG_ZONE_MIN: f32 = 160.0;
 
+        // **On macOS the menus are in the menu bar at the top of the
+        // screen**, as Animate's are; the window keeps only the rest of
+        // this row. See `native_menu`.
+        #[cfg(target_os = "macos")]
+        if self.native_menus(ui.ctx(), commands, template_names, sequence_menu, can_undo, can_redo) {
+            // **And the document tabs, the scene and the symbol path take
+            // its place** on the top line, beside Zoom and Presets, as
+            // Animate's do — the strip they had above the stage is not
+            // drawn, and the stage has its height back.
+            let tabs = self.document_tabs(ui);
+            ui.separator();
+            if let Some(command) = self.breadcrumb(ui) {
+                commands.push(command);
+            }
+            self.tabs_in_title = Some(tabs);
+            return;
+        }
+
         let menu_width = (ui.available_width() - DRAG_ZONE_MIN).max(0.0);
         let menu_rect =
             egui::Rect::from_min_size(ui.cursor().min, egui::vec2(menu_width, ui.available_height()));
@@ -5645,6 +5705,54 @@ impl App {
         ui.scope_builder(egui::UiBuilder::new().max_rect(menu_rect), |ui| {
             commands.extend(panels::menu_bar(ui, &state));
         });
+    }
+
+    /// The menus in the macOS menu bar: built (or built again, when anything
+    /// in them changed) from the same description the window's menu row is
+    /// drawn from, and what was chosen in them since the last frame raised
+    /// as commands. `false` when AppKit could not be reached, and the menus
+    /// are drawn in the window instead.
+    #[cfg(target_os = "macos")]
+    fn native_menus(
+        &mut self,
+        ctx: &egui::Context,
+        commands: &mut Vec<Command>,
+        template_names: &[String],
+        sequence_menu: &panels::SequenceMenuInfo,
+        can_undo: bool,
+        can_redo: bool,
+    ) -> bool {
+        if self.native_menu.is_none() {
+            self.native_menu = crate::native_menu::NativeMenu::new(ctx);
+        }
+        if self.native_menu.is_none() {
+            return false;
+        }
+        // The scripts folder, looked at every few seconds rather than when a
+        // menu opens — the menu bar opens without the window knowing.
+        let now = ctx.input(|i| i.time);
+        if now - self.native_jsfl_scan > 3.0 {
+            self.native_jsfl_scan = now;
+            buzz_ui::jsfl_menu::mark_shown(ctx);
+        }
+        let jsfl = buzz_ui::jsfl_menu::published(ctx);
+        let rebuild = {
+            let state = self.menu_state(template_names, sequence_menu, can_undo, can_redo);
+            let shape = panels::menu_shape(&state, &jsfl);
+            let current = self.native_menu.as_ref().is_some_and(|m| m.is_current(&shape));
+            (!current).then(|| (shape, panels::menu_model(&state, &jsfl)))
+        };
+        let Some(menu) = self.native_menu.as_mut() else { return false };
+        if let Some((shape, model)) = rebuild {
+            menu.install(shape, &model);
+        }
+        for action in menu.take_chosen() {
+            match action {
+                buzz_ui::menu_ui::MenuAction::Command(command) => commands.push(command),
+                buzz_ui::menu_ui::MenuAction::Jsfl(action) => buzz_ui::jsfl_menu::raise(ctx, action),
+            }
+        }
+        true
     }
 
     /// The state `panels::menu_bar` reads, gathered from the editor. A
@@ -5700,13 +5808,16 @@ impl App {
             return;
         }
         let (rect, response) = ui.allocate_exact_size(rest, egui::Sense::click_and_drag());
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            self.editor.doc.display_name(),
-            egui::FontId::proportional(13.0),
-            Palette::text_dim(),
-        );
+        // The name, unless the document tabs are on this line already.
+        if self.tabs_in_title.is_none() {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                self.editor.doc.display_name(),
+                egui::FontId::proportional(13.0),
+                Palette::text_dim(),
+            );
+        }
         self.title_rects.drag = Some(rect);
         self.queue_title_drag(&response);
     }
@@ -5792,6 +5903,134 @@ impl App {
     /// A section holding several panels draws one header and one body: the
     /// tabs across the top, the front tab's contents below. That is the whole
     /// point of grouping — five occasional panels cost the height of one.
+    /// **The icon strip**: one icon per panel in the Far Right column, top to
+    /// bottom; a click opens that panel beside the strip (and closes it), a
+    /// right-click offers to put it back in a column. See
+    /// [`Self::draw_strip_flyout`].
+    fn draw_icon_strip(&mut self, ui: &mut egui::Ui, workspace: &buzz_ui::Workspace, requests: &mut DockRequests) {
+        let icon = buzz_ui::workspace::ICON_STRIP_WIDTH - 8.0;
+        ui.vertical_centered(|ui| {
+            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for id in workspace.on(buzz_ui::Dock::RightOuter) {
+                // Asked for from a menu (`Workspace::reveal`): open it.
+                let revealed = self.editor.workspace.scroll_to == Some(id);
+                if revealed {
+                    self.editor.workspace.scroll_to = None;
+                }
+                let open = self.strip_flyout.is_some_and(|(f, _)| f == id) || revealed;
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(icon, icon), egui::Sense::click());
+                if open {
+                    ui.painter().rect_filled(rect, 4.0, buzz_ui::theme::Palette::active());
+                } else if response.hovered() {
+                    ui.painter().rect_filled(rect, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                }
+                buzz_ui::icons::panel_icon(ui.painter(), rect.shrink(3.0), id, buzz_ui::theme::Palette::text());
+                let response = response.on_hover_text(id.title());
+                if response.clicked() {
+                    self.strip_flyout = if open { None } else { Some((id, rect)) };
+                } else if open || revealed {
+                    // Follows its icon should the strip scroll or the window resize.
+                    self.strip_flyout = Some((id, rect));
+                }
+                response.context_menu(|ui| {
+                    if ui.button("Move to the Right Column").clicked() {
+                        requests.moves.push((id, buzz_ui::Dock::Right));
+                        ui.close();
+                    }
+                    if ui.button("Close Panel").clicked() {
+                        requests.moves.push((id, buzz_ui::Dock::Hidden));
+                        ui.close();
+                    }
+                });
+            }
+        });
+    }
+
+    /// The panel opened from the icon strip, as a window to the strip's left,
+    /// level with its icon, as Animate opens Color or Swatches from its strip.
+    /// **Resizable from any edge** — anchored by its top-right corner, so its
+    /// left edge drags out away from the strip — and the size it is left at
+    /// is kept for next time. Its header docks it into the right column or
+    /// floats it free. A click anywhere but the window, the strip or a menu
+    /// the panel itself opened closes it; so does Esc, or its icon again.
+    fn draw_strip_flyout(&mut self, ctx: &egui::Context, workspace: &buzz_ui::Workspace, commands: &mut Vec<Command>) {
+        let Some((id, anchor)) = self.strip_flyout else {
+            return;
+        };
+        if !workspace.icon_strip || workspace.dock_of(id) != buzz_ui::Dock::RightOuter {
+            self.strip_flyout = None;
+            return;
+        }
+        let screen = ctx.content_rect();
+        const MIN: egui::Vec2 = egui::vec2(220.0, 160.0);
+        let remembered = workspace.slot(id).map(|s| egui::vec2(s.float_size.0, s.float_size.1));
+        let size = remembered
+            .filter(|v| v.x >= MIN.x && v.y >= MIN.y)
+            .unwrap_or(egui::vec2(300.0, 440.0))
+            .min(screen.size() - egui::vec2(80.0, 80.0));
+        let offset = egui::vec2(anchor.left() - 6.0 - screen.right(), (anchor.top() - screen.top()).clamp(30.0, (screen.height() - size.y - 30.0).max(30.0)));
+        let mut close = false;
+        let mut dock = false;
+        let mut float = false;
+        let window = egui::Window::new(id.title())
+            .id(egui::Id::new(("icon-strip-flyout", id)))
+            .anchor(egui::Align2::RIGHT_TOP, offset)
+            .default_size(size)
+            .min_size(MIN)
+            .resizable(true)
+            .collapsible(false)
+            .title_bar(false)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(id.title());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close |= ui.small_button("Close").clicked();
+                        float |= ui.small_button("Float").on_hover_text("A window of its own, anywhere").clicked();
+                        dock |= ui.small_button("Dock").on_hover_text("Into the right column, beside Properties").clicked();
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.draw_panel(ui, id, commands));
+            });
+        let Some(window) = window else { return };
+        let rect = window.response.rect;
+        // Keep the size it was dragged to.
+        if let Some(slot) = self.editor.workspace.slot_mut(id)
+            && ((slot.float_size.0 - rect.width()).abs() > 1.0 || (slot.float_size.1 - rect.height()).abs() > 1.0)
+        {
+            slot.float_size = (rect.width(), rect.height());
+        }
+        if dock {
+            self.editor.workspace.move_to(id, buzz_ui::Dock::Right);
+            self.editor.workspace.reveal(id);
+            close = true;
+        } else if float {
+            self.editor.workspace.float_at(id, (rect.left(), rect.top()));
+            close = true;
+        }
+        let strip = self
+            .dock_rects
+            .iter()
+            .find(|(d, _)| *d == buzz_ui::Dock::RightOuter)
+            .map(|(_, r)| *r);
+        let layer = window.response.layer_id;
+        let pressed_outside = ctx.input(|i| i.pointer.any_pressed())
+            && ctx.input(|i| i.pointer.interact_pos()).is_some_and(|p| {
+                let on = ctx.layer_id_at(p);
+                // Its own layer takes in the resize edges, just outside it.
+                let ours = on == Some(layer);
+                let on_popup = on.is_some_and(|l| l != layer && matches!(l.order, egui::Order::Foreground | egui::Order::Tooltip));
+                !ours && !rect.expand(8.0).contains(p) && !strip.is_some_and(|r| r.contains(p)) && !on_popup
+            });
+        if close || pressed_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.strip_flyout = None;
+        }
+    }
+
     fn draw_column(
         &mut self,
         ui: &mut egui::Ui,
@@ -6541,8 +6780,8 @@ impl App {
                 // and in the panel state so the panel can change it. Carried
                 // across either way round each frame, which is what keeps one
                 // the copy and the other the record.
-                self.editor.assets_panel.thumbnail_size =
-                    self.editor.workspace.asset_thumbnail_size;
+                self.editor.assets_panel.thumbnail_edge =
+                    self.editor.workspace.asset_thumbnail_edge;
                 let thumbs = &mut self.asset_thumbnails;
                 let action = buzz_ui::assets_panel(
                     ui,
@@ -6551,11 +6790,15 @@ impl App {
                     can_add,
                     &mut |path| thumbs.get(path),
                 );
-                if self.editor.assets_panel.thumbnail_size
-                    != self.editor.workspace.asset_thumbnail_size
+                if self.editor.assets_panel.thumbnail_edge
+                    != self.editor.workspace.asset_thumbnail_edge
                 {
-                    self.editor.workspace.asset_thumbnail_size =
-                        self.editor.assets_panel.thumbnail_size;
+                    // Saved once the resizing stops, not on every step of
+                    // a Cmd+scroll.
+                    self.editor.workspace.asset_thumbnail_edge =
+                        self.editor.assets_panel.thumbnail_edge;
+                    self.asset_size_changed = true;
+                } else if std::mem::take(&mut self.asset_size_changed) {
                     self.editor.workspace.save();
                 }
                 if let Some(action) = action {
@@ -6667,6 +6910,8 @@ impl App {
                     camera_selected: self.editor.camera_selected,
                     reveal_layer: self.panel_follow.reveal.take(),
                     selected_light: self.editor.light_panel.selected,
+                    light_row_selected: self.editor.light_row_selected,
+                    light_cells: self.editor.light_frames,
                     playing: self.editor.playback.playing,
                     onion_enabled: self.editor.onion.enabled,
                     auto_keyframe: self.editor.auto_keyframe,
@@ -8447,10 +8692,12 @@ impl App {
             // Clicking a layer takes the camera row's highlight away, as
             // clicking any row takes it from the one before.
             self.editor.camera_selected = false;
+            self.editor.light_row_selected = false;
         }
         if let Some(layers) = response.select_layers {
             self.editor.select_layers(&layers);
             self.editor.camera_selected = false;
+            self.editor.light_row_selected = false;
         }
         if clicked_a_layer {
             // A layer clicked in the timeline is not an object picked on the
@@ -8491,6 +8738,7 @@ impl App {
                 .selection
                 .select_timeline_contents(self.editor.doc.scene(), frame);
             self.editor.camera_selected = false;
+            self.editor.light_row_selected = false;
         }
         if let Some(m) = response.move_frames {
             // M3/M6: the frame selection was dragged — along its rows, onto
@@ -8601,6 +8849,7 @@ impl App {
         }
         if response.select_camera {
             self.editor.camera_selected = true;
+            self.editor.light_row_selected = false;
             // Selecting the camera row selects the Camera tool, which is what
             // Animate does — the row and the tool are the same idea.
             commands.push(Command::SelectTool(ToolId::Camera));
@@ -8621,16 +8870,13 @@ impl App {
             // clicking any row takes the highlight from the one before.
             self.editor.light_panel.selected = Some(id);
             self.editor.camera_selected = false;
+            // ...and F5/F6/F7 key the light, as they would a layer.
+            self.editor.light_row_selected = true;
+            self.editor.light_frames = response.select_light_cells.map(|(_, a, b)| (a, b));
             self.editor.set_tool(ToolId::Selection);
         }
         if let Some((id, above)) = response.place_light {
             self.editor.place_light(id, above);
-        }
-        if let Some((id, frame)) = response.light_key {
-            self.editor.key_light_at(id, frame);
-        }
-        if let Some((id, frame)) = response.light_unkey {
-            self.editor.unkey_light_at(id, frame);
         }
         if let Some(action) = response.action {
             commands.push(match action {
@@ -9142,7 +9388,10 @@ impl App {
     }
 
     fn stage_scrollbars(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
-        const THICKNESS: f32 = 9.0;
+        // The panels' own scroll bars' width — see the colours below.
+        let thickness = ui.spacing().scroll.bar_width.max(6.0);
+        #[allow(non_snake_case)]
+        let THICKNESS = thickness;
         /// How far the bars sit in from the edge of the drawing area.
         const INSET: f32 = 4.0;
         if area.width() < 120.0 || area.height() < 120.0 {
@@ -9173,11 +9422,18 @@ impl App {
         // dark track all but vanished. A light thumb with a dark edge, on a
         // dark track with a light edge, stands out on white and on the dark
         // pasteboard alike — the way the system's own overlay scrollbars do.
-        let track_colour = egui::Color32::from_black_alpha(110);
-        let track_edge = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70));
-        let thumb_colour = egui::Color32::from_gray(225);
-        let thumb_edge = egui::Stroke::new(1.0, egui::Color32::from_black_alpha(190));
-        let thumb_hot = buzz_ui::Palette::active();
+        //
+        // **Styled as the panels' scroll bars are** (user 2026-11-14): the
+        // theme's own thumb colours — resting, hovered, dragged — with no
+        // outline, and the track shown only while the pointer is on it.
+        let widgets = &ui.visuals().widgets;
+        let thumb_colour = widgets.inactive.bg_fill;
+        let thumb_hover = widgets.hovered.bg_fill;
+        let thumb_hot = widgets.active.bg_fill;
+        let track_hover = ui.visuals().extreme_bg_color.gamma_multiply(0.6);
+        let track_colour = egui::Color32::TRANSPARENT;
+        let track_edge = egui::Stroke::NONE;
+        let thumb_edge = egui::Stroke::NONE;
         // Clear of the panel edge, and clear of the corner where the two bars
         // would otherwise meet.
         let area = area.shrink(INSET);
@@ -9199,12 +9455,15 @@ impl App {
             );
             let (thumb, fraction) =
                 thumb_of(track, extent.x0, extent.x1, visible.x0, visible.x1, true);
-            ui.painter().rect(track, THICKNESS / 2.0, track_colour, track_edge, egui::StrokeKind::Inside);
+            let track_fill = if response.hovered() || response.dragged() { track_hover } else { track_colour };
+            ui.painter().rect(track, THICKNESS / 2.0, track_fill, track_edge, egui::StrokeKind::Inside);
             ui.painter().rect(
                 thumb,
                 THICKNESS / 2.0,
-                if response.hovered() || response.dragged() {
+                if response.dragged() {
                     thumb_hot
+                } else if response.hovered() {
+                    thumb_hover
                 } else {
                     thumb_colour
                 },
@@ -9239,12 +9498,15 @@ impl App {
                 egui::Sense::click_and_drag(),
             );
             let (thumb, _) = thumb_of(track, extent.y0, extent.y1, visible.y0, visible.y1, false);
-            ui.painter().rect(track, THICKNESS / 2.0, track_colour, track_edge, egui::StrokeKind::Inside);
+            let track_fill = if response.hovered() || response.dragged() { track_hover } else { track_colour };
+            ui.painter().rect(track, THICKNESS / 2.0, track_fill, track_edge, egui::StrokeKind::Inside);
             ui.painter().rect(
                 thumb,
                 THICKNESS / 2.0,
-                if response.hovered() || response.dragged() {
+                if response.dragged() {
                     thumb_hot
+                } else if response.hovered() {
+                    thumb_hover
                 } else {
                     thumb_colour
                 },
@@ -9291,7 +9553,7 @@ impl App {
                 // Keep the symbol-bounds table warm for this revision, so the
                 // recompute below is a lookup per object even while scrubbing.
                 if self.bounds_table.as_ref().map(|(r, _)| *r) != Some(revision) {
-                    let table = self.editor.scene().symbol_bounds_table();
+                    let table = self.editor.scene().cached_bounds_table();
                     self.bounds_table = Some((revision, table));
                 }
                 let ext = self.compute_content_extent(frame);
@@ -9313,7 +9575,7 @@ impl App {
         let mut extent = scene.stage().stage_rect();
 
         let empty = std::collections::HashMap::new();
-        let table = self.bounds_table.as_ref().map(|(_, t)| t).unwrap_or(&empty);
+        let table = self.bounds_table.as_ref().map(|(_, t)| &**t).unwrap_or(&empty);
         for layer in scene.layers().iter() {
             for object in layer.objects_at(frame) {
                 let bounds = scene.resolved_bounds_with(object, table);
@@ -10439,7 +10701,8 @@ impl App {
             Command::AiRemoveObject => self.ai_remove_object_begin(),
             Command::DeleteAndFill => self.delete_and_fill(),
             Command::AiSplitPictureIntoLayers => self.ai_split_picture_async(),
-            Command::TraceBoldSplit => self.trace_bold_split_async(),
+            Command::TraceBoldSplit => self.trace_split_async(crate::bg_objects::SplitLook::Bold),
+            Command::TraceSplit => self.trace_split_async(crate::bg_objects::SplitLook::Normal),
             Command::AiGenerateBackground => self.gen_bg.open = true,
             Command::AiDirectStory => self.ai_direct_story_async(),
             // Auto-rigging renders the symbol on the GPU and runs pose
@@ -13360,7 +13623,7 @@ impl App {
         // A raw bitmap goes the Trace Bold + Split way (T17): one look
         // whichever command is used.
         if self.selected_picture().is_some() {
-            self.trace_bold_split_async();
+            self.trace_split_async(crate::bg_objects::SplitLook::Bold);
             return;
         }
         self.ai_split_picture_with(false);
@@ -13383,27 +13646,28 @@ impl App {
         })
     }
 
-    /// **Modify ▸ Bitmap ▸ Trace Bold + Split into Layers**: the selected
-    /// picture traced with the Bold preset (Keep textures on), on a task
-    /// thread; when it lands, `poll_trace` goes on to split the artwork it
-    /// made into layers (the new shapes are the selection then).
-    pub(crate) fn trace_bold_split_async(&mut self) {
-        self.editor.trace_in_background(buzz_scene::TraceOptions::bold().with_saved_tuning());
+    /// **AI ▸ Trace Bold + Split into Layers** / **Trace + Split into Layers**:
+    /// the selected picture traced in `look` (Bold: the Bold preset, Keep
+    /// textures on; Normal: Trace Bitmap's own), on a task thread; when it
+    /// lands, `poll_trace` goes on to split the artwork it made into layers (the
+    /// new shapes are the selection then).
+    pub(crate) fn trace_split_async(&mut self, look: crate::bg_objects::SplitLook) {
+        self.editor.trace_in_background(split_trace_options(look));
         if self.editor.pending_trace.is_some() {
-            self.split_after_trace = true;
+            self.split_after_trace = Some(look);
             self.editor.status = Some("Tracing, then splitting into layers\u{2026} (Tasks panel)".into());
         }
     }
 
     /// The same for the agent: the trace runs here and now, the split as a
     /// job (`ai_split_picture_into_layers`). Returns the split's job id.
-    pub(crate) fn agent_trace_bold_split(&mut self) -> Result<u64, String> {
-        self.editor.trace_with(buzz_scene::TraceOptions::bold().with_saved_tuning());
+    pub(crate) fn agent_trace_split(&mut self, look: crate::bg_objects::SplitLook) -> Result<u64, String> {
+        self.editor.trace_with(split_trace_options(look));
         if self.editor.selection.is_empty() {
             return Err(self.editor.status.clone().unwrap_or_else(|| "the trace made nothing".into()));
         }
         self.last_ai_task = None;
-        self.ai_split_picture_with(false);
+        self.ai_split_picture_as(false, look);
         self.agent_track_last_job("ai_split_picture_into_layers")
             .ok_or_else(|| self.editor.status.clone().unwrap_or_else(|| "the split task did not start".into()))
     }
@@ -13411,16 +13675,21 @@ impl App {
     /// [`Self::ai_split_picture_async`], tracing the plates and the objects
     /// with bold outlines when `bold` (Generate Background's one-go path).
     pub(crate) fn ai_split_picture_with(&mut self, bold: bool) {
-        // SAM 2, LaMa and the tracer share the memory ComfyUI's models sit in.
+        self.ai_split_picture_as(bold, crate::bg_objects::SplitLook::Bold);
+    }
+
+    /// [`Self::ai_split_picture_with`], a picture traced and its artwork split in `look`.
+    pub(crate) fn ai_split_picture_as(&mut self, bold: bool, look: crate::bg_objects::SplitLook) {
+        // SAM, LaMa and the tracer share the memory ComfyUI's models sit in.
         crate::comfy::free_for_heavy_task();
         if self.selected_picture().is_some() {
             // Same route as Trace Bold + Split (T17); the old flat-plate
             // picture path below only runs when the trace made nothing.
-            self.editor.trace_with(buzz_scene::TraceOptions::bold().with_saved_tuning());
+            self.editor.trace_with(split_trace_options(look));
         }
         let picked = self.selected_picture();
         let Some((layer, object_id, asset, object_transform, fill_transform)) = picked else {
-            self.ai_split_artwork_async();
+            self.ai_split_artwork_async(look);
             return;
         };
         let redetect = std::mem::take(&mut self.split_redetect);
@@ -13496,7 +13765,7 @@ impl App {
     /// the selected vector shapes, else the active layer's frame, are rendered,
     /// the objects found, and each object becomes one symbol on one new layer.
     /// Off the UI thread; `commit_split_artwork` applies it as one undo step.
-    fn ai_split_artwork_async(&mut self) {
+    fn ai_split_artwork_async(&mut self, look: crate::bg_objects::SplitLook) {
         let redetect = std::mem::take(&mut self.split_redetect);
         let scene = self.editor.doc.scene().clone();
         let frame = self.editor.frame();
@@ -13529,7 +13798,7 @@ impl App {
                     progress.set(step, 4);
                     progress.detail(what);
                 };
-                let opts = crate::bg_objects::ObjectOptions { trace: crate::backdrop::BackdropOptions::default(), max_objects: 16, small_objects: true, redetect, ..Default::default() };
+                let opts = crate::bg_objects::ObjectOptions { trace: crate::backdrop::BackdropOptions::default(), max_objects: 16, small_objects: true, redetect, look, ..Default::default() };
                 match crate::split_artwork::plan_split(&scene, layer, frame, ids.as_deref(), &opts, &mut note) {
                     Ok(plan) => {
                         let _ = send.send(AiResult::SplitArtwork(Box::new(plan)));
@@ -13771,6 +14040,12 @@ impl App {
             record: plan.record.clone(),
             removed: plan.removed.iter().copied().filter(|id| present.contains(id)).collect(),
         };
+        // Where each object lands in `plan_now` (a dropped one nowhere), so what stands on it follows.
+        let mut at: Vec<Option<usize>> = Vec::new();
+        for o in &plan.objects {
+            let keep = o.plate.is_some() || o.shape_ids.iter().any(|id| present.contains(id)) || o.cuts.iter().any(|c| present.contains(&c.id));
+            at.push(keep.then(|| at.iter().flatten().count()));
+        }
         for o in &plan.objects {
             let shape_ids: Vec<_> = o.shape_ids.iter().copied().filter(|id| present.contains(id)).collect();
             if o.plate.is_some() || !shape_ids.is_empty() || o.cuts.iter().any(|c| present.contains(&c.id)) {
@@ -13786,6 +14061,7 @@ impl App {
                     filler: o.filler.clone(),
                     filler_at: o.filler_at,
                     outline: o.outline.clone(),
+                    on: o.on.and_then(|j| at[j]),
                 });
             }
         }
@@ -14755,13 +15031,13 @@ impl App {
             match receive.try_recv() {
                 Ok(outcome) => {
                     if let Some((_, job, _)) = self.trace_running.take() {
-                        let split = std::mem::take(&mut self.split_after_trace);
+                        let split = self.split_after_trace.take();
                         match outcome {
                             Ok(result) => {
                                 self.editor.apply_trace(job, result);
                                 // The new artwork is the selection: cut it into layers.
-                                if split && !self.editor.selection.is_empty() {
-                                    self.ai_split_picture_with(false);
+                                if let Some(look) = split.filter(|_| !self.editor.selection.is_empty()) {
+                                    self.ai_split_picture_as(false, look);
                                 }
                             }
                             Err(message) => {
@@ -14773,7 +15049,7 @@ impl App {
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     self.trace_running = None;
-                    self.split_after_trace = false;
+                    self.split_after_trace = None;
                     self.split_redetect = false;
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -17043,6 +17319,7 @@ impl App {
         self.documents.push(OpenDocument { doc, view });
         let index = self.documents.len() - 1;
         self.switch_to_tab(index);
+        self.editor.keep_master_audio_on_top();
     }
 
     /// **Co-pilot reload.** Put `doc`, freshly read from `path`, into the tab that already
@@ -20512,8 +20789,14 @@ fn section_header(
                         && ui.available_width() >= inline
                     {
                         let height = ui.available_height().max(buzz_ui::theme::Tokens::CONTROL_H);
+                        // All the empty run but a grip's width at the end, so
+                        // the tools have the room the header has — it was
+                        // exactly the minimum, and the rest of the line was cut
+                        // off beside a header still mostly empty.
+                        const GRIP: f32 = 48.0;
+                        let width = (ui.available_width() - GRIP).max(inline);
                         let (slot, _) =
-                            ui.allocate_exact_size(egui::vec2(inline, height), egui::Sense::hover());
+                            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
                         tools_slot = Some(slot);
                     }
                     let rest = ui.available_size();
@@ -22264,6 +22547,16 @@ mod idle_tests {
                 .collect();
         }
 
+        /// [`Self::click`] with `mods` held throughout.
+        fn click_with(&mut self, at: egui::Pos2, button: egui::PointerButton, mods: egui::Modifiers) {
+            let held = std::mem::replace(&mut self.mods, mods);
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            self.frame(vec![egui::Event::PointerButton { pos: at, button, pressed: true, modifiers: mods }]);
+            self.frame(vec![egui::Event::PointerButton { pos: at, button, pressed: false, modifiers: mods }]);
+            self.mods = held;
+            self.frame(vec![]);
+        }
+
         fn click(&mut self, at: egui::Pos2, button: egui::PointerButton) {
             let m = egui::Modifiers::default();
             self.frame(vec![egui::Event::PointerMoved(at)]);
@@ -22621,6 +22914,116 @@ mod idle_tests {
         assert_eq!(scene.layers().get(rows[0]).unwrap().highlight, red);
         assert_eq!(scene.layers().get(rows[1]).unwrap().highlight, red);
         assert_eq!(scene.layers().get(rows[2]).unwrap().highlight, None, "an unselected layer is left alone");
+    }
+
+    /// A drag straight down a column that wobbles a little sideways selects that one column; a
+    /// whole cell across, it takes the next one too.
+    #[test]
+    fn a_frame_drag_straight_down_keeps_to_one_column() {
+        let mut d = MenuDrive::new();
+        d.app.editor.doc.edit("Layers", |s| {
+            s.set_frame_count(30);
+            s.add_layer("Two", buzz_scene::LayerKind::Normal);
+            s.add_layer("Three", buzz_scene::LayerKind::Normal);
+        });
+        d.frame(vec![]);
+        d.frame(vec![]);
+        let rows: Vec<buzz_scene::LayerId> = d.app.editor.doc.scene().layers().iter().map(|l| l.id).collect();
+        let (_, _, w): (egui::Rect, f32, f32) = d.ctx.data(|m| m.get_temp(egui::Id::new((buzz_ui::timeline_panel::ROW_GEOMETRY, rows[0])))).expect("row drawn");
+        let from = d.cell(rows[0], 5);
+        let mid = d.cell(rows[1], 5) + egui::vec2(0.45 * w, 0.0);
+        let to = d.cell(rows[2], 5) + egui::vec2(0.6 * w, 0.0);
+        d.drag(from, &[mid, to], to);
+        let sel = d.app.editor.selection.timeline().cloned().expect("frames selected");
+        assert_eq!((sel.first_frame, sel.last_frame), (5, 5), "a wobble past the cell edge is not a second column: {sel:?}");
+        assert_eq!(sel.layers.len(), 3, "{sel:?}");
+
+        // Away from the column just selected (a press inside a selection moves it).
+        let (from, to) = (d.cell(rows[0], 12), d.cell(rows[2], 13) + egui::vec2(0.2 * w, 0.0));
+        d.drag(from, &[to], to);
+        let sel = d.app.editor.selection.timeline().cloned().expect("frames selected");
+        assert_eq!((sel.first_frame, sel.last_frame), (12, 13), "a whole cell across takes the next column: {sel:?}");
+    }
+
+    /// **Shift+F5 takes out every frame picked**, dragged along a row or
+    /// Shift-clicked from one frame to another — not one at a time.
+    #[test]
+    fn shift_f5_removes_every_frame_picked() {
+        let mut d = MenuDrive::new();
+        d.app.editor.doc.edit("Layers", |s| {
+            s.set_frame_count(30);
+            s.add_layer("Two", buzz_scene::LayerKind::Normal);
+        });
+        d.frame(vec![]);
+        d.frame(vec![]);
+        let rows: Vec<buzz_scene::LayerId> = d.app.editor.doc.scene().layers().iter().map(|l| l.id).collect();
+        // Where the keyframe at frame 20 has got to: removing frames slides
+        // it left (Equal Layer Lengths pads the end, so the length holds).
+        d.app.editor.doc.edit("Key", |s| {
+            s.update_layer(rows[0], |l| {
+                l.frames.insert_keyframe(20);
+            });
+        });
+        let len = |d: &MenuDrive| {
+            d.app.editor.doc.scene().layers().get(rows[0]).unwrap().frames.keyframes().iter().map(|k| k.start).filter(|&f| f > 0).min().unwrap_or(0)
+        };
+        let shift_f5 = |d: &mut MenuDrive| {
+            for pressed in [true, false] {
+                d.frame(vec![egui::Event::Key { key: egui::Key::F5, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::SHIFT }]);
+            }
+            d.frame(vec![]);
+        };
+        let before = len(&d);
+        let (from, to) = (d.cell(rows[0], 5), d.cell(rows[0], 9));
+        d.drag(from, &[to], to);
+        let sel = d.app.editor.selection.timeline().cloned().expect("frames selected");
+        assert_eq!((sel.first_frame, sel.last_frame), (5, 9), "{sel:?}");
+        shift_f5(&mut d);
+        assert_eq!(len(&d), before - 5, "a dragged run: {:?}", d.app.editor.status);
+
+        // Click one frame, Shift-click another.
+        let before = len(&d);
+        let at = d.cell(rows[0], 2);
+        d.click(at, egui::PointerButton::Primary);
+        let at = d.cell(rows[0], 4);
+        d.click_with(at, egui::PointerButton::Primary, egui::Modifiers::SHIFT);
+        let sel = d.app.editor.selection.timeline().cloned().expect("frames selected");
+        assert_eq!((sel.first_frame, sel.last_frame), (2, 4), "{sel:?}");
+        shift_f5(&mut d);
+        assert_eq!(len(&d), before - 3, "a Shift-clicked run: {:?}", d.app.editor.status);
+    }
+
+    /// F6 on a clicked frame cell, and on a column dragged down three layers: a keyframe on each.
+    #[test]
+    fn f6_keys_the_frames_picked_in_the_timeline() {
+        let mut d = MenuDrive::new();
+        d.app.editor.doc.edit("Layers", |s| {
+            s.set_frame_count(30);
+            s.add_layer("Two", buzz_scene::LayerKind::Normal);
+            s.add_layer("Three", buzz_scene::LayerKind::Normal);
+        });
+        d.frame(vec![]);
+        d.frame(vec![]);
+        let rows: Vec<buzz_scene::LayerId> = d.app.editor.doc.scene().layers().iter().map(|l| l.id).collect();
+        let f6 = |d: &mut MenuDrive| {
+            for pressed in [true, false] {
+                d.frame(vec![egui::Event::Key { key: egui::Key::F6, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::default() }]);
+            }
+            d.frame(vec![]);
+        };
+        let keyed = |d: &MenuDrive, layer: buzz_scene::LayerId, frame: u32| d.app.editor.doc.scene().layers().get(layer).unwrap().frames.keyframes().iter().any(|k| k.start == frame);
+        let at = d.cell(rows[1], 4);
+        d.click(at, egui::PointerButton::Primary);
+        f6(&mut d);
+        assert!(keyed(&d, rows[1], 4), "status: {:?}", d.app.editor.status);
+
+        let (from, to) = (d.cell(rows[0], 9), d.cell(rows[2], 9));
+        d.drag(from, &[to], to);
+        f6(&mut d);
+        for &l in &rows {
+            assert!(keyed(&d, l, 9), "status: {:?}", d.app.editor.status);
+            assert!(!keyed(&d, l, 10) && !keyed(&d, l, 8), "only the column dragged");
+        }
     }
 
     /// A quick flick: the pointer is already a row down by the time egui
@@ -23135,7 +23538,7 @@ mod idle_tests {
         let mut texts = Vec::new();
         for _ in 0..3 {
             let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1200.0))),
                 ..Default::default()
             };
             let out = ctx.run_ui(input, |ui| {
@@ -23151,7 +23554,8 @@ mod idle_tests {
                 .collect::<Vec<_>>();
         }
         let all = texts.join("\n");
-        // The column scrolls, so only the top of the panel is on screen; the
+        // The column scrolls, so only the top of the panel is on screen (1200 px tall: the
+        // Models list holds SAM 3's three models since S19); the
         // unit test `ai_panel_renders_every_section_headlessly` draws all
         // eight sections.
         for want in ["Models", "Claude API server", "Test connection", "Voice", "Allow all"] {
@@ -29840,3 +30244,11 @@ mod panel_follow_tests {
     }
 }
 
+/// The trace before a split in `look`: the Bold preset with the user's tuning, or Trace Bitmap's own.
+fn split_trace_options(look: crate::bg_objects::SplitLook) -> buzz_scene::TraceOptions {
+    match look {
+        crate::bg_objects::SplitLook::Bold => buzz_scene::TraceOptions::bold().with_saved_tuning(),
+        // Trace Bitmap's look with its gradients kept (a graded wall, a glow) as in the Bold split.
+        crate::bg_objects::SplitLook::Normal => buzz_scene::TraceOptions { keep_textures: true, ..crate::editor::quick_trace_options() },
+    }
+}

@@ -735,48 +735,53 @@ fn character_sheet(
     });
 
     // -- the wardrobe --
+    // Rolls up, so a long wardrobe does not push the poses out of sight.
     ui.add_space(2.0);
-    ui.label(RichText::new("Wardrobe").strong());
-    ui.label(
-        RichText::new(
-            "Every colour this character wears. Change one and it changes on every \
-             part, on every pose.",
-        )
-        .small()
-        .weak(),
-    );
-    if palette.is_empty() {
-        ui.label(
-            RichText::new("Reading the character\u{2026}")
-                .small()
-                .weak()
-                .italics(),
-        );
-    }
-    for (colour, count) in palette {
-        ui.horizontal(|ui| {
-            let mut edited = to_egui(*colour);
-            let changed = ui
-                .color_edit_button_srgba(&mut edited)
-                .on_hover_text("Re-skin every part painted this colour")
-                .changed();
-            if changed {
-                *action = Some(CastAction::Recolour {
-                    asset: asset.clone(),
-                    from: *colour,
-                    to: from_egui(edited),
-                });
-            }
+    egui::CollapsingHeader::new(RichText::new("Wardrobe").strong())
+        .id_salt("cast-wardrobe")
+        .default_open(true)
+        .show(ui, |ui| {
             ui.label(
-                RichText::new(match count {
-                    1 => "1 part".to_string(),
-                    n => format!("{n} parts"),
-                })
+                RichText::new(
+                    "Every colour this character wears. Change one and it changes on every \
+                     part, on every pose.",
+                )
                 .small()
                 .weak(),
             );
+            if palette.is_empty() {
+                ui.label(
+                    RichText::new("Reading the character\u{2026}")
+                        .small()
+                        .weak()
+                        .italics(),
+                );
+            }
+            for (colour, count) in palette {
+                ui.horizontal(|ui| {
+                    let mut edited = to_egui(*colour);
+                    let changed = ui
+                        .color_edit_button_srgba(&mut edited)
+                        .on_hover_text("Re-skin every part painted this colour")
+                        .changed();
+                    if changed {
+                        *action = Some(CastAction::Recolour {
+                            asset: asset.clone(),
+                            from: *colour,
+                            to: from_egui(edited),
+                        });
+                    }
+                    ui.label(
+                        RichText::new(match count {
+                            1 => "1 part".to_string(),
+                            n => format!("{n} parts"),
+                        })
+                        .small()
+                        .weak(),
+                    );
+                });
+            }
         });
-    }
 
     // -- the poses --
     ui.add_space(4.0);

@@ -47,6 +47,22 @@ fn shown_id() -> Id {
 }
 
 /// Leave the list for the menu to draw this frame.
+/// Ask for the scripts folder to be looked at again, as opening the menu does.
+pub fn mark_shown(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(shown_id(), true));
+}
+
+/// A Commands-menu choice made somewhere other than this menu (the macOS
+/// menu bar), handed to the window as a click here would be.
+pub fn raise(ctx: &egui::Context, action: JsflAction) {
+    ctx.data_mut(|d| d.insert_temp(action_id(), Some(action)));
+}
+
+/// The scripts as last published, for the macOS menu bar to list.
+pub fn published(ctx: &egui::Context) -> JsflMenu {
+    ctx.data(|d| d.get_temp(menu_id())).unwrap_or_default()
+}
+
 pub fn publish(ctx: &egui::Context, menu: JsflMenu) {
     ctx.data_mut(|d| d.insert_temp(menu_id(), menu));
 }

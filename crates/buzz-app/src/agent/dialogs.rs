@@ -53,6 +53,7 @@ pub fn args_hint(command: Command) -> Option<&'static str> {
         AiDirectStory => "{brief: text} -> {started:true, job}; an LLM parses the brief and the result is applied as one undo step when done; call wait_for_jobs for the result",
         AiSplitPictureIntoLayers => "{element?: id of a picture on stage (else the selection), redetect?: bool (default false: a picture the VLM already listed objects for reuses that saved list, so the same picture gives the same layers; true asks the VLM again and saves the new list over the old one)} -> {started:true, job}; AI > Split Picture into Layers: cuts the picture into Sky/Far/Mid/Ground plates and the objects a vision model finds in it (house, tree, lamp...; people and animals are left in the plates), each object a library symbol on its own layer above its plate, all as one undo step when done; the picture itself is kept on a hidden, locked \"Source picture\" layer. Needs the VLM and SAM 2 for objects (without them: plates only, said in the result). Call wait_for_jobs for {split, objects, layers_added, notes}",
         TraceBoldSplit => "{element?: id of a picture on stage (else the selection)} -> {started:true, job}; Modify > Bitmap > Trace Bold + Split into Layers: Bold trace (thick black outlines, Keep textures: skies/glows/ground keep their pixels) now, then the traced artwork is cut into Sky/Far/Land plates and objects as one undo step when the job is done. Call wait_for_jobs for {split, objects, layers_added, notes}",
+        TraceSplit => "{element?: id of a picture on stage (else the selection)} -> {started:true, job}; AI > Trace + Split into Layers: as trace_bold_split in Trace Bitmap's own look (colour regions, no bold outlines, no kept textures) and no outline added round the objects. Call wait_for_jobs for {split, objects, layers_added, notes}",
         AiGenerateBackground => "{prompt: what the background shows, series?: series whose look to draw in (default Khayal3Baje: its ComfyUI profile, LoRA and style text, the Producer's plate path), seed?: whole number (random), tries?: 1..4 (default 1; seeds seed, seed+1..), pick?: 1..tries, the picture to keep (default 1), trace_split?: bool (default true)} -> {started:true, job}; AI > Generate Background: draws the pictures at the stage's size off the UI thread (ComfyUI is started when it is not running), puts picture `pick` on a new bottom layer named Background (selected), then with trace_split runs Trace with bold outlines + Split Picture into Layers on it (a second job). Call wait_for_jobs: the first result has {pictures, seeds, placed, element, split_job?}; wait again for the split job's {split, objects, layers_added, notes}",
         AiRemoveObject => "{point?: {x, y} in stage units, points?: [{x, y, positive?: bool (default true; false excludes)}] (SAM 2 prompts on the picture of the traced layer), ids?: [shape ids] (removed whole), element?: an id on the layer (else the selection/active layer)} -> {started:true, job}; AI > Remove Object (remove_from_picture): the thing under the point is found with SAM 2, the shapes mostly inside it are deleted, shapes partly inside are cut along its outline, and the hole is patched with LaMa (traced, behind the rest) as one undo step when done. Call wait_for_jobs for {removed, shapes, lama}",
         DeleteAndFill => "{ids?: [shape ids] (else the selection)} -> {started:true, job}; Edit > Delete and Fill: the selected shapes of a traced layer are deleted and the hole patched with LaMa, one undo step when done; call wait_for_jobs for {removed, shapes, lama}",
@@ -204,7 +205,8 @@ pub fn run(app: &mut App, command: Command, a: &Value) -> AgentResult {
         Command::AiRigLayers => rig_layers(app, a),
         Command::AiDirectStory => direct_story(app, a),
         Command::AiSplitPictureIntoLayers => split_picture(app, a),
-        Command::TraceBoldSplit => trace_bold_split(app, a),
+        Command::TraceBoldSplit => trace_split(app, a, crate::bg_objects::SplitLook::Bold),
+        Command::TraceSplit => trace_split(app, a, crate::bg_objects::SplitLook::Normal),
         Command::AiGenerateBackground => generate_background(app, a),
         Command::AiRemoveObject | Command::DeleteAndFill => remove_from_picture(app, command, a),
         Command::AiCharacterFromImage => character_from_image(app, a),
@@ -1790,9 +1792,9 @@ fn split_picture(app: &mut App, a: &Value) -> AgentResult {
     ))
 }
 
-/// Trace Bold + Split into Layers -> `App::agent_trace_bold_split`: the Bold
-/// trace (Keep textures) runs now, the split as a job.
-fn trace_bold_split(app: &mut App, a: &Value) -> AgentResult {
+/// Trace (Bold) + Split into Layers -> `App::agent_trace_split`: the trace in
+/// `look` (Bold: Keep textures) runs now, the split as a job.
+fn trace_split(app: &mut App, a: &Value, look: crate::bg_objects::SplitLook) -> AgentResult {
     if let Err(e) = check_keys(a, &["element"]) {
         return AgentResult::err(e);
     }
@@ -1800,11 +1802,15 @@ fn trace_bold_split(app: &mut App, a: &Value) -> AgentResult {
         return AgentResult::err(e);
     }
     app.agent_editor_mut().status = None;
-    match app.agent_trace_bold_split() {
+    let traced = match look {
+        crate::bg_objects::SplitLook::Bold => "the picture is traced (Bold, Keep textures)",
+        crate::bg_objects::SplitLook::Normal => "the picture is traced (Trace Bitmap's look)",
+    };
+    match app.agent_trace_split(look) {
         Ok(job) => AgentResult::ok(super::jobs::started(
             "ai_split_picture_into_layers",
             job,
-            "the picture is traced (Bold, Keep textures); the traced artwork is being cut into layers off the UI thread, added as one undo step when done",
+            &format!("{traced}; the traced artwork is being cut into layers off the UI thread, added as one undo step when done"),
         )),
         Err(why) => AgentResult::err(why),
     }

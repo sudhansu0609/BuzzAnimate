@@ -252,7 +252,7 @@ pub(crate) fn trace(width: u32, height: u32, pixels: &[u8], options: &TraceOptio
         let width = if want > 0.0 {
             want
         } else {
-            options.uniform_width.filter(|&u| u > 0.0).unwrap_or_else(|| crate::trace_bold::bold_width(w.max(h) as f64))
+            options.uniform_width.filter(|&u| u > 0.0).unwrap_or_else(|| crate::trace_bold::bold_width(w.max(h) as f64) * crate::trace_bold::TRACE_BOLD_SHARE)
         };
         (width, options.line_colour.unwrap_or_else(crate::trace_bold::bold_colour))
     });

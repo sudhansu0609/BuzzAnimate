@@ -34,6 +34,7 @@ pub mod cleanup;
 pub mod effect_brush;
 pub mod even_lines;
 pub mod gradient;
+mod group_empty;
 pub mod image;
 pub mod index;
 pub mod layer;
@@ -70,6 +71,11 @@ use std::sync::Arc;
 /// A symbol's resolved extent, keyed by symbol id — every symbol's, built in
 /// one pass by [`Scene::symbol_bounds_table`].
 pub type BoundsTable = std::collections::HashMap<SymbolId, Rect>;
+
+/// [`Scene::cached_bounds_table`]'s entry: the symbol map it was built from
+/// (held, so its address cannot be reused by another while this lives) and
+/// the table.
+type BoundsEntry = (Arc<std::collections::BTreeMap<SymbolId, Arc<Symbol>>>, Arc<BoundsTable>);
 
 use buzz_geom::{Affine, Point, Rect, Size};
 use peniko::Color;
@@ -318,13 +324,23 @@ pub struct Scene {
     /// the artwork somewhere else the moment it was opened. View state
     /// exactly as `editing` is.
     edit_shot: Option<(u32, f64)>,
-    /// Memoised resolved-bounds table, tagged with the revision it was built
-    /// for. Rebuilding it is linear in the library, but resolving bounds is a
+    /// Memoised resolved-bounds table, tagged with the symbol map it was built
+    /// from. Rebuilding it is linear in the library, but resolving bounds is a
     /// per-object, per-frame operation on every selection, so even a linear
     /// rebuild every call is enough to lag a big import. Cached here so a
     /// steady document pays for it once. Interior-mutable and never part of the
     /// document's identity — not serialised, not compared, not undone.
-    bounds_cache: std::sync::RwLock<Option<(u64, Arc<BoundsTable>)>>,
+    ///
+    /// **Keyed by the library, not the revision**, and **shared with every
+    /// clone**: the table describes only the symbols, so moving or resizing
+    /// artwork on the stage — a new revision every pointer move — leaves it
+    /// standing, and the stage's per-frame snapshot finds the table its
+    /// document built (or builds it for both). Keyed by revision and empty in
+    /// every clone, it was rebuilt on every frame the stage was drawn — three
+    /// quarters of a frame's encode on a film with a big library, and why
+    /// moving and resizing felt heavy. Sharing is safe because an entry only
+    /// ever answers for the very symbol map it measured.
+    bounds_cache: Arc<std::sync::RwLock<Option<BoundsEntry>>>,
     /// Memoised live-spring pose sequences, tagged with the revision they were
     /// built for. A spring modifier must be integrated forward across the whole
     /// span, which is too costly to redo for every ghost and scrub; computed
@@ -352,9 +368,8 @@ impl Clone for Scene {
             edit_places: self.edit_places.clone(),
             edit_origins: self.edit_origins.clone(),
             edit_shot: self.edit_shot,
-            // A fresh, empty cache: a snapshot rebuilds its own on first use,
-            // so a clone shares no mutable state with the scene it came from.
-            bounds_cache: std::sync::RwLock::new(None),
+            // Shared: see `bounds_cache`.
+            bounds_cache: Arc::clone(&self.bounds_cache),
             modifier_cache: std::sync::RwLock::new(None),
         }
     }
@@ -539,7 +554,7 @@ impl Default for Scene {
             edit_places: Vec::new(),
             edit_origins: Vec::new(),
             edit_shot: None,
-            bounds_cache: std::sync::RwLock::new(None),
+            bounds_cache: Arc::default(),
             modifier_cache: std::sync::RwLock::new(None),
         };
         // Animate starts every document with one layer named "Layer_1".
@@ -589,7 +604,7 @@ impl Scene {
             edit_places: Vec::new(),
             edit_origins: Vec::new(),
             edit_shot: None,
-            bounds_cache: std::sync::RwLock::new(None),
+            bounds_cache: Arc::default(),
             modifier_cache: std::sync::RwLock::new(None),
         }
     }
@@ -1706,13 +1721,14 @@ impl Scene {
         self.resolved_bounds_with(object, &table)
     }
 
-    /// The resolved-bounds table for the current revision, built once and
-    /// reused until an edit moves the revision on. See [`Self::bounds_cache`].
+    /// The resolved-bounds table for the current symbols, built once and
+    /// reused until a symbol changes. See [`Self::bounds_cache`].
     pub fn cached_bounds_table(&self) -> Arc<BoundsTable> {
+        let symbols = self.library.symbol_map();
         // A read lock for the common case: the table is present and current.
         if let Ok(guard) = self.bounds_cache.read()
-            && let Some((revision, table)) = guard.as_ref()
-            && *revision == self.revision
+            && let Some((built_from, table)) = guard.as_ref()
+            && Arc::ptr_eq(built_from, symbols)
         {
             return Arc::clone(table);
         }
@@ -1720,7 +1736,7 @@ impl Scene {
         // released, then store under a write lock.
         let table = Arc::new(self.symbol_bounds_table());
         if let Ok(mut guard) = self.bounds_cache.write() {
-            *guard = Some((self.revision, Arc::clone(&table)));
+            *guard = Some((Arc::clone(symbols), Arc::clone(&table)));
         }
         table
     }
@@ -3000,6 +3016,11 @@ impl Scene {
     /// Allocate an id without attaching anything to the document yet.
     pub fn next_object_id(&mut self) -> ObjectId {
         ObjectId(self.ids.take())
+    }
+
+    /// A fresh layer id, for a layer made inside a symbol (`add_layer` adds to the open timeline).
+    pub fn next_layer_id(&mut self) -> LayerId {
+        LayerId(self.ids.take())
     }
 
     /// Guarantee future ids exceed `used`.

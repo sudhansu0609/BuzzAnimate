@@ -694,6 +694,15 @@ fn is_character(library: &Library, symbol: &Symbol) -> bool {
 }
 
 impl Library {
+    /// The symbols as one shared map, changed copy-on-write. A holder of a
+    /// clone of this `Arc` sees any change as a different `Arc` — the change
+    /// had to copy the map — so the same `Arc` means the same symbols: what
+    /// the resolved-bounds cache, which holds one, is keyed by (see
+    /// `Scene::cached_bounds_table`).
+    pub(crate) fn symbol_map(&self) -> &Arc<BTreeMap<SymbolId, Arc<Symbol>>> {
+        &self.symbols
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

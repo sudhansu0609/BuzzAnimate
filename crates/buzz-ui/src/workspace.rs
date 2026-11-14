@@ -461,6 +461,13 @@ pub struct Workspace {
     pub left_width: f32,
     pub right_width: f32,
     pub right_outer_width: f32,
+    /// **The Far Right column as a strip of icons**, as Animate's Essentials
+    /// docks Color, Swatches, Transform, Align… down the right edge: one icon
+    /// per panel, the panel opening beside the strip when its icon is
+    /// clicked, and [`ICON_STRIP_WIDTH`] wide. Off, the column draws its panels
+    /// as any column does.
+    #[serde(default)]
+    pub icon_strip: bool,
     pub bottom_height: f32,
     /// How wide one frame cell is drawn, in points.
     ///
@@ -494,10 +501,11 @@ pub struct Workspace {
     /// and close the other top-level folders. Off by default. L3.
     #[serde(default)]
     pub focus_folders: bool,
-    /// How big the Assets panel draws its pictures, and so how it lays them
-    /// out. A way of looking at the library rather than part of any film.
+    /// How big the Assets panel draws its pictures, in points, and so how it
+    /// lays them out (Cmd+scroll over the panel). A way of looking at the
+    /// library rather than part of any film. `0` is the default size.
     #[serde(default)]
-    pub asset_thumbnail_size: crate::assets_panel::ThumbnailSize,
+    pub asset_thumbnail_edge: f32,
     /// The timeline's layer column shows the **parenting view** — Animate's
     /// node graph — instead of layer names.
     ///
@@ -787,21 +795,30 @@ pub const ROW_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.6..=2.5;
 pub const COLUMN_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 216.0..=900.0;
 /// The tool strip, which holds icons rather than rows.
 ///
-/// Wide enough for **two** 28 px tool buttons side by side, the gap between
-/// them, the panel frame's margins either side, and the scroll bar's own
-/// width — not one, as it was measured at before the workspace defects brief:
-/// `panels::tool_bar` falls back to two columns (`tool_strip_columns`)
-/// whenever the strip is too short to stack all twenty-four tools in one,
-/// which most window heights are once Properties, Library and the Timeline
-/// are also on screen, and a column too narrow to actually hold two side by
-/// side turned that fallback into tools silently scrolled out of reach
-/// sideways rather than a second column anyone could see.
-pub const LEFT_WIDTH_RANGE: std::ops::RangeInclusive<f32> = (2.0
-    * crate::theme::Metrics::TOOL_BUTTON
+/// As narrow as **one** 28 px tool button, its margins and the scroll bar:
+/// dragged that narrow, the tools collapse to one per line, each line its
+/// group's tool with the rest a click away (`panels::tool_bar`), as Animate's
+/// narrow toolbar does.
+///
+/// The column's frames and scroll bar take 32 points (see [`TOOL_ROWS_WIDTH`]),
+/// so the floor is one button and those 32 and a little over: dragged to
+/// it, every tool is whole. It was the button and the margins without the
+/// scroll bar, which cut each button down to three quarters of itself.
+pub const LEFT_WIDTH_RANGE: std::ops::RangeInclusive<f32> = (crate::theme::Metrics::TOOL_BUTTON + 34.0)..=400.0;
+/// The tool strip's own width: **three** 28 px buttons side by side — the
+/// longest line of related tools (`tools::TOOL_ROWS`) — the gaps between
+/// them, the margins and the scroll bar.
+///
+/// The column's frames and scroll bar take 32 points of it (measured: a 125
+/// point column leaves 93 for the tools), so this is the line of three, the
+/// few points `panels::tool_bar` asks above it, and those 32 — no more.
+pub const TOOL_ROWS_WIDTH: f32 = 3.0 * crate::theme::Metrics::TOOL_BUTTON + 3.0 * crate::theme::Tokens::SPACE_1 + 32.0;
+/// What the tool strip shipped at before it held rows: two buttons wide. Only
+/// for recognising a layout saved untouched from that default.
+const LEGACY_LEFT_WIDTH: f32 = 2.0 * crate::theme::Metrics::TOOL_BUTTON
     + crate::theme::Tokens::SPACE_1
     + 2.0 * crate::theme::Tokens::SPACE_2
-    + crate::theme::Metrics::SCROLL_BAR)
-    ..=400.0;
+    + crate::theme::Metrics::SCROLL_BAR;
 /// The timeline, which needs a couple of layer rows to be worth having.
 pub const BOTTOM_HEIGHT_RANGE: std::ops::RangeInclusive<f32> = 80.0..=900.0;
 
@@ -834,6 +851,25 @@ const GROUP_INSPECTOR: GroupId = 103;
 const GROUP_PALETTE: GroupId = 104;
 /// Essentials' own right column: Properties and the Library, tabbed.
 const GROUP_ESSENTIALS_RIGHT: GroupId = 105;
+/// The panels on Essentials' icon strip, top to bottom.
+pub const ESSENTIALS_STRIP: [PanelId; 11] = [
+    PanelId::Color,
+    PanelId::Swatches,
+    PanelId::Lighting,
+    PanelId::ToolOptions,
+    PanelId::Filters,
+    PanelId::Layers,
+    PanelId::Depth,
+    PanelId::Rig,
+    PanelId::Sound,
+    PanelId::Cast,
+    PanelId::Sequence,
+];
+/// The first of the strip's sections; each panel on it has its own.
+const GROUP_ESSENTIALS_STRIP: GroupId = 120;
+/// The Far Right column drawn as an icon strip (see [`Workspace::icon_strip`]):
+/// one icon button and the padding round it.
+pub const ICON_STRIP_WIDTH: f32 = 36.0;
 
 /// What the three dock columns are actually drawn at this frame.
 ///
@@ -1194,21 +1230,22 @@ impl Workspace {
     /// directories, the UI scale and reduced-motion preference all belong to
     /// the person rather than to any one arrangement of panels, and picking
     /// a different arrangement is not asking to lose any of them.
+    ///
+    /// **Only the arrangement changes**: which panels sit where, as tabs or
+    /// rolled up, the column widths and the icon strip. Everything else — the
+    /// keymap and script keys, brush tips, AI and rig settings, the timeline's
+    /// look — is the person's, and stays. Picking a workspace used to rebuild
+    /// the whole file from the preset, so it also wiped a keymap built up
+    /// over months.
     pub fn apply_preset(&mut self, preset: WorkspacePreset) {
-        let recovery_dirs = std::mem::take(&mut self.recovery_dirs);
-        let new_document = self.new_document.clone();
-        let theme = self.theme;
-        let ui_scale = self.ui_scale;
-        let reduce_motion = self.reduce_motion;
-
-        *self = Self {
-            recovery_dirs,
-            new_document,
-            theme,
-            ui_scale,
-            reduce_motion,
-            ..preset.build()
-        };
+        let layout = preset.build();
+        self.name = layout.name;
+        self.slots = layout.slots;
+        self.left_width = layout.left_width;
+        self.right_width = layout.right_width;
+        self.right_outer_width = layout.right_outer_width;
+        self.icon_strip = layout.icon_strip;
+        self.bottom_height = layout.bottom_height;
     }
 
     /// The layout this program opens with: Animate's, near enough — tools down
@@ -1437,9 +1474,10 @@ impl Workspace {
             // One tool column, its padding and the scroll bar — the strip is
             // Animate's narrow one, and the extra half-column of empty space
             // beside it was the first thing anybody noticed.
-            left_width: *LEFT_WIDTH_RANGE.start(),
+            left_width: TOOL_ROWS_WIDTH,
             right_width: 300.0,
             right_outer_width: 240.0,
+            icon_strip: false,
             bottom_height: 170.0,
             frame_width: default_frame_width(),
             row_scale: default_row_scale(),
@@ -1466,7 +1504,7 @@ impl Workspace {
                 even_lines: Some(0.0),
                 ..buzz_scene::TraceOptions::default()
             },
-            asset_thumbnail_size: crate::assets_panel::ThumbnailSize::default(),
+            asset_thumbnail_edge: 0.0,
             keymap: std::collections::BTreeMap::new(),
             extra_keys: std::collections::BTreeMap::new(),
             script_keys: std::collections::BTreeMap::new(),
@@ -1496,18 +1534,11 @@ impl Workspace {
         let mut workspace = Self::animate();
         workspace.name = "Essentials".into();
 
-        // Properties fronts the stack; the other five come along behind it,
-        // one click away rather than hidden in Window.
-        for (order, (id, front)) in [
-            (PanelId::Properties, true),
-            (PanelId::Filters, false),
-            (PanelId::ToolOptions, false),
-            (PanelId::Library, false),
-            (PanelId::Assets, false),
-            (PanelId::Cast, false),
-        ]
-        .into_iter()
-        .enumerate()
+        // **Animate's Essentials**: Properties, Library and Assets as tabs in
+        // the right column, Properties in front…
+        for (order, (id, front)) in [(PanelId::Properties, true), (PanelId::Library, false), (PanelId::Assets, false)]
+            .into_iter()
+            .enumerate()
         {
             if let Some(slot) = workspace.slot_mut(id) {
                 slot.dock = Dock::Right;
@@ -1518,19 +1549,26 @@ impl Workspace {
                 slot.collapsed = false;
             }
         }
+        // …and beside it, down the right edge, a strip of icons, each opening
+        // its panel: Color, Swatches and the rest, as Animate keeps Color,
+        // Swatches, Transform, Align, Info and Layer Depth there.
+        for (order, id) in ESSENTIALS_STRIP.into_iter().enumerate() {
+            if let Some(slot) = workspace.slot_mut(id) {
+                slot.dock = Dock::RightOuter;
+                slot.home = Dock::RightOuter;
+                slot.order = order as u32;
+                // A section of its own each: one icon, one panel.
+                slot.group = GROUP_ESSENTIALS_STRIP + order as GroupId;
+                slot.selected = true;
+                slot.collapsed = false;
+            }
+        }
+        workspace.icon_strip = true;
 
         for id in PanelId::ALL {
-            if matches!(
-                id,
-                PanelId::Tools
-                    | PanelId::Properties
-                    | PanelId::Filters
-                    | PanelId::ToolOptions
-                    | PanelId::Library
-                    | PanelId::Assets
-                    | PanelId::Cast
-                    | PanelId::Timeline
-            ) {
+            if matches!(id, PanelId::Tools | PanelId::Properties | PanelId::Library | PanelId::Assets | PanelId::Timeline)
+                || ESSENTIALS_STRIP.contains(&id)
+            {
                 continue;
             }
             if let Some(slot) = workspace.slot_mut(id) {
@@ -1623,7 +1661,7 @@ impl Workspace {
     fn wanted_widths(&self) -> ColumnWidths {
         ColumnWidths {
             left: if self.occupied(Dock::Left) {
-                self.left_width
+                self.left_width.max(*LEFT_WIDTH_RANGE.start())
             } else {
                 0.0
             },
@@ -1632,20 +1670,22 @@ impl Workspace {
             } else {
                 0.0
             },
-            right_outer: if self.occupied(Dock::RightOuter) {
-                self.right_outer_width
-            } else {
+            right_outer: if !self.occupied(Dock::RightOuter) {
                 0.0
+            } else if self.icon_strip {
+                ICON_STRIP_WIDTH
+            } else {
+                self.right_outer_width
             },
         }
     }
 
     /// The narrowest each column may be drawn.
-    fn floor_widths() -> ColumnWidths {
+    fn floor_widths(&self) -> ColumnWidths {
         ColumnWidths {
             left: *LEFT_WIDTH_RANGE.start(),
             right: *COLUMN_WIDTH_RANGE.start(),
-            right_outer: *COLUMN_WIDTH_RANGE.start(),
+            right_outer: if self.icon_strip { ICON_STRIP_WIDTH } else { *COLUMN_WIDTH_RANGE.start() },
         }
     }
 
@@ -1665,7 +1705,7 @@ impl Workspace {
         fit_columns_keeping(
             available,
             self.wanted_widths(),
-            Self::floor_widths(),
+            self.floor_widths(),
             dragging,
         )
     }
@@ -1686,7 +1726,9 @@ impl Workspace {
         if self.occupied(Dock::Right) {
             self.right_width = clamp_to(fitted.right, COLUMN_WIDTH_RANGE);
         }
-        if self.occupied(Dock::RightOuter) {
+        // An icon strip's width is fixed; the column keeps the width it will
+        // have again as a column.
+        if self.occupied(Dock::RightOuter) && !self.icon_strip {
             self.right_outer_width = clamp_to(fitted.right_outer, COLUMN_WIDTH_RANGE);
         }
     }
@@ -1701,7 +1743,7 @@ impl Workspace {
     /// has caught up.
     pub fn column_cap(&self, dock: Dock, available: f32) -> f32 {
         let wanted = self.wanted_widths();
-        let floor = Self::floor_widths();
+        let floor = self.floor_widths();
         let others = match dock {
             Dock::Left => {
                 (if wanted.right > 0.0 { floor.right } else { 0.0 })
@@ -2690,7 +2732,7 @@ impl Workspace {
             (PanelId::MotionEditor, Dock::Hidden, Dock::Right, 3, 3, true, false),
         ];
         self.slots.len() == EXPECTED.len()
-            && self.left_width == *LEFT_WIDTH_RANGE.start()
+            && self.left_width == LEGACY_LEFT_WIDTH
             && self.right_width == 300.0
             && self.right_outer_width == 240.0
             && self.bottom_height == 170.0
@@ -2982,7 +3024,7 @@ mod tests {
         // above the floor" width, standing in for whatever the left column
         // happens to be, not a claim about what that floor is.
         let wanted = ColumnWidths {
-            left: 100.0,
+            left: *LEFT_WIDTH_RANGE.start(),
             right: 300.0,
             right_outer: 240.0,
         };
@@ -3020,7 +3062,7 @@ mod tests {
     #[test]
     fn an_empty_side_takes_nothing() {
         let wanted = ColumnWidths {
-            left: 100.0,
+            left: *LEFT_WIDTH_RANGE.start(),
             right: 900.0,
             right_outer: 0.0,
         };
@@ -3028,7 +3070,7 @@ mod tests {
         assert_eq!(fitted.right_outer, 0.0);
         assert_eq!(
             fitted.right,
-            1000.0 - MIN_STAGE_WIDTH - 100.0,
+            1000.0 - MIN_STAGE_WIDTH - *LEFT_WIDTH_RANGE.start(),
             "the hidden column's points were reserved anyway"
         );
     }
@@ -3038,12 +3080,12 @@ mod tests {
     #[test]
     fn the_widest_column_gives_up_the_space() {
         let wanted = ColumnWidths {
-            left: 100.0,
+            left: *LEFT_WIDTH_RANGE.start(),
             right: 800.0,
             right_outer: 240.0,
         };
         let fitted = fit_columns(1200.0, wanted, floors());
-        assert_eq!(fitted.left, 100.0, "the tool strip was trimmed");
+        assert_eq!(fitted.left, *LEFT_WIDTH_RANGE.start(), "the tool strip was trimmed");
         assert_eq!(fitted.right_outer, 240.0, "the narrow column was trimmed");
         assert!(fitted.right < 800.0);
         assert!((fitted.total() - (1200.0 - MIN_STAGE_WIDTH)).abs() < 1.0);
@@ -3173,60 +3215,27 @@ mod tests {
         }
     }
 
-    /// **Stage 4, item 4: Essentials shows three regions** — Tools, one tab
-    /// stack (Properties in front, Effects, Tool Options, Library, Assets and
-    /// Cast behind it) and Timeline — and hides the rest without losing them:
-    /// every hidden panel still has a slot and a `home` to reopen into.
+    /// **Essentials is Animate's Essentials**: Tools down the left,
+    /// Properties, Library and Assets as tabs on the right with Properties in
+    /// front, beside them a strip of icons — Color, Swatches, Lighting and
+    /// the rest, each a section of its own — and the Timeline along the
+    /// bottom; everything else hidden, without being lost.
     #[test]
     fn essentials_shows_three_regions() {
         let workspace = Workspace::essentials();
         assert_eq!(workspace.name, "Essentials");
+        assert!(workspace.icon_strip, "the Far Right column is an icon strip");
 
-        let shown: Vec<PanelId> = PanelId::ALL
-            .into_iter()
-            .filter(|id| workspace.dock_of(*id) != Dock::Hidden)
-            .collect();
-        assert_eq!(
-            shown.len(),
-            8,
-            "Essentials should show exactly eight panels (Tools, the six-tab \
-             stack, Timeline), shows {shown:?}"
-        );
-        for id in [
-            PanelId::Tools,
-            PanelId::Properties,
-            PanelId::Filters,
-            PanelId::ToolOptions,
-            PanelId::Library,
-            PanelId::Assets,
-            PanelId::Cast,
-            PanelId::Timeline,
-        ] {
-            assert_ne!(
-                workspace.dock_of(id),
-                Dock::Hidden,
-                "{id:?} should be one of Essentials' things"
-            );
-        }
-
-        // Properties, Effects, Tool Options, the Library, Assets and Cast
-        // all share the one column Essentials keeps beside the stage.
-        let section = workspace
-            .section_of(PanelId::Properties)
-            .expect("Properties is on screen");
-        for id in [
-            PanelId::Filters,
-            PanelId::ToolOptions,
-            PanelId::Library,
-            PanelId::Assets,
-            PanelId::Cast,
-        ] {
-            assert!(
-                section.panels.contains(&id),
-                "{id:?} should ride in Properties' stack"
-            );
-        }
+        assert_eq!(workspace.on(Dock::Left), vec![PanelId::Tools]);
+        assert_eq!(workspace.on(Dock::Right), vec![PanelId::Properties, PanelId::Library, PanelId::Assets]);
+        let section = workspace.section_of(PanelId::Properties).expect("Properties is on screen");
+        assert_eq!(section.panels, vec![PanelId::Properties, PanelId::Library, PanelId::Assets], "one tab stack");
         assert_eq!(section.front, PanelId::Properties);
+
+        assert_eq!(workspace.on(Dock::RightOuter), ESSENTIALS_STRIP.to_vec(), "the strip, in order");
+        assert_eq!(workspace.sections(Dock::RightOuter).len(), ESSENTIALS_STRIP.len(), "one icon, one panel");
+        assert!(workspace.on(Dock::Bottom).contains(&PanelId::Timeline));
+        assert_eq!(workspace.column_widths(1920.0).right_outer, ICON_STRIP_WIDTH, "drawn as narrow as an icon");
         assert_eq!(workspace.right_width, 300.0);
         assert_eq!(workspace.bottom_height, 220.0);
 
@@ -3295,9 +3304,14 @@ mod tests {
         workspace.reduce_motion = true;
         workspace.recovery_dirs = vec![std::path::PathBuf::from("B:/films/one")];
 
+        workspace.auto_tidy_layers = false;
+        workspace.frame_width = 13.0;
+
         workspace.apply_preset(WorkspacePreset::Essentials);
 
         assert_eq!(workspace.name, "Essentials");
+        assert!(!workspace.auto_tidy_layers, "a setting, not layout: kept");
+        assert_eq!(workspace.frame_width, 13.0, "kept");
         assert_eq!(workspace.theme, crate::theme::Theme::Light);
         assert_eq!(workspace.ui_scale, 1.5);
         assert!(workspace.reduce_motion);

@@ -86,8 +86,17 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-echo "== Ad-hoc signing"
-codesign --force --deep --sign - "$APP"
+# Signed with this Mac's own certificate when it can be made, so macOS
+# keeps the permissions given to one build for the next (see
+# local_signing.sh); ad hoc otherwise, which asks again every install.
+source "$ROOT/installer/macos/local_signing.sh"
+if KEYCHAIN="$(local_signing_keychain)" \
+    && codesign --force --deep --keychain "$KEYCHAIN" --sign "$LOCAL_SIGNING_NAME" "$APP"; then
+    echo "== Signed as \"$LOCAL_SIGNING_NAME\""
+else
+    echo "== Ad-hoc signing (no local signing identity)"
+    codesign --force --deep --sign - "$APP"
+fi
 
 echo "== Disk image"
 STAGE="$DIST/dmg-stage"

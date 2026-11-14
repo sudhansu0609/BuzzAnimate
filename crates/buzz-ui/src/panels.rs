@@ -14,6 +14,7 @@ use crate::command::{Command, shortcut_text};
 use crate::selection::Selection;
 use crate::style::{DrawStyle, DrawingMode, FillKind, StrokeKind, SymmetryMode};
 use crate::theme::{Metrics, Palette, Tokens};
+use crate::menu_ui::MenuUi;
 use crate::tools::{TOOL_FAMILIES, ToolId, ToolStatus};
 use crate::view::ViewSettings;
 
@@ -105,6 +106,45 @@ pub struct SequenceMenuInfo {
 
 /// Draw the menu bar. Returns whatever the user chose.
 pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
+    let mut raised = Vec::new();
+    egui::MenuBar::new().ui(ui, |ui| {
+        raised = build_menus(&mut MenuUi::Egui(ui), state);
+
+        // **Reset Layout, in plain sight.** It is on the Window menu too, but
+        // the moment somebody wants it is the moment the layout has gone
+        // wrong on them, and a button at the end of the menu bar is there
+        // whatever state the panels are in.
+        //
+        // **Only where it fits.** In a narrow window, or beside a long status
+        // line, the space left after Help is narrower than the button, and a
+        // right-to-left layout then draws it back over Help. There it is
+        // left out; Window ▸ Workspace ▸ Reset Layout is always there.
+        let label = egui::WidgetText::from("Reset Layout").into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Button,
+        );
+        let needed = label.size().x + ui.spacing().button_padding.x * 2.0 + ui.spacing().item_spacing.x * 2.0;
+        if ui.available_width() >= needed {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("Reset Layout")
+                    .on_hover_text("Put every panel back where it started")
+                    .clicked()
+                {
+                    raised.push(Command::ResetWorkspace);
+                }
+            });
+        }
+    });
+    raised
+}
+
+/// **The menus**, written once against [`MenuUi`]: drawn into the window's
+/// menu row by [`menu_bar`], and walked into the macOS menu bar at the top of
+/// the screen (see `crate::menu_ui`). Returns whatever the user chose.
+pub fn build_menus(ui: &mut MenuUi<'_>, state: &MenuState<'_>) -> Vec<Command> {
     let MenuState {
         scene,
         selection,
@@ -119,15 +159,12 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         rotate_mode,
     } = *state;
     let mut raised = Vec::new();
-
-    egui::MenuBar::new().ui(ui, |ui| {
+    {
         let has_selection = !selection.is_empty();
 
-        let item = |ui: &mut Ui, command: Command, enabled: bool, out: &mut Vec<Command>| {
-            let shortcut =
-                crate::command::format_shortcut(ui.ctx(), workspace.shortcut_for(command));
-            let button = egui::Button::new(command.label()).shortcut_text(shortcut);
-            if ui.add_enabled(enabled, button).clicked() {
+        let item = |ui: &mut MenuUi<'_>, command: Command, enabled: bool, out: &mut Vec<Command>| {
+            let shortcut = ui.shortcut(workspace.shortcut_for(command));
+            if ui.button_with(command.label(), shortcut, enabled).clicked() {
                 out.push(command);
                 ui.close();
             }
@@ -289,12 +326,10 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             }
             ui.separator();
 
-            let toggle = |ui: &mut Ui, command: Command, on: bool, out: &mut Vec<Command>| {
+            let toggle = |ui: &mut MenuUi<'_>, command: Command, on: bool, out: &mut Vec<Command>| {
                 let mark = if on { "✔ " } else { "   " };
-                let shortcut = shortcut_text(ui.ctx(), command);
-                let button =
-                    egui::Button::new(format!("{mark}{}", command.label())).shortcut_text(shortcut);
-                if ui.add(button).clicked() {
+                let shortcut = ui.command_shortcut(command);
+                if ui.button_with(format!("{mark}{}", command.label()), shortcut, true).clicked() {
                     out.push(command);
                     ui.close();
                 }
@@ -374,11 +409,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 // panel with its shortcut, not just a name and a tick — most
                 // have none, and the button is simply blank at the right.
                 let shortcut =
-                    crate::command::format_shortcut(ui.ctx(), workspace.shortcut_for(Command::TogglePanel(id)));
+                    ui.shortcut(workspace.shortcut_for(Command::TogglePanel(id)));
                 if ui
-                    .add(
-                        egui::Button::new(format!("{mark}{}", id.title())).shortcut_text(shortcut),
-                    )
+                    .button_with(format!("{mark}{}", id.title()), shortcut, true)
                     .clicked()
                 {
                     raised.push(Command::TogglePanel(id));
@@ -446,12 +479,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                     }
                 }
                 ui.separator();
-                let shortcut = shortcut_text(ui.ctx(), Command::ToggleTheme);
+                let shortcut = ui.command_shortcut(Command::ToggleTheme);
                 if ui
-                    .add(
-                        egui::Button::new(format!("   {}", Command::ToggleTheme.label()))
-                            .shortcut_text(shortcut),
-                    )
+                    .button_with(format!("   {}", Command::ToggleTheme.label()), shortcut, true)
                     .on_hover_text("Step to the next theme in the list")
                     .clicked()
                 {
@@ -462,9 +492,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             ui.separator();
 
             let mark = if workspace.locked { "\u{2714} " } else { "   " };
-            let shortcut = shortcut_text(ui.ctx(), Command::ToggleLayoutLock);
+            let shortcut = ui.command_shortcut(Command::ToggleLayoutLock);
             if ui
-                .add(egui::Button::new(format!("{mark}Lock Layout")).shortcut_text(shortcut))
+                .button_with(format!("{mark}Lock Layout"), shortcut, true)
                 .on_hover_text("Stop panels being dragged, resized or moved")
                 .clicked()
             {
@@ -803,10 +833,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                     ui.close();
                 }
                 if ui
-                    .add_enabled(
-                        sequence.active_shot_setup.is_some(),
-                        egui::Button::new("Edit Setup"),
-                    )
+                    .button_with("Edit Setup", String::new(), sequence.active_shot_setup.is_some())
                     .clicked()
                     && let Some(setup) = sequence.active_shot_setup
                 {
@@ -848,7 +875,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::ClearScriptOutput, true, &mut raised);
             ui.separator();
             // The user's Animate scripts, one item each (JSFL_COMMANDS_PLAN J1).
-            crate::jsfl_menu::show(ui);
+            ui.jsfl_commands();
             ui.separator();
             ui.label(
                 RichText::new("Write scripts in the Actions panel")
@@ -872,6 +899,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             ui.menu_button("Timeline", |ui| {
                 item(ui, Command::CleanUpLayers, true, &mut raised);
                 item(ui, Command::ArrangeLayers, true, &mut raised);
+                item(ui, Command::GroupEmptyLayers, true, &mut raised);
+                item(ui, Command::RemoveFolder, true, &mut raised);
+                item(ui, Command::RemoveAllFolders, true, &mut raised);
                 item(ui, Command::RepairLayerRigs, true, &mut raised);
                 item(ui, Command::RenameBodyLayers, true, &mut raised);
                 item(ui, Command::RenameFaceLayers, true, &mut raised);
@@ -893,7 +923,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 // out beats a checkbox whose state you cannot see from here.
                 for op in crate::align::Align::ALL {
                     if ui
-                        .add_enabled(has_selection, egui::Button::new(op.label()))
+                        .button_with(op.label(), String::new(), has_selection)
                         .clicked()
                     {
                         raised.push(Command::Align {
@@ -907,7 +937,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 ui.menu_button("To Stage", |ui| {
                     for op in crate::align::Align::ALL {
                         if ui
-                            .add_enabled(has_selection, egui::Button::new(op.label()))
+                            .button_with(op.label(), String::new(), has_selection)
                             .clicked()
                         {
                             raised.push(Command::Align { op, to_stage: true });
@@ -920,7 +950,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 ui.label(RichText::new("Distribute").small().weak());
                 for op in crate::align::Distribute::ALL {
                     if ui
-                        .add_enabled(has_selection, egui::Button::new(op.label()))
+                        .button_with(op.label(), String::new(), has_selection)
                         .on_hover_text(match op {
                             crate::align::Distribute::HorizontalSpacing
                             | crate::align::Distribute::VerticalSpacing => {
@@ -940,7 +970,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 ui.label(RichText::new("Match Size").small().weak());
                 for op in crate::align::MatchSize::ALL {
                     if ui
-                        .add_enabled(has_selection, egui::Button::new(op.label()))
+                        .button_with(op.label(), String::new(), has_selection)
                         .on_hover_text("Scale everything up to the largest, about its own centre")
                         .clicked()
                     {
@@ -1000,10 +1030,9 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
                 // anything is selected.
                 let mark = if rotate_mode { "✔ " } else { "   " };
                 let command = Command::ToggleRotateMode;
-                let button = egui::Button::new(format!("{mark}{}", command.label()))
-                    .shortcut_text(shortcut_text(ui.ctx(), command));
+                let shortcut = ui.command_shortcut(command);
                 if ui
-                    .add(button)
+                    .button_with(format!("{mark}{}", command.label()), shortcut, true)
                     .on_hover_text(
                         "Free Transform only rotates, about the transformation point. \
                          Scaling, skewing and moving are switched off.",
@@ -1020,10 +1049,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
         // characters) was the one menu that fell under Stage 6, item 3's
         // 24 px hit-target minimum on width alone; every longer label already
         // clears it from its own text.
-        egui::containers::menu::MenuButton::from_button(
-            egui::Button::new("AI").min_size(egui::vec2(24.0, 0.0)),
-        )
-        .ui(ui, |ui| {
+        ui.menu_button("AI", |ui| {
             // **One place for everything that uses a model**
             // (docs/MENU_CLEANUP_PLAN.md M2), in groups. Tracing a picture and
             // splitting it into layers are here, not under Modify; the
@@ -1034,6 +1060,7 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::AiSplitPictureIntoLayers, true, &mut raised);
             // The same as Split Picture into Layers on a picture, named for what it does.
             item(ui, Command::TraceBoldSplit, has_selection, &mut raised);
+            item(ui, Command::TraceSplit, has_selection, &mut raised);
             item(ui, Command::AiRemoveObject, true, &mut raised);
             item(ui, Command::AiGenerateBackground, true, &mut raised);
             item(ui, Command::AiSceneFromImage, true, &mut raised);
@@ -1069,36 +1096,20 @@ pub fn menu_bar(ui: &mut Ui, state: &MenuState<'_>) -> Vec<Command> {
             item(ui, Command::About, true, &mut raised);
         });
 
-        // **Reset Layout, in plain sight.** It is on the Window menu too, but
-        // the moment somebody wants it is the moment the layout has gone
-        // wrong on them, and a button at the end of the menu bar is there
-        // whatever state the panels are in.
-        //
-        // **Only where it fits.** In a narrow window, or beside a long status
-        // line, the space left after Help is narrower than the button, and a
-        // right-to-left layout then draws it back over Help. There it is
-        // left out; Window ▸ Workspace ▸ Reset Layout is always there.
-        let label = egui::WidgetText::from("Reset Layout").into_galley(
-            ui,
-            Some(egui::TextWrapMode::Extend),
-            f32::INFINITY,
-            egui::TextStyle::Button,
-        );
-        let needed = label.size().x + ui.spacing().button_padding.x * 2.0 + ui.spacing().item_spacing.x * 2.0;
-        if ui.available_width() >= needed {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("Reset Layout")
-                    .on_hover_text("Put every panel back where it started")
-                    .clicked()
-                {
-                    raised.push(Command::ResetWorkspace);
-                }
-            });
-        }
-    });
-
+    }
     raised
+}
+
+/// [`build_menus`] as a tree, every item knowing its command — for the macOS
+/// menu bar. See [`crate::menu_ui::record_menus`].
+pub fn menu_model(state: &MenuState<'_>, jsfl: &crate::jsfl_menu::JsflMenu) -> Vec<crate::menu_ui::MenuNode> {
+    crate::menu_ui::record_menus(jsfl, |ui| build_menus(ui, state))
+}
+
+/// What [`menu_model`] would draw, commands left blank: compared each frame to
+/// decide whether the macOS menus need building again.
+pub fn menu_shape(state: &MenuState<'_>, jsfl: &crate::jsfl_menu::JsflMenu) -> Vec<crate::menu_ui::MenuNode> {
+    crate::menu_ui::record_shape(jsfl, |ui| build_menus(ui, state))
 }
 
 /// The vertical tool strip — Stage 3 of `docs/WORKSPACE_DESIGN_PLAN.md`, as
@@ -1126,7 +1137,6 @@ pub fn tool_bar(ui: &mut Ui, active: ToolId, style: &mut DrawStyle) -> Option<To
 /// second one, says so; none when it has no key).
 pub fn tool_bar_with_keys(ui: &mut Ui, active: ToolId, style: &mut DrawStyle, keys: &dyn Fn(ToolId) -> Vec<String>) -> Option<ToolId> {
     let mut chosen = None;
-    let tools = crate::tools::all_tools();
 
     // **No scroll area of its own.** The dock column it sits in already
     // scrolls, and a vertical scroll area inside another one is told it has
@@ -1137,50 +1147,122 @@ pub fn tool_bar_with_keys(ui: &mut Ui, active: ToolId, style: &mut DrawStyle, ke
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(Tokens::SPACE_1, Tokens::SPACE_1);
 
-        // **`ui.clip_rect().height()`, not `ui.available_height()`.** The
-        // tool strip sits inside the dock column's own `ScrollArea` (see
-        // above), and a `ScrollArea`'s content `Ui` reports its *layout*
-        // space as tall as the content wants to be — effectively unbounded —
-        // while `clip_rect` stays the scroll viewport actually on screen.
-        // Measured against `available_height` here, the two-column fallback
-        // this decides between never fired: a panel too short to show
-        // twenty-four 28 px buttons in one column still measured "plenty of
-        // room" and stayed one column, scrollable but not what item (b) of
-        // the workspace defects brief asks for.
-        let columns = tool_strip_columns(
-            ui.clip_rect().height(),
-            tools.len(),
-            tool_strip_footer_height(),
-        );
-
         // Anchors for the optional flyout: the rect of whichever button
         // happens to be its family's first member, the only one the flyout
         // ever needs to position itself against (see `flyout_id`).
         let mut anchors: Vec<(ToolId, egui::Rect)> = Vec::new();
 
-        if columns == 1 {
-            for tool in tools.iter().copied() {
-                place_tool_button(ui, tool, active, &mut chosen, &mut anchors, keys);
+        // **Related tools on one line**, sections between dividers, as
+        // Animate's toolbar groups them (`TOOL_ROWS`). Dragged narrower than
+        // a line of three, the column **collapses to one tool per line**: each
+        // line shows its group's tool in use (or last used), and the rest of
+        // the group opens beside it — see `collapsed_tool_row`.
+        // A little slack: the column's scroll bar floats over its right edge,
+        // and a third button under it reads as cut off.
+        let three = 3.0 * Metrics::TOOL_BUTTON + 2.0 * Tokens::SPACE_1 + Tokens::SPACE_1;
+        let one_per_line = ui.available_width() < three;
+        for (i, section) in crate::tools::TOOL_ROWS.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(Tokens::SPACE_1);
+                ui.separator();
             }
-        } else {
-            for pair in tools.chunks(2) {
-                ui.horizontal(|ui| {
-                    for tool in pair.iter().copied() {
-                        place_tool_button(ui, tool, active, &mut chosen, &mut anchors, keys);
-                    }
-                });
+            for row in section.iter() {
+                if one_per_line {
+                    collapsed_tool_row(ui, row, active, &mut chosen, keys);
+                } else {
+                    // Flush left, so the tools stand in columns from the
+                    // column's edge with no space wasted before them.
+                    ui.horizontal(|ui| {
+                        for tool in row.iter().copied() {
+                            place_tool_button(ui, tool, active, &mut chosen, &mut anchors, keys);
+                        }
+                    });
+                }
             }
         }
-
         draw_family_flyouts(ui, active, &anchors, &mut chosen, keys);
 
         ui.add_space(Tokens::SPACE_2);
         ui.separator();
         ui.add_space(Tokens::SPACE_1);
-        color_wells(ui, style);
+        color_wells(ui, style, one_per_line);
     });
 
     chosen
+}
+
+/// **One line of related tools, collapsed to a single button**, for a tool
+/// column dragged narrower than a line of three: the line's tool in use, else
+/// the one last used from it, else its first. A click takes that tool; a
+/// right-click or a press held for half a second opens the whole line beside
+/// it, a small corner mark saying there is more, as Animate's toolbar does.
+fn collapsed_tool_row(
+    ui: &mut Ui,
+    row: &[ToolId],
+    active: ToolId,
+    chosen: &mut Option<ToolId>,
+    keys: &dyn Fn(ToolId) -> Vec<String>,
+) {
+    let remembered = egui::Id::new(("tool-row-last", row[0]));
+    if row.contains(&active) {
+        ui.memory_mut(|m| m.data.insert_temp(remembered, active));
+    }
+    let shown = if row.contains(&active) {
+        active
+    } else {
+        ui.memory(|m| m.data.get_temp::<ToolId>(remembered)).unwrap_or(row[0])
+    };
+    let response = tool_button(ui, shown, shown == active, keys);
+    if response.clicked() {
+        *chosen = Some(shown);
+    }
+    if row.len() < 2 {
+        return;
+    }
+    // The corner mark: there is more on this line.
+    let r = response.rect;
+    let mark = ui.visuals().widgets.inactive.fg_stroke.color;
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![r.right_bottom() + egui::vec2(-2.0, -2.0), r.right_bottom() + egui::vec2(-7.0, -2.0), r.right_bottom() + egui::vec2(-2.0, -7.0)],
+        mark,
+        egui::Stroke::NONE,
+    ));
+    let open_key = egui::Id::new(("tool-row-flyout", row[0]));
+    let held = response.is_pointer_button_down_on()
+        && ui.input(|i| i.pointer.press_start_time().is_some_and(|t| i.time - t > 0.5));
+    let mut open = ui.memory(|m| m.data.get_temp::<bool>(open_key)).unwrap_or(false);
+    if response.secondary_clicked() || (held && !open) {
+        open = !open || held;
+    }
+    if !open {
+        ui.memory_mut(|m| m.data.insert_temp(open_key, false));
+        return;
+    }
+    let mut picked = None;
+    let area = egui::Area::new(egui::Id::new(("tool-row-flyout-area", row[0])))
+        .fixed_pos(r.right_top() + egui::vec2(Tokens::SPACE_1, 0.0))
+        .order(egui::Order::Foreground)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for tool in row.iter().copied() {
+                        if tool_button(ui, tool, tool == active, keys).clicked() {
+                            picked = Some(tool);
+                        }
+                    }
+                });
+            });
+        })
+        .response;
+    let on_button = ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| r.contains(p));
+    if picked.is_some() || (ui.input(|i| i.pointer.any_click()) && !area.contains_pointer() && !on_button) {
+        open = false;
+    }
+    if let Some(tool) = picked {
+        *chosen = Some(tool);
+        ui.memory_mut(|m| m.data.insert_temp(remembered, tool));
+    }
+    ui.memory_mut(|m| m.data.insert_temp(open_key, open));
 }
 
 /// One column when the panel is tall enough to stack every tool with no
@@ -1397,7 +1479,21 @@ fn tool_button(ui: &mut Ui, tool: ToolId, active: bool, keys: &dyn Fn(ToolId) ->
 }
 
 /// Stroke and fill wells, with Animate's swap and reset controls.
-fn color_wells(ui: &mut Ui, style: &mut DrawStyle) {
+/// The stroke and fill wells, Swap and Black-and-white. `narrow`: a column of
+/// one tool per line, where each well and its on/off switch stack, and so do
+/// the two buttons, rather than being cut off at the column's edge.
+fn color_wells(ui: &mut Ui, style: &mut DrawStyle, narrow: bool) {
+    if narrow {
+        well_narrow(ui, "Stroke", &mut style.stroke_color, &mut style.stroke_enabled);
+        well_narrow(ui, "Fill", &mut style.fill_color, &mut style.fill_enabled);
+        if crate::widgets::icon_button(ui, "X", "Swap stroke and fill", Some("X")).clicked() {
+            style.swap_colors();
+        }
+        if crate::widgets::icon_button(ui, "D", "Black and white", Some("D")).clicked() {
+            style.reset_colors();
+        }
+        return;
+    }
     ui.horizontal(|ui| {
         ui.add_space(2.0);
         ui.vertical(|ui| {
@@ -1423,6 +1519,35 @@ fn color_wells(ui: &mut Ui, style: &mut DrawStyle) {
             style.reset_colors();
         }
     });
+}
+
+/// A well on its own line, its on/off switch on the right-click.
+fn well_narrow(ui: &mut Ui, label: &str, color: &mut Color, enabled: &mut bool) {
+    let mut rgba = to_egui(*color);
+    // As wide as a tool button, so a one-button column holds it whole.
+    let response = ui
+        .scope(|ui| {
+            ui.spacing_mut().interact_size = egui::vec2(Metrics::TOOL_BUTTON, 20.0);
+            ui.color_edit_button_srgba(&mut rgba)
+        })
+        .inner;
+    if response.changed() {
+        *color = from_egui(rgba);
+        *enabled = true;
+    }
+    let response = response.on_hover_text(format!(
+        "{label} ({}) \u{2014} right-click to turn it {}",
+        if *enabled { "on" } else { "off" },
+        if *enabled { "off" } else { "on" }
+    ));
+    if !*enabled {
+        // Struck through while off.
+        let r = response.rect;
+        ui.painter().line_segment([r.left_bottom(), r.right_top()], egui::Stroke::new(1.5, ui.visuals().error_fg_color));
+    }
+    if response.secondary_clicked() {
+        *enabled = !*enabled;
+    }
 }
 
 fn well(ui: &mut Ui, label: &str, color: &mut Color, enabled: &mut bool) {
@@ -6619,6 +6744,49 @@ mod tests {
             pairs > 100,
             "only {pairs} pairs were picked, so the walk never reached the menus"
         );
+    }
+
+    /// **The menus, recorded for the macOS menu bar**: every top menu there,
+    /// and each item knows what it does — File ▸ Save saves, a View switch
+    /// keeps its tick, a disabled item stays disabled.
+    #[test]
+    fn the_menus_record_with_their_commands() {
+        use crate::menu_ui::{MenuAction, MenuNode};
+        let scene = Scene::default();
+        let selection = Selection::new();
+        let view = ViewSettings::default();
+        let workspace = crate::workspace::Workspace::animate();
+        let sequence = SequenceMenuInfo::default();
+        let state = MenuState {
+            scene: &scene,
+            selection: &selection,
+            view: &view,
+            can_undo: false,
+            can_redo: false,
+            workspace: &workspace,
+            light_gizmos: true,
+            templates: &[],
+            sequence: &sequence,
+            library_symbol: false,
+            rotate_mode: false,
+        };
+        let menus = menu_model(&state, &Default::default());
+        let titles: Vec<&str> = menus.iter().filter_map(|m| match m { MenuNode::Menu { title, .. } => Some(title.as_str()), _ => None }).collect();
+        assert_eq!(&titles[..3], ["File", "Edit", "View"]);
+        assert!(titles.contains(&"Help") && titles.contains(&"AI"));
+        fn find<'a>(nodes: &'a [MenuNode], label: &str) -> Option<&'a MenuNode> {
+            nodes.iter().find_map(|n| match n {
+                MenuNode::Item { label: l, .. } if l == label => Some(n),
+                MenuNode::Menu { items, .. } => find(items, label),
+                _ => None,
+            })
+        }
+        let item = |label: &str| find(&menus, label).cloned().unwrap_or_else(|| panic!("no {label}"));
+        assert!(matches!(item(Command::Save.label()), MenuNode::Item { action: Some(MenuAction::Command(Command::Save)), enabled: true, .. }));
+        assert!(matches!(item(Command::Undo.label()), MenuNode::Item { enabled: false, action: Some(MenuAction::Command(Command::Undo)), .. }));
+        assert!(matches!(item(Command::ToggleRulers.label()), MenuNode::Item { checked, action: Some(MenuAction::Command(Command::ToggleRulers)), .. } if checked == view.show_rulers));
+        // (An item that does nothing in this state — the Shot menu's, with
+        // no shot open — has no action, and the macOS menu greys it out.)
     }
 
     /// Panels must not panic on an empty document, which is the state the app

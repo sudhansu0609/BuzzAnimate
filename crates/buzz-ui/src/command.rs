@@ -205,6 +205,10 @@ pub enum Command {
     /// Sky / Far / Land (or a Room, indoors) and objects (AI > Split Picture into
     /// Layers), in one go. In the AI menu under Picture.
     TraceBoldSplit,
+    /// **Trace + Split into Layers** (S19): as [`Command::TraceBoldSplit`] in Trace
+    /// Bitmap's own look (no bold outlines, no kept textures), and the objects get no
+    /// outline of their own. In the AI menu under Picture.
+    TraceSplit,
     ConvertLinesToFills,
     ExpandFill,
     SmoothSelection,
@@ -596,6 +600,15 @@ pub enum Command {
     /// **Arrange Layers**: file top-level layers into folders by content
     /// without changing the drawing order (`docs/LAYER_MANAGEMENT_PLAN.md` L3).
     ArrangeLayers,
+    /// **Group Empty Layers**: in every folder, the layers with artwork or
+    /// sound first and the empty ones after — reordered only, nothing deleted
+    /// or moved between folders, so the picture is unchanged.
+    GroupEmptyLayers,
+    /// **Remove Folder, Keep Layers**: the folder right-clicked (or the one
+    /// the active layer is in) goes, its layers staying where they are.
+    RemoveFolder,
+    /// **Remove All Folders, Keep Layers**, on the timeline being edited.
+    RemoveAllFolders,
     /// **Repair Layer Rigs…**: rewire layer-parenting rigs built with the
     /// old Bones → Layers wiring so a limb's front piece leads, rebaking keys
     /// so no frame changes.
@@ -824,6 +837,7 @@ command_table! {
             TraceLineArt => "trace_line_art",
             TraceBitmapOptions => "trace_bitmap_options",
             TraceBoldSplit => "trace_bold_split",
+            TraceSplit => "trace_split",
             ConvertLinesToFills => "convert_lines_to_fills",
             ExpandFill => "expand_fill",
             SmoothSelection => "smooth_selection",
@@ -956,6 +970,9 @@ command_table! {
             PuppetMode => "puppet_mode",
             CleanUpLayers => "clean_up_layers",
             ArrangeLayers => "arrange_layers",
+            GroupEmptyLayers => "group_empty_layers",
+            RemoveFolder => "remove_folder",
+            RemoveAllFolders => "remove_all_folders",
             RepairLayerRigs => "repair_layer_rigs",
             RenameBodyLayers => "rename_body_layers",
             RenameFaceLayers => "rename_face_layers",
@@ -1291,6 +1308,7 @@ impl Command {
             TraceLineArt => "Trace as Line Art",
             TraceBitmapOptions => "Trace Picture\u{2026}",
             TraceBoldSplit => "Trace Bold + Split into Layers",
+            TraceSplit => "Trace + Split into Layers",
             ConvertLinesToFills => "Convert Lines to Fills",
             ExpandFill => "Expand Fill…",
             SmoothSelection => "Smooth",
@@ -1445,6 +1463,9 @@ impl Command {
             PuppetMode => "Puppet Mode",
             CleanUpLayers => "Clean Up Layers\u{2026}",
             ArrangeLayers => "Arrange Layers",
+            GroupEmptyLayers => "Group Empty Layers",
+            RemoveFolder => "Remove Folder, Keep Layers",
+            RemoveAllFolders => "Remove All Folders, Keep Layers",
             RepairLayerRigs => "Repair Layer Rigs\u{2026}",
             RenameBodyLayers => "Rename Body Layers",
             RenameFaceLayers => "Rename Face Layers",
@@ -1573,7 +1594,7 @@ impl Command {
             // the rest of the picture. Animate binds neither.
             ThickenStroke => sc(Modifiers::NONE, Key::CloseBracket),
             ThinStroke => sc(Modifiers::NONE, Key::OpenBracket),
-            TraceBitmap | TraceLineArt | TraceBitmapOptions | TraceBoldSplit => None,
+            TraceBitmap | TraceLineArt | TraceBitmapOptions | TraceBoldSplit | TraceSplit => None,
             ConvertLinesToFills => None,
             SmoothSelection => None,
             RecogniseShape => None,
@@ -1727,6 +1748,9 @@ impl Command {
             PuppetMode => None,
             CleanUpLayers => None,
             ArrangeLayers => None,
+            GroupEmptyLayers => None,
+            RemoveFolder => None,
+            RemoveAllFolders => None,
             RepairLayerRigs => None,
             // Ctrl+R, the user's key for it in Animate, is Import to Stage
             // here; it stays unbound rather than steal it.
@@ -1885,6 +1909,7 @@ pub fn palette_commands() -> Vec<Command> {
         TraceLineArt,
         TraceBitmapOptions,
         TraceBoldSplit,
+        TraceSplit,
         ConvertLinesToFills,
         ExpandFill,
         SmoothSelection,
@@ -1934,6 +1959,9 @@ pub fn palette_commands() -> Vec<Command> {
         PuppetMode,
         CleanUpLayers,
         ArrangeLayers,
+        GroupEmptyLayers,
+        RemoveFolder,
+        RemoveAllFolders,
         RepairLayerRigs,
         RenameBodyLayers,
         RenameFaceLayers,
@@ -2150,6 +2178,7 @@ mod tests {
             TraceLineArt,
             TraceBitmapOptions,
             TraceBoldSplit,
+            TraceSplit,
             ConvertLinesToFills,
             ExpandFill,
             SmoothSelection,
@@ -2197,6 +2226,9 @@ mod tests {
             PuppetMode,
             CleanUpLayers,
             ArrangeLayers,
+            GroupEmptyLayers,
+            RemoveFolder,
+            RemoveAllFolders,
             RepairLayerRigs,
             RenameBodyLayers,
             RenameFaceLayers,
@@ -2389,7 +2421,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            253
+            254
         );
     }
 

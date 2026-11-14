@@ -63,13 +63,12 @@ pub struct TimelineResponse {
     pub move_layer: Option<(LayerId, usize, Option<LayerId>)>,
     /// A light's channel was clicked: make it the selected light.
     pub select_light: Option<LightId>,
+    /// Frames picked on a light's row — a click, a drag along it, or a
+    /// Shift+click from the frame already picked: `(light, first, last)`.
+    pub select_light_cells: Option<(LightId, u32, u32)>,
     /// A light's row was dragged to a new place in the layer stack: directly
     /// above this layer, or (`None`) at the top. See `Scene::place_light`.
     pub place_light: Option<(LightId, Option<LayerId>)>,
-    /// Add a keyframe to this light at this frame (from the channel's menu).
-    pub light_key: Option<(LightId, u32)>,
-    /// Remove this light's keyframe at this frame.
-    pub light_unkey: Option<(LightId, u32)>,
     /// The parenting view was switched on or off.
     pub toggle_parenting: bool,
     /// The depth view was switched on or off.
@@ -209,6 +208,10 @@ impl TweenRequest {
 #[derive(Clone, Copy, Debug, Default)]
 struct FrameVerticalDrag {
     start_y: f32,
+    /// Where the press was, in frames from frame 0's left edge (fractional): the drag keeps to
+    /// `start_frame`'s column until the pointer is a whole cell away from it, so a drag straight
+    /// down that wobbles a pixel or two sideways selects one column, not two.
+    start_at: f32,
     start_frame: u32,
     current_frame: u32,
     anchor_layer: Option<LayerId>,
@@ -796,6 +799,12 @@ pub struct TimelineState {
     /// Which light's channel is highlighted — the one the light keyframe
     /// commands act on, and the one whose row is always shown so it can be keyed.
     pub selected_light: Option<LightId>,
+    /// That light's row is the current row: the frame commands key it, so its
+    /// name is lit as a selected layer's is.
+    pub light_row_selected: bool,
+    /// The frames selected on that light's row, `(first, last)`, drawn as a
+    /// layer's selected frames are.
+    pub light_cells: Option<(u32, u32)>,
     pub playing: bool,
     pub onion_enabled: bool,
     /// Auto Keyframe: changing artwork at a frame with no keyframe of its own
@@ -1267,7 +1276,7 @@ pub fn timeline_panel(ui: &mut Ui, scene: &Scene, state: &TimelineState) -> Time
 /// never clips the Reset button off its end. L1's filter, search, Compact and
 /// "N hidden" label added about 330 points; K2's Protect lock about 70, and
 /// its scope dropdown (shown while protect is on) about 175 more.
-pub const LAYER_TOOLS_INLINE_WIDTH: f32 = 1450.0;
+pub const LAYER_TOOLS_INLINE_WIDTH: f32 = 360.0;
 
 /// [`timeline_panel`], with the layer tools (New Layer, Folder, Camera,
 /// Parent, Depth, the two size sliders) drawn into `tools_slot` rather than
@@ -1327,14 +1336,20 @@ pub fn timeline_panel_with_tools_slot(
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
             tools.set_clip_rect(slot);
-            layer_tools(&mut tools, scene, state, &mut response);
+            // **On the header line, always**, as Animate keeps its layer
+            // buttons on the timeline's top line: what does not fit goes
+            // under More (see `layer_tools`) rather than sending them all
+            // back to a strip under the layers. It needed 1450 points to come
+            // up here at all, which a window with its side columns open never
+            // had.
+            layer_tools(&mut tools, scene, state, &mut response, true);
         }
         None => {
             egui::Panel::bottom("timeline-layer-tools")
                 .resizable(false)
                 .default_size(LAYER_TOOLS_HEIGHT)
                 .min_size(LAYER_TOOLS_HEIGHT)
-                .show(ui, |ui| layer_tools(ui, scene, state, &mut response));
+                .show(ui, |ui| layer_tools(ui, scene, state, &mut response, false));
         }
     }
 
@@ -1560,7 +1575,7 @@ pub fn timeline_panel_with_tools_slot(
 /// buttons are a third door onto one room, not a third implementation. Delete
 /// is disabled at one layer, because a document with no layers is not a state
 /// Animate lets you reach and not one worth supporting here.
-fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut TimelineResponse) {
+fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut TimelineResponse, inline: bool) {
     // `horizontal_wrapped`, not `horizontal`: Stage 6, item 3 brought every
     // button on this row up to `Tokens::CONTROL_H`/24 px wide-or-taller,
     // which is wider, in total, than the narrowest legal window — wrapping
@@ -1592,9 +1607,14 @@ fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Time
         // tools the same way a layer's own eye is reachable from its row —
         // Animate keeps "Show/Hide Camera" beside its layer buttons rather
         // than making it a menu a user has to already know exists.
+        let camera_on = scene.camera().enabled;
         if ui
-            .add(egui::Button::new("Camera").selected(scene.camera().enabled))
-            .on_hover_text("Add/Remove Camera")
+            .add(egui::Button::new(if camera_on { "Camera: On" } else { "Camera: Off" }).selected(camera_on))
+            .on_hover_text(if camera_on {
+                "Disable the camera layer \u{2014} its keyframes are kept for when it is enabled again"
+            } else {
+                "Enable the camera layer"
+            })
             .clicked()
         {
             out.command = Some(crate::Command::ToggleCamera);
@@ -1658,167 +1678,259 @@ fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Time
             ));
         }
 
-        // How many, on the same line: the count is the one thing about the
-        // layer stack that is not visible when the list is scrolled.
-        ui.label(
-            egui::RichText::new(format!("{} layers", scene.layers().len()))
-                .small()
-                .weak(),
-        );
-
-        // **L1: the layer filter.** Hide empty rows, or show only what is on
-        // the playhead frame, plus a name search — view only, never the film.
-        ui.separator();
-        let mut filter = state.layer_filter;
-        egui::ComboBox::from_id_salt("timeline-layer-filter")
-            .width(112.0)
-            .selected_text(filter.label())
-            .show_ui(ui, |ui| {
-                for option in LayerFilter::EVERY {
-                    ui.selectable_value(&mut filter, option, option.label());
+        // **The rest, as many as fit.** On the timeline's header line each
+        // goes on the line while there is room for it, and whatever does not
+        // fit is kept under More at the end — nothing is ever cut off out of
+        // reach, as it was when the line scrolled sideways with no bar to
+        // say so. In the strip under the layers there is room for them all.
+        let items = [
+            ToolItem::Filter,
+            ToolItem::Search,
+            ToolItem::Compact,
+            ToolItem::Focus,
+            ToolItem::Locked,
+            ToolItem::Protect,
+            ToolItem::Count,
+            ToolItem::Size,
+        ];
+        if !inline {
+            for item in items {
+                tool_item(ui, item, scene, state, out, false);
+            }
+            return;
+        }
+        const MORE: f32 = 64.0;
+        let mut overflow = Vec::new();
+        for (i, item) in items.into_iter().enumerate() {
+            let rest_fits = items[i..].iter().map(|it| it.width(state)).sum::<f32>() <= ui.available_width();
+            if overflow.is_empty() && (rest_fits || item.width(state) + MORE <= ui.available_width()) {
+                tool_item(ui, item, scene, state, out, true);
+            } else {
+                overflow.push(item);
+            }
+        }
+        if !overflow.is_empty() {
+            ui.menu_button("More", |ui| {
+                for item in overflow {
+                    ui.horizontal(|ui| tool_item(ui, item, scene, state, out, false));
                 }
             })
             .response
-            .on_hover_text("Which layer rows to show");
-        if filter != state.layer_filter {
-            out.set_layer_filter = Some(filter);
-        }
-        let mut search = state.layer_search.clone();
-        if ui
-            .add(
-                egui::TextEdit::singleline(&mut search)
-                    .id_salt("timeline-layer-search")
-                    .hint_text("Find layer")
-                    .desired_width(80.0),
-            )
-            .on_hover_text("Show only layers whose name contains this")
-            .changed()
-        {
-            out.set_layer_search = Some(search);
-        }
-        if state.row_filter.hidden_count > 0
-            && ui
-                .add(
-                    egui::Label::new(
-                        egui::RichText::new(format!("{} hidden", state.row_filter.hidden_count))
-                            .small()
-                            .color(Palette::warning()),
-                    )
-                    .sense(Sense::click()),
-                )
-                .on_hover_text("Show all layers")
-                .clicked()
-        {
-            out.set_layer_filter = Some(LayerFilter::All);
-            out.set_layer_search = Some(String::new());
-        }
-        if ui
-            .add(egui::Button::new("Compact").selected(state.compact))
-            .on_hover_text("Short rows, to see more layers at once")
-            .clicked()
-        {
-            out.toggle_compact = true;
-        }
-        // L3: Focus selection — open the active layer's folders, close the rest.
-        if ui
-            .add(egui::Button::new("Focus").selected(state.focus_folders))
-            .on_hover_text("Open the active layer's folder and close the other folders")
-            .clicked()
-        {
-            out.toggle_focus_folders = true;
-        }
-        if ui
-            .add(egui::Button::new("\u{1F513} Locked").selected(state.frames_on_locked_layers))
-            .on_hover_text(
-                "Edit Frames on Locked Layers \u{2014} insert and remove frames and \
-                 keyframes, tweens, and move, cut or paste frames on locked layers too. \
-                 The lock still keeps their artwork from being clicked or drawn over.",
-            )
-            .clicked()
-        {
-            out.toggle_frames_on_locked_layers = true;
-        }
-        // K2: Protect Other Keyframes — the lock, and its scope beside it.
-        if ui
-            .add(egui::Button::new("\u{1F512} Protect").selected(state.protect_keyframes.is_some()))
-            .on_hover_text(
-                "Protect Other Keyframes \u{2014} an edit inside a shared symbol opened \
-                 from the stage changes only the clicked keyframe (a copy is made); \
-                 Auto Keyframe stays on",
-            )
-            .clicked()
-        {
-            out.toggle_protect_keyframes = true;
-        }
-        if let Some(scope) = state.protect_keyframes {
-            let name = |s: buzz_scene::ProtectScope| match s {
-                buzz_scene::ProtectScope::ThisKeyframe => "This keyframe",
-                buzz_scene::ProtectScope::FromHere => "This keyframe and later",
-            };
-            let mut picked = scope;
-            egui::ComboBox::from_id_salt("protect_scope")
-                .selected_text(name(scope))
-                .show_ui(ui, |ui| {
-                    for s in [
-                        buzz_scene::ProtectScope::ThisKeyframe,
-                        buzz_scene::ProtectScope::FromHere,
-                    ] {
-                        ui.selectable_value(&mut picked, s, name(s));
-                    }
-                });
-            if picked != scope {
-                out.set_protect_scope = Some(picked);
-            }
-        }
-
-        // **The two zooms.** Animate has a Tiny-to-Large menu for the frames
-        // and a Short/Normal/Tall one for the rows; these are the same two
-        // things as sliders, because the useful size depends on the film. A
-        // four-thousand-frame timeline wants narrow cells and a twelve-frame
-        // cycle wants wide ones, and neither is a setting anybody sets once.
-        ui.separator();
-        let mut width = state.frame_width;
-        let mut rows = state.row_scale;
-
-        // **The numbers are shown.** A bare slider says a size can be changed
-        // and not what it currently is, which is the one thing somebody
-        // matching two documents needs.
-        ui.label(egui::RichText::new("frame width").small().weak());
-        if ui
-            .add(
-                egui::Slider::new(&mut width, crate::workspace::FRAME_WIDTH_RANGE)
-                    .suffix(" px")
-                    .fixed_decimals(0)
-                    .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.5 }),
-            )
-            .on_hover_text("How wide one frame is drawn")
-            .changed()
-        {
-            out.set_frame_width = Some(width);
-        }
-
-        ui.label(egui::RichText::new("row height").small().weak());
-        if ui
-            .add(
-                egui::Slider::new(&mut rows, crate::workspace::ROW_SCALE_RANGE)
-                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                    .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.5 }),
-            )
-            .on_hover_text("How tall each layer's row is")
-            .changed()
-        {
-            out.set_row_scale = Some(rows);
-        }
-
-        if ui
-            .button("Reset")
-            .on_hover_text("Back to the standard frame and row size")
-            .clicked()
-        {
-            out.set_frame_width = Some(Metrics::FRAME_WIDTH);
-            out.set_row_scale = Some(1.0);
+            .on_hover_text("The rest of the layer tools");
         }
     });
+}
+
+/// The layer tools after the five buttons every timeline shows, in the order
+/// they are laid down — see [`layer_tools`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolItem {
+    Filter,
+    Search,
+    Compact,
+    Focus,
+    Locked,
+    Protect,
+    Count,
+    Size,
+}
+
+impl ToolItem {
+    /// About how wide it is drawn on the header line, spacing included.
+    fn width(self, state: &TimelineState) -> f32 {
+        match self {
+            Self::Filter => 132.0,
+            Self::Search => 96.0,
+            Self::Compact => 80.0,
+            Self::Focus => 62.0,
+            Self::Locked => 80.0,
+            Self::Protect => if state.protect_keyframes.is_some() { 240.0 } else { 86.0 },
+            Self::Count => 70.0,
+            Self::Size => 56.0,
+        }
+    }
+}
+
+/// One of the layer tools after the first five. `compact` draws Size as a
+/// menu rather than its two sliders.
+fn tool_item(ui: &mut Ui, item: ToolItem, scene: &Scene, state: &TimelineState, out: &mut TimelineResponse, compact: bool) {
+    match item {
+        ToolItem::Count => {
+            // The count is the one thing about the layer stack that is not
+            // visible when the list is scrolled.
+            ui.label(egui::RichText::new(format!("{} layers", scene.layers().len())).small().weak());
+        }
+        ToolItem::Filter => {
+            // **L1: the layer filter.** Hide empty rows, or show only what is
+            // on the playhead frame — view only, never the film.
+            let mut filter = state.layer_filter;
+            egui::ComboBox::from_id_salt("timeline-layer-filter")
+                .width(112.0)
+                .selected_text(filter.label())
+                .show_ui(ui, |ui| {
+                    for option in LayerFilter::EVERY {
+                        ui.selectable_value(&mut filter, option, option.label());
+                    }
+                })
+                .response
+                .on_hover_text("Which layer rows to show");
+            if filter != state.layer_filter {
+                out.set_layer_filter = Some(filter);
+            }
+        }
+        ToolItem::Search => {
+            let mut search = state.layer_search.clone();
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut search)
+                        .id_salt("timeline-layer-search")
+                        .hint_text("Find layer")
+                        .desired_width(80.0),
+                )
+                .on_hover_text("Show only layers whose name contains this")
+                .changed()
+            {
+                out.set_layer_search = Some(search);
+            }
+            if state.row_filter.hidden_count > 0
+                && ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{} hidden", state.row_filter.hidden_count))
+                                .small()
+                                .color(Palette::warning()),
+                        )
+                        .sense(Sense::click()),
+                    )
+                    .on_hover_text("Show all layers")
+                    .clicked()
+            {
+                out.set_layer_filter = Some(LayerFilter::All);
+                out.set_layer_search = Some(String::new());
+            }
+        }
+        ToolItem::Compact => {
+            if ui
+                .add(egui::Button::new("Compact").selected(state.compact))
+                .on_hover_text("Short rows, to see more layers at once")
+                .clicked()
+            {
+                out.toggle_compact = true;
+            }
+        }
+        ToolItem::Focus => {
+            // L3: Focus selection — open the active layer's folders, close the rest.
+            if ui
+                .add(egui::Button::new("Focus").selected(state.focus_folders))
+                .on_hover_text("Open the active layer's folder and close the other folders")
+                .clicked()
+            {
+                out.toggle_focus_folders = true;
+            }
+        }
+        ToolItem::Locked => {
+            if ui
+                .add(egui::Button::new("\u{1F513} Locked").selected(state.frames_on_locked_layers))
+                .on_hover_text(
+                    "Edit Frames on Locked Layers \u{2014} insert and remove frames and \
+                     keyframes, tweens, and move, cut or paste frames on locked layers too. \
+                     The lock still keeps their artwork from being clicked or drawn over.",
+                )
+                .clicked()
+            {
+                out.toggle_frames_on_locked_layers = true;
+            }
+        }
+        ToolItem::Protect => {
+            // K2: Protect Other Keyframes — the lock, and its scope beside it.
+            if ui
+                .add(egui::Button::new("\u{1F512} Protect").selected(state.protect_keyframes.is_some()))
+                .on_hover_text(
+                    "Protect Other Keyframes \u{2014} an edit inside a shared symbol opened \
+                     from the stage changes only the clicked keyframe (a copy is made); \
+                     Auto Keyframe stays on",
+                )
+                .clicked()
+            {
+                out.toggle_protect_keyframes = true;
+            }
+            if let Some(scope) = state.protect_keyframes {
+                let name = |s: buzz_scene::ProtectScope| match s {
+                    buzz_scene::ProtectScope::ThisKeyframe => "This keyframe",
+                    buzz_scene::ProtectScope::FromHere => "This keyframe and later",
+                };
+                let mut picked = scope;
+                egui::ComboBox::from_id_salt("protect_scope")
+                    .selected_text(name(scope))
+                    .show_ui(ui, |ui| {
+                        for s in [buzz_scene::ProtectScope::ThisKeyframe, buzz_scene::ProtectScope::FromHere] {
+                            ui.selectable_value(&mut picked, s, name(s));
+                        }
+                    });
+                if picked != scope {
+                    out.set_protect_scope = Some(picked);
+                }
+            }
+        }
+        ToolItem::Size => {
+            // **The two zooms**, frame width and row height: sliders, because
+            // the useful size depends on the film. On the header line they
+            // open from a Size button.
+            if compact {
+                ui.menu_button("Size", |ui| size_controls(ui, state, out))
+                    .response
+                    .on_hover_text("Frame width and row height");
+            } else {
+                ui.separator();
+                size_controls(ui, state, out);
+            }
+        }
+    }
+}
+
+/// The frame width and row height sliders, and Reset.
+fn size_controls(ui: &mut Ui, state: &TimelineState, out: &mut TimelineResponse) {
+    let mut width = state.frame_width;
+    let mut rows = state.row_scale;
+
+    // **The numbers are shown.** A bare slider says a size can be changed
+    // and not what it currently is, which is the one thing somebody
+    // matching two documents needs.
+    ui.label(egui::RichText::new("frame width").small().weak());
+    if ui
+        .add(
+            egui::Slider::new(&mut width, crate::workspace::FRAME_WIDTH_RANGE)
+                .suffix(" px")
+                .fixed_decimals(0)
+                .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.5 }),
+        )
+        .on_hover_text("How wide one frame is drawn")
+        .changed()
+    {
+        out.set_frame_width = Some(width);
+    }
+
+    ui.label(egui::RichText::new("row height").small().weak());
+    if ui
+        .add(
+            egui::Slider::new(&mut rows, crate::workspace::ROW_SCALE_RANGE)
+                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.5 }),
+        )
+        .on_hover_text("How tall each layer's row is")
+        .changed()
+    {
+        out.set_row_scale = Some(rows);
+    }
+
+    if ui
+        .button("Reset")
+        .on_hover_text("Back to the standard frame and row size")
+        .clicked()
+    {
+        out.set_frame_width = Some(Metrics::FRAME_WIDTH);
+        out.set_row_scale = Some(1.0);
+    }
 }
 
 /// Playback controls and readouts.
@@ -2561,12 +2673,14 @@ fn ruler(
         && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
         && pos.x >= grid_left
     {
-        let frame = ((pos.x - grid_left) / cell_width).floor().max(0.0) as u32;
+        let at = ((pos.x - grid_left) / cell_width).max(0.0);
+        let frame = at.floor() as u32;
         ui.ctx().data_mut(|d| {
             d.insert_temp(
                 egui::Id::new("timeline_frame_vertical_drag"),
                 FrameVerticalDrag {
                     start_y: rect.min.y,
+                    start_at: at,
                     start_frame: frame.min(columns.saturating_sub(1)),
                     current_frame: frame.min(columns.saturating_sub(1)),
                     anchor_layer: scene.layers().iter().next().map(|l| l.id),
@@ -2782,12 +2896,14 @@ fn playhead_follow_target(
 /// timeline, never inside a symbol: a camera row there would suggest each
 /// symbol carries a camera of its own, which it does not — the film has one.
 ///
-/// **C1**: shown once the camera is switched on, *or* once it has any keys —
-/// a camera someone switched off still has a shot worth seeing and a lock
-/// worth reaching, the same way a hidden layer keeps its row rather than
-/// vanishing from the timeline. Drawn dimmed while off; see `camera_row`.
+/// **Shown while the camera is switched on**, as Animate's Add/Remove Camera
+/// adds and takes away its layer: the Camera button on the layer tools (or
+/// the row's own eye) is how the camera layer is enabled and disabled. Off,
+/// the row is gone but its keyframes are kept, and come back with it. It
+/// used to stay, dimmed, once it had keys, so switching it off did not
+/// appear to do anything.
 fn shows_camera_row(scene: &Scene) -> bool {
-    scene.edit_path().is_empty() && (scene.camera().enabled || !scene.camera().is_empty())
+    scene.edit_path().is_empty() && scene.camera().enabled
 }
 
 /// The camera row's interpolated-run tint: a blue distinct from the accent,
@@ -2816,6 +2932,31 @@ fn light_tween_tint() -> Color32 {
     } else {
         Color32::from_rgb(0xEE, 0xDD, 0xB8)
     }
+}
+
+/// The last frame any layer filed in `folder` (at any depth) runs to, or
+/// `None` when nothing in it has frames.
+fn folder_last_frame(scene: &Scene, folder: LayerId) -> Option<u32> {
+    let layers = scene.layers();
+    layers
+        .children_of(folder)
+        .into_iter()
+        .filter_map(|id| {
+            let child = layers.get(id)?;
+            if child.kind == LayerKind::Folder {
+                folder_last_frame(scene, id)
+            } else {
+                child.length().checked_sub(1)
+            }
+        })
+        .max()
+}
+
+/// A folder's span: the filled-frame paper, a shade darker.
+fn folder_fill() -> Color32 {
+    let c = Palette::timeline_cell_filled();
+    let dim = |v: u8| (v as f32 * 0.82) as u8;
+    Color32::from_rgb(dim(c.r()), dim(c.g()), dim(c.b()))
 }
 
 /// The camera's row, above every layer.
@@ -3109,41 +3250,49 @@ fn light_row(
             .intersect(ui.clip_rect()),
     );
 
-    let track = light.track.as_ref();
-    let has_key = |frame: u32| track.is_some_and(|t| t.has_key_at(frame));
-    let is_empty = track.is_none_or(|t| t.is_empty());
-    let last = track.map_or(0, |t| t.last_frame());
-    // A warm amber for the interpolated run, distinct from the camera's blue.
+    // **Drawn as a layer is**: a light shines the whole film, so its frames
+    // run unbroken to the film's end. A key is a keyframe dot — hollow where
+    // the light is switched off, as a blank keyframe shows nothing, its span
+    // the plainer grey — and only a tweened span, one that blends into the
+    // next key, is tinted with the tween's arrow. It used to stop at the last
+    // key and tint every span as a tween, though a key made now holds.
+    let keys: &[buzz_scene::LightKey] = light.track.as_ref().map_or(&[], |t| t.keys());
+    let end = scene.frame_count().max(1) - 1;
+    // This row's selected frames, when it is the row selected.
+    let selected_here = state
+        .light_cells
+        .filter(|_| state.light_row_selected && state.selected_light == Some(light.id));
+    // A warm amber for the blended run, distinct from the camera's blue.
     let tint = light_tween_tint();
 
     for frame in visible_columns(ui.clip_rect(), grid_left, cell_width, columns) {
         let x = grid_left + frame as f32 * cell_width;
         let cell =
             egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_width, height));
-        let kind = if has_key(frame) {
-            FrameKind::Keyframe
-        } else if !is_empty && frame < last {
-            FrameKind::Span
-        } else if !is_empty && frame == last {
-            FrameKind::SpanEnd
-        } else {
-            FrameKind::Empty
+        let at = keys.partition_point(|k| k.frame <= frame);
+        let governing = at.checked_sub(1).map(|i| &keys[i]);
+        let kind = match governing {
+            _ if frame > end => FrameKind::Empty,
+            Some(k) if k.frame == frame && k.enabled => FrameKind::Keyframe,
+            Some(k) if k.frame == frame => FrameKind::BlankKeyframe,
+            _ if frame == end => FrameKind::SpanEnd,
+            _ => FrameKind::Span,
         };
-        let tween = (!is_empty && frame <= last && !has_key(frame)).then_some(TweenCell {
-            tint,
-            complete: true,
-            arrow: false,
-        });
+        let tween = governing
+            .filter(|k| k.tween && at < keys.len() && frame <= end)
+            .map(|_| TweenCell { tint, complete: true, arrow: true });
+        let selected = selected_here.is_some_and(|(a, b)| (a..=b).contains(&frame))
+            || (selected_here.is_none() && frame == state.current_frame);
         draw_frame_cell(
             &painter,
             cell,
             kind,
             tween,
-            false,
-            frame == state.current_frame,
+            governing.is_some_and(|k| !k.enabled),
+            selected,
             None,
             None,
-            !is_empty && frame == last,
+            frame == end,
         );
     }
 
@@ -3151,7 +3300,7 @@ fn light_row(
     names.rect_filled(
         name_row,
         0.0,
-        if Some(light.id) == state.selected_light {
+        if state.light_row_selected && Some(light.id) == state.selected_light {
             Palette::active()
         } else {
             names_bg()
@@ -3190,13 +3339,44 @@ fn light_row(
         out.place_light = Some(drop);
     }
 
+    // **Frames are picked as on a layer**: a click takes one, a drag along
+    // the row takes the run it covers, Shift+click takes everything from the
+    // frame already picked. The playhead goes to the first of them, which is
+    // where the frame commands start.
+    let frame_at = |x: f32| (((x - grid_left) / cell_width).max(0.0) as u32).min(columns.saturating_sub(1));
+    let anchor_id = ui.id().with(("timeline-light-drag", light.id.0));
+    if response.drag_started()
+        && let Some(press) = ui.ctx().input(|i| i.pointer.press_origin())
+        && press.x > grid_left
+        && !name_row.contains(press)
+    {
+        ui.ctx().data_mut(|d| d.insert_temp(anchor_id, frame_at(press.x)));
+    }
+    let anchor = ui.ctx().data(|d| d.get_temp::<u32>(anchor_id));
+    if let Some(anchor) = anchor
+        && response.dragged()
+        && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+    {
+        let here = frame_at(pos.x);
+        let (a, b) = (anchor.min(here), anchor.max(here));
+        out.select_light = Some(light.id);
+        out.select_light_cells = Some((light.id, a, b));
+        out.scrub_to = Some(a);
+    }
+    if response.drag_stopped() {
+        ui.ctx().data_mut(|d| d.remove::<u32>(anchor_id));
+    }
     if response.clicked() {
         out.select_light = Some(light.id);
         if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
             && pos.x > grid_left
         {
-            let frame = ((pos.x - grid_left) / cell_width) as u32;
-            out.scrub_to = Some(frame.min(columns.saturating_sub(1)));
+            let frame = frame_at(pos.x);
+            let shift = ui.input(|i| i.modifiers.shift);
+            let from = selected_here.map_or(state.current_frame, |(a, _)| a);
+            let (a, b) = if shift { (from.min(frame), from.max(frame)) } else { (frame, frame) };
+            out.select_light_cells = Some((light.id, a, b));
+            out.scrub_to = Some(a);
         }
     }
 
@@ -3212,18 +3392,32 @@ fn light_row(
             .unwrap_or(state.current_frame);
         ui.ctx().data_mut(|d| d.insert_temp(menu_frame_id, frame));
     }
+    // A layer's frame commands, as on the camera's row: the light's row is
+    // selected and the playhead moved to the frame first, so the command
+    // that follows keys this light there.
     response.context_menu(|ui| {
         let menu_frame = ui
             .ctx()
             .data(|d| d.get_temp::<u32>(menu_frame_id))
             .unwrap_or(state.current_frame);
-        if ui.button("Add Keyframe Here").clicked() {
-            out.light_key = Some((id, menu_frame));
-            ui.close();
+        out.select_light = Some(id);
+        // Inside the frames picked, the menu acts on all of them; anywhere
+        // else it picks the frame it was opened on.
+        match selected_here.filter(|(a, b)| (*a..=*b).contains(&menu_frame)) {
+            Some((a, _)) => out.scrub_to = Some(a),
+            None => {
+                out.select_light_cells = Some((id, menu_frame, menu_frame));
+                out.scrub_to = Some(menu_frame);
+            }
         }
-        if has_key(menu_frame) && ui.button("Remove Keyframe").clicked() {
-            out.light_unkey = Some((id, menu_frame));
-            ui.close();
+        frame_action_items(ui, out);
+        ui.separator();
+        // A light blends or holds; it has no shape to tween.
+        for tween in [TweenRequest::Classic, TweenRequest::Motion, TweenRequest::Remove] {
+            if ui.button(tween.label()).clicked() {
+                out.tween = Some(tween);
+                ui.close();
+            }
         }
     });
 }
@@ -3315,6 +3509,10 @@ fn layer_row(
         let [r, g, b, _] = h.to_rgba8().to_u8_array();
         Color32::from_rgba_unmultiplied(r, g, b, HIGHLIGHT_WASH_ALPHA)
     });
+    // **A folder reads as a filled layer, a shade darker**: one unbroken span
+    // as far as the layers filed in it run, with no keyframe dots of its own.
+    // It used to be an empty strip, the same as a layer with nothing on it.
+    let folder_end = (layer.kind == LayerKind::Folder).then(|| folder_last_frame(scene, layer.id)).flatten();
     for frame in visible.clone() {
         let x = grid_left + frame as f32 * cell_width;
         let cell =
@@ -3328,6 +3526,16 @@ fn layer_row(
             .frames
             .keyframe_at(frame)
             .is_some_and(|k| k.is_blank() && k.sound.is_none());
+        if let Some(end) = folder_end {
+            let kind = match frame {
+                f if f > end => FrameKind::Empty,
+                f if f == end => FrameKind::SpanEnd,
+                _ => FrameKind::Span,
+            };
+            let selected = state.timeline_selection.as_ref().is_some_and(|s| s.contains(layer.id, frame));
+            draw_frame_cell(&grid, cell, kind, None, false, selected, highlight_wash, Some(folder_fill()), frame == end);
+            continue;
+        }
         draw_frame_cell(
             &grid,
             cell,
@@ -3731,12 +3939,14 @@ fn layer_row(
             .input(|i| i.pointer.press_origin().or(i.pointer.interact_pos()))
         && pos.x >= grid_edge
     {
-        let frame = ((pos.x - grid_left) / cell_width).floor().max(0.0) as u32;
+        let at = ((pos.x - grid_left) / cell_width).max(0.0);
+        let frame = at.floor() as u32;
         ui.ctx().data_mut(|d| {
             d.insert_temp(
                 drag_id,
                 FrameVerticalDrag {
                     start_y: pos.y,
+                    start_at: at,
                     start_frame: frame.min(columns.saturating_sub(1)),
                     current_frame: frame.min(columns.saturating_sub(1)),
                     anchor_layer: Some(layer.id),
@@ -4429,8 +4639,15 @@ fn layer_context_menu(
         crate::Command::MoveLayerUp,
         crate::Command::MoveLayerDown,
         crate::Command::DeleteLayer,
+        crate::Command::GroupEmptyLayers,
+        crate::Command::RemoveFolder,
+        crate::Command::RemoveAllFolders,
     ] {
         if ui.button(command.label()).clicked() {
+            // The folder right-clicked is the one it means.
+            if command == crate::Command::RemoveFolder {
+                out.select_layer = Some(layer.id);
+            }
             out.command = Some(command);
             ui.close();
         }
@@ -4477,21 +4694,7 @@ fn frame_context_menu(ui: &mut Ui, scene: &Scene, out: &mut TimelineResponse) {
         ui.close();
     }
     ui.separator();
-
-    for action in [
-        FrameAction::InsertFrame,
-        FrameAction::RemoveFrame,
-        FrameAction::InsertKeyframe,
-        FrameAction::InsertBlankKeyframe,
-        FrameAction::ClearKeyframe,
-    ] {
-        let button = egui::Button::new(action.label()).shortcut_text(action.shortcut_text());
-        if ui.add(button).clicked() {
-            out.action = Some(action);
-            ui.close();
-        }
-    }
-
+    frame_action_items(ui, out);
     ui.separator();
 
     for tween in [
@@ -4502,6 +4705,24 @@ fn frame_context_menu(ui: &mut Ui, scene: &Scene, out: &mut TimelineResponse) {
     ] {
         if ui.button(tween.label()).clicked() {
             out.tween = Some(tween);
+            ui.close();
+        }
+    }
+}
+
+/// Insert/Remove Frame, Insert Keyframe, Insert Blank Keyframe and Clear
+/// Keyframe, with their shortcuts: the frame menu's own commands.
+fn frame_action_items(ui: &mut Ui, out: &mut TimelineResponse) {
+    for action in [
+        FrameAction::InsertFrame,
+        FrameAction::RemoveFrame,
+        FrameAction::InsertKeyframe,
+        FrameAction::InsertBlankKeyframe,
+        FrameAction::ClearKeyframe,
+    ] {
+        let button = egui::Button::new(action.label()).shortcut_text(action.shortcut_text());
+        if ui.add(button).clicked() {
+            out.action = Some(action);
             ui.close();
         }
     }
@@ -4621,7 +4842,16 @@ fn frame_drag_select(ui: &mut Ui, scene: &Scene, columns: u32, state: &TimelineS
                 .map(|(r, g, w)| (id, r, g, w))
         })
         .collect();
-    let Some(&(_, _, grid_left, cell_width)) = geometry.first() else {
+    // The frames' left edge and cell width from a row drawn this pass: a row scrolled out of view
+    // keeps the geometry it had when last drawn, from before any scroll since.
+    let pass = ui.ctx().cumulative_pass_nr();
+    let drawn: Vec<LayerId> = ui
+        .ctx()
+        .data(|d| d.get_temp::<(u64, Vec<LayerId>)>(egui::Id::new(ROWS_DRAWN)))
+        .filter(|(stamp, _)| *stamp == pass)
+        .map(|(_, rows)| rows)
+        .unwrap_or_default();
+    let Some(&(_, _, grid_left, cell_width)) = geometry.iter().find(|(id, ..)| drawn.contains(id)).or(geometry.first()) else {
         return;
     };
     let under = geometry
@@ -4633,7 +4863,8 @@ fn frame_drag_select(ui: &mut Ui, scene: &Scene, columns: u32, state: &TimelineS
     let to = under.and_then(|u| rows.iter().position(|&id| id == u)).unwrap_or(from);
     let picked: Vec<LayerId> = rows[from.min(to)..=from.max(to)].to_vec();
 
-    drag.current_frame = (((pos.x - grid_left) / cell_width).floor().max(0.0) as u32).min(columns.saturating_sub(1));
+    let at = ((pos.x - grid_left) / cell_width).max(0.0);
+    drag.current_frame = if (at - drag.start_at).abs() < 1.0 { drag.start_frame } else { (at.floor() as u32).min(columns.saturating_sub(1)) };
     ui.ctx().data_mut(|d| d.insert_temp(drag_id, drag));
     out.select_layers = Some(picked.clone());
     out.scrub_to = Some(drag.current_frame);
@@ -5016,6 +5247,8 @@ mod tests {
             timeline_selection: None,
             camera_selected: false,
             selected_light: None,
+            light_row_selected: false,
+            light_cells: None,
             playing: false,
             onion_enabled: false,
             auto_keyframe: false,
@@ -5716,18 +5949,17 @@ mod tests {
             },
             |ui| {
                 let mut out = TimelineResponse::default();
-                let row = ui.horizontal(|ui| layer_tools(ui, &scene, &state(), &mut out));
+                let row = ui.horizontal(|ui| layer_tools(ui, &scene, &state(), &mut out, true));
                 width = row.response.rect.width();
             },
         );
         assert!(
-            width > 300.0,
+            width > LAYER_TOOLS_INLINE_WIDTH,
             "the layer tools drew nothing measurable ({width})"
         );
-        assert!(
-            width <= LAYER_TOOLS_INLINE_WIDTH,
-            "the layer tools are {width:.0} points wide, more than the              {LAYER_TOOLS_INLINE_WIDTH} the header line reserves for them"
-        );
+        // On the header line beside the Timeline tab, with a laptop's side
+        // columns open, there are about a thousand points; narrower, it scrolls.
+        assert!(width <= 1000.0, "the header-line layer tools are {width:.0} points wide");
     }
 
     /// Defects brief item 3b: the New Layer / New Folder / Delete strip is
@@ -6175,11 +6407,39 @@ mod tests {
         );
     }
 
-    /// **C1**: a camera switched off still shows its row once it carries any
-    /// keys — a shot already cut, and a lock worth reaching, do not vanish
-    /// from the timeline just because the eye is closed.
+    /// **A folder's span runs as far as its layers do**, through folders
+    /// inside it; an empty folder has none.
     #[test]
-    fn the_camera_row_stays_once_it_has_keys_even_when_switched_off() {
+    fn a_folder_spans_as_far_as_its_layers() {
+        let mut scene = Scene::default();
+        let outer = scene.add_layer("Outer", LayerKind::Folder);
+        assert_eq!(folder_last_frame(&scene, outer), None, "nothing in it");
+        let inner = scene.add_layer("Inner", LayerKind::Folder);
+        let short = scene.add_layer("Short", LayerKind::Normal);
+        let long = scene.add_layer("Long", LayerKind::Normal);
+        scene.update_layer(short, |l| {
+            l.frames.insert_frame(4);
+        });
+        scene.update_layer(long, |l| {
+            l.frames.insert_frame(29);
+        });
+        scene.edit_open_layers(|stack| {
+            let at = stack.index_of(outer).unwrap() + 1;
+            stack.move_to(inner, at, Some(outer));
+            let at = stack.index_of(outer).unwrap() + 1;
+            stack.move_to(short, at, Some(outer));
+            let at = stack.index_of(inner).unwrap() + 1;
+            stack.move_to(long, at, Some(inner));
+        });
+        let length = |id| scene.layers().get(id).unwrap().length();
+        assert_eq!(folder_last_frame(&scene, inner), Some(length(long) - 1));
+        assert_eq!(folder_last_frame(&scene, outer), Some(length(long).max(length(short)) - 1));
+    }
+
+    /// **Disabling the camera takes its row away**, keys and all kept: on
+    /// again, it is back as it was.
+    #[test]
+    fn the_camera_row_goes_when_the_camera_is_switched_off() {
         let mut scene = Scene::default();
         assert!(
             !shows_camera_row(&scene),
@@ -6190,10 +6450,10 @@ mod tests {
             .camera_mut()
             .set_key(buzz_scene::CameraKey::new(0, kurbo::Point::ZERO));
         scene.camera_mut().enabled = false;
-        assert!(
-            shows_camera_row(&scene),
-            "a keyed camera keeps its row even switched off"
-        );
+        assert!(!shows_camera_row(&scene), "switched off, the camera layer is gone");
+        assert!(!scene.camera().is_empty(), "with its keys kept");
+        scene.camera_mut().enabled = true;
+        assert!(shows_camera_row(&scene), "and back when switched on");
     }
 
     /// **F1's drop-zone decision, as a pure fn:** the outer quarters are

@@ -783,6 +783,17 @@ pub fn sam2_mask(
     points: &[Sam2Point],
     box_prompt: Option<[f32; 4]>,
 ) -> Result<Option<(GrayImage, f32)>> {
+    Ok(sam2_masks(embeddings, points, box_prompt)?.and_then(|all| all.into_iter().max_by(|a, b| a.1.total_cmp(&b.1))))
+}
+
+/// As [`sam2_mask`], every candidate mask of the decoder (SAM's whole / part / sub-part) with
+/// its predicted IoU, in the decoder's order. The best-scoring one is often the cleanest
+/// *part* of the object (a table's front face without its top), the largest the whole.
+pub fn sam2_masks(
+    embeddings: &Sam2Embeddings,
+    points: &[Sam2Point],
+    box_prompt: Option<[f32; 4]>,
+) -> Result<Option<Vec<(GrayImage, f32)>>> {
     let Some(session) = sam2_session(ModelId::Sam2Decoder) else {
         return Ok(None);
     };
@@ -872,25 +883,7 @@ pub fn sam2_mask(
     let iou_dims: Vec<usize> = iou_shape.as_ref().iter().map(|&d| d.max(0) as usize).collect();
     let iou_masks_per_prompt = iou_dims.get(2).copied().unwrap_or(num_masks).max(1);
 
-    // Pick the best-scoring mask for prompt 0 (our single point/box group).
-    let mut best_mask_idx = 0usize;
-    let mut best_score = f32::NEG_INFINITY;
-    for m in 0..num_masks.min(iou_masks_per_prompt) {
-        let score = iou_slice[m];
-        if score > best_score {
-            best_score = score;
-            best_mask_idx = m;
-        }
-    }
-
     let mask_stride = mh * mw;
-    let mask_offset = best_mask_idx * mask_stride;
-    let logits = &mask_slice[mask_offset..mask_offset + mask_stride];
-    let mut probs = vec![0.0f32; mask_stride];
-    for (i, &v) in logits.iter().enumerate() {
-        probs[i] = 1.0 / (1.0 + (-v).exp());
-    }
-
     // `pred_masks` sits at the encoder's 1024x1024 letterboxed scale,
     // downsampled by mw/1024 (typically 4x, to 256x256). Scale a copy of the
     // image's LetterboxInfo down to that grid, then reuse `unletterbox_mask`.
@@ -905,18 +898,23 @@ pub fn sam2_mask(
         pad_x: embeddings.info.pad_x * sx,
         pad_y: embeddings.info.pad_y * sy,
     };
-    let unletterboxed = unletterbox_mask(&probs, mw as u32, mh as u32, &mask_info);
-
     let (ow, oh) = (embeddings.info.orig_width, embeddings.info.orig_height);
-    let mut out = GrayImage::new(ow, oh);
-    for y in 0..oh {
-        for x in 0..ow {
-            let v = (unletterboxed[(y * ow + x) as usize] * 255.0).clamp(0.0, 255.0) as u8;
-            out.put_pixel(x, y, Luma([v]));
+    // The candidates of prompt 0 (our single point/box group).
+    let mut all = Vec::new();
+    for m in 0..num_masks.min(iou_masks_per_prompt) {
+        let logits = &mask_slice[m * mask_stride..(m + 1) * mask_stride];
+        let probs: Vec<f32> = logits.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect();
+        let unletterboxed = unletterbox_mask(&probs, mw as u32, mh as u32, &mask_info);
+        let mut out = GrayImage::new(ow, oh);
+        for y in 0..oh {
+            for x in 0..ow {
+                let v = (unletterboxed[(y * ow + x) as usize] * 255.0).clamp(0.0, 255.0) as u8;
+                out.put_pixel(x, y, Luma([v]));
+            }
         }
+        all.push((out, iou_slice[m]));
     }
-
-    Ok(Some((out, best_score)))
+    Ok(Some(all))
 }
 
 /// Runs LaMa inpainting on an already-512x512 image/mask pair (the model's

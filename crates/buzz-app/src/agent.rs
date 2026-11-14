@@ -125,7 +125,7 @@ pub fn route(command: Command) -> Route {
         // Open a dialog or panel that needs parameters: run from args.
         New | LipSync | TraceBitmapOptions | SetScene | DirectScene | SceneryFor | Perform
         | AddFollowThrough | AddWiggle | AddPendulum | AddHairMotion | AddTitleCard | AiIdentifyAssets | AiRigVectorCharacter | AiRigLayers
-        | AiDirectStory | AiSplitPictureIntoLayers | TraceBoldSplit | AiGenerateBackground | AiCharacterFromImage | AiMouthChart | ClearAllKeyframes | CleanUpLayers
+        | AiDirectStory | AiSplitPictureIntoLayers | TraceBoldSplit | TraceSplit | AiGenerateBackground | AiCharacterFromImage | AiMouthChart | ClearAllKeyframes | CleanUpLayers
         | ArrangeLayers | RepairLayerRigs | RigHead | EvenLines | OptimizeShapes | RemoveBackgroundSpecks | PasteMotion | PasteMotionSpecial | PastePose | CopyPerformance
         | PastePerformance | PastePerformanceSpecial | StoryboardMake | StoryboardEdit
         | StoryboardExport | DeleteAndFill | AiRemoveObject => Route::Args,
@@ -171,7 +171,7 @@ pub fn route(command: Command) -> Route {
         | ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere
         | ToggleCamera | AddCameraKeyframe | RemoveCameraKeyframe | ResetCamera
         | AddLightKeyframe | RemoveLightKeyframe | SaveAsTemplate | RenameBodyLayers
-        | RenameFaceLayers => Route::Run,
+        | RenameFaceLayers | GroupEmptyLayers | RemoveFolder | RemoveAllFolders => Route::Run,
 
         // Data-carrying: the args select the value.
         TogglePanel(_) | SetTheme(_) | SetUiScale(_) | SetWorkspacePreset(_)

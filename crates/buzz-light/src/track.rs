@@ -143,6 +143,36 @@ impl LightTrack {
         self.keys.len() != before
     }
 
+    /// Insert (`delta > 0`) or remove (`delta < 0`) frames at `frame`: every
+    /// key *after* it moves by `delta`, so a span opens or closes the way
+    /// Insert Frame and Remove Frame do on a layer, as the camera's track
+    /// does. A key at `frame` stays unless frames are removed, then it goes.
+    /// Returns whether anything changed.
+    pub fn shift_after(&mut self, frame: u32, delta: i32) -> bool {
+        let before = self.keys.clone();
+        if delta < 0 {
+            self.keys.retain(|k| k.frame != frame);
+        }
+        for k in self.keys.iter_mut().filter(|k| k.frame > frame) {
+            k.frame = (k.frame as i64 + delta as i64).max(0) as u32;
+        }
+        self.keys != before
+    }
+
+    /// Tween (`true`) or hold (`false`) the span `frame` is in: the key at or
+    /// before it blends into the next one, or holds until it. Returns the
+    /// governing key's frame, `None` when there is no key at or before `frame`.
+    pub fn set_tween(&mut self, frame: u32, tween: bool) -> Option<u32> {
+        let key = self.keys.iter_mut().rev().find(|k| k.frame <= frame)?;
+        key.tween = tween;
+        Some(key.frame)
+    }
+
+    /// The key after the one at `frame`, if any: what a tween there moves to.
+    pub fn next_key_after(&self, frame: u32) -> Option<&LightKey> {
+        self.keys.iter().find(|k| k.frame > frame)
+    }
+
     pub fn clear(&mut self) {
         self.keys.clear();
     }

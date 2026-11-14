@@ -48,12 +48,29 @@ const ALT_COPY_LABEL: &str = "Duplicate";
 /// One layer's share of Copy Frames: where its selected frames start (from
 /// the selection's first frame), how many there were, and the drawings that
 /// start among them, each by its offset from the selection's first frame.
+/// `row` is how many layers below the topmost copied layer it sat, so a paste
+/// keeps the layers stacked as they were.
 #[derive(Debug, Clone)]
 pub struct ClippedLayer {
     pub layer: LayerId,
+    pub row: usize,
     pub offset: u32,
     pub length: u32,
     pub drawings: Vec<(u32, Vec<std::sync::Arc<Object>>)>,
+}
+
+/// The layers that hold artwork frames — every one but the folders and the
+/// sound layers (an audio guide, or one whose keyframes carry sound) — top
+/// first, as the timeline lists them: the rows Copy and Paste Frames count
+/// down, so pasted artwork never lands on a sound layer.
+fn frame_rows(scene: &buzz_scene::Scene) -> Vec<LayerId> {
+    scene
+        .layers()
+        .iter()
+        .filter(|l| l.kind != LayerKind::Folder)
+        .filter(|l| !l.audio_guide && !l.frames.keyframes().iter().any(|k| k.sound.is_some()))
+        .map(|l| l.id)
+        .collect()
 }
 
 /// The frame clipboard: Copy Frames' layers, in the order they were met, and
@@ -403,6 +420,13 @@ pub struct Editor {
     /// not a layer — so which row is current cannot live in `Selection`, which
     /// addresses layers and objects.
     pub camera_selected: bool,
+    /// A light's row is the current timeline row (the light is
+    /// `light_panel.selected`), so F5/F6/F7 and the frame menu key the light
+    /// rather than the layers. Cleared whenever the camera row or a layer is.
+    pub light_row_selected: bool,
+    /// The frames picked on that light's row, `(first, last)`: what its frame
+    /// commands act on while the playhead is among them.
+    pub light_frames: Option<(u32, u32)>,
     /// Where the panels are. View state, saved beside the preferences rather
     /// than in the document: a layout belongs to the person, not to the film.
     pub workspace: buzz_ui::Workspace,
@@ -502,11 +526,6 @@ pub struct Editor {
     /// there is nothing else to read the film playhead from). See
     /// [`Editor::film_playhead`].
     sequence_scrub: Option<u32>,
-    /// Every symbol's resolved extent, memoised by document revision. Hit-testing
-    /// and the selection chrome resolve an instance's bounds against this table
-    /// rather than re-walking the library per object — the difference between a
-    /// snappy click and a second's pause on a rig-heavy import.
-    bounds_cache: std::cell::RefCell<Option<(u64, SymbolBounds)>>,
     /// Where each object on screen is drawn — frame, layer, and its place in
     /// that frame's list — for [`Self::drawn_at`]. Chrome asks per selected
     /// object every frame; scanning every layer for each of 2,600 selected
@@ -841,6 +860,8 @@ impl Editor {
             filter_panel: buzz_ui::FilterPanelState::default(),
             motion_editor: buzz_ui::MotionEditorState::default(),
             camera_selected: false,
+            light_row_selected: false,
+            light_frames: None,
             workspace,
             light_gesture: None,
             shape_gesture: None,
@@ -875,7 +896,6 @@ impl Editor {
             waveform_cache: WaveformCache::default(),
             master_waveform_cache: None,
             sequence_scrub: None,
-            bounds_cache: std::cell::RefCell::new(None),
             drawn_index: std::cell::RefCell::new(None),
             selection_cache: std::cell::RefCell::new(None),
         };
@@ -1038,19 +1058,12 @@ impl Editor {
         });
     }
 
-    /// Every symbol's resolved extent, memoised by revision. Rebuilt only on an
-    /// edit; a lookup for the whole document otherwise. See
-    /// [`buzz_scene::Scene::symbol_bounds_table`].
+    /// Every symbol's resolved extent: the scene's own table, rebuilt only
+    /// when a symbol changes. See [`buzz_scene::Scene::cached_bounds_table`].
+    /// It was a copy of its own, rebuilt on every edit — every move and
+    /// every release of a drag paid for measuring the whole library.
     fn symbol_bounds(&self) -> SymbolBounds {
-        let revision = self.doc.scene().revision();
-        if let Some((r, table)) = self.bounds_cache.borrow().as_ref()
-            && *r == revision
-        {
-            return std::sync::Arc::clone(table);
-        }
-        let table = std::sync::Arc::new(self.doc.scene().symbol_bounds_table());
-        *self.bounds_cache.borrow_mut() = Some((revision, std::sync::Arc::clone(&table)));
-        table
+        self.doc.scene().cached_bounds_table()
     }
 
     /// **Is a gesture in progress?**
@@ -1262,7 +1275,6 @@ impl Editor {
         // Object ids are per document, so one document's anchors must not
         // follow the selection into another that happens to reuse the id.
         self.anchor_selection = None;
-        self.bounds_cache = std::cell::RefCell::new(None);
         self.drawn_index = std::cell::RefCell::new(None);
         self.selection_cache = std::cell::RefCell::new(None);
         self.waveform_cache = WaveformCache::default();
@@ -3308,6 +3320,9 @@ impl Editor {
                         // on the stage and its row lights up in the timeline.
                         if let Some((layer, _)) = self.doc.scene().find_object(id) {
                             self.selection.set_active_layer(Some(layer));
+                            // ...and not the camera's or a light's row any more.
+                            self.camera_selected = false;
+                            self.light_row_selected = false;
                         }
                     }
                     None if !additive => self.selection.clear(),
@@ -3549,14 +3564,13 @@ impl Editor {
     /// taken in the layer's local space — the space the shape paths are stored in
     /// — so a layer moved by depth or parenting still fills where it is drawn.
     fn bucket_flood(&mut self, point: Point, style: &DrawStyle) {
-        let Some(layer) = self.active_layer() else {
-            self.status = Some("No layer available to fill".into());
-            return;
+        let layer = match self.artwork_layer() {
+            Ok(layer) => layer,
+            Err(why) => {
+                self.status = Some(why);
+                return;
+            }
         };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
-            return;
-        }
         if !style.fill_enabled {
             self.status = Some("Set a fill colour first".into());
             return;
@@ -3617,14 +3631,13 @@ impl Editor {
     }
 
     fn add_shape(&mut self, shape: ShapeData, label: &'static str) {
-        let Some(layer) = self.active_layer() else {
-            self.status = Some("No layer available to draw on".into());
-            return;
+        let layer = match self.artwork_layer() {
+            Ok(layer) => layer,
+            Err(why) => {
+                self.status = Some(why);
+                return;
+            }
         };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
-            return;
-        }
         if !self.style.can_draw() {
             self.status = Some("Set a stroke or fill colour first".into());
             return;
@@ -3678,14 +3691,13 @@ impl Editor {
         mode: buzz_ui::PaintMode,
     ) {
         use buzz_ui::PaintMode;
-        let Some(layer) = self.active_layer() else {
-            self.status = Some("No layer available to draw on".into());
-            return;
+        let layer = match self.artwork_layer() {
+            Ok(layer) => layer,
+            Err(why) => {
+                self.status = Some(why);
+                return;
+            }
         };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
-            return;
-        }
         if !self.style.can_draw() {
             self.status = Some("Set a stroke or fill colour first".into());
             return;
@@ -3788,14 +3800,13 @@ impl Editor {
     /// editor holds the font) and stored as an ordinary filled shape; the string
     /// rides along on `Object::text` so it stays editable.
     pub fn place_text(&mut self, at: Point) {
-        let Some(layer) = self.active_layer() else {
-            self.status = Some("No layer available to place text on".into());
-            return;
+        let layer = match self.artwork_layer() {
+            Ok(layer) => layer,
+            Err(why) => {
+                self.status = Some(why);
+                return;
+            }
         };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
-            return;
-        }
         const DEFAULT: &str = "Text";
         let size = 48.0;
         let Some(path) = buzz_text::outline(DEFAULT, size, None) else {
@@ -4293,7 +4304,9 @@ impl Editor {
         table: &std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>,
     ) -> Option<ObjectId> {
         let scene = self.doc.scene();
-        let mut hit = None;
+        // Everything under the point, back to front, with how strongly each
+        // is drawn.
+        let mut hits: Vec<(ObjectId, f32)> = Vec::new();
         // `selectable` yields back to front, so the last match is on top.
         // Walked in the order the renderer paints, so the last match really is
         // what is on top. See `LayerStack::selectable_in_paint_order`.
@@ -4342,11 +4355,23 @@ impl Editor {
                     None => continue,
                 };
                 if object_contains(scene, object, local, local_tolerance, elapsed, 0, table) {
-                    hit = Some(object.id);
+                    hits.push((object.id, layer.alpha as f32 * object_opacity(object)));
                 }
             }
         }
-        hit
+        // **A faint veil is clicked through.** The topmost hit wins — unless
+        // it is barely there (a fog or haze drawn at a fifth of its strength
+        // over half the stage) and there is solid artwork under it, which is
+        // what the click was for. Clicking where there is nothing but the
+        // veil still takes the veil. It used to take the veil everywhere it
+        // reached, so nothing under it could be selected or moved.
+        let solid = |o: &f32| *o >= FAINT_OPACITY;
+        match hits.last() {
+            Some((_, top)) if !solid(top) => {
+                hits.iter().rev().find(|(_, o)| solid(o)).or(hits.last()).map(|(id, _)| *id)
+            }
+            top => top.map(|(id, _)| *id),
+        }
     }
 
     /// The colour under `point` for the eyedropper — the topmost shape's fill or
@@ -5141,14 +5166,13 @@ impl Editor {
     /// a few kilobytes. What is given up is painting *across* strokes, which
     /// §7 records.
     fn paint_raster(&mut self, canvas: &buzz_scene::Canvas, brush: &buzz_scene::SoftBrush) {
-        let Some(layer) = self.active_layer() else {
-            self.status = Some("No layer available to paint on".into());
-            return;
+        let layer = match self.artwork_layer() {
+            Ok(layer) => layer,
+            Err(why) => {
+                self.status = Some(why);
+                return;
+            }
         };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
-            return;
-        }
 
         let frame = self.current_frame;
         let auto = self.auto_keyframe;
@@ -5337,14 +5361,13 @@ impl Editor {
     /// snow", and asking the user to gather up nine shapes first would make
     /// the brush feel like a spill rather than a stroke.
     fn add_artwork(&mut self, pieces: Vec<buzz_scene::ArtPiece>, label: &'static str) {
-        let Some(layer) = self.active_layer() else {
-            self.status = Some("No layer available to draw on".into());
-            return;
+        let layer = match self.artwork_layer() {
+            Ok(layer) => layer,
+            Err(why) => {
+                self.status = Some(why);
+                return;
+            }
         };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
-            return;
-        }
         if pieces.is_empty() {
             return;
         }
@@ -5417,14 +5440,13 @@ impl Editor {
     /// A frame that is already a keyframe is left as it is and drawn onto, so a
     /// wave can be laid over an animation that is already there.
     fn add_artwork_frames(&mut self, frames: Vec<Vec<buzz_scene::ArtPiece>>, label: &'static str) {
-        let Some(layer) = self.active_layer() else {
-            self.status = Some("No layer available to draw on".into());
-            return;
+        let layer = match self.artwork_layer() {
+            Ok(layer) => layer,
+            Err(why) => {
+                self.status = Some(why);
+                return;
+            }
         };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
-            return;
-        }
         if frames.iter().all(Vec::is_empty) {
             return;
         }
@@ -5869,6 +5891,7 @@ impl Editor {
                     self.selection
                         .select_timeline_contents(self.doc.scene(), self.current_frame);
                     self.camera_selected = false;
+                    self.light_row_selected = false;
                 }
             }
             Nudge { .. } if self.machine.rotate_only() => {
@@ -5977,18 +6000,7 @@ impl Editor {
             ExpandFill => self.expand_selection(2.0),
             ThickenStroke => self.thicken_or_grow_tool(1.25),
             ThinStroke => self.thicken_or_grow_tool(0.8),
-            // As many colours as the picture has (the palette stops on its
-            // own once a colour is no longer distinct): the six of the
-            // defaults merged a night street into black and white.
-            TraceBitmap => self.trace_in_background(buzz_scene::TraceOptions {
-                mode: buzz_scene::TraceMode::Outline,
-                colours: QUICK_TRACE_COLOURS,
-                keep_alpha: true,
-                soft_tones: true,
-                optimize_after: true,
-                even_lines: Some(0.0),
-                ..buzz_scene::TraceOptions::default()
-            }),
+            TraceBitmap => self.trace_in_background(quick_trace_options()),
             TraceLineArt => self.trace_in_background(buzz_scene::TraceOptions::line_art()),
             TraceBitmapOptions => match self.picture_selection_status() {
                 None => self.trace_dialog = Some(self.workspace.trace.with_saved_tuning()),
@@ -6055,6 +6067,9 @@ impl Editor {
             ArrangeLayers => {
                 self.arrange_layers();
             }
+            GroupEmptyLayers => self.group_empty_layers(),
+            RemoveFolder => self.remove_folders(false),
+            RemoveAllFolders => self.remove_folders(true),
             CopyFrames => self.copy_frames(false),
             CutFrames => self.copy_frames(true),
             PasteFrames => self.paste_frames(),
@@ -6499,7 +6514,7 @@ impl Editor {
             // all three need a background thread (rigging also a GPU render
             // and pose detection; the scene-from-image one, a non-blocking
             // file dialog too) that `Editor` has no way to start on its own.
-            AiRigVectorCharacter | AiRigLayers | AiSceneFromImage | AiSplitPictureIntoLayers | TraceBoldSplit | AiGenerateBackground | AiDirectStory | DeleteAndFill | AiRemoveObject => {}
+            AiRigVectorCharacter | AiRigLayers | AiSceneFromImage | AiSplitPictureIntoLayers | TraceBoldSplit | TraceSplit | AiGenerateBackground | AiDirectStory | DeleteAndFill | AiRemoveObject => {}
             // Handled by `App` (`crate::estate`): they talk to BuzzEdit and
             // Buzzcaf Studio over HTTP, which `Editor` has no thread for.
             SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => {}
@@ -7254,12 +7269,7 @@ impl Editor {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "Bitmap".to_string());
 
-        let Some(layer) = self.active_layer() else {
-            anyhow::bail!("no layer available to place it on");
-        };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            anyhow::bail!("the active layer is locked");
-        }
+        let layer = self.artwork_layer().map_err(|why| anyhow::anyhow!(why))?;
 
         let stage = self.doc.scene().stage().size;
         let centre = Point::new(self.camera.center.x + offset.0, self.camera.center.y + offset.1);
@@ -7397,14 +7407,13 @@ impl Editor {
             self.status = Some("That picture is no longer in the Library".into());
             return false;
         };
-        let Some(layer) = self.active_layer() else {
-            self.status = Some("No layer available to place it on".into());
-            return false;
+        let layer = match self.artwork_layer() {
+            Ok(layer) => layer,
+            Err(why) => {
+                self.status = Some(why);
+                return false;
+            }
         };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
-            return false;
-        }
 
         let stage = self.doc.scene().stage().size;
         let centre = at.unwrap_or(self.camera.center);
@@ -8059,12 +8068,25 @@ impl Editor {
             anyhow::bail!("the active scene has no key");
         };
         self.doc.set_master_audio(scene_key, layer_id);
+        self.keep_master_audio_on_top();
         self.master_waveform_cache = None;
         // Master Audio mode: a new master is enforced straight away.
         if self.doc.master_audio_mode() {
             self.enforce_master_audio_now();
         }
         Ok(name)
+    }
+
+    /// **The master audio's layer first, just under the camera** — where every
+    /// edit keeps it (`Document::edit`) — moved there now as its own undo
+    /// step if it is anywhere else: a film opened or a master just chosen.
+    pub fn keep_master_audio_on_top(&mut self) {
+        let revision = self.doc.scene().revision();
+        self.doc.edit("Keep Master Audio on Top", |_| {});
+        self.doc.end_gesture();
+        if self.doc.scene().revision() != revision {
+            self.status = Some("The master audio is kept as the first layer, under the camera".into());
+        }
     }
 
     /// Point the master audio at a sound already carried by a layer of the
@@ -8087,6 +8109,7 @@ impl Editor {
             return;
         }
         self.doc.set_master_audio(scene_key, layer);
+        self.keep_master_audio_on_top();
         self.master_waveform_cache = None;
         self.status = Some("That layer is now the master audio".into());
         // Master Audio mode: a new master is enforced straight away.
@@ -8716,9 +8739,9 @@ impl Editor {
         }
         self.doc.rename_scene(new_index, name);
 
-        self.bounds_cache.borrow_mut().take();
         self.selection.clear();
         self.camera_selected = false;
+        self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(0);
         self.playback.playing = false;
@@ -9306,9 +9329,9 @@ impl Editor {
             return;
         }
         self.doc.switch_scene(index);
-        self.bounds_cache.borrow_mut().take();
         self.selection.clear();
         self.camera_selected = false;
+        self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         // A fresh scene may be shorter than where the playhead sat; prune what
         // is no longer on screen.
@@ -9319,9 +9342,9 @@ impl Editor {
     /// Add a new empty scene after the active one and edit it.
     pub fn add_scene(&mut self) {
         self.doc.add_scene();
-        self.bounds_cache.borrow_mut().take();
         self.selection.clear();
         self.camera_selected = false;
+        self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(0);
         self.playback.playing = false;
@@ -9334,9 +9357,9 @@ impl Editor {
     /// [`buzz_doc::Document::duplicate_scene`].
     pub fn duplicate_scene(&mut self, index: usize) {
         self.doc.duplicate_scene(index);
-        self.bounds_cache.borrow_mut().take();
         self.selection.clear();
         self.camera_selected = false;
+        self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(0);
         self.playback.playing = false;
@@ -9345,9 +9368,9 @@ impl Editor {
     /// Move a scene in the running order and follow it.
     pub fn move_scene(&mut self, from: usize, to: usize) {
         self.doc.move_scene(from, to);
-        self.bounds_cache.borrow_mut().take();
         self.selection.clear();
         self.camera_selected = false;
+        self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(self.current_frame);
         self.playback.playing = false;
@@ -9356,9 +9379,9 @@ impl Editor {
     /// Delete a scene. The last remaining scene cannot be removed.
     pub fn delete_scene(&mut self, index: usize) {
         self.doc.delete_scene(index);
-        self.bounds_cache.borrow_mut().take();
         self.selection.clear();
         self.camera_selected = false;
+        self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(self.current_frame);
     }
@@ -9781,14 +9804,13 @@ impl Editor {
         let Some(asset) = self.doc.scene().images().get(image).cloned() else {
             return;
         };
-        let Some(layer) = self.active_layer() else {
-            self.status = Some("No layer to place it on".into());
-            return;
+        let layer = match self.artwork_layer() {
+            Ok(layer) => layer,
+            Err(why) => {
+                self.status = Some(why);
+                return;
+            }
         };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
-            return;
-        }
         let at = self.camera.screen_to_doc(screen);
         let stage = self.doc.scene().stage().size;
         let (w, h) = (asset.width as f64, asset.height as f64);
@@ -9810,13 +9832,13 @@ impl Editor {
     }
 
     fn place_symbol(&mut self, symbol: buzz_scene::SymbolId, at: Point) {
-        let Some(layer) = self.active_layer() else {
-            return;
+        let layer = match self.artwork_layer() {
+            Ok(layer) => layer,
+            Err(why) => {
+                self.status = Some(why);
+                return;
+            }
         };
-        if self.doc.scene().layers().is_effectively_locked(layer) {
-            self.status = Some("The active layer is locked".into());
-            return;
-        }
 
         let frame = self.current_frame;
         let mut placed = None;
@@ -10192,6 +10214,12 @@ impl Editor {
 
     /// Set the tween on every distinct keyframe span touched by the timeline selection.
     fn set_tween(&mut self, tween: Tween) {
+        if self.light_row_selected
+            && let Some(id) = self.light_panel.selected.filter(|id| self.doc.scene().lights().get(*id).is_some())
+        {
+            self.set_light_tween(id, tween);
+            return;
+        }
         if self.camera_selected {
             // The camera's keys always interpolate; a tween on its row is the
             // governing key's pacing. Classic = even, Motion = ease in and out,
@@ -11492,6 +11520,50 @@ impl Editor {
     /// **Auto-tidy** after a build (`Workspace::auto_tidy_layers`): Arrange
     /// Layers when the setting is on, silently but for the status line. `what`
     /// names the build for the status line.
+    /// **Group Empty Layers**: see `Scene::group_empty_layers`. One undo step,
+    /// none when the empty layers are already together.
+    pub fn group_empty_layers(&mut self) {
+        let mut moved = 0;
+        self.doc.edit("Group Empty Layers", |scene| moved = scene.group_empty_layers());
+        self.doc.end_gesture();
+        self.status = Some(if moved == 0 {
+            "Group Empty Layers: the empty layers are already together".into()
+        } else {
+            format!("Group Empty Layers: {moved} rows moved \u{2014} layers with artwork first, empty ones after, in each folder; nothing deleted")
+        });
+    }
+
+    /// **Remove Folder(s), Keep Layers** — see `Scene::remove_folders`. One
+    /// folder: the active layer, if it is a folder, else the folder it is
+    /// in. One undo step.
+    pub fn remove_folders(&mut self, all: bool) {
+        let folder = (!all).then(|| {
+            let scene = self.doc.scene();
+            let active = self.selection.active_layer()?;
+            let layer = scene.layers().get(active)?;
+            if layer.kind == LayerKind::Folder { Some(active) } else { layer.parent }
+        });
+        let only = match folder {
+            Some(None) => {
+                self.status = Some("Remove Folder: right-click a folder, or a layer inside one".into());
+                return;
+            }
+            Some(Some(id)) => Some(vec![id]),
+            None => None,
+        };
+        let mut gone = 0;
+        self.doc.edit(if all { "Remove All Folders" } else { "Remove Folder" }, |scene| {
+            gone = scene.remove_folders(only.as_deref());
+        });
+        self.doc.end_gesture();
+        self.selection.prune(self.doc.scene());
+        self.status = Some(if gone == 0 {
+            "There are no folders here".into()
+        } else {
+            format!("{gone} folder{} removed \u{2014} their layers stay where they were", if gone == 1 { "" } else { "s" })
+        });
+    }
+
     pub fn auto_tidy_layers(&mut self, what: &str) {
         if !self.workspace.auto_tidy_layers {
             return;
@@ -12359,6 +12431,146 @@ impl Editor {
         true
     }
 
+    /// **The frame commands on a light's row**, as on a layer's: Insert
+    /// Keyframe (F6) keys the light as it is now; Insert Blank Keyframe (F7)
+    /// keys it switched off — no light from there, as a blank keyframe shows
+    /// nothing; Clear Keyframe (Shift+F6) and Clear Frames remove the key;
+    /// Insert/Remove Frame (F5, Shift+F5) open or close a frame by moving the
+    /// later keys. They used to reach the layers instead, so a light's key
+    /// could only be added or removed from its right-click menu.
+    fn light_frame_op(&mut self, id: buzz_scene::LightId, op: FrameOp) {
+        // The frames picked on the row (a click picks one), as on a layer.
+        let (first, last) = self.light_frames_here();
+        let count = last - first + 1;
+        let frames = if count == 1 { format!("frame {}", first + 1) } else { format!("frames {}\u{2013}{}", first + 1, last + 1) };
+        let keyed = |e: &Self| -> usize {
+            e.doc.scene().lights().get(id).and_then(|l| l.track.as_ref()).map_or(0, |t| t.keys().iter().filter(|k| (first..=last).contains(&k.frame)).count())
+        };
+        let status = match op {
+            FrameOp::InsertKeyframe => {
+                self.key_light_as(id, first..=last, op.label(), false);
+                format!("Light keyframe at {frames}")
+            }
+            FrameOp::InsertBlankKeyframe => {
+                self.key_light_as(id, first..=last, op.label(), true);
+                format!("Blank light keyframe at {frames}: the light is off from there")
+            }
+            FrameOp::ClearKeyframe | FrameOp::ClearFrames => {
+                let n = keyed(self);
+                if n == 0 {
+                    format!("This light has no keyframe at {frames}")
+                } else {
+                    self.doc.edit(op.label(), |scene| {
+                        if let Some(track) = scene.lights_mut().get_mut(id).and_then(|l| l.track.as_mut()) {
+                            for f in first..=last {
+                                track.remove_key(f);
+                            }
+                        }
+                    });
+                    self.doc.end_gesture();
+                    format!("Removed {n} light keyframe{} at {frames}", if n == 1 { "" } else { "s" })
+                }
+            }
+            FrameOp::InsertFrame => {
+                // As many frames as are picked, before the first of them.
+                self.doc.edit(op.label(), |scene| {
+                    if let Some(track) = scene.lights_mut().get_mut(id).and_then(|l| l.track.as_mut()) {
+                        track.shift_after(first, count as i32);
+                    }
+                });
+                self.doc.end_gesture();
+                format!("{count} frame{} inserted on the light at frame {}", if count == 1 { "" } else { "s" }, first + 1)
+            }
+            FrameOp::RemoveFrame => {
+                // The picked frames go, with any key on them; the later keys close up.
+                self.doc.edit(op.label(), |scene| {
+                    if let Some(track) = scene.lights_mut().get_mut(id).and_then(|l| l.track.as_mut()) {
+                        for f in first..=last {
+                            track.remove_key(f);
+                        }
+                        track.shift_after(last, -(count as i32));
+                    }
+                });
+                self.doc.end_gesture();
+                format!("Removed {frames} from the light")
+            }
+            FrameOp::ReverseFrames => "Reverse Frames works on layers, not on a light".into(),
+        };
+        self.status = Some(status);
+    }
+
+    /// **A tween on a light's row**: the key the playhead's span starts at
+    /// blends into the next key (Classic or Motion Tween), or holds until it
+    /// again (Remove Tween) — colour, brightness, position, all of it. A
+    /// light has no shape to tween, and a tween needs a later key to blend to.
+    fn set_light_tween(&mut self, id: buzz_scene::LightId, tween: Tween) {
+        let (frame, last) = self.light_frames_here();
+        let Some(track) = self.doc.scene().lights().get(id).and_then(|l| l.track.clone()) else {
+            self.status = Some("Tween: key the light first (F6)".into());
+            return;
+        };
+        let Some(start) = track.keys().iter().rev().find(|k| k.frame <= frame).map(|k| k.frame) else {
+            self.status = Some("Tween: key the light first (F6)".into());
+            return;
+        };
+        if tween.is_active() && tween.kind == buzz_scene::TweenKind::Shape {
+            self.status = Some("A shape tween needs artwork - a light has none".into());
+            return;
+        }
+        if track.next_key_after(start).is_none() {
+            self.status = Some("Tween: add a later light keyframe to blend into (F6)".into());
+            return;
+        }
+        // Every span the picked frames touch: the one they start in, and each
+        // one a key among them begins — those with a later key to blend into.
+        let spans: Vec<u32> = track
+            .keys()
+            .iter()
+            .map(|k| k.frame)
+            .filter(|&k| k == start || (k > start && k <= last))
+            .filter(|&k| track.next_key_after(k).is_some())
+            .collect();
+        let end = spans.last().and_then(|&k| track.next_key_after(k)).map_or(start, |k| k.frame);
+        let on = tween.is_active();
+        self.doc.edit(if on { "Light Tween" } else { "Remove Light Tween" }, |scene| {
+            if let Some(track) = scene.lights_mut().get_mut(id).and_then(|l| l.track.as_mut()) {
+                for &k in &spans {
+                    track.set_tween(k, on);
+                }
+            }
+        });
+        self.doc.end_gesture();
+        self.status = Some(if on {
+            format!("The light blends from frame {} to frame {}", start + 1, end + 1)
+        } else {
+            format!("The light holds from frame {} to frame {}", start + 1, end + 1)
+        });
+    }
+
+    /// The layer new artwork goes on, or why there is none: the active layer,
+    /// unless it is locked or carries sound — a sound layer holds its sound
+    /// and nothing else — or the camera's or a light's row is the one
+    /// selected, which are not layers and hold no artwork either.
+    fn artwork_layer(&mut self) -> Result<LayerId, String> {
+        if self.camera_selected {
+            return Err("The camera holds no artwork \u{2014} click a layer to put it on".into());
+        }
+        if self.light_row_selected {
+            return Err("A light holds no artwork \u{2014} click a layer to put it on".into());
+        }
+        let Some(layer) = self.active_layer() else {
+            return Err("No layer available to put it on".into());
+        };
+        if self.doc.scene().layers().is_effectively_locked(layer) {
+            return Err("The active layer is locked".into());
+        }
+        if !self.sound_layers_among([layer]).is_empty() {
+            let name = self.doc.scene().layers().get(layer).map(|l| l.name.clone()).unwrap_or_default();
+            return Err(format!("{name} is a sound layer and holds only sound \u{2014} click another layer to put artwork on"));
+        }
+        Ok(layer)
+    }
+
     /// The layers among `layers` that carry sound: a keyframe's sound, the
     /// master audio, or an audio guide. Frame commands spanning other layers
     /// leave these alone, so the dialogue stays under its picture.
@@ -12385,6 +12597,12 @@ impl Editor {
     /// Apply a frame operation to all selected cells in one undo transaction.
     fn frame_op(&mut self, op: FrameOp) {
         if self.camera_selected && self.camera_frame_op(op) {
+            return;
+        }
+        if self.light_row_selected
+            && let Some(id) = self.light_panel.selected.filter(|id| self.doc.scene().lights().get(*id).is_some())
+        {
+            self.light_frame_op(id, op);
             return;
         }
         let mut targets = self.timeline_targets();
@@ -13061,6 +13279,9 @@ impl Editor {
             self.status = Some("There is no frame here to copy".into());
             return;
         };
+        let rows = frame_rows(scene);
+        let row_of = |id: LayerId| rows.iter().position(|&r| r == id).unwrap_or(0);
+        let top = spans.iter().map(|&(id, ..)| row_of(id)).min().unwrap_or(0);
         let clipped: Vec<ClippedLayer> = spans
             .iter()
             .filter_map(|&(id, a, b)| {
@@ -13069,7 +13290,7 @@ impl Editor {
                     .filter(|&f| f == a || frames.is_keyframe(f))
                     .filter_map(|f| Some((f - first, frames.frame_contents(f)?)))
                     .collect();
-                Some(ClippedLayer { layer: id, offset: a - first, length: b - a + 1, drawings })
+                Some(ClippedLayer { layer: id, row: row_of(id) - top, offset: a - first, length: b - a + 1, drawings })
             })
             .collect();
         // Top layer first, as the timeline shows them, for the layers a paste
@@ -13121,43 +13342,82 @@ impl Editor {
         ));
     }
 
-    /// **Paste Frames** at the playhead.
+    /// Where Paste Frames lands: the topmost selected layer and the first
+    /// selected frame, when the frame selection is where the playhead is;
+    /// otherwise the topmost selected layer (else the active one) at the
+    /// playhead — a frame selection left behind by scrubbing the ruler does
+    /// not pull the paste back to it. A folder hands it to the first layer
+    /// below it. `None` when there is no layer that holds frames.
+    fn paste_target(&self) -> Option<(LayerId, u32)> {
+        let scene = self.doc.scene();
+        let rows = frame_rows(scene);
+        // A layer's row, a folder's being the first layer filed below it.
+        let row_of = |id: LayerId| {
+            let index = scene.layers().index_of(id)?;
+            rows.iter().position(|&r| scene.layers().index_of(r).is_some_and(|i| i >= index))
+        };
+        let topmost = |layers: &mut dyn Iterator<Item = LayerId>| layers.filter_map(row_of).min().map(|r| rows[r]);
+        let frame = self.current_frame;
+        if let Some(cells) = self.selection.timeline().filter(|t| (t.first_frame..=t.last_frame).contains(&frame)) {
+            if let Some(layer) = topmost(&mut cells.layers.iter().copied()) {
+                return Some((layer, cells.first_frame));
+            }
+        }
+        let layer = topmost(&mut self.selection.selected_layers().iter().copied())
+            .or_else(|| self.selection.active_layer().and_then(row_of).map(|r| rows[r]))
+            .or_else(|| rows.first().copied())?;
+        Some((layer, frame))
+    }
+
+    /// **Paste Frames** onto the frame selected in the timeline.
     ///
-    /// Each layer's frames go back onto **the layer they came from**, so a
-    /// copied drawing arrives assembled rather than flattened onto whichever
-    /// layer happened to be active. A layer that has since been deleted is
-    /// skipped rather than guessed at.
+    /// As Animate does: the frames go onto **the selected layer, at the
+    /// selected frame** — the top-left cell of the frame selection, else the
+    /// selected layer at the playhead. Several copied layers go onto that
+    /// layer and the ones below it, stacked as they were copied; a layer with
+    /// no row left below it gets a new one at the bottom. It used to put them
+    /// back on the layers they were cut from whatever was selected, so a cut
+    /// frame could not be moved to another layer.
     ///
-    /// As Animate's Paste Frames: the copied frames are *inserted* — what was
-    /// at the playhead moves along to make room, and carries on after the
-    /// pasted frames as it was. The objects are given fresh ids, so pasting
-    /// twice gives two drawings rather than one shared between two frames.
+    /// The copied frames are *inserted* — what was at that frame moves along
+    /// to make room, and carries on after the pasted frames as it was. The
+    /// objects are given fresh ids, so pasting twice gives two drawings
+    /// rather than one shared between two frames.
     fn paste_frames(&mut self) {
         let Some(clip) = self.frame_clipboard.clone() else {
             self.status = Some("There are no frames on the clipboard".into());
             return;
         };
+        let target = self.paste_target();
         // **Somewhere else** — another symbol, the main timeline, another
-        // document: the layers they came from are not here (or are other
-        // layers that happen to share an id), so they arrive as new layers.
+        // document: the symbols they use may not be here, so they arrive as
+        // new layers. So do they when there is no layer to paste onto.
         let here = (self.doc.uid(), self.doc.scene_key(self.doc.active_scene()), self.doc.scene().edit_path().to_vec());
-        if clip.source != here || clip.layers.iter().any(|c| self.doc.scene().layers().get(c.layer).is_none()) {
-            self.paste_frames_as_layers(&clip);
+        let Some((target, frame)) = target.filter(|_| clip.source == here) else {
+            let frame = target.map_or(self.current_frame, |(_, f)| f);
+            self.paste_frames_as_layers(&clip, frame);
             return;
-        }
+        };
         let clipboard = clip.layers;
 
-        let frame = self.current_frame;
         let mut pasted = 0usize;
         let mut layers = 0usize;
         let mut locked = 0usize;
+        let mut added = 0usize;
         let allow_locked = self.workspace.frames_on_locked_layers;
         self.doc.edit("Paste Frames", |scene| {
+            let mut rows = frame_rows(scene);
+            let first = rows.iter().position(|&r| r == target).unwrap_or(0);
             for clipped in &clipboard {
-                let layer = clipped.layer;
-                if scene.layers().get(layer).is_none() {
-                    continue;
+                // Below the bottom layer: a new layer there to take it.
+                while rows.len() <= first + clipped.row {
+                    let n = scene.layers().len() + 1;
+                    let id = scene.add_layer(format!("Layer_{n}"), LayerKind::Normal);
+                    scene.move_layer_to(id, scene.layers().len() - 1, None);
+                    rows.push(id);
+                    added += 1;
                 }
+                let layer = rows[first + clipped.row];
                 if !allow_locked && scene.layers().is_effectively_locked(layer) {
                     locked += 1;
                     continue;
@@ -13198,15 +13458,17 @@ impl Editor {
             self.status = Some(if locked > 0 {
                 "Every layer on the clipboard is locked".into()
             } else {
-                "The layers these frames came from are gone".to_string()
+                "There is no layer to paste onto".to_string()
             });
             return;
         }
+        let name = self.doc.scene().layers().get(target).map(|l| l.name.clone()).unwrap_or_default();
         self.status = Some(format!(
-            "Pasted {pasted} object{} at frame {} on {layers} layer{}{}",
+            "Pasted {pasted} object{} at frame {} on {}{}{}",
             if pasted == 1 { "" } else { "s" },
             frame + 1,
-            if layers == 1 { "" } else { "s" },
+            if layers == 1 { name } else { format!("{layers} layers from {name} down") },
+            if added > 0 { format!(" ({added} new layer(s) added below)") } else { String::new() },
             if locked > 0 {
                 format!(" \u{2014} {locked} locked layer(s) skipped")
             } else {
@@ -13217,11 +13479,11 @@ impl Editor {
 
     /// **Paste Frames somewhere other than where they were copied**: each
     /// copied layer arrives as a new layer named like it, on top of the
-    /// timeline being edited, its frames starting at the playhead — with the
+    /// timeline being edited, its frames starting at `frame` — with the
     /// symbols they use, as Paste brings them: one this document already holds
     /// unchanged is not copied again, one from another document arrives as
     /// its own. One undo step.
-    fn paste_frames_as_layers(&mut self, clip: &FrameClip) {
+    fn paste_frames_as_layers(&mut self, clip: &FrameClip, frame: u32) {
         let mut lifted = clip.scene.clone();
         let shared: Vec<buzz_scene::SymbolId> = lifted
             .library()
@@ -13232,7 +13494,6 @@ impl Editor {
         for id in shared {
             lifted.library_mut().remove(id);
         }
-        let frame = self.current_frame;
         let before: Vec<LayerId> = self.doc.scene().layers().iter().map(|l| l.id).collect();
         let mut arrived: Vec<LayerId> = Vec::new();
         self.doc.edit("Paste Frames", |scene| {
@@ -14111,10 +14372,14 @@ impl Editor {
             }
         });
         let on = self.doc.scene().camera().enabled;
+        if !on {
+            // Its row is gone with it.
+            self.camera_selected = false;
+        }
         self.status = Some(if on {
             "Camera enabled — use the Camera tool to move it".into()
         } else {
-            "Camera disabled".to_string()
+            "Camera disabled \u{2014} its keyframes are kept for when it is enabled again".to_string()
         });
     }
 
@@ -14222,28 +14487,58 @@ impl Editor {
     /// light's track on and snapshots its whole state, exactly as a camera key
     /// captures the whole camera.
     pub fn key_light_at(&mut self, id: buzz_scene::LightId, frame: u32) {
-        self.doc.edit("Light Keyframe", |scene| {
+        self.key_light_as(id, frame..=frame, "Light Keyframe", false);
+    }
+
+    /// [`Self::key_light_at`] on every frame of `frames`, under `label`, as one
+    /// undo step; `off` keys the light switched off there (Insert Blank
+    /// Keyframe on its row). Each key is the light as it looked at its frame
+    /// before any of them were made, and keeps the tween of the span it lands
+    /// in, so keying a blended run does not break the blend.
+    fn key_light_as(&mut self, id: buzz_scene::LightId, frames: std::ops::RangeInclusive<u32>, label: &str, off: bool) {
+        self.doc.edit(label, |scene| {
             let Some(light) = scene.lights().get(id).cloned() else { return };
-            // The light as it looks here: the track's state when it animates.
+            // The light as it looks at each frame: the track's state when it animates.
             let animates = light.track.as_ref().is_some_and(|t| t.animates());
-            let shown = match &light.track {
-                Some(track) if animates => track.state_at(frame, &light),
-                _ => light.clone(),
-            };
-            let key = buzz_scene::LightKey::from_light(frame, &shown);
+            let keys: Vec<buzz_scene::LightKey> = frames
+                .clone()
+                .map(|frame| {
+                    let shown = match &light.track {
+                        Some(track) if animates => track.state_at(frame, &light),
+                        _ => light.clone(),
+                    };
+                    let mut key = buzz_scene::LightKey::from_light(frame, &shown);
+                    key.enabled &= !off;
+                    key.tween = light
+                        .track
+                        .as_ref()
+                        .and_then(|t| t.keys().iter().rev().find(|k| k.frame <= frame))
+                        .is_some_and(|k| k.tween);
+                    key
+                })
+                .collect();
             // The first key, made later than frame 1, also keys frame 1 as the
             // light stands, so a change made at this key does not reach back.
-            let first = (!animates && frame > 0).then(|| buzz_scene::LightKey::from_light(0, &light));
+            let first = (!animates && *frames.start() > 0).then(|| buzz_scene::LightKey::from_light(0, &light));
             if let Some(light) = scene.lights_mut().get_mut(id) {
                 let track = light.track.get_or_insert_with(buzz_scene::LightTrack::new);
                 track.enabled = true;
                 if let Some(first) = first.filter(|_| !track.has_key_at(0)) {
                     track.set_key(first);
                 }
-                track.set_key(key);
+                for key in keys {
+                    track.set_key(key);
+                }
             }
         });
         self.doc.end_gesture();
+    }
+
+    /// The frames a light's row command acts on: those picked on its row
+    /// when the playhead is among them, else the playhead's own.
+    fn light_frames_here(&self) -> (u32, u32) {
+        let frame = self.current_frame;
+        self.light_frames.filter(|(a, b)| (*a..=*b).contains(&frame)).unwrap_or((frame, frame))
     }
 
     /// Remove one light's key at `frame`.
@@ -14709,12 +15004,14 @@ impl Editor {
             self.status = Some("There is nothing on the clipboard".into());
             return;
         };
-        let scene = self.doc.scene().clone();
-        self.selection.ensure_active_layer(&scene);
-        let Some(layer) = self.selection.active_layer() else {
-            self.status = Some("There is no layer to paste onto".into());
-            return;
+        let layer = match self.artwork_layer() {
+            Ok(layer) => layer,
+            Err(why) => {
+                self.status = Some(why);
+                return;
+            }
         };
+        let scene = self.doc.scene().clone();
 
         // Offset like Duplicate does, and for the same reason: a copy landing
         // exactly on its original is indistinguishable from nothing happening.
@@ -16085,6 +16382,19 @@ impl FrameOp {
             Self::ClearFrames => "Clear Frames",
             Self::ReverseFrames => "Reverse Frames",
         }
+    }
+}
+
+/// Below this opacity, artwork with something solid under it is clicked
+/// through: see `Editor::object_at_frame`.
+const FAINT_OPACITY: f32 = 0.35;
+
+/// How strongly an object is drawn, by its own alpha: an instance's colour
+/// effect. Shapes count as solid; their fills are not inspected.
+fn object_opacity(object: &Object) -> f32 {
+    match &object.kind {
+        buzz_scene::ObjectKind::Instance(instance) => instance.color.multiply[3].clamp(0.0, 1.0),
+        _ => 1.0,
     }
 }
 
@@ -19152,6 +19462,21 @@ fn same_colour(a: Color, b: Color) -> bool {
 /// out at ~28), so this is "every colour the picture has", not 64 shades.
 const QUICK_TRACE_COLOURS: usize = 64;
 
+/// **Trace Bitmap**'s options (also Trace + Split into Layers): colour regions, as many colours as
+/// the picture has (the palette stops on its own once a colour is no longer distinct: the six of
+/// the defaults merged a night street into black and white).
+pub(crate) fn quick_trace_options() -> buzz_scene::TraceOptions {
+    buzz_scene::TraceOptions {
+        mode: buzz_scene::TraceMode::Outline,
+        colours: QUICK_TRACE_COLOURS,
+        keep_alpha: true,
+        soft_tones: true,
+        optimize_after: true,
+        even_lines: Some(0.0),
+        ..buzz_scene::TraceOptions::default()
+    }
+}
+
 /// Picture pixels traced per stage unit, at most.
 ///
 /// A photo imported at 5120 × 2880 and shown at 1920 × 1080 carries 2.7
@@ -20870,6 +21195,158 @@ mod tests {
         assert_eq!(light(9).intensity, intensity);
     }
 
+    /// **The master audio stays the first layer, under the camera.** Chosen
+    /// while it sat lower, it moves up as its own undo step; a new layer, a
+    /// drag down or Group Empty Layers cannot take it from there.
+    #[test]
+    fn the_master_audio_stays_on_top() {
+        let mut e = editor();
+        let audio = e.selection.active_layer().expect("a layer");
+        e.doc_add_layer("Above", buzz_scene::LayerKind::Normal);
+        let key = e.doc.scene_key(e.doc.active_scene()).expect("a scene key");
+        e.doc.set_master_audio(key, audio);
+        let top = |e: &Editor| e.scene().layers().iter().next().map(|l| l.id);
+        assert_ne!(top(&e), Some(audio), "below another layer to begin with");
+
+        e.keep_master_audio_on_top();
+        assert_eq!(top(&e), Some(audio), "moved up");
+        e.doc_add_layer("New", buzz_scene::LayerKind::Normal);
+        assert_eq!(top(&e), Some(audio), "a new layer goes under it");
+        e.reorder_layer(audio, 2);
+        assert_eq!(top(&e), Some(audio), "dragged down, it stays");
+        e.run(Command::GroupEmptyLayers);
+        assert_eq!(top(&e), Some(audio), "grouping keeps it first");
+        assert_eq!(e.scene().layers().len(), 3, "nothing deleted");
+    }
+
+    /// **A light's row takes the frame commands, as a layer's does.** With its
+    /// row clicked, F6 keys the light, F7 keys it off (a blank keyframe),
+    /// Shift+F6 removes the key and F5 moves the later keys along — and the
+    /// layers are left alone. A Classic Tween blends a span, Remove Tween
+    /// holds it again. Picking artwork on the stage hands F6 back to the
+    /// layers.
+    #[test]
+    fn a_light_row_takes_the_frame_commands() {
+        let mut e = editor();
+        let layer = e.selection.active_layer().expect("a layer");
+        let mut id = None;
+        e.doc.edit("Light", |scene| id = Some(scene.add_light(buzz_scene::LightKind::Sun { azimuth: 0.0, elevation: 0.5 })));
+        let id = id.expect("a light");
+        let keys = |e: &Editor| -> Vec<(u32, bool)> {
+            e.scene().lights().get(id).and_then(|l| l.track.as_ref()).map_or(Vec::new(), |t| t.keys().iter().map(|k| (k.frame, k.enabled)).collect())
+        };
+        let layer_keys = |e: &Editor| e.scene().layers().get(layer).unwrap().frames.keyframes().len();
+        let before = layer_keys(&e);
+        // As a click on the light's row does.
+        e.light_panel.selected = Some(id);
+        e.light_row_selected = true;
+
+        e.set_frame(10);
+        e.run(Command::InsertKeyframe);
+        assert_eq!(keys(&e), vec![(0, true), (10, true)], "keyed at 10 (and held from frame 1): {:?}", e.status);
+        e.set_frame(20);
+        e.run(Command::InsertBlankKeyframe);
+        assert_eq!(keys(&e).last(), Some(&(20, false)), "a blank keyframe switches the light off");
+        e.set_frame(5);
+        e.run(Command::InsertFrame);
+        assert_eq!(keys(&e), vec![(0, true), (11, true), (21, false)], "the later keys move along");
+        e.set_frame(11);
+        e.run(Command::ClearKeyframe);
+        assert_eq!(keys(&e), vec![(0, true), (21, false)], "Shift+F6 removes the light's key");
+        assert_eq!(layer_keys(&e), before, "the layer is not touched");
+
+        let tweened = |e: &Editor, f: u32| -> bool {
+            e.scene().lights().get(id).and_then(|l| l.track.as_ref()).unwrap().keys().iter().find(|k| k.frame == f).unwrap().tween
+        };
+        e.set_frame(8);
+        e.run(Command::CreateClassicTween);
+        assert!(tweened(&e, 0), "the span from frame 1 blends: {:?}", e.status);
+        e.run(Command::RemoveTween);
+        assert!(!tweened(&e, 0), "and holds again");
+        e.set_frame(30);
+        e.run(Command::CreateClassicTween);
+        assert!(!tweened(&e, 21), "nothing after the last key to blend into: {:?}", e.status);
+
+        // No artwork on a light's row: it goes nowhere, and says so.
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        e.set_frame(0);
+        assert!(draw_square(&mut e, 0.0, 0.0, 20.0, Color::BLACK).is_none(), "drawn with a light's row selected");
+        e.light_row_selected = false;
+        let square = draw_square(&mut e, 0.0, 0.0, 20.0, Color::BLACK).expect("drawn on the layer");
+        e.light_row_selected = true;
+        e.selection.clear();
+        e.apply(ToolAction::PickAt { point: Point::new(10.0, 10.0), additive: false });
+        assert_eq!(e.selection.ids(), vec![square], "picked");
+        assert!(!e.light_row_selected, "picking artwork on the stage leaves the light's row");
+    }
+
+    /// **Several frames picked on a light's row**, as on a layer: F6 keys
+    /// each, Shift+F6 clears every key among them, Shift+F5 takes them out
+    /// and the later keys close up, a tween covers every span they touch.
+    #[test]
+    fn a_light_rows_frames_are_picked_together() {
+        let mut e = editor();
+        let mut id = None;
+        e.doc.edit("Light", |scene| id = Some(scene.add_light(buzz_scene::LightKind::Sun { azimuth: 0.0, elevation: 0.5 })));
+        let id = id.expect("a light");
+        let frames = |e: &Editor| -> Vec<u32> {
+            e.scene().lights().get(id).and_then(|l| l.track.as_ref()).map_or(Vec::new(), |t| t.keys().iter().map(|k| k.frame).collect())
+        };
+        e.light_panel.selected = Some(id);
+        e.light_row_selected = true;
+        let pick = |e: &mut Editor, a: u32, b: u32| {
+            e.light_frames = Some((a, b));
+            e.set_frame(a);
+        };
+
+        pick(&mut e, 4, 6);
+        e.run(Command::InsertKeyframe);
+        assert_eq!(frames(&e), vec![0, 4, 5, 6], "a key on each frame picked (and frame 1): {:?}", e.status);
+        pick(&mut e, 0, 5);
+        e.run(Command::CreateClassicTween);
+        let tweened: Vec<bool> = e.scene().lights().get(id).unwrap().track.as_ref().unwrap().keys().iter().map(|k| k.tween).collect();
+        assert_eq!(tweened, vec![true, true, true, false], "every span touched blends; the last key has nothing after it");
+        pick(&mut e, 5, 6);
+        e.run(Command::ClearKeyframe);
+        assert_eq!(frames(&e), vec![0, 4], "both keys cleared: {:?}", e.status);
+        e.run(Command::InsertKeyframe);
+        pick(&mut e, 1, 3);
+        e.run(Command::RemoveFrame);
+        assert_eq!(frames(&e), vec![0, 1, 2, 3], "three frames out, the later keys closed up");
+    }
+
+    /// **No artwork on the camera's row or a sound layer.** A drawing, a
+    /// paste or a library symbol made there used to land on the sound layer
+    /// (or the layer behind the camera's row); it is refused, with the reason.
+    #[test]
+    fn no_artwork_goes_on_the_camera_or_a_sound_layer() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let picture = e.selection.active_layer().expect("a layer");
+        let square = draw_square(&mut e, 0.0, 0.0, 20.0, Color::BLACK).expect("drawn");
+        e.selection.set([square]);
+        e.run(Command::Copy);
+
+        let sound = e.doc_add_layer("Voice", buzz_scene::LayerKind::Normal);
+        e.doc.edit("Guide", |scene| {
+            scene.update_layer(sound, |l| l.audio_guide = true);
+        });
+        e.selection.set_active_layer(Some(sound));
+        let objects = |e: &Editor, l: LayerId| e.scene().layers().get(l).unwrap().objects_at(0).len();
+        assert!(draw_square(&mut e, 0.0, 0.0, 20.0, Color::BLACK).is_none());
+        e.run(Command::Paste);
+        assert_eq!(objects(&e, sound), 0, "nothing on the sound layer: {:?}", e.status);
+        assert!(e.status.as_deref().is_some_and(|s| s.contains("sound layer")), "{:?}", e.status);
+
+        e.selection.set_active_layer(Some(picture));
+        e.camera_selected = true;
+        e.run(Command::Paste);
+        assert_eq!(objects(&e, picture), 1, "nothing pasted with the camera's row selected: {:?}", e.status);
+        e.camera_selected = false;
+        e.run(Command::Paste);
+        assert_eq!(objects(&e, picture), 2, "a layer takes it");
+    }
+
     /// **Equal Layer Lengths**: a drawing put on a short layer, or a layer made
     /// longer, leaves every layer as long as the longest — in the same undo
     /// step, so Undo takes the extension back with the edit.
@@ -20937,6 +21414,53 @@ mod tests {
         assert_eq!(e.scene().layers().get(first).unwrap().frames.length(), length + 3);
         assert_eq!((on(&e, first, 15), on(&e, first, 17), on(&e, first, 18)), (1, 1, 1));
         assert_eq!(on(&e, second, 15), 1, "the other layer is not pasted onto");
+    }
+
+    /// **Paste Frames lands on the cell selected, not where the frames were
+    /// cut from.** Cutting frame 5 of one layer, clicking frame 12 of another
+    /// and pasting put the drawing straight back on the first layer. Two
+    /// layers' frames pasted onto the bottom layer bring a new one below it.
+    #[test]
+    fn pasted_frames_go_onto_the_selected_cell() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let lower = e.selection.active_layer().expect("a layer");
+        let upper = e.doc_add_layer("Upper", buzz_scene::LayerKind::Normal);
+        e.selection.set_active_layer(Some(upper));
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE),
+            label: "Draw",
+        });
+        e.doc.edit("Frames", |s| {
+            s.update_layer(upper, |l| {
+                l.frames.insert_frame(19);
+            });
+        });
+        let on = |e: &Editor, layer: LayerId, frame: u32| e.scene().layers().get(layer).unwrap().objects_at(frame).len();
+        // As a click on a cell does: select it and move the playhead there.
+        let click = |e: &mut Editor, layer: LayerId, frame: u32| {
+            e.selection.set_timeline(buzz_ui::TimelineSelection::cell(layer, frame));
+            e.set_frame(frame);
+        };
+
+        click(&mut e, upper, 5);
+        e.run(buzz_ui::Command::CutFrames);
+        assert_eq!(on(&e, upper, 5), 0, "cut");
+        click(&mut e, lower, 12);
+        e.run(buzz_ui::Command::PasteFrames);
+        assert_eq!(on(&e, lower, 12), 1, "on the layer clicked, at the frame clicked: {:?}", e.status);
+        assert_eq!(on(&e, upper, 12), 1, "the cut layer is not pasted onto (its own drawing held there)");
+        assert_eq!(on(&e, lower, 11), 0, "nothing before the frame clicked");
+
+        // A frame selection on two layers, pasted onto the bottom layer.
+        e.selection.set_timeline(buzz_ui::TimelineSelection::new([upper, lower], 12, 12, upper, 12));
+        e.run(buzz_ui::Command::CopyFrames);
+        let before = e.scene().layers().len();
+        click(&mut e, lower, 3);
+        e.run(buzz_ui::Command::PasteFrames);
+        assert_eq!(e.scene().layers().len(), before + 1, "a new layer below for the second row: {:?}", e.status);
+        let bottom = e.scene().layers().iter().last().unwrap().id;
+        assert_eq!((on(&e, lower, 3), on(&e, bottom, 3)), (1, 1), "stacked as they were copied");
     }
 
     /// Pasting when the layers are gone says so and leaves no empty step in

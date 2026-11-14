@@ -25,6 +25,15 @@ use crate::bg_objects::ObjectOptions;
 const TAKE_MIN: f64 = 0.6;
 /// The same for a shape with an outline stroke.
 const TAKE_MIN_STROKE: f64 = 0.25;
+/// Objects covering a shape within this share of the best cover are a tie: the smallest takes it.
+const TAKE_TIE: f64 = 0.05;
+/// A stands on B (`sits_on`): this much of A's box inside B's, A's mask at most this share of
+/// B's, A's bottom edge at least this share of B's height above B's.
+const ON_BOX_IN: f64 = 0.8;
+const ON_AREA_MAX: f64 = 0.3;
+const ON_ABOVE: f64 = 0.05;
+/// The gaps (px) closed between an object's mask and the masks of what stands on it.
+const CARRY_CLOSE: i32 = 6;
 /// An object whose shapes paint less of its mask than this is dropped (it sits inside another).
 const PAINTED_MIN: f64 = 0.5;
 /// A filled shape not taken whole is cut along every object whose reach overlaps it by at least
@@ -40,8 +49,9 @@ const STROKE_INSIDE_MIN: f64 = 0.6;
 /// halves overlap instead of meeting edge to edge, where both soft edges let the background show
 /// through as a pale line.
 const SEAM_OVERLAP: i32 = 2;
-/// The width of an object's outline (bitmap px) at the least: a bold line, whatever the artwork's.
-const OUTLINE_WIDTH: f64 = 3.5;
+/// The width of an object's outline (bitmap px) at the least: a bold line, whatever the artwork's
+/// (Trace Bold's share of the old 3.5, so it is no heavier than the traced lines).
+const OUTLINE_WIDTH: f64 = 3.5 * buzz_scene::trace_bold::TRACE_BOLD_SHARE;
 /// How much of the pixel staircase a traced mask outline keeps (px; see `TraceOptions::detail`).
 const OUTLINE_DETAIL: f64 = 1.5;
 /// How much a traced mask outline's corners are rounded (`TraceOptions::smooth`).
@@ -152,6 +162,9 @@ pub struct ArtworkObject {
     /// plan's `to_world`), drawn in the artwork's line style on top of its shapes so the cut
     /// edges read as drawn ones; `None` for a depth layer.
     pub outline: Option<ShapeData>,
+    /// The object (index into the plan's objects) this one stands on (a book on a table): it goes
+    /// into that one's symbol, on a layer of its own, instead of a layer of the timeline (S19).
+    pub on: Option<usize>,
 }
 
 /// What the worker thread decided; `apply` carries it out.
@@ -1213,7 +1226,7 @@ pub fn plan_split(
     let picture = render_in(scene, layer, frame, &shapes, region, (w, h), false)?;
     let to_world = Affine::translate((region.x0, region.y0)) * Affine::scale(region.width() / w as f64);
     let to_px = to_world.inverse();
-    note("Finding the objects (VLM + SAM 2)");
+    note("Finding the objects (VLM + SAM)");
     let mut notes = Vec::new();
     // An indoor scene (a room, a shop inside) has no sky: its furniture is asked for, and
     // everything that is not an object stays on one Room layer.
@@ -1226,11 +1239,16 @@ pub fn plan_split(
         notes.push("no objects found; nothing split".into());
     }
     // The shapes are cut along smooth curves, not along SAM 2's coarse, ragged edge. A thin thing
-    // (a pole, a pen) that the smoothing would wear away is smoothed less, or kept as it is.
+    // (a pole, a pen) that the smoothing would wear away is smoothed less, or kept as it is; SAM 3's
+    // fine masks only lose their pixel steps (S19).
     for d in &mut found {
+        if crate::bg_objects::is_thin_mask(&d.mask, d.bbox) {
+            continue;
+        }
         let area = |m: &GrayImage| m.iter().filter(|&&v| v > 127).count();
         let before = area(&d.mask);
-        if let Some(smooth) = [MASK_SMOOTH, 1.0].into_iter().map(|sigma| smooth_mask(&d.mask, sigma)).find(|m| area(m) as f64 >= 0.7 * before as f64) {
+        let sigmas: &[f32] = if d.sharp { &[1.0] } else { &[MASK_SMOOTH, 1.0] };
+        if let Some(smooth) = sigmas.iter().map(|&sigma| smooth_mask(&d.mask, sigma)).find(|m| area(m) as f64 >= 0.7 * before as f64) {
             d.mask = smooth;
         }
     }
@@ -1318,11 +1336,45 @@ pub fn plan_split(
     // or more (S13; `cut_of`): the cuts are made below, nearest object first.
     // An object's reach is its mask grown a few px, so the outline strokes round its silhouette (half
     // outside the matte) go with it instead of being left under it.
-    let reach: Vec<GrayImage> = found.iter().map(|d| GrayImage::from_raw(w, h, buzz_ai::segment::dilate(d.mask.as_raw(), w, h, REACH)).unwrap_or_else(|| d.mask.clone())).collect();
+    // A thing's reach and the line it cuts along also cover what stands on it, the gaps between
+    // them closed (a book on a table's top edge leaves a notch in the table's mask): the strips along
+    // the book's edge go with the table, not the room (S19).
+    let carried = sits_on_masks(&found.iter().map(|d| Some((d.bbox, &d.mask))).collect::<Vec<_>>());
+    let holds: Vec<Option<GrayImage>> = (0..found.len())
+        .map(|i| {
+            let on: Vec<usize> = (0..found.len()).filter(|&j| carried[j] == Some(i)).collect();
+            if on.is_empty() {
+                return None;
+            }
+            let mut m = found[i].mask.clone();
+            for j in on {
+                for (u, v) in m.iter_mut().zip(found[j].mask.iter()) {
+                    *u = (*u).max(*v);
+                }
+            }
+            GrayImage::from_raw(w, h, buzz_ai::segment::morph_close(m.as_raw(), w, h, CARRY_CLOSE))
+        })
+        .collect();
+    let reach: Vec<GrayImage> = found
+        .iter()
+        .zip(&holds)
+        .map(|(d, held)| {
+            let m = held.as_ref().unwrap_or(&d.mask);
+            GrayImage::from_raw(w, h, buzz_ai::segment::dilate(m.as_raw(), w, h, REACH)).unwrap_or_else(|| m.clone())
+        })
+        .collect();
     let reach_box: Vec<Rect> = found
         .iter()
-        .map(|d| Rect::new(d.bbox[0] as f64 - REACH as f64, d.bbox[1] as f64 - REACH as f64, d.bbox[2] as f64 + REACH as f64, d.bbox[3] as f64 + REACH as f64))
+        .enumerate()
+        .map(|(i, d)| {
+            let b = (0..found.len()).filter(|&j| carried[j] == Some(i)).fold(d.bbox, |b, j| {
+                let c = found[j].bbox;
+                [b[0].min(c[0]), b[1].min(c[1]), b[2].max(c[2]), b[3].max(c[3])]
+            });
+            Rect::new(b[0] as f64 - REACH as f64, b[1] as f64 - REACH as f64, b[2] as f64 + REACH as f64, b[3] as f64 + REACH as f64)
+        })
         .collect();
+    let reach_area: Vec<usize> = reach.iter().map(|r| r.iter().filter(|&&v| v > 127).count()).collect();
     let mut owner: Vec<Option<usize>> = Vec::with_capacity(shapes.len());
     // Per object: the filled shapes (indices into `shapes`, paint order) it cuts a piece of.
     let mut cut_of: Vec<Vec<usize>> = vec![Vec::new(); found.len()];
@@ -1332,15 +1384,13 @@ pub fn plan_split(
             continue;
         };
         let pts = sample_points(sd, to_px * o.transform);
-        let mut best: Option<(usize, f64)> = None;
         // An outline stroke runs on beyond the object it edges, so a smaller share is enough.
         let take = if sd.stroke.is_some() { TAKE_MIN_STROKE } else { TAKE_MIN };
-        for (i, r) in reach.iter().enumerate() {
-            let c = covered(r, &pts);
-            if best.is_none_or(|b| c > b.1) {
-                best = Some((i, c));
-            }
-        }
+        let cover: Vec<f64> = reach.iter().map(|r| covered(r, &pts)).collect();
+        let top = cover.iter().copied().fold(0.0, f64::max);
+        // Of the objects covering it about as well as the best, the smallest: a book on a table is
+        // the book's, though the table's mask (its holes filled) covers it as well (S19).
+        let best = (0..cover.len()).filter(|&i| cover[i] >= top - TAKE_TIE).min_by_key(|&i| (reach_area[i], i)).map(|i| (i, cover[i]));
         // A line that runs on far beyond the object (the picture's frame, a long wall edge) is not
         // the object's own, however much of it passes close by: it stays where it is.
         let stays_inside = |i: usize| {
@@ -1401,8 +1451,9 @@ pub fn plan_split(
         // The pieces this object would cut off, each from what the objects before it left.
         let mut left_after: Vec<(usize, BezPath)> = Vec::new();
         if !cut_of[i].is_empty() {
-            let outline = mask_outline(&d.mask, opts);
-            let grown = GrayImage::from_raw(w, h, buzz_ai::segment::dilate(d.mask.as_raw(), w, h, SEAM_OVERLAP)).unwrap_or_else(|| d.mask.clone());
+            let along = holds[i].as_ref().unwrap_or(&d.mask);
+            let outline = mask_outline(along, opts);
+            let grown = GrayImage::from_raw(w, h, buzz_ai::segment::dilate(along.as_raw(), w, h, SEAM_OVERLAP)).unwrap_or_else(|| along.clone());
             let outline_in = mask_outline(&grown, opts);
             for &k in &cut_of[i] {
                 let o = &shapes[k];
@@ -1596,15 +1647,17 @@ pub fn plan_split(
         }
     }
     // Each kept object's silhouette (what its shapes paint), smoothed and with its small holes
-    // filled, gives it its bold outline and the filler of the hole it leaves: one flat shape in
-    // the colour round it, none where the sky is behind it (the Sky layer shows there).
+    // filled, gives it its bold outline and the hole it leaves, none where the sky is behind it
+    // (the Sky layer shows there). The holes are filled below.
     struct Crop {
         label: String,
         bbox: [u32; 4],
         sam: GrayImage,
         shape_ids: Vec<ObjectId>,
         cuts: Vec<Cut>,
+        hole: GrayImage,
         filler: Vec<ShapeData>,
+        filler_at: Affine,
         outline: Option<ShapeData>,
     }
     let (line_colour, line_px) = line_style(&shapes, to_px);
@@ -1634,17 +1687,47 @@ pub fn plan_split(
                 *o = 0;
             }
         }
-        let filler = if hole.iter().any(|&v| v > 127) {
-            let colour = ring_colour(&picture, &hole, &exclude);
-            let path = mask_outline(&hole, opts);
-            if path.elements().is_empty() { Vec::new() } else { vec![ShapeData::filled(path, colour)] }
-        } else {
-            Vec::new()
-        };
-        let outline = Some(mask_outline(&silhouette, opts))
+
+        // A bold outline only in the Bold look; in Trace Bitmap's look the object's own edge shows (S19).
+        let outline = (opts.look == crate::bg_objects::SplitLook::Bold)
+            .then(|| mask_outline(&silhouette, opts))
             .filter(|path| !path.elements().is_empty())
             .map(|path| ShapeData::stroked(path, line_colour, line_px));
-        crops.push(Crop { label: d.label, bbox: [x0, y0, x1, y1], sam, shape_ids, cuts, filler, outline });
+        crops.push(Crop { label: d.label, bbox: [x0, y0, x1, y1], sam, shape_ids, cuts, hole, filler: Vec::new(), filler_at: to_world, outline });
+    }
+    // The clean plate (S19): every hole patched at once by LaMa (the colour fill where it cannot),
+    // and each object's patch traced in the artwork's own trace, under the depth layer behind it:
+    // hide or move the object and the room behind it shows, not a flat block.
+    let mut holes = GrayImage::new(w, h);
+    for c in &crops {
+        for (u, v) in holes.iter_mut().zip(c.hole.iter()) {
+            *u = (*u).max(*v);
+        }
+    }
+    if holes.iter().any(|&v| v > 127) {
+        note("Filling the holes behind the objects (LaMa)");
+        let mut patched = picture.clone();
+        let report = patch_hole(&mut patched, &holes, PATCH_GROW);
+        notes.push(format!(
+            "hole fillers: {} piece(s) painted by LaMa, {} by the colour round them{}",
+            report.lama,
+            report.not_installed + report.failed + report.skipped,
+            if report.not_installed > 0 { " (LaMa is not installed)" } else { "" }
+        ));
+        use rayon::prelude::*;
+        let fills: Vec<(Vec<ShapeData>, Affine)> = crops.par_iter().map(|c| patch_filler(&patched, &c.hole, opts, to_world)).collect();
+        for (c, (filler, at)) in crops.iter_mut().zip(fills) {
+            if filler.is_empty() && c.hole.iter().any(|&v| v > 127) {
+                // The trace made nothing of it: one flat shape in the colour round it.
+                let path = mask_outline(&c.hole, opts);
+                if !path.elements().is_empty() {
+                    c.filler = vec![ShapeData::filled(path, ring_colour(&picture, &c.hole, &exclude))];
+                }
+            } else {
+                c.filler = filler;
+                c.filler_at = at;
+            }
+        }
     }
     // Without SAM 2 (colour rule): the sky carried straight down (and up) its columns, so the sky
     // base reads as more sky.
@@ -1709,8 +1792,9 @@ pub fn plan_split(
             shape_ids: c.shape_ids,
             cuts: c.cuts,
             filler: c.filler,
-            filler_at: to_world,
+            filler_at: c.filler_at,
             outline: c.outline,
+            on: None,
         });
     }
     // Nearest first (lower bottom edge): `apply` puts each new layer right above the source, so
@@ -1749,6 +1833,12 @@ pub fn plan_split(
     for o in &mut objects {
         o.n = *counts.entry(o.label.clone()).and_modify(|c| *c += 1).or_insert(1);
     }
+    for (i, on) in sits_on(&objects).into_iter().enumerate() {
+        if let Some(j) = on {
+            notes.push(format!("objects: {} {} stands on {} {}: it goes into that one's symbol", objects[i].label, objects[i].n, objects[j].label, objects[j].n));
+        }
+        objects[i].on = on;
+    }
     // Then the depth layers, nearest first (Land, Far, Sky): each is made right above the source
     // too, so the sky ends up lowest. Sky gets a full-frame base (its colour carried into the
     // empty rest) so hiding anything above it never shows a hole.
@@ -1782,9 +1872,91 @@ pub fn plan_split(
             filler,
             filler_at: to_world,
             outline: None,
+            on: None,
         });
     }
     Ok(ArtworkPlan { layer, frame, objects, notes, picture, to_world, record, removed })
+}
+
+/// What each object stands on (S19), resolved to the one at the bottom of the pile: a book on a
+/// box on a table goes with the table. A stands on B when A's box lies mostly (`ON_BOX_IN`) in
+/// B's, A is much smaller (`ON_AREA_MAX` of B's mask), A's mask touches B's, and A ends higher
+/// up the picture than B by `ON_ABOVE` of B's height: a chair in front of a cupboard reaches lower.
+fn sits_on(objects: &[ArtworkObject]) -> Vec<Option<usize>> {
+    let items: Vec<Option<([u32; 4], &GrayImage)>> = objects.iter().map(|o| o.plate.is_none().then_some((o.bbox, &o.mask))).collect();
+    sits_on_masks(&items)
+}
+
+/// [`sits_on`] on boxes and masks (`None`: a depth layer, never on anything).
+fn sits_on_masks(items: &[Option<([u32; 4], &GrayImage)>]) -> Vec<Option<usize>> {
+    let area = |m: &GrayImage| m.iter().filter(|&&v| v > 127).count() as f64;
+    let areas: Vec<f64> = items.iter().map(|o| o.map_or(0.0, |(_, m)| area(m))).collect();
+    let box_area = |b: [u32; 4]| (b[2] - b[0]) as f64 * (b[3] - b[1]) as f64;
+    let mut on: Vec<Option<usize>> = vec![None; items.len()];
+    for (i, a) in items.iter().enumerate() {
+        let Some((abox, amask)) = a else { continue };
+        let mut best: Option<usize> = None;
+        for (j, b) in items.iter().enumerate() {
+            let Some((bbox_, bmask)) = b else { continue };
+            if i == j || areas[i] > ON_AREA_MAX * areas[j] || best.is_some_and(|k| areas[k] <= areas[j]) {
+                continue;
+            }
+            let (ba, bb) = (*abox, *bbox_);
+            let ix = ba[2].min(bb[2]).saturating_sub(ba[0].max(bb[0])) as f64;
+            let iy = ba[3].min(bb[3]).saturating_sub(ba[1].max(bb[1])) as f64;
+            let above = ba[3] as f64 + ON_ABOVE * (bb[3] - bb[1]) as f64 <= bb[3] as f64;
+            if ix * iy < ON_BOX_IN * box_area(ba) || !above || amask.dimensions() != bmask.dimensions() {
+                continue;
+            }
+            let (w, h) = bmask.dimensions();
+            let near = buzz_ai::segment::dilate(bmask.as_raw(), w, h, 3);
+            if amask.iter().zip(near.iter()).any(|(p, q)| *p > 127 && *q > 0) {
+                best = Some(j);
+            }
+        }
+        on[i] = best;
+    }
+    // To the bottom of each pile (areas strictly grow along it, so it ends).
+    (0..on.len())
+        .map(|i| {
+            let mut at = on[i]?;
+            while let Some(next) = on[at] {
+                at = next;
+            }
+            Some(at)
+        })
+        .collect()
+}
+
+/// The traced patch over `hole` (and a little round it, so it sits under the neighbours with no
+/// seam) of the LaMa-`patched` picture, with where it goes (patch pixels -> the source layer).
+fn patch_filler(patched: &RgbaImage, hole: &GrayImage, opts: &ObjectOptions, to_world: Affine) -> (Vec<ShapeData>, Affine) {
+    let (w, h) = hole.dimensions();
+    let grown = buzz_ai::segment::dilate(hole.as_raw(), w, h, PATCH_GROW + 2);
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
+    for (i, v) in grown.iter().enumerate() {
+        if *v > 0 {
+            let (x, y) = ((i as u32) % w, (i as u32) / w);
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + 1);
+            y1 = y1.max(y + 1);
+        }
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return (Vec::new(), to_world);
+    }
+    let (cw, ch) = (x1 - x0, y1 - y0);
+    let mut crop = image::imageops::crop_imm(patched, x0, y0, cw, ch).to_image();
+    for y in 0..ch {
+        for x in 0..cw {
+            crop.get_pixel_mut(x, y)[3] = if grown[((y0 + y) * w + x0 + x) as usize] > 0 { 255 } else { 0 };
+        }
+    }
+    // Gradients kept (Keep textures), as the artwork round it keeps them.
+    let options = buzz_scene::TraceOptions { keep_textures: true, ..opts.trace.trace_options() };
+    let shapes = buzz_scene::trace(cw, ch, crop.as_raw(), &options).shapes;
+    (shapes, to_world * Affine::translate((x0 as f64, y0 as f64)))
 }
 
 /// The run record's `result.json` for a finished artwork split: the layers `apply` made
@@ -1867,6 +2039,8 @@ pub fn apply(scene: &mut Scene, plan: &ArtworkPlan) -> Vec<String> {
     let mut insides: Vec<ShapeData> = plan.objects.iter().flat_map(|o| o.cuts.iter().map(|c| c.inside.clone())).collect();
     buzz_scene::adopt_texture_images(&mut insides, scene);
     let mut insides = insides.into_iter();
+    // Every object's shapes taken off the source first (in stage space), then the symbols made.
+    let mut lifted: Vec<Vec<Arc<Object>>> = Vec::with_capacity(plan.objects.len());
     for o in &plan.objects {
         // Whole shapes and cut-off inside pieces, in the source's paint order.
         let at = |id: &ObjectId| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
@@ -1916,19 +2090,59 @@ pub fn apply(scene: &mut Scene, plan: &ArtworkPlan) -> Vec<String> {
             base.append(&mut taken);
             taken = base;
         }
-        if taken.is_empty() {
+        if let Some(line) = &o.outline {
+            if !taken.is_empty() {
+                taken.push(Arc::new(Object::shape(scene.next_object_id(), line.clone()).with_transform(plan.to_world)));
+            }
+        }
+        lifted.push(taken);
+    }
+    let name_of = |o: &ArtworkObject| if o.plate.is_some() { o.label.clone() } else { format!("{} {}", o.label, o.n) };
+    for (i, o) in plan.objects.iter().enumerate() {
+        if o.on.is_some() {
             continue;
         }
-        if let Some(line) = &o.outline {
-            taken.push(Arc::new(Object::shape(scene.next_object_id(), line.clone()).with_transform(plan.to_world)));
+        // What stands on it rides in its symbol, each on a layer of its own, the nearest on top.
+        let carried: Vec<usize> = (0..plan.objects.len()).filter(|&j| plan.objects[j].on == Some(i) && !lifted[j].is_empty()).collect();
+        if lifted[i].is_empty() && carried.is_empty() {
+            continue;
         }
-        let name = if o.plate.is_some() { o.label.clone() } else { format!("{} {}", o.label, o.n) };
+        let name = name_of(o);
+        // An object's registration point is the bottom centre of all it holds (where it stands, what
+        // dragging it from the Library into another scene puts at the cursor); a depth layer's stays
+        // the stage origin.
+        let origin = if o.plate.is_some() {
+            Point::ZERO
+        } else {
+            let bounds = lifted[i].iter().chain(carried.iter().flat_map(|&j| lifted[j].iter())).map(|x| scene.resolved_bounds(x)).filter(|b| b.width().is_finite() && b.height().is_finite()).reduce(|a, b| a.union(b));
+            bounds.map_or(Point::ZERO, |b| Point::new((b.x0 + b.x1) / 2.0, b.y1))
+        };
+        let shift = Affine::translate((-origin.x, -origin.y));
+        let rebase = |list: &[Arc<Object>]| -> Vec<Arc<Object>> {
+            list.iter()
+                .map(|x| {
+                    let mut x = (**x).clone();
+                    x.transform = shift * x.transform;
+                    Arc::new(x)
+                })
+                .collect()
+        };
         let symbol = scene.add_symbol(name.clone(), SymbolKind::Graphic, Some("Split objects"));
         let Some(inner) = scene.library().get(symbol).and_then(|s| s.layers.iter().next()).map(|l| l.id) else { continue };
+        let own = rebase(&lifted[i]);
+        let rows: Vec<(LayerId, String, Vec<Arc<Object>>)> = carried.iter().rev().map(|&j| (scene.next_layer_id(), name_of(&plan.objects[j]), rebase(&lifted[j]))).collect();
         scene.library_mut().update(symbol, |sym| {
             sym.layers.update(inner, |l| {
-                l.frames.set_objects(0, taken);
+                if !rows.is_empty() {
+                    l.name = "Art".into();
+                }
+                l.frames.set_objects(0, own);
             });
+            for (id, row, objects) in rows {
+                let mut layer = buzz_scene::Layer::new(id, row, LayerKind::Normal);
+                layer.frames.set_objects(0, objects);
+                sym.layers.push_front(layer);
+            }
         });
         let new = scene.add_layer(name.clone(), LayerKind::Normal);
         // Directly above the source layer.
@@ -1941,7 +2155,7 @@ pub fn apply(scene: &mut Scene, plan: &ArtworkPlan) -> Vec<String> {
                 l.frames.insert_blank_keyframe(start);
             }
         });
-        scene.add_instance_at(new, start, symbol, Affine::IDENTITY);
+        scene.add_instance_at(new, start, symbol, Affine::translate((origin.x, origin.y)));
         scene.update_layer(new, |l| {
             if l.frames.length() < span {
                 l.frames.insert_frame(span - 1);
@@ -2579,6 +2793,7 @@ mod tests {
                 filler: Vec::new(),
                 filler_at: Affine::IDENTITY,
                 outline: None,
+                on: None,
             }],
             notes: Vec::new(),
             picture: RgbaImage::new(1, 1),
@@ -2602,5 +2817,58 @@ mod tests {
         let inner: Vec<ObjectId> = scene.library().get(symbol).unwrap().layers.iter().next().unwrap().frames.objects_at(0).iter().map(|o| o.id).collect();
         assert_eq!(inner.len(), 1);
         assert_ne!(inner[0], house, "the moved house has an id of its own");
+    }
+
+    fn object(label: &str, bbox: [u32; 4], mask: GrayImage, shape_ids: Vec<ObjectId>) -> ArtworkObject {
+        ArtworkObject {
+            plate: None,
+            behind: Plate::Land,
+            label: label.into(),
+            n: 1,
+            bbox,
+            mask,
+            shape_ids,
+            cuts: Vec::new(),
+            filler: Vec::new(),
+            filler_at: Affine::IDENTITY,
+            outline: None,
+            on: None,
+        }
+    }
+
+    fn mask_of(b: [u32; 4]) -> GrayImage {
+        GrayImage::from_fn(200, 200, |x, y| image::Luma([if (b[0]..b[2]).contains(&x) && (b[1]..b[3]).contains(&y) { 255 } else { 0 }]))
+    }
+
+    /// A book on a table goes with the table; a chair in front of it (reaching as low) does not.
+    #[test]
+    fn a_thing_stands_on_what_holds_it() {
+        let table = object("Table", [20, 60, 180, 160], mask_of([20, 60, 180, 160]), Vec::new());
+        let book = object("Book", [40, 62, 70, 76], mask_of([40, 62, 70, 76]), Vec::new());
+        let chair = object("Chair", [100, 100, 140, 160], mask_of([100, 100, 140, 160]), Vec::new());
+        let cup = object("Cup", [45, 60, 55, 70], mask_of([45, 60, 55, 70]), Vec::new());
+        assert_eq!(sits_on(&[table, book, chair, cup]), vec![None, Some(0), None, Some(0)], "the cup on the book goes with the table");
+    }
+
+    /// A split object is one symbol holding what stands on it on a layer of its own, its
+    /// registration point at the bottom centre: placed in another scene it stands where dropped.
+    #[test]
+    fn what_stands_on_an_object_rides_in_its_symbol() {
+        let mut scene = Scene::default();
+        let layer = scene.layers().iter().next().unwrap().id;
+        let table = scene.add_shape_at(layer, 0, rect(0.0)).unwrap();
+        let book = scene.add_shape_at(layer, 0, ShapeData::filled(Rect::new(20.0, -10.0, 40.0, 5.0).to_path(1e-9), peniko::Color::WHITE)).unwrap();
+        let mut objects = vec![object("Table", [0, 0, 100, 100], GrayImage::new(1, 1), vec![table]), object("Book", [20, 0, 40, 5], GrayImage::new(1, 1), vec![book])];
+        objects[1].on = Some(0);
+        let plan = ArtworkPlan { layer, frame: 0, objects, notes: Vec::new(), picture: RgbaImage::new(1, 1), to_world: Affine::IDENTITY, record: None, removed: Vec::new() };
+        assert_eq!(apply(&mut scene, &plan), vec!["Table 1".to_string()], "no layer of its own for the book");
+        let symbol = scene.library().iter().find(|s| s.name == "Table 1").unwrap();
+        let rows: Vec<&str> = symbol.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(rows, vec!["Book 1", "Art"], "the book above the table");
+        let placed = scene.layers().iter().find(|l| l.name == "Table 1").unwrap().frames.objects_at(0)[0].clone();
+        assert_eq!(placed.transform, Affine::translate((50.0, 100.0)), "the instance sits at the table's bottom centre");
+        let art = symbol.layers.iter().find(|l| l.name == "Art").unwrap().frames.objects_at(0)[0].clone();
+        let b = scene.resolved_bounds(&art);
+        assert_eq!((b.x0, b.y1), (-50.0, 0.0), "the art is drawn round the registration point");
     }
 }

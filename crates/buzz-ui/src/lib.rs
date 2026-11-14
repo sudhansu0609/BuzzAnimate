@@ -38,6 +38,7 @@ pub mod light_panel;
 pub mod lipsync_panel;
 pub mod motion_editor;
 pub mod new_document;
+pub mod menu_ui;
 pub mod panels;
 pub mod produce_dialog;
 pub mod episode_window;
@@ -81,7 +82,7 @@ pub use optimize_dialog::{OptimizeAction, OptimizeDialogState, optimize_dialog};
 pub use arrange_dialog::{ArrangeAction, ArrangeDialogState, arrange_dialog};
 pub use clear_keys_dialog::{ClearKeysState, clear_keys_dialog};
 pub use cleanup_dialog::{CleanupState, cleanup_dialog};
-pub use assets_panel::{AssetAction, AssetPanelState, ThumbnailSize, assets_panel};
+pub use assets_panel::{AssetAction, AssetPanelState, assets_panel};
 pub use brush::{BrushKind, BrushSettings, BrushTips, PatternShape};
 pub use camera_panel::{CameraPanelState, CameraResponse, camera_hud, camera_panel};
 pub use character_panel::{

@@ -1024,6 +1024,14 @@ impl Document {
         let slot = &mut self.scenes[self.active];
         let before = slot.scene.clone();
         f(&mut slot.scene);
+        // **The master audio stays the first layer**, just under the camera,
+        // whatever the edit did — a new layer, a drag, Arrange Layers, a
+        // paste — inside this same undo step.
+        if let Some((key, layer)) = self.master_audio
+            && key == slot.key
+        {
+            slot.scene.pin_layer_to_top(layer);
+        }
 
         // Nothing actually changed, so there is nothing to undo.
         if slot.scene.revision() == before.revision() {

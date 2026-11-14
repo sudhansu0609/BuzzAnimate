@@ -91,7 +91,9 @@ lopdf.workspace = true
 # Both are already in the build through wgpu and rfd; nothing new is fetched.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSMenu", "NSMenuItem", "NSCell"] }
+# The menus in the macOS menu bar (`native_menu`).
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
 
 [target.'cfg(windows)'.build-dependencies]
 # Embeds the icon into the .exe, so Explorer and the taskbar show it too.

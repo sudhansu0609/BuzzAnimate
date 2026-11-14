@@ -20,6 +20,12 @@ pub enum ModelId {
     Sam2Encoder,
     /// Segment Anything 2.1 hiera-tiny mask decoder.
     Sam2Decoder,
+    /// Segment Anything 3 image encoder (Split into Layers: whole objects by name).
+    Sam3Vision,
+    /// Segment Anything 3 text encoder (CLIP), with its tokenizer files.
+    Sam3Text,
+    /// Segment Anything 3 detector and mask decoder.
+    Sam3Decoder,
     /// LaMa (large-mask inpainting) for raster completion.
     LaMa,
     /// SigLIP vision encoder for image-to-asset similarity.
@@ -40,6 +46,9 @@ impl ModelId {
             ModelId::DwPoseEstimator,
             ModelId::Sam2Encoder,
             ModelId::Sam2Decoder,
+            ModelId::Sam3Vision,
+            ModelId::Sam3Text,
+            ModelId::Sam3Decoder,
             ModelId::LaMa,
             ModelId::SigLip,
             ModelId::Whisper,
@@ -54,6 +63,9 @@ impl ModelId {
             Self::DwPoseEstimator => "DWPose Estimator (133 kp)",
             Self::Sam2Encoder => "SAM 2.1 Encoder (Hiera-Tiny)",
             Self::Sam2Decoder => "SAM 2.1 Decoder (Hiera-Tiny)",
+            Self::Sam3Vision => "SAM 3 Image Encoder",
+            Self::Sam3Text => "SAM 3 Text Encoder",
+            Self::Sam3Decoder => "SAM 3 Detector and Mask Decoder",
             Self::LaMa => "LaMa Inpainting",
             Self::SigLip => "SigLIP Vision Encoder",
             Self::Whisper => "Whisper base.en (speech to text)",
@@ -154,6 +166,49 @@ pub static REGISTRY: &[ModelEntry] = &[
             sha256: "e9874d900dd4134ed60eab1e97910327c2419e0b2954485d8fd6e7f1a1470f47",
             bytes: 20_958_208,
         }],
+    },
+    ModelEntry {
+        id: ModelId::Sam3Vision,
+        filename: "sam3-vision-encoder.onnx",
+        url: "https://github.com/jamjamjon/assets/releases/download/sam3/vision-encoder.onnx",
+        sha256: "1ca59d288e9f41e58b0e24f5bef2b815e291ebc32a98a98fd487465116c1603b",
+        bytes: 1_840_414_607,
+        licence: "SAM License (Meta)",
+        description: "Split into Layers: SAM 3's picture encoder (ViT, 1008 px) for finding whole objects by name.",
+        extra_files: &[],
+    },
+    ModelEntry {
+        id: ModelId::Sam3Text,
+        filename: "sam3-text-encoder.onnx",
+        url: "https://github.com/jamjamjon/assets/releases/download/sam3/text-encoder.onnx",
+        sha256: "8d64e22ce6db55fb38a8b6c66bb8dff1c3a5a2d4304fe2d5ef7fc76d13b20dcf",
+        bytes: 1_413_177_890,
+        licence: "SAM License (Meta)",
+        description: "Split into Layers: SAM 3's text encoder (CLIP) and its tokenizer, for the object names.",
+        extra_files: &[
+            ExtraFile {
+                filename: crate::sam3::SAM3_VOCAB,
+                url: "https://github.com/jamjamjon/assets/releases/download/sam3/vocab.json",
+                sha256: "5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363",
+                bytes: 862_328,
+            },
+            ExtraFile {
+                filename: crate::sam3::SAM3_MERGES,
+                url: "https://github.com/jamjamjon/assets/releases/download/sam3/merges.txt",
+                sha256: "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a",
+                bytes: 524_619,
+            },
+        ],
+    },
+    ModelEntry {
+        id: ModelId::Sam3Decoder,
+        filename: "sam3-decoder.onnx",
+        url: "https://github.com/jamjamjon/assets/releases/download/sam3/decoder.onnx",
+        sha256: "d89b6f2dc3300baa56f4519d9ddcfb3fae9fb0fe6f173fa96faaff296034d3ad",
+        bytes: 96_317_152,
+        licence: "SAM License (Meta)",
+        description: "Split into Layers: SAM 3's detector and mask decoder: every instance of a name, whole, with a score.",
+        extra_files: &[],
     },
     ModelEntry {
         id: ModelId::LaMa,

@@ -6,6 +6,7 @@ pub mod llm;
 pub mod agent;
 pub mod ai_config;
 pub mod segment;
+pub mod sam3;
 pub mod pose;
 pub mod character;
 pub mod outpaint;

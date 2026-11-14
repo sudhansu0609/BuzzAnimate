@@ -30,6 +30,10 @@ pub fn bold_width(long_edge: f64) -> f64 {
     BOLD_WEIGHT_PX * long_edge.max(1.0) / 1920.0
 }
 
+/// Trace Bold draws its lines at this share of [`bold_width`] (the user, 2026-11-14: the FLA weight
+/// was too heavy on traced backgrounds). Even Lines keeps the full weight.
+pub const TRACE_BOLD_SHARE: f64 = 0.6;
+
 /// The thin weight for detail.
 pub fn detail_width(width: f64) -> f64 {
     width * DETAIL_SHARE

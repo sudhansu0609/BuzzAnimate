@@ -738,3 +738,107 @@ mod tests {
         }
     }
 }
+
+/// **A panel's symbol for the icon strip** (`Workspace::icon_strip`), drawn
+/// like the tool symbols above and for the same reason: centred in `rect`,
+/// in `color`. Animate's own strip shows Color as a split swatch, Swatches as
+/// a grid of chips, and so on; these follow it.
+pub fn panel_icon(painter: &Painter, rect: Rect, panel: crate::workspace::PanelId, color: Color32) {
+    use crate::workspace::PanelId as P;
+    let r = rect.shrink(rect.width() * 0.2);
+    let (x0, y0, w, h) = (r.left(), r.top(), r.width(), r.height());
+    let at = |u: f32, v: f32| Pos2::new(x0 + u * w, y0 + v * h);
+    let line = Stroke::new(1.5, color);
+    let seg = |a: (f32, f32), b: (f32, f32)| {
+        painter.line_segment([at(a.0, a.1), at(b.0, b.1)], line);
+    };
+    match panel {
+        P::Color => {
+            // A fill swatch overlapping a stroke swatch, as Animate's Color.
+            painter.rect_filled(Rect::from_min_max(at(0.0, 0.0), at(0.65, 0.65)), 1.0, color);
+            painter.rect_stroke(Rect::from_min_max(at(0.35, 0.35), at(1.0, 1.0)), 1.0, line, egui::StrokeKind::Inside);
+        }
+        P::Swatches => {
+            for i in 0..3 {
+                for j in 0..3 {
+                    let (u, v) = (i as f32 / 3.0, j as f32 / 3.0);
+                    painter.rect_filled(Rect::from_min_max(at(u + 0.03, v + 0.03), at(u + 0.3, v + 0.3)), 0.0, color);
+                }
+            }
+        }
+        P::Lighting => {
+            painter.circle_filled(at(0.5, 0.5), w * 0.2, color);
+            for k in 0..8 {
+                let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                let d = vec2(a.cos(), a.sin());
+                painter.add(Shape::line_segment([at(0.5, 0.5) + d * w * 0.32, at(0.5, 0.5) + d * w * 0.48], line));
+            }
+        }
+        P::ToolOptions => {
+            // Sliders.
+            for (v, knob) in [(0.2, 0.3), (0.5, 0.7), (0.8, 0.45)] {
+                seg((0.0, v), (1.0, v));
+                painter.circle_filled(at(knob, v), w * 0.1, color);
+            }
+        }
+        P::Filters => {
+            // A funnel.
+            painter.add(Shape::convex_polygon(vec![at(0.0, 0.1), at(1.0, 0.1), at(0.6, 0.55), at(0.4, 0.55)], Color32::TRANSPARENT, line));
+            seg((0.4, 0.55), (0.4, 0.95));
+            seg((0.6, 0.55), (0.6, 0.8));
+            seg((0.4, 0.95), (0.6, 0.8));
+        }
+        P::Layers => {
+            for v in [0.0, 0.3, 0.6] {
+                painter.add(Shape::convex_polygon(vec![at(0.5, v), at(1.0, v + 0.2), at(0.5, v + 0.4), at(0.0, v + 0.2)], Color32::TRANSPARENT, line));
+            }
+        }
+        P::Depth => {
+            // Three planes stepping back.
+            for (i, inset) in [0.0f32, 0.15, 0.3].into_iter().enumerate() {
+                let top = 0.1 + i as f32 * 0.25;
+                painter.rect_stroke(Rect::from_min_max(at(inset, top), at(1.0 - inset, top + 0.3)), 0.0, line, egui::StrokeKind::Inside);
+            }
+        }
+        P::Rig => {
+            // A bone: a joint at each end.
+            seg((0.2, 0.8), (0.8, 0.2));
+            painter.circle_stroke(at(0.2, 0.8), w * 0.14, line);
+            painter.circle_stroke(at(0.8, 0.2), w * 0.14, line);
+        }
+        P::Sound => {
+            // A speaker and a wave.
+            painter.add(Shape::convex_polygon(vec![at(0.0, 0.35), at(0.25, 0.35), at(0.55, 0.1), at(0.55, 0.9), at(0.25, 0.65), at(0.0, 0.65)], color, Stroke::NONE));
+            seg((0.72, 0.3), (0.82, 0.5));
+            seg((0.82, 0.5), (0.72, 0.7));
+            seg((0.88, 0.15), (1.0, 0.5));
+            seg((1.0, 0.5), (0.88, 0.85));
+        }
+        P::Cast => {
+            // A figure.
+            painter.circle_stroke(at(0.5, 0.22), w * 0.18, line);
+            painter.add(Shape::convex_polygon(vec![at(0.15, 1.0), at(0.25, 0.55), at(0.75, 0.55), at(0.85, 1.0)], Color32::TRANSPARENT, line));
+        }
+        P::Sequence => {
+            // A film strip.
+            painter.rect_stroke(Rect::from_min_max(at(0.0, 0.1), at(1.0, 0.9)), 1.0, line, egui::StrokeKind::Inside);
+            seg((0.33, 0.1), (0.33, 0.9));
+            seg((0.66, 0.1), (0.66, 0.9));
+        }
+        P::Properties => {
+            painter.circle_stroke(at(0.5, 0.5), w * 0.48, line);
+            seg((0.5, 0.42), (0.5, 0.78));
+            painter.circle_filled(at(0.5, 0.25), w * 0.06, color);
+        }
+        P::Library | P::Assets => {
+            // A box, open at the top.
+            painter.rect_stroke(Rect::from_min_max(at(0.05, 0.35), at(0.95, 0.95)), 1.0, line, egui::StrokeKind::Inside);
+            seg((0.05, 0.35), (0.25, 0.1));
+            seg((0.95, 0.35), (0.75, 0.1));
+        }
+        _ => {
+            // Anything else: its title's initial.
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, &panel.title()[..1], egui::FontId::proportional(rect.height() * 0.5), color);
+        }
+    }
+}

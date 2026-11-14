@@ -60,60 +60,15 @@ pub enum AssetAction {
     ArrangeByTypeAndStyle,
 }
 
-/// How big the pictures are drawn, and — because the two are the same
-/// decision — how the assets are laid out.
-///
-/// Animate's Library offers a list and a preview; this is the same idea taken
-/// one step further, because an asset library is browsed by *eye*. A row of
-/// names with a stamp beside each is the right shape for finding a thing you
-/// can already name; a grid of large pictures is the right shape for finding
-/// the one that looks right, which is what an asset folder is actually for.
-///
-/// One control rather than two, because a large picture in a one-per-row list
-/// wastes most of the panel and a small one in a grid is a field of dots. The
-/// size *implies* the layout, so there is no way to choose a combination that
-/// does not work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum ThumbnailSize {
-    /// A stamp beside the name, one asset per row. The densest listing.
-    Small,
-    /// A picture with its name beside it, still one per row.
-    #[default]
-    Medium,
-    /// A grid of pictures with the name underneath, as many across as fit.
-    Large,
-}
-
-impl ThumbnailSize {
-    pub const ALL: [Self; 3] = [Self::Small, Self::Medium, Self::Large];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Small => "Small",
-            Self::Medium => "Medium",
-            Self::Large => "Large",
-        }
-    }
-
-    /// Edge of the picture, in points.
-    pub fn edge(self) -> f32 {
-        match self {
-            Self::Small => 20.0,
-            Self::Medium => 40.0,
-            Self::Large => 84.0,
-        }
-    }
-
-    /// Does this size lay the assets out as a grid rather than as rows?
-    pub fn is_grid(self) -> bool {
-        matches!(self, Self::Large)
-    }
-
-    /// Width of one cell in the grid, including the room its name needs.
-    pub fn cell(self) -> f32 {
-        self.edge() + 12.0
-    }
-}
+/// The smallest a picture is drawn, in points. Below [`ROWS_BELOW`] the
+/// assets are listed one per row, picture beside name; from there up they are
+/// a grid of pictures with the name under each.
+pub const MIN_EDGE: f32 = 24.0;
+/// The largest a picture is drawn — the pictures are rendered for it.
+pub const MAX_EDGE: f32 = 140.0;
+/// The size a picture starts at: a grid of a few across a docked panel.
+pub const DEFAULT_EDGE: f32 = 84.0;
+const ROWS_BELOW: f32 = 40.0;
 
 /// Panel state that is not part of the document, and not part of the library.
 #[derive(Debug, Clone, Default)]
@@ -124,8 +79,10 @@ pub struct AssetPanelState {
     pub search: String,
     /// An Animate import in progress: assets done, and how many there are.
     pub importing: Option<(usize, usize)>,
-    /// How big the pictures are, and so how the assets are laid out.
-    pub thumbnail_size: ThumbnailSize,
+    /// How big the pictures are, in points, and so how the assets are laid
+    /// out; Cmd+scroll or a pinch over the panel changes it. `0` is the
+    /// default size. See [`Self::edge`].
+    pub thumbnail_edge: f32,
     /// Whether the panel shows every asset, only animated ones, or only stills.
     pub motion: MotionFilter,
     /// A folder whose deletion has been asked for once and not yet confirmed.
@@ -140,7 +97,6 @@ pub struct AssetPanelState {
     pub confirm_delete_asset: Option<std::path::PathBuf>,
     /// A rename in progress.
     renaming: Option<(std::path::PathBuf, String)>,
-    expanded: std::collections::BTreeSet<String>,
 }
 
 /// **An asset being dragged**, as the payload a folder can catch.
@@ -153,23 +109,31 @@ pub struct AssetPanelState {
 pub struct DraggedAsset(pub Asset);
 
 impl AssetPanelState {
-    fn is_expanded(&self, path: &str) -> bool {
-        self.expanded.contains(path)
-    }
-
-    fn toggle(&mut self, path: &str) {
-        if !self.expanded.remove(path) {
-            self.expanded.insert(path.to_string());
-        }
-    }
-
     fn matches(&self, name: &str) -> bool {
         let needle = self.search.trim().to_lowercase();
         needle.is_empty() || name.to_lowercase().contains(&needle)
     }
+
+    /// The pictures' edge in points, within [`MIN_EDGE`]..=[`MAX_EDGE`].
+    pub fn edge(&self) -> f32 {
+        if self.thumbnail_edge <= 0.0 {
+            DEFAULT_EDGE
+        } else {
+            self.thumbnail_edge.clamp(MIN_EDGE, MAX_EDGE)
+        }
+    }
 }
 
 /// Draw the Assets panel.
+///
+/// **Pictures, and Animated or Static** — nothing else on show. The panel
+/// used to stack a heading and count, a search box, three size buttons, the
+/// motion switch, a row of five buttons, the folder path on disk and Place
+/// and Delete on every asset, which buried the assets themselves. The
+/// pictures grow and shrink with Cmd+scroll or a pinch over the panel; what
+/// the buttons did is on the right-click menus — an asset's (Place, Rename,
+/// Delete), a folder's (Delete) and the panel's own (Add Selection, New
+/// Folder, From Animate, Arrange, Read Again).
 pub fn assets_panel(
     ui: &mut Ui,
     library: &AssetLibrary,
@@ -179,23 +143,21 @@ pub fn assets_panel(
 ) -> Option<AssetAction> {
     let mut action = None;
 
-    ui.horizontal(|ui| {
-        ui.heading("Assets");
-        ui.label(
-            RichText::new(format!("{} items", library.len()))
-                .small()
-                .weak(),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button("\u{27F3}")
-                .on_hover_text("Read the assets folder again")
-                .clicked()
-            {
-                action = Some(AssetAction::Rescan);
-            }
-        });
-    });
+    // **The panel's own menu**, on the empty space around the assets: laid
+    // down first, so every asset and folder drawn over it keeps its own.
+    let background = ui.interact(ui.max_rect(), ui.id().with("assets-background"), egui::Sense::click());
+    background.context_menu(|ui| panel_menu(ui, state, can_add, &mut action));
+
+    // **Cmd+scroll or a pinch resizes the pictures**, while the pointer is
+    // over the panel; a plain scroll still scrolls the list.
+    if ui.rect_contains_pointer(ui.max_rect()) {
+        let zoom = ui.input(|i| i.zoom_delta());
+        if zoom != 1.0 {
+            state.thumbnail_edge = (state.edge() * zoom).clamp(MIN_EDGE, MAX_EDGE);
+        }
+    }
+
+    filter_bar(ui, library, state, &mut action);
 
     // An unreadable library must say so: an empty list otherwise reads as
     // "you have no assets", which is a different and much worse message.
@@ -207,220 +169,132 @@ pub fn assets_panel(
         );
     }
 
-    ui.horizontal(|ui| {
-        ui.label("\u{1F50D}");
-        ui.text_edit_singleline(&mut state.search);
-        if !state.search.is_empty() && ui.small_button("x").on_hover_text("Clear").clicked() {
-            state.search.clear();
-        }
-    });
-
-    // **Picture size, which is also the layout.** See [`ThumbnailSize`] for
-    // why the two are one control rather than two.
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Size").small().weak());
-        for option in ThumbnailSize::ALL {
-            if ui
-                .selectable_label(state.thumbnail_size == option, option.label())
-                .clicked()
-            {
-                state.thumbnail_size = option;
-            }
-        }
-    });
-
-    // Animated or still. On "All" the two are shown apart, under their own
-    // headings inside each folder; the other two narrow to one or the other.
-    MotionFilter::toggle(ui, &mut state.motion);
-    ui.separator();
-
-    if library.is_empty() && library.folders().is_empty() {
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(
-                "No assets yet.\n\nSelect artwork and press + to keep it here. Assets live \
-                 outside the document, so anything kept here can be placed into any file.",
-            )
-            .weak()
-            .italics(),
-        );
-    } else {
-        draw_folder(ui, library, state, "", 0, &mut action, thumbnail);
-    }
-
-    ui.separator();
-    // Wrapped: four controls and a hint are wider than a dock column at its
-    // narrowest, and unwrapped the last of them — "From Animate…" — was drawn
-    // off the end of the panel where it could not be clicked.
-    ui.horizontal_wrapped(|ui| {
-        // **Named, not a plus.** "+" beside a library reads as "new folder" as
-        // easily as "keep this", and the one thing this button does is the
-        // reason the panel exists.
-        let add = ui.add_enabled(can_add, egui::Button::new("Add Selection").small());
-        if add
-            .on_hover_text("Keep the selected artwork here as a reusable asset")
-            .clicked()
-        {
-            action = Some(AssetAction::Add {
-                folder: state.selected_folder.clone(),
-            });
-        }
-        if !can_add {
-            ui.label(
-                RichText::new("select artwork to add")
-                    .small()
-                    .weak()
-                    .italics(),
-            );
-        }
-        if ui.small_button("Fld").on_hover_text("New folder").clicked() {
-            action = Some(AssetAction::NewFolder);
-        }
-        if ui
-            .small_button("From Animate\u{2026}")
-            .on_hover_text(
-                "Bring in an Animate asset library \u{2014} everything under its \
-                 Assets folder, filed the way Animate filed it",
-            )
-            .clicked()
-        {
-            action = Some(AssetAction::ImportFromAnimate);
-        }
-        if ui
-            .small_button("Arrange by type & style\u{2026}")
-            .on_hover_text(
-                "File assets into Type folders (Characters, Buildings, Trees\u{2026}) and \
-                 Style folders inside them \u{2014} previewed first, and undoable",
-            )
-            .clicked()
-        {
-            action = Some(AssetAction::ArrangeByTypeAndStyle);
-        }
-        if !state.selected_folder.is_empty() {
-            ui.label(RichText::new(&state.selected_folder).small().weak());
-        }
-    });
-
     if let Some((done, total)) = state.importing {
         ui.add(
             egui::ProgressBar::new(done as f32 / total.max(1) as f32)
                 .text(format!("importing {done} of {total} from Animate")),
         );
     }
+    ui.add_space(4.0);
 
-    if let Some(root) = library.root() {
+    if library.is_empty() && library.folders().is_empty() {
+        ui.add_space(6.0);
         ui.label(
-            RichText::new(root.display().to_string())
-                .small()
-                .weak()
-                .italics(),
-        )
-        .on_hover_text("Where these files are kept");
+            RichText::new(
+                "No assets yet.\n\nSelect artwork, then right-click here and choose Add \
+                 Selection. Assets live outside the document, so anything kept here can be \
+                 placed into any file.",
+            )
+            .weak()
+            .italics(),
+        );
+    } else {
+        // **Just the assets**: every one in the chosen folder and the folders
+        // inside it, in one grid by name — no folder rows. "Characters" and
+        // "Objects" used to stand between the switch and the pictures.
+        let top = state.selected_folder.split('/').next().unwrap_or_default().to_string();
+        let mut here: Vec<Asset> = library
+            .assets()
+            .iter()
+            .filter(|a| {
+                let first = a.folder.split('/').next().unwrap_or_default();
+                if top.is_empty() { !first.starts_with('_') } else { first == top }
+            })
+            .filter(|a| state.matches(&a.name))
+            .cloned()
+            .collect();
+        here.sort_by_key(|a| a.name.to_lowercase());
+        draw_assets(ui, state, &here, 0.0, &mut action, thumbnail);
     }
 
     action
 }
 
-fn draw_folder(
-    ui: &mut Ui,
-    library: &AssetLibrary,
-    state: &mut AssetPanelState,
-    parent: &str,
-    depth: usize,
-    action: &mut Option<AssetAction>,
-    thumbnail: AssetThumbnailSource<'_>,
-) {
-    let indent = depth as f32 * 14.0;
-
-    let folders: Vec<String> = library.child_folders(parent).into_iter().cloned().collect();
-
-    for folder in folders {
-        let leaf = folder.rsplit('/').next().unwrap_or(&folder).to_string();
-        let open = state.is_expanded(&folder) || !state.search.trim().is_empty();
-        let selected = state.selected_folder == folder;
-
-        ui.horizontal(|ui| {
-            ui.add_space(indent);
-            if ui
-                .small_button(if open { "\u{23F7}" } else { "\u{25B6}" })
-                .clicked()
-            {
-                state.toggle(&folder);
+/// **One line: the top folders, then Animated and Static.** A folder button
+/// (Animate, Cast…) shows the assets in it and everything filed inside it,
+/// and is where Add Selection keeps a new one; clicking it again shows every
+/// folder's. Dropping an asset on one files it there, and right-click deletes
+/// it. Animated or Static shows that kind alone; clicking the lit one again
+/// shows both. Folders whose names start with `_` (backups) are not shown.
+fn filter_bar(ui: &mut Ui, library: &AssetLibrary, state: &mut AssetPanelState, action: &mut Option<AssetAction>) {
+    let top = state.selected_folder.split('/').next().unwrap_or_default().to_string();
+    ui.horizontal_wrapped(|ui| {
+        let folders: Vec<String> =
+            library.child_folders("").into_iter().filter(|f| !f.starts_with('_')).cloned().collect();
+        for folder in folders {
+            let on = top == folder;
+            let (dropped, payload) = ui.dnd_drop_zone::<DraggedAsset, egui::Response>(egui::Frame::NONE, |ui| {
+                ui.selectable_label(on, &folder)
+                    .on_hover_text("Show this folder's assets \u{b7} drop an asset here to file it \u{b7} right-click to delete")
+            });
+            let button = dropped.inner;
+            if let Some(payload) = payload {
+                *action = Some(AssetAction::MoveToFolder { asset: payload.0.clone(), folder: folder.clone() });
             }
-            ui.label(RichText::new("F").small().weak())
-                .on_hover_text("Folder");
-            // **A folder catches an asset dropped on it.** The label is the
-            // target rather than the whole row, so the drop lands on the thing
-            // that is named — dropping on the Delete button at the far end
-            // would be a filing gesture that reads as a destructive one.
-            let dropped =
-                ui.dnd_drop_zone::<DraggedAsset, egui::Response>(egui::Frame::NONE, |ui| {
-                    ui.selectable_label(selected, &leaf).on_hover_text(
-                        "Click makes this the folder new assets go into \u{b7} drop \
-                         an asset here to file it",
-                    )
-                });
-            let label = dropped.0.inner;
-            if let Some(payload) = dropped.1 {
-                *action = Some(AssetAction::MoveToFolder {
-                    asset: payload.0.clone(),
-                    folder: folder.clone(),
-                });
+            if button.clicked() {
+                state.selected_folder = if on { String::new() } else { folder.clone() };
             }
-            if label.clicked() {
-                state.selected_folder = if selected {
-                    String::new()
-                } else {
-                    folder.clone()
-                };
-            }
-            // Right-click as well as the button, because a right-click is where
-            // a hand goes looking for "delete" on anything in a tree.
-            label.context_menu(|ui| {
+            button.context_menu(|ui| {
                 if ui.button("Delete folder and contents").clicked() {
-                    *action = Some(AssetAction::DeleteFolder {
-                        folder: folder.clone(),
-                    });
+                    *action = Some(AssetAction::DeleteFolder { folder: folder.clone() });
                     ui.close();
                 }
             });
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // **Spelled out, not a pictogram.** The trash-can glyph is not
-                // in the bundled fonts, so the button that was here drew as an
-                // empty box - which is why deleting looked as though it had
-                // been taken away.
-                if ui
-                    .small_button("Delete")
-                    .on_hover_text("Delete this folder and everything in it")
-                    .clicked()
-                {
-                    *action = Some(AssetAction::DeleteFolder {
-                        folder: folder.clone(),
-                    });
-                }
-            });
-        });
-
-        if open {
-            draw_folder(ui, library, state, &folder, depth + 1, action, thumbnail);
         }
-    }
-
-    let here: Vec<Asset> = library
-        .in_folder(parent)
-        .into_iter()
-        .filter(|a| state.matches(&a.name))
-        .cloned()
-        .collect();
-    draw_assets(ui, state, &here, indent, action, thumbnail);
+        ui.separator();
+        for (option, label) in [(MotionFilter::Animated, "Animated"), (MotionFilter::Static, "Static")] {
+            let on = state.motion == option;
+            if ui.selectable_label(on, label).clicked() {
+                state.motion = if on { MotionFilter::All } else { option };
+            }
+        }
+    });
 }
 
-/// The assets in one folder, separated into animated and still.
-///
-/// On "All" both groups are drawn, each under its own heading; asked for one
-/// kind alone the other is left out and the heading with it, since the whole
-/// listing is then of a single kind.
+/// What the panel's buttons did, on its right-click menu.
+fn panel_menu(ui: &mut Ui, state: &AssetPanelState, can_add: bool, action: &mut Option<AssetAction>) {
+    let add = ui
+        .add_enabled(can_add, egui::Button::new("Add Selection"))
+        .on_hover_text("Keep the selected artwork here as a reusable asset")
+        .on_disabled_hover_text("Select artwork on the stage first");
+    if add.clicked() {
+        *action = Some(AssetAction::Add { folder: state.selected_folder.clone() });
+        ui.close();
+    }
+    if ui.button("New Folder").clicked() {
+        *action = Some(AssetAction::NewFolder);
+        ui.close();
+    }
+    ui.separator();
+    if ui
+        .button("From Animate\u{2026}")
+        .on_hover_text(
+            "Bring in an Animate asset library \u{2014} everything under its Assets folder, \
+             filed the way Animate filed it",
+        )
+        .clicked()
+    {
+        *action = Some(AssetAction::ImportFromAnimate);
+        ui.close();
+    }
+    if ui
+        .button("Arrange by type & style\u{2026}")
+        .on_hover_text(
+            "File assets into Type folders (Characters, Buildings, Trees\u{2026}) and Style \
+             folders inside them \u{2014} previewed first, and undoable",
+        )
+        .clicked()
+    {
+        *action = Some(AssetAction::ArrangeByTypeAndStyle);
+        ui.close();
+    }
+    if ui.button("Read the Folder Again").clicked() {
+        *action = Some(AssetAction::Rescan);
+        ui.close();
+    }
+}
+
+/// The assets on show, animated or still or both together.
 fn draw_assets(
     ui: &mut Ui,
     state: &mut AssetPanelState,
@@ -432,8 +306,8 @@ fn draw_assets(
     let (animated, still): (Vec<&Asset>, Vec<&Asset>) = here.iter().partition(|a| a.animated);
     match state.motion {
         MotionFilter::All => {
-            draw_asset_group(ui, state, "Animated", &animated, indent, action, thumbnail);
-            draw_asset_group(ui, state, "Static", &still, indent, action, thumbnail);
+            let all: Vec<&Asset> = here.iter().collect();
+            draw_asset_group(ui, state, "", &all, indent, action, thumbnail);
         }
         MotionFilter::Animated => {
             draw_asset_group(ui, state, "", &animated, indent, action, thumbnail);
@@ -469,8 +343,8 @@ fn draw_asset_group(
         });
     }
 
-    let size = state.thumbnail_size;
-    if !size.is_grid() {
+    let edge = state.edge();
+    if edge < ROWS_BELOW {
         for &asset in here {
             asset_row(ui, state, asset, indent, action, thumbnail);
         }
@@ -481,7 +355,7 @@ fn draw_asset_group(
     // widgets, but each cell here is a picture over a name of its own width,
     // so the cells are allocated at a fixed size and wrapped by hand — which
     // is also what keeps the columns lined up.
-    let cell = size.cell();
+    let cell = edge + 12.0;
     let available = (ui.available_width() - indent).max(cell);
     let columns = ((available / cell).floor() as usize).max(1);
 
@@ -503,38 +377,88 @@ fn asset_cell(
     action: &mut Option<AssetAction>,
     thumbnail: AssetThumbnailSource<'_>,
 ) {
-    let size = state.thumbnail_size;
-    let edge = size.edge();
-
-    ui.allocate_ui(egui::vec2(size.cell(), edge + 22.0), |ui| {
+    let edge = state.edge();
+    ui.allocate_ui(egui::vec2(edge + 12.0, edge + 22.0), |ui| {
         ui.vertical_centered(|ui| {
-            let (rect, response) =
-                ui.allocate_exact_size(egui::vec2(edge, edge), egui::Sense::click());
-            draw_thumbnail(ui, rect, asset, thumbnail);
-
-            let response = response.on_hover_text(format!(
-                "{}\nClick places it in the document",
-                asset.label()
-            ));
-            if response.clicked() {
-                *action = Some(AssetAction::Place(asset.clone()));
+            asset_picture(ui, state, asset, edge, action, thumbnail);
+            if !asset_name_editor(ui, state, asset, action) {
+                // Truncated by hand: a painted label does not shorten itself,
+                // and a long name would push the whole column out of line.
+                let chars = ((edge + 12.0) / 6.5) as usize;
+                ui.label(RichText::new(shorten(&asset.name, chars.max(6))).small());
             }
-            response.context_menu(|ui| asset_menu(ui, state, asset, action));
-
-            // Truncated by hand: a painted label does not shorten itself, and
-            // a long name would push the whole column out of line.
-            let name = shorten(&asset.name, 12);
-            ui.label(RichText::new(name).small());
         });
     });
+}
+
+/// **An asset's picture**, which is the whole of what it offers: click places
+/// it, dragging carries it onto the stage or a folder, double-click renames,
+/// right-click for Place, Rename and Delete.
+///
+/// One widget sensing clicks and drags, with the drag payload set by hand,
+/// rather than a drag source wrapping a clickable picture: a drag widget laid
+/// over others swallows their clicks (see `draw_symbol_row` in the Library).
+/// The grid's pictures used to take only clicks, so an asset could be dragged
+/// out at the list sizes alone.
+fn asset_picture(
+    ui: &mut Ui,
+    state: &mut AssetPanelState,
+    asset: &Asset,
+    edge: f32,
+    action: &mut Option<AssetAction>,
+    thumbnail: AssetThumbnailSource<'_>,
+) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(edge, edge), egui::Sense::click_and_drag());
+    draw_thumbnail(ui, rect, asset, thumbnail);
+    if response.hovered() {
+        ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, crate::theme::Palette::text()), egui::StrokeKind::Inside);
+    }
+    if response.drag_started() {
+        response.dnd_set_drag_payload(DraggedAsset(asset.clone()));
+    }
+    let response = response.on_hover_text(format!(
+        "{}\nClick places it \u{b7} drag it onto the stage or a folder \u{b7} double-click \
+         renames \u{b7} Cmd+scroll resizes \u{b7} right-click for more",
+        asset.label()
+    ));
+    if response.double_clicked() {
+        state.renaming = Some((asset.path.clone(), asset.name.clone()));
+    } else if response.clicked() {
+        *action = Some(AssetAction::Place(asset.clone()));
+    }
+    response.context_menu(|ui| asset_menu(ui, state, asset, action));
+}
+
+/// The name being typed, when this asset is being renamed: Enter keeps it.
+/// Returns whether it drew the editor.
+fn asset_name_editor(ui: &mut Ui, state: &mut AssetPanelState, asset: &Asset, action: &mut Option<AssetAction>) -> bool {
+    let Some((path, text)) = state.renaming.as_mut() else {
+        return false;
+    };
+    if *path != asset.path {
+        return false;
+    }
+    let response = ui.text_edit_singleline(text);
+    let done = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    response.request_focus();
+    if done && let Some((_, text)) = state.renaming.take() {
+        *action = Some(AssetAction::Rename { asset: asset.clone(), name: text });
+    }
+    true
 }
 
 /// The picture, or the space it will occupy.
 ///
 /// The square is always reserved so rows and columns do not jump about as
 /// pictures arrive over the next few frames.
+///
+/// **Asked for only when it is on screen.** Every asset in an open folder used
+/// to ask, scrolled out of view or not, and a library larger than the
+/// picture cache kept loading, evicting and loading again — reading files
+/// for as long as the panel was open.
 fn draw_thumbnail(ui: &Ui, rect: egui::Rect, asset: &Asset, thumbnail: AssetThumbnailSource<'_>) {
-    match thumbnail(&asset.path) {
+    let picture = if ui.is_rect_visible(rect) { thumbnail(&asset.path) } else { None };
+    match picture {
         Some(texture) => {
             egui::Image::new((texture, rect.size())).paint_at(ui, rect);
         }
@@ -606,6 +530,7 @@ fn asset_menu(
     }
 }
 
+/// One asset at the smallest sizes: its picture with the name beside it.
 fn asset_row(
     ui: &mut Ui,
     state: &mut AssetPanelState,
@@ -614,58 +539,13 @@ fn asset_row(
     action: &mut Option<AssetAction>,
     thumbnail: AssetThumbnailSource<'_>,
 ) {
-    // **Draggable, so it can be filed.** An asset could be made and renamed but
-    // never moved: the folder it landed in was the folder that happened to be
-    // selected when it was kept, and putting it somewhere else meant deleting
-    // it and adding it again from the document it came from. Dragging it onto a
-    // folder is what every library in every program offers, and it is the only
-    // gesture that does not need the asset to still exist somewhere else.
-    let drag_id = ui.id().with(("asset-drag", &asset.path));
+    let edge = state.edge();
     ui.horizontal(|ui| {
         ui.add_space(indent);
-
-        // **The picture, before the name.** Choosing an asset meant reading a
-        // list of names and opening the ones you could not remember, which is
-        // the slowest possible way to answer "which of these is the oak".
-        //
-        // **And the picture is the drag handle**, not the whole row.
-        // `dnd_drag_source` interacts over everything it wraps, and a drag
-        // widget laid over a row swallows the clicks meant for what is in it —
-        // wrapping the row took Rename, Delete and Place with it. The Library
-        // had the same defect for the same reason; see `draw_symbol_row`.
-        let edge = state.thumbnail_size.edge();
-        let dragged = ui.dnd_drag_source(drag_id, DraggedAsset(asset.clone()), |ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(edge, edge), egui::Sense::hover());
-            draw_thumbnail(ui, rect, asset, thumbnail);
-        });
-        dragged
-            .response
-            .on_hover_text("Drag onto a folder to file it there");
+        asset_picture(ui, state, asset, edge, action, thumbnail);
         ui.add_space(4.0);
-
-        let renaming = state
-            .renaming
-            .as_ref()
-            .is_some_and(|(path, _)| *path == asset.path);
-
-        if renaming {
-            let mut done = false;
-            if let Some((_, text)) = state.renaming.as_mut() {
-                let response = ui.text_edit_singleline(text);
-                done = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                response.request_focus();
-            }
-            if done && let Some((_, text)) = state.renaming.take() {
-                *action = Some(AssetAction::Rename {
-                    asset: asset.clone(),
-                    name: text,
-                });
-            }
-        } else {
-            let response = ui.selectable_label(false, &asset.name).on_hover_text(
-                "Click places it in the document \u{b7} double-click renames \u{b7} \
-                 right-click for more",
-            );
+        if !asset_name_editor(ui, state, asset, action) {
+            let response = ui.selectable_label(false, &asset.name);
             if response.double_clicked() {
                 state.renaming = Some((asset.path.clone(), asset.name.clone()));
             } else if response.clicked() {
@@ -673,35 +553,6 @@ fn asset_row(
             }
             response.context_menu(|ui| asset_menu(ui, state, asset, action));
         }
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // **Spelled out, not a pictogram.** This was a trash-can glyph,
-            // which the bundled fonts do not have - the note beside it said as
-            // much about another glyph and then used one anyway. It drew as an
-            // empty box, so deleting an asset looked impossible.
-            //
-            // Two clicks, because a file on disk has no undo: the first arms and
-            // the button becomes "Delete?", the second confirms.
-            let armed = state.confirm_delete_asset.as_deref() == Some(asset.path.as_path());
-            if ui
-                .small_button(if armed { "Delete?" } else { "Delete" })
-                .on_hover_text(if armed {
-                    "Click again to delete this asset for good \u{2014} there is no undo"
-                } else {
-                    "Delete this asset from the library"
-                })
-                .clicked()
-            {
-                *action = Some(AssetAction::Delete(asset.clone()));
-            }
-            if ui
-                .small_button("Place")
-                .on_hover_text("Put a copy into this document")
-                .clicked()
-            {
-                *action = Some(AssetAction::Place(asset.clone()));
-            }
-        });
     });
 }
 
@@ -741,8 +592,8 @@ mod tests {
                 ..Default::default()
             };
             let _ = ctx.run_ui(Default::default(), |ui| {
-                for size in ThumbnailSize::ALL {
-                    state.thumbnail_size = size;
+                for edge in [0.0, MIN_EDGE, DEFAULT_EDGE, MAX_EDGE] {
+                    state.thumbnail_edge = edge;
                     let _ = assets_panel(ui, library, &mut state, can_add, &mut |_| None);
                 }
             });

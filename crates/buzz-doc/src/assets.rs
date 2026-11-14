@@ -320,7 +320,9 @@ impl AssetLibrary {
     ///
     /// Its layers still arrive as new layers on top of the timeline being
     /// edited; each is pushed along so its first frame is `frame`, with blank
-    /// frames before it.
+    /// frames before it. They are **named after the asset** (see
+    /// [`asset_layer_name`]) — they used to keep the asset file's own names,
+    /// so every dropped asset came in as another "Layer_1".
     pub fn place_at_frame(
         &self,
         asset: &Asset,
@@ -335,6 +337,19 @@ impl AssetLibrary {
             .map(|l| l.id)
             .filter(|id| !before.contains(id))
             .collect();
+        // The layers filed directly on the timeline, not inside a folder
+        // that came with them: a folder's own layers keep their names.
+        let top: Vec<_> = arrived
+            .iter()
+            .copied()
+            .filter(|id| scene.layers().get(*id).is_none_or(|l| l.parent.is_none_or(|p| !arrived.contains(&p))))
+            .collect();
+        let mut unnamed = 0;
+        for id in &top {
+            let own = scene.layers().get(*id).map(|l| l.name.clone()).unwrap_or_default();
+            let name = asset_layer_name(&asset.name, &own, &mut unnamed, top.len());
+            scene.update_layer(*id, |l| l.name = name);
+        }
         for id in arrived {
             scene.update_layer(id, |l| l.frames.delay(frame));
         }
@@ -520,8 +535,53 @@ pub fn sanitise(name: &str) -> String {
     }
 }
 
+/// The name a placed asset's layer takes: the asset's own name when it brings
+/// one layer (or one folder). With several, a layer named by default
+/// (`Layer_3`) takes the asset's name, numbered after the first — `Tree`,
+/// `Tree_2` — counted in `unnamed`; one with a name of its own keeps it after
+/// the asset's: `Tree trunk`.
+fn asset_layer_name(asset: &str, own: &str, unnamed: &mut usize, count: usize) -> String {
+    let default = own
+        .strip_prefix("Layer")
+        .map(|rest| rest.trim_start_matches(['_', ' ']))
+        .is_some_and(|n| n.is_empty() || n.chars().all(|c| c.is_ascii_digit()));
+    if count <= 1 {
+        asset.to_string()
+    } else if default {
+        *unnamed += 1;
+        if *unnamed == 1 { asset.to_string() } else { format!("{asset}_{unnamed}") }
+    } else {
+        format!("{asset} {own}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// **A placed asset's layers are named after it.** Dragging an asset onto
+    /// the stage brought its layers in under the file's own names, so every
+    /// asset arrived as another "Layer_1".
+    #[test]
+    fn placed_asset_layers_take_the_assets_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut library = AssetLibrary::at(dir.path());
+        let mut one = buzz_scene::Scene::default();
+        let first = one.layers().iter().next().unwrap().id;
+        one.update_layer(first, |l| l.name = "Layer_1".into());
+        let tree = library.save("Tree", "", &one).expect("save");
+        let mut two = one.clone();
+        two.add_layer("trunk", buzz_scene::LayerKind::Normal);
+        two.add_layer("Layer_3", buzz_scene::LayerKind::Normal);
+        let bush = library.save("Bush", "", &two).expect("save");
+
+        let mut scene = buzz_scene::Scene::default();
+        let names = |scene: &Scene| scene.layers().iter().map(|l| l.name.clone()).collect::<Vec<_>>();
+        let before = scene.layers().len();
+        library.place_at_frame(&tree, &mut scene, 0).expect("placed");
+        assert_eq!(names(&scene)[..scene.layers().len() - before], ["Tree".to_string()]);
+        library.place_at_frame(&bush, &mut scene, 4).expect("placed");
+        assert_eq!(names(&scene)[..3], ["Bush".to_string(), "Bush trunk".into(), "Bush_2".into()][..], "{:?}", names(&scene));
+    }
+
     /// **Filing an asset by dragging it onto a folder.**
     ///
     /// An asset could be made and renamed but never moved: the folder it landed

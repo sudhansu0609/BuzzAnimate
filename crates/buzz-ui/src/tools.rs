@@ -234,6 +234,30 @@ pub const TOOL_GROUPS: &[&[ToolId]] = &[
     &[ToolId::Camera, ToolId::Hand, ToolId::Zoom],
 ];
 
+/// **The tool column, as Animate groups it: related tools side by side on
+/// one line** — Selection with Subselection, the shapes together, the fill
+/// tools together — in sections split by a divider, three to a line at most
+/// so the column stays narrow. It used to be one tool to a line, two dozen
+/// lines long. Every tool is on exactly one line (see
+/// `every_tool_has_one_place_in_the_rows`).
+pub const TOOL_ROWS: &[&[&[ToolId]]] = &[
+    &[
+        &[ToolId::Selection, ToolId::Subselection],
+        &[ToolId::FreeTransform, ToolId::GradientTransform],
+        &[ToolId::Lasso, ToolId::MagicWand],
+    ],
+    &[
+        &[ToolId::Brush, ToolId::Pencil, ToolId::Eraser],
+        &[ToolId::Rectangle, ToolId::Oval, ToolId::PolyStar],
+        &[ToolId::Line, ToolId::Pen, ToolId::Text],
+    ],
+    &[
+        &[ToolId::PaintBucket, ToolId::InkBottle, ToolId::Eyedropper],
+        &[ToolId::Bone, ToolId::AssetWarp, ToolId::MotionPath],
+    ],
+    &[&[ToolId::Hand, ToolId::Zoom, ToolId::Camera]],
+];
+
 /// Every tool, in toolbar order.
 pub fn all_tools() -> Vec<ToolId> {
     TOOL_GROUPS.iter().flat_map(|g| g.iter().copied()).collect()
@@ -290,6 +314,16 @@ pub fn tool_for_key(key: Key) -> Option<ToolId> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn every_tool_has_one_place_in_the_rows() {
+        let mut placed: Vec<ToolId> = TOOL_ROWS.iter().flat_map(|s| s.iter()).flat_map(|r| r.iter().copied()).collect();
+        assert!(TOOL_ROWS.iter().flat_map(|s| s.iter()).all(|r| r.len() <= 3), "three to a line at most");
+        let mut all = all_tools();
+        placed.sort_by_key(|t| format!("{t:?}"));
+        all.sort_by_key(|t| format!("{t:?}"));
+        assert_eq!(placed, all);
+    }
 
     #[test]
     fn the_toolbar_contains_every_tool_exactly_once() {

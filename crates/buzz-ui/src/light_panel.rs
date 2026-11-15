@@ -54,6 +54,9 @@ pub struct LightResponse {
     pub set_shadows_only: Option<bool>,
     /// The built-in character shadows (no light needed) on or off.
     pub set_character_shadows: Option<bool>,
+    /// The built-in character shadows' direction, length, darkness or
+    /// placement changed: the whole light, as it now is.
+    pub set_character_light: Option<Light>,
     /// What the light draws its bands around: nothing, each shape, or the
     /// whole figure.
     pub set_edges: Option<EdgeMode>,
@@ -234,6 +237,10 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
     {
         out.set_character_shadows = Some(shadows);
     }
+    // Their settings, while they are what throws the shadows.
+    if !rig.no_character_shadows && !rig.is_active() {
+        out.set_character_light = character_shadow_settings(ui, rig, state);
+    }
 
     if rig.lights.is_empty() {
         ui.add_space(4.0);
@@ -287,7 +294,7 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
                 }
                 // The light's own colour, as a swatch that is also the editor.
                 let mut colour = to_egui(light.color);
-                if ui.color_edit_button_srgba(&mut colour).changed() {
+                if crate::widgets::color_button(ui, &mut colour).changed() {
                     out.changed = Some(Light {
                         color: from_egui(colour),
                         ..light.clone()
@@ -381,8 +388,7 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
                 ui.horizontal(|ui| {
                     ui.label("Horizon");
                     let mut colour = to_egui(*horizon);
-                    if ui
-                        .color_edit_button_srgba(&mut colour)
+                    if crate::widgets::color_button(ui, &mut colour)
                         .on_hover_text(
                             "The colour low on the stage; the light's own colour is overhead",
                         )
@@ -647,91 +653,7 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
             }
 
             if edited.shadows {
-                egui::CollapsingHeader::new(RichText::new("Shadow placement").strong())
-                    .id_salt("shadow-placement")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(
-                                "Adjusts the silhouette after automatic projection. The light still controls its direction and motion.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-
-                        egui::Grid::new("shadow-placement-grid")
-                            .num_columns(2)
-                            .show(ui, |ui| {
-                                ui.label("Offset X");
-                                changed |= ui
-                                    .add(egui::DragValue::new(&mut edited.shadow_adjustment.offset.x).speed(1.0).suffix(" px"))
-                                    .changed();
-                                ui.end_row();
-                                ui.label("Offset Y");
-                                changed |= ui
-                                    .add(egui::DragValue::new(&mut edited.shadow_adjustment.offset.y).speed(1.0).suffix(" px"))
-                                    .changed();
-                                ui.end_row();
-
-                                ui.label("Width");
-                                let before_x = edited.shadow_adjustment.scale_x;
-                                let x_changed = ui
-                                    .add(egui::DragValue::new(&mut edited.shadow_adjustment.scale_x).speed(0.01).range(0.01..=100.0))
-                                    .changed();
-                                if x_changed && state.shadow_scale_linked && before_x.abs() > f64::EPSILON {
-                                    edited.shadow_adjustment.scale_y *= edited.shadow_adjustment.scale_x / before_x;
-                                }
-                                changed |= x_changed;
-                                ui.end_row();
-
-                                ui.label("Height");
-                                let before_y = edited.shadow_adjustment.scale_y;
-                                let y_changed = ui
-                                    .add(egui::DragValue::new(&mut edited.shadow_adjustment.scale_y).speed(0.01).range(0.01..=100.0))
-                                    .changed();
-                                if y_changed && state.shadow_scale_linked && before_y.abs() > f64::EPSILON {
-                                    edited.shadow_adjustment.scale_x *= edited.shadow_adjustment.scale_y / before_y;
-                                }
-                                changed |= y_changed;
-                                ui.end_row();
-
-                                ui.label("Rotation");
-                                let mut rotation = edited.shadow_adjustment.rotation.to_degrees();
-                                if ui.add(egui::DragValue::new(&mut rotation).speed(0.5).suffix(" deg")).changed() {
-                                    edited.shadow_adjustment.rotation = rotation.to_radians();
-                                    changed = true;
-                                }
-                                ui.end_row();
-                                ui.label("Horizontal skew");
-                                let mut skew_x = edited.shadow_adjustment.skew_x.to_degrees();
-                                if ui.add(egui::Slider::new(&mut skew_x, -80.0..=80.0).suffix(" deg")).changed() {
-                                    edited.shadow_adjustment.skew_x = skew_x.to_radians();
-                                    changed = true;
-                                }
-                                ui.end_row();
-                                ui.label("Vertical skew");
-                                let mut skew_y = edited.shadow_adjustment.skew_y.to_degrees();
-                                if ui.add(egui::Slider::new(&mut skew_y, -80.0..=80.0).suffix(" deg")).changed() {
-                                    edited.shadow_adjustment.skew_y = skew_y.to_radians();
-                                    changed = true;
-                                }
-                                ui.end_row();
-                                ui.label("Pivot X");
-                                changed |= ui.add(egui::DragValue::new(&mut edited.shadow_adjustment.pivot.x).speed(1.0)).changed();
-                                ui.end_row();
-                                ui.label("Pivot Y");
-                                changed |= ui.add(egui::DragValue::new(&mut edited.shadow_adjustment.pivot.y).speed(1.0)).changed();
-                                ui.end_row();
-                            });
-
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut state.shadow_scale_linked, "Link width and height");
-                            if ui.small_button("Reset placement").clicked() {
-                                edited.shadow_adjustment = buzz_scene::ShadowAdjustment::default();
-                                changed = true;
-                            }
-                        });
-                    });
+                changed |= shadow_placement(ui, &mut edited.shadow_adjustment, state, "shadow-placement");
             }
 
             ui.horizontal(|ui| {
@@ -876,8 +798,7 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
     ui.horizontal(|ui| {
         ui.label("Fill");
         let mut base = to_egui(rig.base);
-        if ui
-            .color_edit_button_srgba(&mut base)
+        if crate::widgets::color_button(ui, &mut base)
             .on_hover_text("What is left where no light reaches \u{2014} rarely quite black")
             .changed()
         {
@@ -978,6 +899,159 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
     });
 
     out
+}
+
+/// **Where a shadow sits**, after the light has thrown it: offset, width and
+/// height, rotation, skew and the pivot they turn about. The same grid for a
+/// light's shadows and for the built-in character shadows. `true` when
+/// something changed.
+fn shadow_placement(ui: &mut Ui, adjustment: &mut buzz_scene::ShadowAdjustment, state: &mut LightPanelState, id: &str) -> bool {
+    let mut changed = false;
+    egui::CollapsingHeader::new(RichText::new("Shadow placement").strong())
+        .id_salt(id)
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(
+                    "Adjusts the silhouette after automatic projection. The light still controls its direction and motion.",
+                )
+                .small()
+                .weak(),
+            );
+
+            egui::Grid::new((id, "grid")).num_columns(2).show(ui, |ui| {
+                ui.label("Offset X");
+                changed |= ui.add(egui::DragValue::new(&mut adjustment.offset.x).speed(1.0).suffix(" px")).changed();
+                ui.end_row();
+                ui.label("Offset Y");
+                changed |= ui.add(egui::DragValue::new(&mut adjustment.offset.y).speed(1.0).suffix(" px")).changed();
+                ui.end_row();
+
+                ui.label("Width");
+                let before_x = adjustment.scale_x;
+                let x_changed = ui.add(egui::DragValue::new(&mut adjustment.scale_x).speed(0.01).range(0.01..=100.0)).changed();
+                if x_changed && state.shadow_scale_linked && before_x.abs() > f64::EPSILON {
+                    adjustment.scale_y *= adjustment.scale_x / before_x;
+                }
+                changed |= x_changed;
+                ui.end_row();
+
+                ui.label("Height");
+                let before_y = adjustment.scale_y;
+                let y_changed = ui.add(egui::DragValue::new(&mut adjustment.scale_y).speed(0.01).range(0.01..=100.0)).changed();
+                if y_changed && state.shadow_scale_linked && before_y.abs() > f64::EPSILON {
+                    adjustment.scale_x *= adjustment.scale_y / before_y;
+                }
+                changed |= y_changed;
+                ui.end_row();
+
+                ui.label("Rotation");
+                let mut rotation = adjustment.rotation.to_degrees();
+                if ui.add(egui::DragValue::new(&mut rotation).speed(0.5).suffix(" deg")).changed() {
+                    adjustment.rotation = rotation.to_radians();
+                    changed = true;
+                }
+                ui.end_row();
+                ui.label("Horizontal skew");
+                let mut skew_x = adjustment.skew_x.to_degrees();
+                if ui.add(egui::Slider::new(&mut skew_x, -80.0..=80.0).suffix(" deg")).changed() {
+                    adjustment.skew_x = skew_x.to_radians();
+                    changed = true;
+                }
+                ui.end_row();
+                ui.label("Vertical skew");
+                let mut skew_y = adjustment.skew_y.to_degrees();
+                if ui.add(egui::Slider::new(&mut skew_y, -80.0..=80.0).suffix(" deg")).changed() {
+                    adjustment.skew_y = skew_y.to_radians();
+                    changed = true;
+                }
+                ui.end_row();
+                ui.label("Pivot X");
+                changed |= ui.add(egui::DragValue::new(&mut adjustment.pivot.x).speed(1.0)).changed();
+                ui.end_row();
+                ui.label("Pivot Y");
+                changed |= ui.add(egui::DragValue::new(&mut adjustment.pivot.y).speed(1.0)).changed();
+                ui.end_row();
+            });
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut state.shadow_scale_linked, "Link width and height");
+                if ui.small_button("Reset placement").clicked() {
+                    *adjustment = buzz_scene::ShadowAdjustment::default();
+                    changed = true;
+                }
+            });
+        });
+    changed
+}
+
+/// **The built-in character shadows' settings**: which way they fall and how
+/// high the sun that throws them stands, how dark and how long they are, and
+/// where they sit. Shown while they are what draws the shadows (no light of
+/// the document's own switched on). `Some` with the whole light when changed.
+fn character_shadow_settings(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> Option<Light> {
+    let stored = rig.character_light();
+    let mut light = stored.clone();
+    let mut changed = false;
+    egui::CollapsingHeader::new(RichText::new("Character shadow settings").strong())
+        .id_salt("character-shadow-settings")
+        .default_open(true)
+        .show(ui, |ui| {
+            if let LightKind::Sun { azimuth, elevation } = &mut light.kind {
+                changed |= sun_dial(ui, azimuth, elevation);
+                let mut degrees = azimuth.to_degrees();
+                ui.horizontal(|ui| {
+                    ui.label("Direction");
+                    if ui
+                        .add(egui::Slider::new(&mut degrees, -180.0..=180.0).suffix("\u{b0}").max_decimals(1))
+                        .on_hover_text("Which way round the stage the sun lies; the shadows fall the other way")
+                        .changed()
+                        // A slider rounds what it shows to its decimals as
+                        // it draws, and reports that as a change: only a move
+                        // bigger than the rounding is the animator's.
+                        && (degrees - azimuth.to_degrees()).abs() > 0.051
+                    {
+                        *azimuth = degrees.to_radians();
+                        changed = true;
+                    }
+                });
+                let mut height = elevation.to_degrees();
+                ui.horizontal(|ui| {
+                    ui.label("Sun height");
+                    if ui
+                        .add(egui::Slider::new(&mut height, 1.0..=90.0).suffix("\u{b0}").max_decimals(1))
+                        .on_hover_text("Low throws long shadows; high puts them under the characters' feet")
+                        .changed()
+                        && (height - elevation.to_degrees()).abs() > 0.051
+                    {
+                        *elevation = height.to_radians();
+                        changed = true;
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Darkness");
+                changed |= ui
+                    .add(egui::Slider::new(&mut light.shadow_strength, 0.0..=1.0).fixed_decimals(2))
+                    .on_hover_text("How dark the shadows land. 0 leaves the ground untouched; 1 is a solid silhouette.")
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Length");
+                changed |= ui
+                    .add(egui::Slider::new(&mut light.shadow_length, 0.0..=3.0).fixed_decimals(2))
+                    .on_hover_text("How far the shadows run, against what the sun's height says. 0 puts them under the characters.")
+                    .changed();
+            });
+            changed |= shadow_placement(ui, &mut light.shadow_adjustment, state, "character-shadow-placement");
+            if ui.small_button("Reset character shadows").clicked() {
+                light = LightRig::character_shadow_light();
+                changed = true;
+            }
+        });
+    // Only a real change: a slider can report one on a frame that moved
+    // nothing, and every report is an undo step.
+    (changed && light != stored).then_some(light)
 }
 
 /// The sun's direction, as a dial you point.

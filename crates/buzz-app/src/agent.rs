@@ -131,7 +131,7 @@ pub fn route(command: Command) -> Route {
         | StoryboardExport | DeleteAndFill | AiRemoveObject => Route::Args,
 
         // Needs the user, or has no document effect.
-        Quit | Close | MoveStageFrames | ShortcutEditor | Snapshots | About | AiModels | AiGenerateImage | NextDocument | PreviousDocument | PasteboardColour
+        Quit | Close | MoveStageFrames | MarkTalkRange | ShortcutEditor | Snapshots | About | AiModels | AiGenerateImage | NextDocument | PreviousDocument | PasteboardColour
         | TestMovie | RunScript | VoicePushToTalk | VoiceMute => Route::Excluded,
         // Dialogs over BuzzEdit and Buzzcaf Studio; their tools take args.
         SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => Route::Excluded,
@@ -167,7 +167,7 @@ pub fn route(command: Command) -> Route {
         | CreateShapeTween | RemoveTween | InsertFrame | RemoveFrame | InsertKeyframe
         | InsertBlankKeyframe | ClearKeyframe | PlayPause | NextFrame | PreviousFrame
         | FirstFrame | LastFrame | CutFrames | CopyFrames | PasteFrames | SelectAllFrames | CopyMotion | CopyPose | ClearFrames
-        | ReverseFrames | CopyPasteStage | PuppetMode | ToggleOnionSkin | ToggleAutoKeyframe | ToggleFramesOnLockedLayers | ToggleEqualLayerLengths | ToggleEditMultipleFrames
+        | ReverseFrames | CopyPasteStage | ClearTalkRanges | PuppetMode | ToggleOnionSkin | ToggleAutoKeyframe | ToggleFramesOnLockedLayers | ToggleEqualLayerLengths | ToggleEditMultipleFrames
         | ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere
         | ToggleCamera | AddCameraKeyframe | RemoveCameraKeyframe | ResetCamera
         | AddLightKeyframe | RemoveLightKeyframe | SaveAsTemplate | RenameBodyLayers

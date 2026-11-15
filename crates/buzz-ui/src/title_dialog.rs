@@ -97,7 +97,7 @@ pub fn title_card_dialog(ctx: &egui::Context, state: &mut TitleCardState) -> Tit
 
 fn colour_button(ui: &mut Ui, rgb: &mut [u8; 3]) {
     let mut colour = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-    if ui.color_edit_button_srgba(&mut colour).changed() {
+    if crate::widgets::color_button(ui, &mut colour).changed() {
         *rgb = [colour.r(), colour.g(), colour.b()];
     }
 }

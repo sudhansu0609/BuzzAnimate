@@ -343,10 +343,6 @@ pub fn cast_panel(
         cast_list(ui, characters, state, &mut action, thumbnail);
     }
 
-    fresh_window(ui, state, &mut action);
-    delete_window(ui, state, &mut action);
-    add_pose_window(ui, state, &mut action);
-
     // The sheet for whoever is open: their wardrobe, and the poses they know.
     if let Some(open) = state.open.clone() {
         if let Some(asset) = characters.iter().find(|a| a.path == open) {
@@ -386,6 +382,20 @@ pub fn cast_panel(
         }
     });
 
+    action
+}
+
+/// **The Cast panel's windows** — Start Fresh, Delete characters and Add Pose
+/// — drawn by the shell at the top level, as its other dialogs are. Shown
+/// from inside the docked panel they were painted but took no pointer (egui
+/// found nothing under it), so the name field never took the focus: what
+/// was typed went to the tool keys instead, and the window could not be
+/// used. Drawn here they also stay open with the Cast tab out of sight.
+pub fn cast_windows(ctx: &egui::Context, state: &mut CastPanelState) -> Option<CastAction> {
+    let mut action = None;
+    fresh_window(ctx, state, &mut action);
+    delete_window(ctx, state, &mut action);
+    add_pose_window(ctx, state, &mut action);
     action
 }
 
@@ -527,7 +537,7 @@ const START_FRESH_HINT: &str =
 
 /// The Start Fresh confirmation: which pose to keep, OK / Cancel. Nothing is
 /// written until OK; the shell backs the files up first.
-fn fresh_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<CastAction>) {
+fn fresh_window(ctx: &egui::Context, state: &mut CastPanelState, action: &mut Option<CastAction>) {
     let Some(mut ask) = state.fresh.take() else {
         return;
     };
@@ -536,7 +546,7 @@ fn fresh_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<Cas
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .show(ui.ctx(), |ui| {
+        .show(ctx, |ui| {
             match &ask.target {
                 Some(asset) => ui.label(format!("Clear every keyframe of {}?", asset.name)),
                 None => ui.label(format!("Clear every keyframe of all {} characters in the cast?", ask.count)),
@@ -571,7 +581,7 @@ fn fresh_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<Cas
 
 /// The multi-delete confirmation: how many, which are cast in a series, and
 /// where they go. Nothing is hard-deleted.
-fn delete_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<CastAction>) {
+fn delete_window(ctx: &egui::Context, state: &mut CastPanelState, action: &mut Option<CastAction>) {
     let Some(ask) = state.delete_ask.take() else {
         return;
     };
@@ -580,7 +590,7 @@ fn delete_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<Ca
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .show(ui.ctx(), |ui| {
+        .show(ctx, |ui| {
             ui.label(format!("Move {} characters out of the Cast?", ask.assets.len()));
             ui.label(
                 RichText::new("They are moved to a _cast_backup folder beside the cast, not erased.")
@@ -613,7 +623,7 @@ fn delete_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<Ca
 }
 
 /// **Add Pose…**: a name and one of three sources.
-fn add_pose_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<CastAction>) {
+fn add_pose_window(ctx: &egui::Context, state: &mut CastPanelState, action: &mut Option<CastAction>) {
     let Some(mut ask) = state.add_pose.take() else {
         return;
     };
@@ -623,7 +633,7 @@ fn add_pose_window(ui: &mut Ui, state: &mut CastPanelState, action: &mut Option<
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .show(ui.ctx(), |ui| {
+        .show(ctx, |ui| {
             let name = ask.asset.as_ref().map(|a| a.name.clone()).unwrap_or_default();
             ui.horizontal(|ui| {
                 ui.label(name);
@@ -760,8 +770,7 @@ fn character_sheet(
             for (colour, count) in palette {
                 ui.horizontal(|ui| {
                     let mut edited = to_egui(*colour);
-                    let changed = ui
-                        .color_edit_button_srgba(&mut edited)
+                    let changed = crate::widgets::color_button(ui, &mut edited)
                         .on_hover_text("Re-skin every part painted this colour")
                         .changed();
                     if changed {

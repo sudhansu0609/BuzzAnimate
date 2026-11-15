@@ -247,7 +247,7 @@ fn body(ui: &mut Ui, state: &mut NewDocumentState, out: &mut NewDocumentResponse
                 state.setup.background[1],
                 state.setup.background[2],
             );
-            if ui.color_edit_button_srgba(&mut colour).changed() {
+            if crate::widgets::color_button(ui, &mut colour).changed() {
                 state.setup.background = [colour.r(), colour.g(), colour.b()];
             }
             ui.end_row();

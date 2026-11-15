@@ -4229,16 +4229,41 @@ fn is_character_layer(scene: &Scene, layer: &buzz_scene::Layer, frame: u32) -> b
     layer.objects_at(frame).iter().any(|o| o.instance().is_some_and(|i| is_character_symbol(scene, i.symbol, 0)))
 }
 
+/// **Is this a character, by its parts.** The standard names (`head`, `body`,
+/// `rightArm`, `leftArm`) say so at once; otherwise three different body parts
+/// in its layer names do — `armFrontLeft`, `wristFrontleft`, `rajuFaceFront`,
+/// `frontrightThigh` — which is how a character drawn in Animate under its own
+/// names is still told from a tree or a door (user 2026-11-15: such a
+/// character threw no shadow). Looked for up to three symbols deep.
 fn is_character_symbol(scene: &Scene, symbol: buzz_scene::SymbolId, depth: usize) -> bool {
     let Some(def) = scene.library().get(symbol) else { return false };
-    let part = |name: &str| {
-        let n: String = name.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
-        matches!(n.as_str(), "head" | "body" | "rightarm" | "leftarm")
-    };
-    if def.layers.iter().any(|l| part(&l.name)) {
+    let normal = |name: &str| name.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+    if def.layers.iter().any(|l| matches!(normal(&l.name).as_str(), "head" | "body" | "rightarm" | "leftarm")) {
         return true;
     }
-    depth < 2
+    const PARTS: [&[&str]; 10] = [
+        &["head", "face"],
+        &["torso", "body", "chest"],
+        &["arm"],
+        &["wrist"],
+        &["palm", "hand"],
+        &["thigh"],
+        &["shin", "leg"],
+        &["foot", "feet", "shoe", "sandal"],
+        &["neck"],
+        &["hip", "pelvis"],
+    ];
+    let found = PARTS
+        .iter()
+        .filter(|words| def.layers.iter().any(|l| {
+            let n = normal(&l.name);
+            words.iter().any(|w| n.contains(w))
+        }))
+        .count();
+    if found >= 3 {
+        return true;
+    }
+    depth < 3
         && def.layers.iter().any(|l| {
             l.all_objects().any(|o| o.instance().is_some_and(|i| i.symbol != symbol && is_character_symbol(scene, i.symbol, depth + 1)))
         })
@@ -11182,6 +11207,19 @@ mod symbol_scene {
         let mut tree_off = tree.clone();
         tree_off.lights_mut().no_character_shadows = true;
         assert_eq!(differs(&draw(&tree), &draw(&tree_off)), 0, "a tree throws none");
+
+        // A character drawn in Animate under its own part names — no `head`,
+        // no `leftArm` — is still a character, and throws one.
+        let mut named = figure("deepak", "armFrontLeft");
+        let symbol = named.library().iter().find(|s| s.name == "deepak").unwrap().id;
+        named.enter_symbol(symbol);
+        for part in ["wristFrontleft", "rajuFaceFront", "frontrightThigh"] {
+            named.add_layer(part, buzz_scene::LayerKind::Normal);
+        }
+        named.exit_symbol();
+        let mut named_off = named.clone();
+        named_off.lights_mut().no_character_shadows = true;
+        assert!(differs(&draw(&named), &draw(&named_off)) > 200, "a character by its parts throws a shadow");
     }
 
     /// **A mask inside a symbol opened in place clips where it does at the

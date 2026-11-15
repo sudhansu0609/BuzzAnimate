@@ -145,3 +145,59 @@ mod tests {
         });
     }
 }
+
+/// **How big a colour picker opens**: the colour field this many points
+/// square, the hue and opacity strips this wide. egui's own colour button
+/// opens at 275 and the swatches' at 220, which covered a good part of the
+/// stage for a choice the eye makes at a glance (user 2026-11-15: too big).
+pub const PICKER_SIZE: f32 = 150.0;
+
+/// **A colour button** — a swatch that opens the picker — at [`PICKER_SIZE`].
+/// In place of egui's `color_edit_button_srgba`, whose picker size is fixed.
+/// The response is marked changed when the colour was edited.
+pub fn color_button(ui: &mut Ui, color: &mut egui::Color32) -> Response {
+    let size = ui.spacing().interact_size;
+    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        egui::color_picker::show_color_at(ui.painter(), *color, rect);
+        let stroke = if response.hovered() {
+            ui.visuals().widgets.hovered.fg_stroke
+        } else {
+            egui::Stroke::new(1.0, Palette::hairline())
+        };
+        ui.painter().rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+    }
+    let mut changed = false;
+    egui::Popup::menu(&response)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            compact_picker_style(ui);
+            changed = egui::color_picker::color_picker_color32(ui, color, egui::color_picker::Alpha::BlendOrAdditive);
+        });
+    if changed {
+        response.mark_changed();
+    }
+    response
+}
+
+/// **The picker's own row of numbers and buttons made small** with it: egui
+/// sizes that row from the body text and the standard control size, and it
+/// alone held the popup at 300 points wide once the colour field was smaller.
+pub fn compact_picker_style(ui: &mut Ui) {
+    let style = ui.style_mut();
+    style.spacing.slider_width = PICKER_SIZE;
+    style.override_text_style = Some(egui::TextStyle::Small);
+    style.spacing.interact_size = egui::vec2(24.0, 16.0);
+    style.spacing.button_padding = egui::vec2(3.0, 1.0);
+    style.spacing.item_spacing = egui::vec2(4.0, 3.0);
+}
+
+/// [`color_button`] for an unmultiplied `[r, g, b, a]`.
+pub fn color_button_unmultiplied(ui: &mut Ui, rgba: &mut [u8; 4]) -> Response {
+    let mut color = egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
+    let response = color_button(ui, &mut color);
+    if response.changed() {
+        *rgba = color.to_srgba_unmultiplied();
+    }
+    response
+}

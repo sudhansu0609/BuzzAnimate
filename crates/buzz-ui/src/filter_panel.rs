@@ -182,7 +182,7 @@ pub fn filter_panel(
         let mut amount = current.tint_amount * 100.0;
         ui.horizontal(|ui| {
             ui.label("Tint");
-            if ui.color_edit_button_srgba(&mut tint).changed() {
+            if crate::widgets::color_button(ui, &mut tint).changed() {
                 out.set_layer_tint = Some((from_egui(tint), current.tint_amount));
             }
         });
@@ -995,7 +995,7 @@ fn colour_field(ui: &mut Ui, label: &str, color: &mut peniko::Color) -> bool {
     let mut changed = false;
     crate::panels::property_row(ui, label, None, |ui| {
         let mut rgba = to_egui(*color);
-        if ui.color_edit_button_srgba(&mut rgba).changed() {
+        if crate::widgets::color_button(ui, &mut rgba).changed() {
             *color = from_egui(rgba);
             changed = true;
         }

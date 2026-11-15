@@ -54,6 +54,22 @@ pub struct WandOptions {
     /// all of them. One pixel of slack is invisible at any sane zoom and takes
     /// a hundredfold off the count.
     pub simplify: f64,
+    /// **Stop at drawn lines and edges.** A pixel on a strong edge — an
+    /// outline, the rim of a leaf against the sky — can be taken, so no fringe
+    /// is left behind, but the region does not grow through it. Colours are
+    /// also judged against the picture's own contrast (a night scene is all
+    /// dark, and an absolute tolerance took the road, the trees and the sky
+    /// together), and a gentle gradient — a sky lightening towards the
+    /// horizon — is followed further than the tolerance alone would go.
+    pub stop_at_lines: bool,
+    /// **Catch the gaps**: with Contiguous on, the same colour in pockets close
+    /// by — sky between the fronds of a palm, ground between blades of grass —
+    /// is taken with the region rather than left behind.
+    pub catch_gaps: bool,
+    /// **Smooth edges**: specks left inside filled, one-pixel spikes and dents
+    /// shaved off, and the outline rounded, so nothing sticks out or stays
+    /// behind.
+    pub smooth: bool,
 }
 
 impl Default for WandOptions {
@@ -62,7 +78,18 @@ impl Default for WandOptions {
             tolerance: 32.0 / 255.0,
             contiguous: true,
             simplify: 1.0,
+            stop_at_lines: true,
+            catch_gaps: true,
+            smooth: true,
         }
+    }
+}
+
+impl WandOptions {
+    /// The plain wand: the colour clicked, the tolerance, and nothing else —
+    /// Photoshop's, pixel for pixel.
+    pub fn plain(tolerance: f64, contiguous: bool) -> Self {
+        Self { tolerance, contiguous, simplify: 1.0, stop_at_lines: false, catch_gaps: false, smooth: false }
     }
 }
 
@@ -130,10 +157,407 @@ fn alike(a: [u8; 4], b: [u8; 4], tolerance_255: f64) -> bool {
     dc * visible <= tolerance_255
 }
 
+/// **The picture in CIE Lab**, the colour space built so that equal
+/// distances look equally different: L (0–100) stored ×2.5, a and b offset
+/// by 128, one byte each. Worked out once per click, in parallel. Measured in
+/// sRGB a night scene is all within a few dozen levels — the road, a dark-red
+/// door and the black outlines alike — and the old tolerance took the lot;
+/// in Lab the door is plainly another colour and the outline plainly darker.
+struct LabPicture {
+    w: usize,
+    h: usize,
+    lab: Vec<[u8; 3]>,
+    alpha: Vec<u8>,
+    /// Every difference is multiplied by this: see [`LabPicture::contrast`].
+    scale: f32,
+}
+
+impl LabPicture {
+    fn new(asset: &ImageAsset) -> Self {
+        use rayon::prelude::*;
+        let (w, h) = (asset.width as usize, asset.height as usize);
+        let linear: Vec<f32> = (0..256)
+            .map(|v| {
+                let c = v as f32 / 255.0;
+                if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+            })
+            .collect();
+        let f = |t: f32| if t > 0.008_856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
+        let pixels = &asset.pixels;
+        let n = w * h;
+        let lab: Vec<[u8; 3]> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let Some(p) = pixels.get(i * 4..i * 4 + 4) else { return [0, 128, 128] };
+                let (r, g, b) = (linear[p[0] as usize], linear[p[1] as usize], linear[p[2] as usize]);
+                let x = (0.412_456_4 * r + 0.357_576_1 * g + 0.180_437_5 * b) / 0.950_47;
+                let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175 * b;
+                let z = (0.019_333_9 * r + 0.119_192 * g + 0.950_304_1 * b) / 1.088_83;
+                let (fx, fy, fz) = (f(x), f(y), f(z));
+                let l = 116.0 * fy - 16.0;
+                let a = 500.0 * (fx - fy);
+                let bb = 200.0 * (fy - fz);
+                [(l * 2.5).round().clamp(0.0, 255.0) as u8, (a + 128.0).round().clamp(0.0, 255.0) as u8, (bb + 128.0).round().clamp(0.0, 255.0) as u8]
+            })
+            .collect();
+        let alpha: Vec<u8> = (0..n).map(|i| pixels.get(i * 4 + 3).copied().unwrap_or(0)).collect();
+        let mut pic = Self { w, h, lab, alpha, scale: 1.0 };
+        pic.scale = pic.contrast();
+        pic
+    }
+
+    /// **The picture's own contrast**, as the factor its differences are
+    /// scaled by: the spread of lightness its visible pixels use (5th to 95th
+    /// percentile) set against 60 of Lab's 100, from 1 for a picture that uses
+    /// the range to 4 for a night scene that lives in the bottom fifth of it.
+    /// A tolerance is then a share of what the picture itself shows: in a
+    /// night village the road, the house walls and the sky sit within ΔE 13
+    /// of each other and are still plainly different things.
+    fn contrast(&self) -> f32 {
+        let step = ((self.w * self.h) as f64 / 40_000.0).sqrt().max(1.0) as usize;
+        let mut ls: Vec<u8> = (0..self.w * self.h).step_by(step).filter(|i| self.alpha[*i] > 0).map(|i| self.lab[i][0]).collect();
+        if ls.len() < 16 {
+            return 1.0;
+        }
+        ls.sort_unstable();
+        let spread = f32::from(ls[ls.len() * 95 / 100].saturating_sub(ls[ls.len() * 5 / 100])) / 2.5;
+        (60.0 / spread.max(1.0)).clamp(1.0, 4.0)
+    }
+
+    /// The difference between pixel `i` and a colour, in ΔE (Lab units),
+    /// with alpha judged as in [`alike`]: colour counts as much as the less
+    /// visible of the two is seen, and a change of alpha counts in full.
+    fn to(&self, i: usize, c: [u8; 3], alpha: u8) -> f32 {
+        let p = self.lab[i];
+        let dl = (f32::from(p[0]) - f32::from(c[0])) / 2.5;
+        let da = f32::from(p[1]) - f32::from(c[1]);
+        let db = f32::from(p[2]) - f32::from(c[2]);
+        let visible = f32::from(self.alpha[i].min(alpha)) / 255.0;
+        ((dl * dl + da * da + db * db).sqrt() * visible * self.scale).max(f32::from(self.alpha[i].abs_diff(alpha)) / 2.55)
+    }
+
+    fn between(&self, i: usize, j: usize) -> f32 {
+        self.to(i, self.lab[j], self.alpha[j])
+    }
+
+    /// Is pixel `i` on an edge: a neighbour differs from it by more than `at`.
+    fn edge(&self, i: usize, at: f32) -> bool {
+        let (x, y) = (i % self.w, i / self.w);
+        (x > 0 && self.between(i, i - 1) > at)
+            || (x + 1 < self.w && self.between(i, i + 1) > at)
+            || (y > 0 && self.between(i, i - self.w) > at)
+            || (y + 1 < self.h && self.between(i, i + self.w) > at)
+    }
+
+    /// The 4-neighbours of `i` inside the picture.
+    fn neighbours(&self, i: usize) -> impl Iterator<Item = usize> + '_ {
+        let (x, y) = (i % self.w, i / self.w);
+        [
+            (x > 0).then(|| i - 1),
+            (x + 1 < self.w).then(|| i + 1),
+            (y > 0).then(|| i - self.w),
+            (y + 1 < self.h).then(|| i + self.w),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
 /// Every pixel the wand takes, starting from `seed`.
 ///
 /// `None` when the seed is outside the picture.
 pub fn flood(asset: &ImageAsset, seed: (i64, i64), options: WandOptions) -> Option<Mask> {
+    if !options.stop_at_lines && !options.catch_gaps && !options.smooth {
+        return flood_plain(asset, seed, options);
+    }
+    let (w, h) = (asset.width as i64, asset.height as i64);
+    if seed.0 < 0 || seed.1 < 0 || seed.0 >= w || seed.1 >= h || w == 0 || h == 0 {
+        return None;
+    }
+    let pic = LabPicture::new(asset);
+    let (wu, hu) = (w as usize, h as usize);
+    // The tolerance's 0–255 in ΔE: the default 32 is a ΔE of 10, the point
+    // at which two colours are plainly different side by side.
+    let tolerance = (options.tolerance.clamp(0.0, 1.0) * 255.0 / 3.2) as f32;
+    let seed_i = seed.1 as usize * wu + seed.0 as usize;
+
+    // **The colour clicked**: the average of the pixels round the click that
+    // are within tolerance of it, so the grain of a painted sky or a JPEG
+    // does not decide the answer by which pixel was under the pointer.
+    let mut sum = [0f32; 4];
+    let mut n = 0f32;
+    let mut window = Vec::new();
+    for dy in -2i64..=2 {
+        for dx in -2i64..=2 {
+            let (x, y) = (seed.0 + dx, seed.1 + dy);
+            if x < 0 || y < 0 || x >= w || y >= h {
+                continue;
+            }
+            window.push(y as usize * wu + x as usize);
+        }
+    }
+    for &i in &window {
+        if pic.between(i, seed_i) <= tolerance.max(1.0) {
+            for k in 0..3 {
+                sum[k] += f32::from(pic.lab[i][k]);
+            }
+            sum[3] += f32::from(pic.alpha[i]);
+            n += 1.0;
+        }
+    }
+    let target: [u8; 3] = std::array::from_fn(|k| (sum[k] / n.max(1.0)).round() as u8);
+    let target_alpha = (sum[3] / n.max(1.0)).round() as u8;
+
+    // **What counts as an edge here**: several times the grain between
+    // neighbouring pixels round the click (a textured ground has more of it
+    // than a smooth sky), and never less than a third of the tolerance.
+    let edge_at = if options.stop_at_lines {
+        let mut steps: Vec<f32> = Vec::new();
+        for dy in -4i64..=4 {
+            for dx in -4i64..4 {
+                let (x, y) = (seed.0 + dx, seed.1 + dy);
+                if x < 0 || y < 0 || x + 1 >= w || y >= h {
+                    continue;
+                }
+                let i = y as usize * wu + x as usize;
+                steps.push(pic.between(i, i + 1));
+            }
+        }
+        steps.sort_by(f32::total_cmp);
+        let grain = steps.get(steps.len() / 2).copied().unwrap_or(0.0);
+        (grain * 4.0).max(tolerance / 3.0).max(2.5)
+    } else {
+        f32::INFINITY
+    };
+
+    let mut bits = vec![false; wu * hu];
+    if !options.contiguous {
+        for (i, b) in bits.iter_mut().enumerate() {
+            *b = pic.to(i, target, target_alpha) <= tolerance;
+        }
+    } else {
+        grow(&pic, seed_i, target, target_alpha, tolerance, edge_at, &mut bits);
+        if options.catch_gaps {
+            catch_gaps(&pic, target, target_alpha, tolerance, edge_at, &mut bits);
+        }
+    }
+    if options.smooth {
+        smooth_mask(&pic, target, target_alpha, tolerance, &mut bits);
+    }
+    let count = bits.iter().filter(|b| **b).count();
+    Some(Mask { width: asset.width, height: asset.height, bits, count })
+}
+
+/// **The contiguous region**, grown from the click: a pixel is taken when it
+/// is within tolerance of the colour clicked — or, a step on from a pixel
+/// already taken, when it differs from that one by little and from the colour
+/// clicked by no more than three times the tolerance — eight, when the step
+/// is very gentle — which is what follows a sky down its gradient to the
+/// horizon. A pixel on an edge is taken but grows no further, so
+/// a drawn line stops the region however alike the colours either side are.
+fn grow(pic: &LabPicture, seed: usize, target: [u8; 3], alpha: u8, tolerance: f32, edge_at: f32, bits: &mut [bool]) {
+    if pic.to(seed, target, alpha) > tolerance.max(1.0) * 2.0 {
+        return;
+    }
+    // A smooth sky in 8-bit steps now and then ticks all three channels at
+    // once (about ΔE 2), still far below an edge: the floor keeps it gentle.
+    let gentle = (edge_at * 0.5).max(2.5);
+    let mut queue = std::collections::VecDeque::new();
+    bits[seed] = true;
+    queue.push_back(seed);
+    while let Some(i) = queue.pop_front() {
+        if i != seed && pic.edge(i, edge_at) {
+            continue;
+        }
+        for j in pic.neighbours(i) {
+            if bits[j] {
+                continue;
+            }
+            let to_target = pic.to(j, target, alpha);
+            let step = pic.between(j, i);
+            // A sky changes by far less than an edge from one pixel to the
+            // next, so a very gentle step is followed much further.
+            let reach = if step <= gentle * 0.6 { 8.0 } else if step <= gentle { 3.0 } else { 1.0 };
+            if to_target <= tolerance * reach {
+                bits[j] = true;
+                queue.push_back(j);
+            }
+        }
+    }
+}
+
+/// **The same colour close by**: pockets of it that the region nearly
+/// reaches — sky between fronds, ground between blades — joined to it. A
+/// pocket counts when it is within a short reach of the region (about half a
+/// percent of the picture's size) and smaller than a quarter of it, so a
+/// second sky on the far side of a house is still a second click.
+fn catch_gaps(pic: &LabPicture, target: [u8; 3], alpha: u8, tolerance: f32, edge_at: f32, bits: &mut [bool]) {
+    let (w, h) = (pic.w, pic.h);
+    let reach = ((w.max(h) as f32) * 0.006).round().max(4.0) as usize;
+    let main = bits.iter().filter(|b| **b).count();
+    if main == 0 {
+        return;
+    }
+    let near = dilate(bits, w, h, reach);
+    let candidate = |i: usize| pic.to(i, target, alpha) <= tolerance && !pic.edge(i, edge_at);
+    let mut seen = vec![false; w * h];
+    let mut stack = Vec::new();
+    for start in 0..w * h {
+        if bits[start] || seen[start] || !near[start] || !candidate(start) {
+            continue;
+        }
+        // One pocket, walked whole; taken when it is small beside the region.
+        let mut pocket = Vec::new();
+        seen[start] = true;
+        stack.push(start);
+        while let Some(i) = stack.pop() {
+            pocket.push(i);
+            for j in pic.neighbours(i) {
+                if !seen[j] && !bits[j] && candidate(j) {
+                    seen[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+        if pocket.len() * 4 <= main {
+            for i in pocket {
+                bits[i] = true;
+            }
+        }
+    }
+    // Their rims: the edge pixels round each pocket, within tolerance.
+    let grown = dilate(bits, w, h, 1);
+    for i in 0..w * h {
+        if grown[i] && !bits[i] && pic.to(i, target, alpha) <= tolerance {
+            bits[i] = true;
+        }
+    }
+}
+
+/// `bits` grown by `r` pixels in every direction (a square neighbourhood):
+/// along every row, then along every column, each line on its own core.
+fn dilate(bits: &[bool], w: usize, h: usize, r: usize) -> Vec<bool> {
+    use rayon::prelude::*;
+    if r == 0 {
+        return bits.to_vec();
+    }
+    // Along one line: a cell is near when a taken one is within r of it.
+    fn line(src: &[bool], dst: &mut [bool], r: usize) {
+        let len = src.len();
+        let mut last: Option<usize> = None;
+        let mut next = usize::MAX;
+        // The first taken cell at or after k, found by walking ahead once.
+        let mut ahead = 0usize;
+        for k in 0..len {
+            if src[k] {
+                last = Some(k);
+            }
+            if next == usize::MAX || next < k {
+                next = usize::MAX;
+                ahead = ahead.max(k);
+                while ahead < len && ahead <= k + r {
+                    if src[ahead] {
+                        next = ahead;
+                        break;
+                    }
+                    ahead += 1;
+                }
+            }
+            dst[k] = last.is_some_and(|l| k - l <= r) || (next != usize::MAX && next - k <= r);
+        }
+    }
+    let mut rows = vec![false; w * h];
+    rows.par_chunks_mut(w).zip(bits.par_chunks(w)).for_each(|(dst, src)| line(src, dst, r));
+    let columns: Vec<Vec<bool>> = (0..w)
+        .into_par_iter()
+        .map(|x| {
+            let src: Vec<bool> = (0..h).map(|y| rows[y * w + x]).collect();
+            let mut dst = vec![false; h];
+            line(&src, &mut dst, r);
+            dst
+        })
+        .collect();
+    let mut out = vec![false; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for (x, cell) in row.iter_mut().enumerate() {
+            *cell = columns[x][y];
+        }
+    });
+    out
+}
+
+/// `bits` shrunk by `r` pixels: the complement of the complement grown.
+fn erode(bits: &[bool], w: usize, h: usize, r: usize) -> Vec<bool> {
+    let inverse: Vec<bool> = bits.iter().map(|b| !b).collect();
+    dilate(&inverse, w, h, r).into_iter().map(|b| !b).collect()
+}
+
+/// **Nothing sticking out, nothing left behind**: a closing then an opening
+/// of one pixel (two on a very large picture) takes off the spikes and fills
+/// the nicks along the edge; holes inside that are specks — tiny, or small and
+/// close to the colour clicked — are filled; and loose crumbs away from the
+/// region are dropped.
+fn smooth_mask(pic: &LabPicture, target: [u8; 3], alpha: u8, tolerance: f32, bits: &mut Vec<bool>) {
+    let (w, h) = (pic.w, pic.h);
+    let total = bits.iter().filter(|b| **b).count();
+    if total == 0 {
+        return;
+    }
+    let r = (w.max(h) / 2400).max(1);
+    let closed = erode(&dilate(bits, w, h, r), w, h, r);
+    let opened = dilate(&erode(&closed, w, h, r), w, h, r);
+    // An opening can wipe out a region narrower than itself; keep the closed
+    // one then rather than lose what was clicked.
+    *bits = if opened.iter().filter(|b| **b).count() * 2 >= total { opened } else { closed };
+
+    let speck = ((w * h) as f64 * 0.000_02).max(16.0) as usize;
+    let small = ((w * h) as f64 * 0.000_5).max(64.0) as usize;
+    let total = bits.iter().filter(|b| **b).count();
+    for value in [false, true] {
+        let mut seen = vec![false; w * h];
+        let mut stack = Vec::new();
+        for start in 0..w * h {
+            if bits[start] != value || seen[start] {
+                continue;
+            }
+            let mut part = Vec::new();
+            let mut border = false;
+            seen[start] = true;
+            stack.push(start);
+            while let Some(i) = stack.pop() {
+                part.push(i);
+                let (x, y) = (i % w, i / w);
+                border |= x == 0 || y == 0 || x + 1 == w || y + 1 == h;
+                for j in pic.neighbours(i) {
+                    if !seen[j] && bits[j] == value {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+            if !value {
+                // A hole (or the outside): filled when it is a speck, or small
+                // and mostly near the colour clicked.
+                if border || part.len() > small {
+                    continue;
+                }
+                let like = part.len() <= speck || {
+                    let close = part.iter().filter(|i| pic.to(**i, target, alpha) <= tolerance * 2.0).count();
+                    close * 2 >= part.len()
+                };
+                if like {
+                    part.into_iter().for_each(|i| bits[i] = true);
+                }
+            } else if part.len() <= speck && part.len() * 4 < total {
+                // A crumb on its own: gone.
+                part.into_iter().for_each(|i| bits[i] = false);
+            }
+        }
+    }
+}
+
+/// The plain wand's flood: the colour clicked and the tolerance, nothing else.
+fn flood_plain(asset: &ImageAsset, seed: (i64, i64), options: WandOptions) -> Option<Mask> {
     let (w, h) = (asset.width as i64, asset.height as i64);
     if seed.0 < 0 || seed.1 < 0 || seed.0 >= w || seed.1 >= h || w == 0 || h == 0 {
         return None;
@@ -227,6 +651,17 @@ pub fn flood(asset: &ImageAsset, seed: (i64, i64), options: WandOptions) -> Opti
 /// Outer boundaries are wound one way and holes the other, so filling the
 /// result non-zero leaves the holes open.
 pub fn trace(mask: &Mask, simplify: f64) -> BezPath {
+    trace_loops(mask, simplify, false)
+}
+
+/// [`trace`], with every loop rounded after it is simplified (one pass of
+/// Chaikin's corner cutting), so the cut edge runs smooth instead of in pixel
+/// steps.
+pub fn trace_smooth(mask: &Mask, simplify: f64) -> BezPath {
+    trace_loops(mask, simplify, true)
+}
+
+fn trace_loops(mask: &Mask, simplify: f64, round: bool) -> BezPath {
     // Every boundary edge of every taken pixel, directed so that the inside is
     // always on the same hand. Four cases, one per side.
     let mut out: HashMap<(i32, i32), Vec<(i32, i32)>> = HashMap::new();
@@ -288,11 +723,11 @@ pub fn trace(mask: &Mask, simplify: f64) -> BezPath {
         }
     }
 
-    build_path(loops, simplify)
+    build_path(loops, simplify, round)
 }
 
 /// Turn traced loops into one path, simplified to fit the point budget.
-fn build_path(loops: Vec<Vec<(i32, i32)>>, simplify: f64) -> BezPath {
+fn build_path(loops: Vec<Vec<(i32, i32)>>, simplify: f64, round: bool) -> BezPath {
     let mut epsilon = simplify.max(0.0);
     loop {
         let mut path = BezPath::new();
@@ -308,6 +743,7 @@ fn build_path(loops: Vec<Vec<(i32, i32)>>, simplify: f64) -> BezPath {
             } else {
                 pts
             };
+            let pts = if round && pts.len() >= 4 { chaikin(&pts) } else { pts };
             if pts.len() < 3 || signed_area(&pts).abs() < MIN_LOOP_AREA_PX {
                 continue;
             }
@@ -323,6 +759,27 @@ fn build_path(loops: Vec<Vec<(i32, i32)>>, simplify: f64) -> BezPath {
         }
         epsilon = if epsilon <= 0.0 { 1.0 } else { epsilon * 2.0 };
     }
+}
+
+/// One pass of Chaikin's corner cutting on a closed loop, **bounded**: every
+/// corner bevelled by a quarter of its edges but never more than one and a
+/// half pixels, so the pixel steps along an edge read as a curve while a real
+/// corner — the picture's own, or a roof's — stays where it is. (Unbounded,
+/// a quarter of a 1,920-pixel edge took 480 pixels off each corner of a sky.)
+fn chaikin(pts: &[Point]) -> Vec<Point> {
+    const MAX_CUT: f64 = 1.5;
+    let mut out = Vec::with_capacity(pts.len() * 2);
+    for i in 0..pts.len() {
+        let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+        let len = (b - a).hypot();
+        if len <= f64::EPSILON {
+            continue;
+        }
+        let t = (MAX_CUT / len).min(0.25);
+        out.push(a.lerp(b, t));
+        out.push(a.lerp(b, 1.0 - t));
+    }
+    out
 }
 
 /// Twice the signed area, by the shoelace formula.
@@ -446,7 +903,7 @@ pub fn region_at(fill: &ImageFill, local: Point, options: WandOptions) -> Option
     if mask.is_empty() {
         return None;
     }
-    let traced = trace(&mask, options.simplify);
+    let traced = if options.smooth { trace_smooth(&mask, options.simplify) } else { trace(&mask, options.simplify) };
     if traced.is_empty() {
         return None;
     }
@@ -505,7 +962,8 @@ mod tests {
         assert!(!mask.get(0, 0));
     }
 
-    /// **Tolerance is the whole tool.** Zero takes only the exact colour.
+    /// **The plain wand: tolerance is the whole tool.** Zero takes only the
+    /// exact colour.
     #[test]
     fn tolerance_decides_how_much_is_taken() {
         // A ramp: every column one step brighter than the last.
@@ -524,27 +982,11 @@ mod tests {
             Arc::new(pixels),
         ));
 
-        let exact = flood(
-            &asset,
-            (32, 4),
-            WandOptions {
-                tolerance: 0.0,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let exact = flood(&asset, (32, 4), WandOptions::plain(0.0, true)).unwrap();
         assert_eq!(exact.count(), 8, "only its own column");
 
-        let loose = flood(
-            &asset,
-            (32, 4),
-            WandOptions {
-                // Sixteen levels of 4 either way: nine columns.
-                tolerance: 16.0 / 255.0,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        // Sixteen levels of 4 either way: nine columns.
+        let loose = flood(&asset, (32, 4), WandOptions::plain(16.0 / 255.0, true)).unwrap();
         assert_eq!(loose.count(), 9 * 8);
     }
 
@@ -704,6 +1146,116 @@ mod tests {
     fn a_click_off_the_picture_takes_nothing() {
         let fill = ImageFill::new(disc(64, 20.0), Rect::new(0.0, 0.0, 64.0, 64.0));
         assert!(region_at(&fill, Point::new(-50.0, -50.0), WandOptions::default()).is_none());
+    }
+
+    /// Growing a mask matches the plain definition — taken when a taken pixel
+    /// is within r along both axes — on scattered masks of awkward sizes.
+    #[test]
+    fn growing_a_mask_matches_the_definition() {
+        let mut seed = 12345u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (w, h, r) in [(17usize, 9usize, 1usize), (31, 23, 2), (8, 40, 3), (50, 1, 4)] {
+            let bits: Vec<bool> = (0..w * h).map(|_| next() % 23 == 0).collect();
+            let grown = dilate(&bits, w, h, r);
+            for y in 0..h {
+                for x in 0..w {
+                    let want = (y.saturating_sub(r)..=(y + r).min(h - 1))
+                        .any(|yy| (x.saturating_sub(r)..=(x + r).min(w - 1)).any(|xx| bits[yy * w + xx]));
+                    assert_eq!(grown[y * w + x], want, "{w}x{h} r{r} at {x},{y}");
+                }
+            }
+        }
+    }
+
+    /// **Rounding never cuts a real corner**: a big rectangle keeps its
+    /// corners within a pixel and a half, and its area within a hair.
+    #[test]
+    fn rounding_keeps_big_corners() {
+        let square = vec![Point::new(0.0, 0.0), Point::new(1000.0, 0.0), Point::new(1000.0, 600.0), Point::new(0.0, 600.0)];
+        let round = chaikin(&square);
+        let near_corner = round.iter().map(|p| (p.x.powi(2) + p.y.powi(2)).sqrt()).fold(f64::MAX, f64::min);
+        assert!(near_corner < 2.2, "the corner is still there: closest point {near_corner}");
+        let lost = signed_area(&square).abs() - signed_area(&round).abs();
+        assert!(lost < 10.0, "lost {lost} of the area");
+    }
+
+    /// Paint a picture from a function of the pixel.
+    fn picture(w: u32, h: u32, paint: impl Fn(u32, u32) -> [u8; 4]) -> Arc<ImageAsset> {
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                pixels.extend_from_slice(&paint(x, y));
+            }
+        }
+        Arc::new(ImageAsset::from_pixels(crate::ImageId(7), "Painted", w, h, Arc::new(pixels)))
+    }
+
+    /// **A night scene stops at its outlines.** A dark road, a black outline
+    /// two pixels wide (with a grey step either side, as anti-aliasing draws
+    /// it) and a dark-red door beyond: all within 32 levels of each other,
+    /// so the plain wand takes the lot; the wand stops at the line.
+    #[test]
+    fn a_dark_road_stops_at_its_outline() {
+        let asset = picture(120, 60, |x, _| match x {
+            0..=56 => [24, 17, 7, 255],
+            57 => [12, 8, 4, 255],
+            58..=59 => [0, 0, 0, 255],
+            60 => [20, 10, 8, 255],
+            _ => [45, 18, 14, 255],
+        });
+        let plain = flood(&asset, (10, 30), WandOptions::plain(32.0 / 255.0, true)).unwrap();
+        assert!(plain.get(100, 30), "the plain wand runs over the line into the door");
+        let wand = flood(&asset, (10, 30), WandOptions::default()).unwrap();
+        assert!(wand.get(55, 30), "the road is taken up to the line");
+        assert!(!wand.get(59, 30) && !wand.get(100, 30), "the line and the door are not");
+    }
+
+    /// **A sky follows its gradient to the horizon**, and **pockets of it**
+    /// between the fronds of a tree are taken with it, while the tree is not.
+    #[test]
+    fn a_sky_is_taken_down_its_gradient_and_between_the_leaves() {
+        let (w, h) = (200u32, 120u32);
+        let asset = picture(w, h, |x, y| {
+            // A dark tree from x 60 to 140 below y 30, with small holes of sky
+            // through its crown just under its edge (every 12 px, 4 across).
+            let in_tree = (60..140).contains(&x) && y >= 30;
+            let hole = in_tree && (32..36).contains(&y) && (x % 12) < 4;
+            if in_tree && !hole {
+                [10, 30, 12, 255]
+            } else {
+                // Sky: lighter towards the bottom, one level every 4 rows.
+                let v = 60 + (y / 4) as u8;
+                [v, v + 10, v + 40, 255]
+            }
+        });
+        let mask = flood(&asset, (10, 5), WandOptions::default()).unwrap();
+        assert!(mask.get(10, 115), "the sky right down at the horizon");
+        assert!(mask.get(73, 33), "a hole of sky through the crown");
+        assert!(!mask.get(100, 80), "not the tree");
+    }
+
+    /// **Nothing left behind**: a speck of grain inside a flat region is
+    /// filled, and a one-pixel spike of the region off its edge is shaved.
+    #[test]
+    fn specks_are_filled_and_spikes_shaved() {
+        let asset = picture(80, 80, |x, y| {
+            if (40..42).contains(&x) && (40..42).contains(&y) {
+                [255, 255, 255, 255] // a white speck in the blue
+            } else if x >= 60 && !(y == 30 && x < 70) {
+                [200, 40, 30, 255] // red, with a one-pixel blue spike into it
+            } else {
+                [20, 40, 200, 255]
+            }
+        });
+        let mask = flood(&asset, (10, 10), WandOptions::default()).unwrap();
+        assert!(mask.get(40, 40), "the speck is filled");
+        assert!(!mask.get(66, 30), "the spike into the red is shaved off");
+        assert!(!mask.get(70, 10), "the red is not taken");
     }
 
     /// Big enough to be a real photograph, and it must not take all day.

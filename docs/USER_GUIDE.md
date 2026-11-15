@@ -802,6 +802,22 @@ Frame 4: U      (Pursed vowel)      Frame 9: Etc   (Consonants: D,T,S,K)
 
 ---
 
+### Talk Ranges: Many Lines, One Key (`Control ▸ Mark Talk Range…`)
+
+Animate several lines and characters with one press of your talking command (Shift+A, `autoTalkingAnimation`).
+
+1. Select the frames of a line in the timeline (or put the playhead where it starts), then choose **Mark Talk Range…**. It is also on the ruler's right-click menu.
+2. Check the frames and tick who talks there. You can tick more than one character. Click **Mark**. A blue band with the names appears on the ruler.
+3. Mark as many ranges as you like, for any characters.
+4. Press **Shift+A**. For every range, for every character ticked on it, the command runs from the range's first frame to its last: hands, body, brows, eyes and blinks. The mouth is lip-synced over the same frames by Rhubarb. It all lands as **one undo step**.
+5. Right-click a band on the ruler to remove it, or choose **Clear Talk Ranges** for all of them, and move on to the next part.
+
+- Ranges are temporary. They belong to the scene and the open tab, and are never saved in the `.buzz` file.
+- Any shelf command whose first question asks for the **END frame** runs over the ranges this way (`autoTalkingAnimation`, `randomTalkingBodyMovement`, `autoLipSyncImporter`). One-key commands such as the hand moves (1–8) or F work as before.
+- A character who isn't on the stage at a range's first frame is skipped, and the status line says so.
+
+---
+
 ## 17. Production Staging, Directing & Motion That Runs Itself
 
 The **`buzz-act`** subsystem does the parts of a shot that are *arithmetic rather than drawing*: arranging a set, standing a cast in it, walking them about, and keeping everything alive between the keys. It lives under **`Insert ▸ Scene`**, and every one of these commands leaves behind **ordinary layers, shapes, keyframes and poses** — one `Ctrl + Z` takes any of it back, and the first thing you are meant to do with the result is change it.

@@ -590,6 +590,13 @@ pub enum Command {
     /// symbol set to show that frame's number. Pressed again on the frame it
     /// copied, it lets go. One command, so one key.
     CopyPasteStage,
+    /// **Mark Talk Range…**: mark frames on the ruler for one or more
+    /// characters. A talking command run while ranges are marked (Shift+A)
+    /// runs over each of them, for each of its characters, with the lip sync.
+    /// Not saved with the document.
+    MarkTalkRange,
+    /// **Clear Talk Ranges**: let go of every talk range on this scene.
+    ClearTalkRanges,
     /// **Puppet Mode**: a character's parts as one timeline row, posed on the
     /// stage by turning them about their joints, every pose keyed and eased.
     /// Run again on the puppet to have the parts back as layers.
@@ -967,6 +974,8 @@ command_table! {
             ReverseFrames => "reverse_frames",
             MoveStageFrames => "move_stage_frames",
             CopyPasteStage => "copy_paste_stage",
+            MarkTalkRange => "mark_talk_range",
+            ClearTalkRanges => "clear_talk_ranges",
             PuppetMode => "puppet_mode",
             CleanUpLayers => "clean_up_layers",
             ArrangeLayers => "arrange_layers",
@@ -1460,6 +1469,8 @@ impl Command {
             ReverseFrames => "Reverse Frames",
             MoveStageFrames => "Move Stage Frames\u{2026}",
             CopyPasteStage => "Copy / Paste Stage",
+            MarkTalkRange => "Mark Talk Range\u{2026}",
+            ClearTalkRanges => "Clear Talk Ranges",
             PuppetMode => "Puppet Mode",
             CleanUpLayers => "Clean Up Layers\u{2026}",
             ArrangeLayers => "Arrange Layers",
@@ -1745,6 +1756,8 @@ impl Command {
             ReverseFrames => None,
             MoveStageFrames => None,
             CopyPasteStage => None,
+            MarkTalkRange => sc(Modifiers::SHIFT, Key::T),
+            ClearTalkRanges => None,
             PuppetMode => None,
             CleanUpLayers => None,
             ArrangeLayers => None,
@@ -1956,6 +1969,8 @@ pub fn palette_commands() -> Vec<Command> {
         ReverseFrames,
         MoveStageFrames,
         CopyPasteStage,
+        MarkTalkRange,
+        ClearTalkRanges,
         PuppetMode,
         CleanUpLayers,
         ArrangeLayers,
@@ -2223,6 +2238,8 @@ mod tests {
             ReverseFrames,
             MoveStageFrames,
             CopyPasteStage,
+            MarkTalkRange,
+            ClearTalkRanges,
             PuppetMode,
             CleanUpLayers,
             ArrangeLayers,
@@ -2421,7 +2438,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            254
+            259
         );
     }
 

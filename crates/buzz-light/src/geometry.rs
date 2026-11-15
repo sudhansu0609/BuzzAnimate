@@ -646,7 +646,12 @@ impl ShadowThrow {
                 let sy = rake * stretch;
                 let ground_proj =
                     Affine::new([1.0, 0.0, -sx, -sy, sx * base.y, base.y * (1.0 + sy)]);
-                adjustment.affine() * ground_proj
+                // **The animator's adjustment about this caster's own feet**,
+                // its pivot an offset from them. About the document's corner,
+                // the same width or turn moved a character far from it much
+                // more than one near it: every shadow landed somewhere else.
+                let feet = Affine::translate(base.to_vec2());
+                feet * adjustment.affine() * feet.inverse() * ground_proj
             }
         }
     }
@@ -1644,6 +1649,30 @@ mod tests {
     ///
     /// The whole difference between a shadow and a second copy of the drawing:
     /// wherever the light is, the contact line does not move.
+    #[test]
+    fn a_shadow_adjustment_moves_every_caster_alike() {
+        let light = {
+            let mut l = crate::Light::new(crate::LightId(1), "Sun", LightKind::Sun { azimuth: 0.3, elevation: 0.6 });
+            l.shadows = true;
+            l.shadow_adjustment.scale_x = 1.6;
+            l.shadow_adjustment.scale_y = 0.5;
+            l.shadow_adjustment.rotation = 0.4;
+            l.shadow_adjustment.skew_x = 0.3;
+            l.shadow_adjustment.offset = Vec2::new(12.0, -5.0);
+            l
+        };
+        let throw = shadow_throw(&light, 70.0).expect("a ground shadow");
+        // Two casters alike, one near the corner, one far across the stage:
+        // each one's head lands the same way from its own feet.
+        let near = Rect::new(10.0, 10.0, 60.0, 110.0);
+        let far = Rect::new(1510.0, 810.0, 1560.0, 910.0);
+        let head = |r: Rect| Point::new((r.x0 + r.x1) * 0.5, r.y0);
+        let feet = |r: Rect| Point::new((r.x0 + r.x1) * 0.5, r.y1);
+        let a = throw.at(near) * head(near) - feet(near);
+        let b = throw.at(far) * head(far) - feet(far);
+        assert!((a - b).hypot() < 1e-6, "near {a:?} far {b:?}");
+    }
+
     #[test]
     fn a_ground_shadow_is_anchored_at_the_casters_feet() {
         let caster = Rect::new(100.0, 100.0, 200.0, 300.0);

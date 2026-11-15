@@ -481,6 +481,10 @@ pub struct Editor {
     /// ticks on one ruler would be unreadable. The last command run wins, and
     /// its status line says which.
     pub ruler_marks: Vec<u32>,
+    /// **Talk ranges** (Mark Talk Range…), on every scene of this document:
+    /// what a talking command (Shift+A) runs over while there are some. Kept
+    /// with the tab, never saved.
+    pub talk_ranges: Vec<TalkRange>,
     /// L1 of `docs/LAYER_MANAGEMENT_PLAN.md`: the layer filter's emptiness
     /// cache (measured once per scene revision) and the last rows it hid.
     pub layer_rows: buzz_ui::LayerRowCache,
@@ -545,6 +549,8 @@ pub struct Editor {
 struct SelectionCache {
     revision: u64,
     frame: u32,
+    /// The timeline it was built on — see [`Editor::edit_context`].
+    context: EditContext,
     /// The frames Edit Multiple Frames is showing: switching it on draws the
     /// selection on other frames' terms, with no edit and no frame change.
     multi: Vec<u32>,
@@ -558,9 +564,15 @@ struct SelectionCache {
 struct DrawnIndex {
     revision: u64,
     frame: u32,
+    /// The timeline it was built on — see [`Editor::edit_context`].
+    context: EditContext,
     multi: Vec<u32>,
     at: std::collections::HashMap<ObjectId, (u32, LayerId, usize)>,
 }
+
+/// **Which timeline is open**: the symbols entered, and the place the last
+/// was opened at. See [`Editor::edit_context`].
+type EditContext = (Vec<buzz_scene::SymbolId>, [u64; 6]);
 
 /// Every symbol's resolved extent, keyed by id. See [`Editor::symbol_bounds`].
 type SymbolBounds =
@@ -707,6 +719,19 @@ struct BoxSession {
     stamp: (u64, usize, usize),
 }
 
+/// **A talk range** (Mark Talk Range\u{2026}): frames `start..=end` of scene
+/// `scene`'s main timeline, for the characters named in `who` (as
+/// [`crate::scene_life::Talker::name`] has them). A talking command run while
+/// there are some runs from `start` to `end` for each of them, and the mouth is
+/// lip-synced over the same frames.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TalkRange {
+    pub scene: usize,
+    pub start: u32,
+    pub end: u32,
+    pub who: Vec<String>,
+}
+
 /// **D2: the half of `Editor` that belongs to one open document**, not to the
 /// person using the app.
 ///
@@ -731,6 +756,7 @@ pub struct DocView {
     pub group_pivot: Option<(Vec<ObjectId>, Point)>,
     pub sequence_scrub: Option<u32>,
     pub ruler_marks: Vec<u32>,
+    pub talk_ranges: Vec<TalkRange>,
     pub edit_frames: Vec<u32>,
     pub selected_light: Option<buzz_scene::LightId>,
     /// Decoded sound and the output stream — see [`Editor::sound`]. Per
@@ -764,6 +790,7 @@ impl DocView {
             group_pivot: None,
             sequence_scrub: None,
             ruler_marks: Vec::new(),
+            talk_ranges: Vec::new(),
             edit_frames: Vec::new(),
             selected_light: None,
             sound: crate::sound::SoundBank::new(doc.scene().stage().frame_rate),
@@ -871,6 +898,7 @@ impl Editor {
             scrub_until: None,
             scrub_frame: None,
             ruler_marks: Vec::new(),
+            talk_ranges: Vec::new(),
             layer_rows: buzz_ui::LayerRowCache::default(),
             layer_search: String::new(),
             focus_seen: None,
@@ -1266,6 +1294,7 @@ impl Editor {
             group_pivot: std::mem::replace(&mut self.group_pivot, view.group_pivot),
             sequence_scrub: std::mem::replace(&mut self.sequence_scrub, view.sequence_scrub),
             ruler_marks: std::mem::replace(&mut self.ruler_marks, view.ruler_marks),
+            talk_ranges: std::mem::replace(&mut self.talk_ranges, view.talk_ranges),
             edit_frames: std::mem::replace(&mut self.edit_frames, view.edit_frames),
             selected_light: std::mem::replace(&mut self.light_panel.selected, view.selected_light),
             sound: std::mem::replace(&mut self.sound, view.sound),
@@ -2279,6 +2308,34 @@ impl Editor {
         self.machine.tool()
     }
 
+    /// The Tool Options panel shown, wherever the layout keeps it: in the
+    /// far-right icon strip its pop-out opened (it then stays open until its
+    /// Close button or its icon — see `App::draw_strip_flyout`); in a column,
+    /// in front of its section and unrolled; closed, back at its home.
+    fn show_tool_options(&mut self) {
+        use buzz_ui::{Dock, PanelId};
+        let workspace = &mut self.workspace;
+        if workspace.icon_strip && workspace.dock_of(PanelId::ToolOptions) == Dock::RightOuter {
+            // What a menu's reveal does: the strip opens its pop-out.
+            workspace.scroll_to = Some(PanelId::ToolOptions);
+            return;
+        }
+        if !workspace.is_open(PanelId::ToolOptions) {
+            workspace.restore_default_place(PanelId::ToolOptions);
+            // Closed in the default arrangement too: open it at its home, as
+            // Window's own toggle does.
+            if !workspace.is_open(PanelId::ToolOptions) && !workspace.locked {
+                workspace.toggle(PanelId::ToolOptions);
+            }
+            if workspace.icon_strip && workspace.dock_of(PanelId::ToolOptions) == Dock::RightOuter {
+                workspace.scroll_to = Some(PanelId::ToolOptions);
+                return;
+            }
+        }
+        workspace.select_tab(PanelId::ToolOptions);
+        workspace.set_collapsed(PanelId::ToolOptions, false);
+    }
+
     pub fn set_tool(&mut self, tool: ToolId) {
         if tool.is_ready() {
             let changed = self.machine.tool() != tool;
@@ -2289,10 +2346,12 @@ impl Editor {
             // no use at all while it is the tab *behind* Properties: picking up
             // the Paint Bucket changed a panel nobody could see. Choosing a
             // tool is exactly the moment its settings become the thing being
-            // looked at, so the panel comes forward the way clicking its tab
-            // would — no layout moves, and a section rolled up stays rolled up.
-            if changed {
-                self.workspace.select_tab(buzz_ui::PanelId::ToolOptions);
+            // looked at, so the panel comes forward — unrolled, and put back
+            // where it lives if it was closed (user 2026-11-14: rolled up or
+            // closed, picking a tool showed nothing). The Hand only pans, so
+            // it leaves the panels alone.
+            if changed && tool != ToolId::Hand {
+                self.show_tool_options();
             }
             // Free Transform needs something to put handles on. Picking it up
             // with nothing selected takes the active layer's artwork, so the
@@ -4522,11 +4581,23 @@ impl Editor {
     /// Run `read` on the selection cache if it still describes this document,
     /// playhead, selection and zoom; `None` when it does not (or `read` finds
     /// nothing in it).
+    /// **The timeline the caches describe.** Opening a symbol (or leaving
+    /// one) changes neither the document's revision nor, often, the frame
+    /// number — a character double-clicked at frame 0 opens on its own frame
+    /// 0 — so a cache keyed on those two alone went on describing the stage
+    /// it was built on: every part inside had no bounds, so a click on one
+    /// drew no box and gave nothing to drag.
+    fn edit_context(&self) -> EditContext {
+        let scene = self.doc.scene();
+        (scene.edit_path().to_vec(), scene.edit_place().as_coeffs().map(f64::to_bits))
+    }
+
     fn selection_cache_get<T>(&self, read: impl FnOnce(&SelectionCache) -> Option<T>) -> Option<T> {
         let cache = self.selection_cache.borrow();
         let c = cache.as_ref()?;
         if c.revision != self.doc.scene().revision()
             || c.frame != self.current_frame
+            || c.context != self.edit_context()
             || c.multi != self.multi_frames()
             || c.zoom != self.camera.zoom.to_bits()
             || !self.selection.ids().iter().eq(c.ids.iter())
@@ -4545,6 +4616,7 @@ impl Editor {
             *cache = Some(SelectionCache {
                 revision: self.doc.scene().revision(),
                 frame: self.current_frame,
+                context: self.edit_context(),
                 multi: self.multi_frames(),
                 ids: self.selection.ids(),
                 zoom: self.camera.zoom.to_bits(),
@@ -4900,8 +4972,9 @@ impl Editor {
     fn drawn_at_index(&self, id: ObjectId) -> Option<(u32, LayerId, usize)> {
         let scene = self.doc.scene();
         let revision = scene.revision();
+        let context = self.edit_context();
         let stale = self.drawn_index.borrow().as_ref().is_none_or(|i| {
-            i.revision != revision || i.frame != self.current_frame
+            i.revision != revision || i.frame != self.current_frame || i.context != context
         });
         let multi = if stale { Vec::new() } else { self.multi_frames() };
         let stale = stale
@@ -4924,6 +4997,7 @@ impl Editor {
             *self.drawn_index.borrow_mut() = Some(DrawnIndex {
                 revision,
                 frame: self.current_frame,
+                context,
                 multi,
                 at,
             });
@@ -6052,6 +6126,9 @@ impl Editor {
             ClearFrames => self.frame_op(FrameOp::ClearFrames),
             ReverseFrames => self.frame_op(FrameOp::ReverseFrames),
             CopyPasteStage => self.copy_paste_stage(),
+            ClearTalkRanges => self.clear_talk_ranges(),
+            // A dialog, which the app opens.
+            MarkTalkRange => {}
             PuppetMode => self.toggle_puppet(),
             CleanUpLayers => self.cleanup.open_fresh(),
             RepairLayerRigs => self.repair_rigs_open = true,
@@ -9143,6 +9220,15 @@ impl Editor {
         let (_, start, clip) = self.sound.stage_track_trimmed(scene)?;
         let levels = clip.frame_levels(scene.stage().frame_rate);
         Some(buzz_script::Dialogue { start, levels: Arc::new(levels) })
+    }
+
+    /// Where the line spoken at `from` ends (the frame after it), as a
+    /// talking command's `fl.buzzAnimate.lineEnd` hears it. `None`: no
+    /// dialogue, or nothing spoken from there on.
+    pub fn spoken_line_end(&self, from: u32) -> Option<u32> {
+        let dialogue = self.script_dialogue()?;
+        let pause = (self.doc.scene().stage().frame_rate * 0.5).round().max(1.0) as usize;
+        buzz_script::line_end(&dialogue, from, pause)
     }
 
     /// **Run `source` as one undo step** — the Actions panel's Run, and every
@@ -12959,6 +13045,48 @@ impl Editor {
             if renumbered > 0 { format!(", {renumbered} symbols renumbered to their new frames") } else { String::new() },
             if master.is_some() { " (the master audio stays where it is)" } else { "" }
         ));
+    }
+
+    /// The talk ranges on the scene being edited, in frame order, with
+    /// their place in [`Self::talk_ranges`].
+    pub fn talk_ranges_here(&self) -> Vec<(usize, &TalkRange)> {
+        let scene = self.doc.active_scene();
+        let mut here: Vec<(usize, &TalkRange)> = self.talk_ranges.iter().enumerate().filter(|(_, r)| r.scene == scene).collect();
+        here.sort_by_key(|(_, r)| (r.start, r.end));
+        here
+    }
+
+    /// **Mark a talk range**: frames `start..=end` of this scene for `who`.
+    pub fn mark_talk_range(&mut self, start: u32, end: u32, who: Vec<String>) {
+        let (start, end) = (start.min(end), start.max(end));
+        let names = who.join(", ");
+        self.talk_ranges.push(TalkRange { scene: self.doc.active_scene(), start, end, who });
+        self.status = Some(format!(
+            "Talk range {}\u{2013}{} marked for {names}; Shift+A runs over every range marked",
+            start + 1,
+            end + 1
+        ));
+    }
+
+    /// Remove the talk range at `index` of [`Self::talk_ranges_here`].
+    pub fn remove_talk_range(&mut self, index: usize) {
+        if let Some(&(at, _)) = self.talk_ranges_here().get(index) {
+            let gone = self.talk_ranges.remove(at);
+            self.status = Some(format!("Talk range {}\u{2013}{} removed", gone.start + 1, gone.end + 1));
+        }
+    }
+
+    /// **Clear Talk Ranges**: every one on this scene.
+    pub fn clear_talk_ranges(&mut self) {
+        let scene = self.doc.active_scene();
+        let before = self.talk_ranges.len();
+        self.talk_ranges.retain(|r| r.scene != scene);
+        let n = before - self.talk_ranges.len();
+        self.status = Some(match n {
+            0 => "No talk ranges to clear".into(),
+            1 => "1 talk range cleared".into(),
+            n => format!("{n} talk ranges cleared"),
+        });
     }
 
     /// **Copy Stage**: everything on the stage at the playhead — what every
@@ -30177,6 +30305,30 @@ mod tests {
 
     /// The consequence, through the editor's own hit-testing: a click anywhere
     /// on the character's artwork finds it, not only at its origin.
+    /// **A part inside a character opened from the stage can be selected**:
+    /// it has a box, at the same frame number the stage was on. Opening the
+    /// symbol changed neither the revision nor the frame, and the caches keyed
+    /// on those went on describing the stage, so every part had no bounds.
+    #[test]
+    fn parts_inside_a_character_opened_on_the_same_frame_have_a_box() {
+        let mut e = editor();
+        let id = place_nested_character(&mut e);
+        e.selection.set([id]);
+        assert!(e.selection_bounds_drawn().is_some(), "the character on the stage");
+        assert!(e.enter_instance_in_place(id));
+        assert_eq!(e.current_frame, 0, "opened on the same frame number");
+        let parts: Vec<ObjectId> = e.scene().layers().iter().flat_map(|l| l.objects_at(0).iter().map(|o| o.id).collect::<Vec<_>>()).collect();
+        assert_eq!(parts.len(), 3);
+        for part in parts {
+            e.selection.set([part]);
+            assert!(e.selection_bounds_drawn().is_some(), "{part:?} inside the character has a box");
+        }
+        // And back out: the character has its box again.
+        e.run(Command::EditDocument);
+        e.selection.set([id]);
+        assert!(e.selection_bounds_drawn().is_some(), "the character, back on the stage");
+    }
+
     #[test]
     fn a_character_can_be_clicked_anywhere_on_its_artwork() {
         let mut e = editor();

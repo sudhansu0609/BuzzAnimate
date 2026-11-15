@@ -1246,6 +1246,13 @@ pub struct LightRig {
     /// [`LightRig::with_character_shadows`]. A light added by hand replaces it.
     #[serde(default)]
     pub no_character_shadows: bool,
+    /// **The built-in character shadows' light, as the animator set it** in
+    /// the Lighting panel — which way the shadows fall, how long and dark
+    /// they are, and where they sit. `None` is the built-in sun
+    /// ([`LightRig::character_shadow_light`]). Its shadows still come from
+    /// characters only, and a light switched on still takes over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_light: Option<Light>,
     /// Only characters throw shadows from this rig: set on the built-in rig of
     /// [`LightRig::with_character_shadows`], so a tree or the grass does not
     /// throw one. Never saved.
@@ -1474,6 +1481,7 @@ impl Default for LightRig {
             model: ShadeModel::Form,
             shadows_only: false,
             no_character_shadows: false,
+            character_light: None,
             characters_only: false,
         }
     }
@@ -1576,6 +1584,7 @@ impl LightRig {
             model: self.model,
             shadows_only: self.shadows_only,
             no_character_shadows: self.no_character_shadows,
+            character_light: self.character_light.clone(),
             characters_only: self.characters_only,
         }
     }
@@ -1586,6 +1595,17 @@ impl LightRig {
     /// throws, and nothing else of it.
     pub fn character_shadow_light() -> Light {
         let mut light = Light::new(LightId(u64::MAX), "Character shadows", LightKind::sun());
+        light.shadows = true;
+        light
+    }
+
+    /// **The light the built-in character shadows come from**: the one set in
+    /// the Lighting panel ([`Self::character_light`]), else the built-in sun.
+    /// Always switched on and always casting, whatever was stored.
+    pub fn character_light(&self) -> Light {
+        let mut light = self.character_light.clone().unwrap_or_else(Self::character_shadow_light);
+        light.id = LightId(u64::MAX);
+        light.enabled = true;
         light.shadows = true;
         light
     }
@@ -1601,7 +1621,7 @@ impl LightRig {
             return None;
         }
         Some(LightRig {
-            lights: vec![Self::character_shadow_light()],
+            lights: vec![self.character_light()],
             enabled: true,
             shadows_only: true,
             characters_only: true,
@@ -2503,6 +2523,35 @@ mod tests {
 
     fn sun(azimuth: f64, elevation: f64) -> Light {
         Light::new(LightId(1), "Sun", LightKind::Sun { azimuth, elevation })
+    }
+
+    /// **The built-in character shadows can be set**: a sun turned and a
+    /// length chosen in the Lighting panel is what the characters' shadows
+    /// come from, still switched on and casting whatever was stored, and a
+    /// light switched on still takes over.
+    #[test]
+    fn the_built_in_character_light_is_the_one_set() {
+        let mut rig = LightRig::default();
+        let built_in = rig.with_character_shadows().expect("characters cast with no light");
+        assert_eq!(built_in.lights[0].kind, LightRig::character_shadow_light().kind);
+
+        let mut set = LightRig::character_shadow_light();
+        set.kind = LightKind::Sun { azimuth: 1.2, elevation: 0.4 };
+        set.shadow_length = 0.5;
+        set.shadow_adjustment.offset = Vec2::new(30.0, -8.0);
+        set.enabled = false;
+        set.shadows = false;
+        rig.character_light = Some(set);
+        let thrown = rig.with_character_shadows().expect("still on");
+        let light = &thrown.lights[0];
+        assert_eq!(light.kind, LightKind::Sun { azimuth: 1.2, elevation: 0.4 });
+        assert_eq!(light.shadow_length, 0.5);
+        assert_eq!(light.shadow_adjustment.offset, Vec2::new(30.0, -8.0));
+        assert!(light.enabled && light.shadows, "the built-in light always casts");
+        assert!(thrown.characters_only && thrown.shadows_only);
+
+        let lit = LightRig { lights: vec![sun(0.3, 0.6)], enabled: true, ..rig.clone() };
+        assert!(lit.with_character_shadows().is_none(), "a light switched on takes over");
     }
 
     fn rig_with(light: Light) -> LightRig {

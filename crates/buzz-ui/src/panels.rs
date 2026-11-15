@@ -640,6 +640,8 @@ pub fn build_menus(ui: &mut MenuUi<'_>, state: &MenuState<'_>) -> Vec<Command> {
                 Command::ReverseFrames,
                 Command::CopyPasteStage,
                 Command::MoveStageFrames,
+                Command::MarkTalkRange,
+                Command::ClearTalkRanges,
                 Command::ExposeOnTwos,
                 Command::ExposeOnThrees,
                 Command::PaintThrough,
@@ -1528,7 +1530,7 @@ fn well_narrow(ui: &mut Ui, label: &str, color: &mut Color, enabled: &mut bool) 
     let response = ui
         .scope(|ui| {
             ui.spacing_mut().interact_size = egui::vec2(Metrics::TOOL_BUTTON, 20.0);
-            ui.color_edit_button_srgba(&mut rgba)
+            crate::widgets::color_button(ui, &mut rgba)
         })
         .inner;
     if response.changed() {
@@ -1553,7 +1555,7 @@ fn well_narrow(ui: &mut Ui, label: &str, color: &mut Color, enabled: &mut bool) 
 fn well(ui: &mut Ui, label: &str, color: &mut Color, enabled: &mut bool) {
     ui.horizontal(|ui| {
         let mut rgba = to_egui(*color);
-        if ui.color_edit_button_srgba(&mut rgba).changed() {
+        if crate::widgets::color_button(ui, &mut rgba).changed() {
             *color = from_egui(rgba);
             *enabled = true;
         }
@@ -1726,7 +1728,7 @@ fn color_effect_section(
             let mut tint = to_egui(color);
             let mut percent = amount * 100.0;
             property_row(ui, "Tint", None, |ui| {
-                if ui.color_edit_button_srgba(&mut tint).changed() {
+                if crate::widgets::color_button(ui, &mut tint).changed() {
                     out = Some(ColorTransform::tint(from_egui(tint), percent / 100.0));
                 }
             });
@@ -1874,7 +1876,7 @@ fn color_effect_controls(
             let mut percent = amount * 100.0;
 
             property_row(ui, "Tint", None, |ui| {
-                if ui.color_edit_button_srgba(&mut tint).changed() {
+                if crate::widgets::color_button(ui, &mut tint).changed() {
                     picked = Some(buzz_scene::ColorTransform::tint(from_egui(tint), percent / 100.0));
                 }
             });
@@ -2637,6 +2639,29 @@ fn wand_properties(ui: &mut Ui, style: &mut DrawStyle) {
         ui.checkbox(&mut style.wand.contiguous, "").on_hover_text(
             "Take only what joins on to the click. Off takes every matching \
              colour in the picture — all of the sky, even where a tree divides it.",
+        );
+        ui.end_row();
+
+        ui.label("Stop at lines");
+        ui.checkbox(&mut style.wand.stop_at_lines, "").on_hover_text(
+            "Stop at drawn outlines and edges, judge colours against the picture's \
+             own contrast (a night scene is all dark), and follow a sky's gradient \
+             down to the horizon. Off is the plain wand: the colour clicked and the \
+             tolerance, nothing else.",
+        );
+        ui.end_row();
+
+        ui.label("Catch gaps");
+        ui.add_enabled(style.wand.contiguous, egui::Checkbox::new(&mut style.wand.catch_gaps, "")).on_hover_text(
+            "Take the same colour in pockets close by — sky between the fronds \
+             of a palm, ground between blades of grass — with the region.",
+        );
+        ui.end_row();
+
+        ui.label("Smooth edges");
+        ui.checkbox(&mut style.wand.smooth, "").on_hover_text(
+            "Fill specks left inside, shave off one-pixel spikes and round the \
+             outline, so nothing sticks out or stays behind.",
         );
         ui.end_row();
     });
@@ -4882,7 +4907,7 @@ pub fn gradient_editor(ui: &mut Ui, gradient: &mut Gradient) -> bool {
     for (i, stop) in stops.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             let mut c = to_egui(stop.color);
-            if ui.color_edit_button_srgba(&mut c).changed() {
+            if crate::widgets::color_button(ui, &mut c).changed() {
                 stop.color = from_egui(c);
                 changed = true;
             }
@@ -5102,7 +5127,7 @@ fn color_swatch_picker(ui: &mut Ui, target: egui::Id, color: &mut Color32) -> bo
     egui::Popup::from_toggle_button_response(&response)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            ui.spacing_mut().slider_width = 220.0;
+            crate::widgets::compact_picker_style(ui);
             changed |= egui::color_picker::color_picker_color32(
                 ui,
                 color,

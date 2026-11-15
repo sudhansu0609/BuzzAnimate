@@ -86,7 +86,7 @@ pub use assets_panel::{AssetAction, AssetPanelState, assets_panel};
 pub use brush::{BrushKind, BrushSettings, BrushTips, PatternShape};
 pub use camera_panel::{CameraPanelState, CameraResponse, camera_hud, camera_panel};
 pub use character_panel::{
-    CAST_FOLDER, AddPoseAsk, CastAction, DeleteAsk, CastPanelState, PoseSource, FreshAsk, CastThumbnailSource, cast_panel,
+    CAST_FOLDER, AddPoseAsk, CastAction, DeleteAsk, CastPanelState, PoseSource, FreshAsk, CastThumbnailSource, cast_panel, cast_windows,
 };
 pub use command::Command;
 pub use command_palette::{CommandPaletteState, command_palette};
@@ -129,7 +129,7 @@ pub use swatch_panel::{SwatchState, swatch_panel};
 pub use tasks_panel::{FinishedRow, TaskAction, TaskRow, TasksView, tasks_panel};
 pub use theme::{Metrics, Palette};
 pub use timeline_panel::{
-    FrameAction, LayerFilter, LayerRowCache, MoveFrames, RowFilter, TimelineResponse,
+    FrameAction, LayerFilter, LayerRowCache, MoveFrames, RowFilter, TalkRangeBand, TimelineResponse,
     TimelineState, TweenRequest, WAVE_PEAKS_PER_FRAME, Waveform, frame_move_targets, frame_move_targets_filtered,
     row_filter_hidden, timeline_panel,
     timeline_panel_with_tools_slot,

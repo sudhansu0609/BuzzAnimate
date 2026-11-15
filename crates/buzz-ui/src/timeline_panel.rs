@@ -119,6 +119,9 @@ pub struct TimelineResponse {
     /// the layer names. Carried as a command so it runs through the same path
     /// as the menu item and the shortcut, undo included.
     pub command: Option<crate::Command>,
+    /// The talk range at this index of [`TimelineState::talk_ranges`] was
+    /// removed from the ruler's right-click menu.
+    pub remove_talk_range: Option<usize>,
     /// The frame cells were made wider or narrower.
     ///
     /// Not undoable, and deliberately: how big the timeline is drawn is not a
@@ -874,6 +877,18 @@ pub struct TimelineState {
     /// **Copy / Paste Stage** is holding the stage copied at this frame, so
     /// its button reads Paste Stage. `None`: the button reads Copy Stage.
     pub stage_copied: Option<u32>,
+    /// **Talk ranges** marked on this scene (Mark Talk Range…), drawn as
+    /// bands along the ruler with the characters' names on them.
+    pub talk_ranges: Vec<TalkRangeBand>,
+}
+
+/// One talk range as the ruler draws it: frames `start..=end`, and who it is
+/// for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TalkRangeBand {
+    pub start: u32,
+    pub end: u32,
+    pub label: String,
 }
 
 /// A sound's envelope, positioned on the timeline.
@@ -2345,6 +2360,30 @@ fn transport_controls(
                 out.action = Some(action);
             }
         }
+
+        // **Talk Range**: one button — a click marks a range (the frames
+        // selected, else from the playhead to the end of the line), a
+        // right-click clears them. Counted once there are some.
+        ui.separator();
+        let marked = state.talk_ranges.len();
+        let label = if marked == 0 { "Talk Range".to_string() } else { format!("Talk Ranges \u{00b7} {marked}") };
+        let key = state
+            .key_names
+            .get(&crate::Command::MarkTalkRange)
+            .filter(|k| !k.is_empty())
+            .map(|k| format!(" ({k})"))
+            .unwrap_or_default();
+        let button = egui::Button::new(egui::RichText::new(label).small()).selected(marked > 0);
+        let response = ui.add(button).on_hover_text(format!(
+            "Mark the frames a talking command (Shift+A) runs over, and who talks in them{key}. \
+             Right-click to clear every range."
+        ));
+        if response.clicked() {
+            out.command = Some(crate::Command::MarkTalkRange);
+        }
+        if response.secondary_clicked() && marked > 0 {
+            out.command = Some(crate::Command::ClearTalkRanges);
+        }
     }
 }
 
@@ -2522,6 +2561,7 @@ fn ruler(
     }
 
     draw_loop_band(&painter, rect, grid_left, columns, region, cell_width);
+    draw_talk_ranges(&painter, rect, grid_left, columns, &state.talk_ranges, cell_width);
     draw_playhead(&painter, rect, grid_left, state.current_frame, cell_width);
 
     // **P1: the grid pages to keep the playhead in view.** Animate does the
@@ -2743,7 +2783,64 @@ fn ruler(
             out.scrub_to = Some(clamped);
             ui.close();
         }
+        ui.separator();
+        for (i, band) in state.talk_ranges.iter().enumerate() {
+            if (band.start..=band.end).contains(&clamped)
+                && ui.button(format!("Remove Talk Range: {}", band.label)).clicked()
+            {
+                out.remove_talk_range = Some(i);
+                ui.close();
+            }
+        }
+        if ui.button(crate::Command::MarkTalkRange.label()).clicked() {
+            out.command = Some(crate::Command::MarkTalkRange);
+            ui.close();
+        }
+        if !state.talk_ranges.is_empty() && ui.button(crate::Command::ClearTalkRanges.label()).clicked() {
+            out.command = Some(crate::Command::ClearTalkRanges);
+            ui.close();
+        }
     });
+}
+
+/// **The talk ranges**, along the ruler: a band over the frames each one
+/// covers, its edges marked, the characters' names written on it. Kept under
+/// the frame numbers' line so the numbers still read.
+fn draw_talk_ranges(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    grid_left: f32,
+    columns: u32,
+    bands: &[TalkRangeBand],
+    cell_width: f32,
+) {
+    let color = Palette::active();
+    for band in bands {
+        if band.start >= columns {
+            continue;
+        }
+        let last = band.end.min(columns.saturating_sub(1));
+        let left = grid_left + band.start as f32 * cell_width;
+        let right = (grid_left + (last + 1) as f32 * cell_width).max(left + 2.0);
+        let strip = egui::Rect::from_min_max(egui::pos2(left, rect.min.y + 12.0), egui::pos2(right, rect.max.y - 4.0));
+        painter.rect_filled(strip, 2.0, color.gamma_multiply(0.75));
+        for x in [left, right] {
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x - 1.0, rect.min.y), egui::pos2(x + 1.0, rect.max.y)),
+                0.0,
+                color,
+            );
+        }
+        // The names, as far as they fit.
+        let label = painter.with_clip_rect(strip.intersect(painter.clip_rect()));
+        label.text(
+            egui::pos2(left + 4.0, strip.center().y),
+            Align2::LEFT_CENTER,
+            &band.label,
+            FontId::proportional(9.0),
+            Color32::WHITE,
+        );
+    }
 }
 
 /// The looping section, marked along the ruler.
@@ -5271,6 +5368,7 @@ mod tests {
             nearest_depth: -900.0,
             shot_end: None,
             stage_copied: None,
+            talk_ranges: Vec::new(),
         }
     }
 

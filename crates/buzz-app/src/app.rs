@@ -728,6 +728,9 @@ enum AiResult {
         placement: buzz_geom::Affine,
         secs: f64,
     },
+    /// A talking command over the talk ranges, with the dialogue under them
+    /// heard by Rhubarb: keys as Animate visemes from `start`.
+    TalkRangesHeard { pending: PendingTalkRanges, keys: Vec<(u32, usize)>, start: u32, secs: f64 },
     /// Sequence > Lip Sync All Characters (E3): the dialogue heard and matched to the script's lines.
     LipSyncAllHeard {
         lines: Vec<crate::scene_life::SpokenLine>,
@@ -1168,6 +1171,9 @@ pub struct App {
     /// press elsewhere in the same handler can test it against the resize
     /// border without egui's own input state, which is a frame behind.
     last_cursor: Option<egui::Pos2>,
+    /// The system pointer is hidden with `NSCursor.hide` — see
+    /// [`hide_system_cursor`] — and owes an `unhide`.
+    system_cursor_hidden: bool,
     /// Per-frame section timing and the over-budget warning. See
     /// [`crate::profile`].
     profiler: crate::profile::FrameProfiler,
@@ -1218,6 +1224,8 @@ pub struct App {
     symbol_dialog: Option<crate::symbol_dialog::SymbolDialog>,
     /// Move Stage Frames…: the frames to move and where to, while it is open.
     move_stage: Option<MoveStageFrames>,
+    /// Mark Talk Range…, while it is open.
+    talk_range_dialog: Option<TalkRangeDialog>,
     /// Lip Sync All Characters, heard and waiting on the Who's who window.
     who_is_who: Option<WhoIsWho>,
     /// The export presets, built-in and the user's own, for the Export dialog.
@@ -1695,6 +1703,7 @@ impl App {
             window_maximized: false,
             logo_texture: None,
             last_cursor: None,
+            system_cursor_hidden: false,
             scroll_extent: None,
             bounds_table: None,
             lights_generation: 0,
@@ -1710,6 +1719,7 @@ impl App {
             quit_prompt: false,
             symbol_dialog: None,
             move_stage: None,
+            talk_range_dialog: None,
             who_is_who: None,
             presets: crate::presets::PresetLibrary::load(),
             lights: fresh_light_cache(),
@@ -3217,6 +3227,10 @@ pub const KEYBOARD_COMMANDS: &[Command] = &[
     Command::PreviousFrame,
     Command::FirstFrame,
     Command::LastFrame,
+    // Talk ranges: mark one (Shift+T) and clear them, with keys of their own
+    // so many lines can be marked without reaching for the mouse.
+    Command::MarkTalkRange,
+    Command::ClearTalkRanges,
 ];
 
 /// What a key can be bound to.
@@ -3236,6 +3250,28 @@ fn modifier_count(m: egui::Modifiers) -> usize {
 
 /// Collect commands raised by the keyboard, and the shelf scripts whose keys
 /// were pressed.
+/// **The system pointer hidden while a drawing tool is over the stage**
+/// (user 2026-11-15: the Brush showed the arrow beside its dot). egui asks
+/// for no cursor and egui-winit passes that on, but on macOS winit hides it
+/// through the view's cursor rects, which the system does not honour here —
+/// the arrow stayed. `NSCursor.hide` is what AppKit itself uses; it counts,
+/// so it is called only when the state changes and always undone. Elsewhere
+/// winit's own hiding is left to do the job.
+fn hide_system_cursor(hidden: &mut bool, hide: bool) {
+    if *hidden == hide {
+        return;
+    }
+    *hidden = hide;
+    #[cfg(target_os = "macos")]
+    {
+        if hide {
+            objc2_app_kit::NSCursor::hide();
+        } else {
+            objc2_app_kit::NSCursor::unhide();
+        }
+    }
+}
+
 fn keyboard_commands(ctx: &egui::Context, editor: &mut Editor) -> (Vec<Command>, Vec<String>) {
     let mut out = Vec::new();
     let mut scripts = Vec::new();
@@ -4521,7 +4557,6 @@ impl App {
                     // Over the artwork, after the chrome, so it is never drawn
                     // under a ruler or a selection outline.
                     self.stage_scrollbars(ui, area);
-                    self.stage_zoom_overlay(ui, area);
                     self.stage_camera_controls(ui, area);
                     if self.doc_available() {
                         self.draw_tool_cursor(ui, area);
@@ -4598,6 +4633,8 @@ impl App {
         self.close_prompt_dialog(&ctx);
         self.symbol_dialog_ui(&ctx);
         self.move_stage_frames_dialog(&ctx);
+        self.talk_range_dialog_ui(&ctx);
+        self.cast_windows_ui(&ctx);
         self.who_is_who_dialog(&ctx);
         self.export_dialog(&ctx);
         self.lip_sync_dialog(&ctx);
@@ -5033,6 +5070,19 @@ impl App {
         self.editor.cast_panel = state;
 
         if let Some(action) = action {
+            self.apply_cast_action(action);
+        }
+    }
+
+    /// The Cast panel's windows (Start Fresh, Delete characters, Add Pose), at
+    /// the top level with the other dialogs — see [`buzz_ui::cast_windows`].
+    fn cast_windows_ui(&mut self, ctx: &egui::Context) {
+        if self.editor.cast_panel.add_pose.is_some() {
+            // Add Pose lists the open document's symbols, current even when
+            // the Cast tab is out of sight.
+            self.editor.cast_panel.library_symbols = self.editor.doc.scene().library().iter().map(|s| s.name.clone()).collect();
+        }
+        if let Some(action) = buzz_ui::cast_windows(ctx, &mut self.editor.cast_panel) {
             self.apply_cast_action(action);
         }
     }
@@ -5953,7 +6003,8 @@ impl App {
     /// left edge drags out away from the strip — and the size it is left at
     /// is kept for next time. Its header docks it into the right column or
     /// floats it free. A click anywhere but the window, the strip or a menu
-    /// the panel itself opened closes it; so does Esc, or its icon again.
+    /// the panel itself opened closes it; so does Esc, or its icon again —
+    /// except Tool Options, which only its Close button or its icon closes.
     fn draw_strip_flyout(&mut self, ctx: &egui::Context, workspace: &buzz_ui::Workspace, commands: &mut Vec<Command>) {
         let Some((id, anchor)) = self.strip_flyout else {
             return;
@@ -6026,7 +6077,11 @@ impl App {
                 let on_popup = on.is_some_and(|l| l != layer && matches!(l.order, egui::Order::Foreground | egui::Order::Tooltip));
                 !ours && !rect.expand(8.0).contains(p) && !strip.is_some_and(|r| r.contains(p)) && !on_popup
             });
-        if close || pressed_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // **Tool Options stays open until it is closed** (user 2026-11-15):
+        // it is open beside the stage to be used while drawing on it, so a
+        // click on the stage — or Esc, which the tools use — leaves it.
+        let pinned = id == buzz_ui::PanelId::ToolOptions;
+        if close || (!pinned && (pressed_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)))) {
             self.strip_flyout = None;
         }
     }
@@ -6502,7 +6557,7 @@ impl App {
                         let mut color32 = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
                         let color_response = ui
                             .add_enabled_ui(selection.is_some(), |ui| {
-                                ui.color_edit_button_srgba(&mut color32)
+                                buzz_ui::widgets::color_button(ui, &mut color32)
                             })
                             .inner
                             .on_hover_text("Colour")
@@ -6927,7 +6982,7 @@ impl App {
                     key_names: {
                         use Command::*;
                         let ctx = ui.ctx();
-                        [FirstFrame, PreviousFrame, PlayPause, NextFrame, LastFrame, ToggleOnionSkin, ToggleAutoKeyframe, ToggleEditMultipleFrames]
+                        [FirstFrame, PreviousFrame, PlayPause, NextFrame, LastFrame, ToggleOnionSkin, ToggleAutoKeyframe, ToggleEditMultipleFrames, MarkTalkRange]
                             .into_iter()
                             .map(|c| (c, self.editor.workspace.shortcuts_for(c).iter().map(|s| ctx.format_shortcut(s)).collect::<Vec<_>>().join(" or ")))
                             .collect()
@@ -6943,6 +6998,7 @@ impl App {
                     beats: self.editor.ruler_marks.clone(),
                     shot_end: self.editor.shot_end_marker(),
                     stage_copied: self.editor.stage_clip.as_ref().map(|c| c.0),
+                    talk_ranges: self.talk_range_bands(),
                 };
                 let response = buzz_ui::timeline_panel_with_tools_slot(
                     ui,
@@ -7545,6 +7601,12 @@ impl App {
                 return;
             }
         };
+        // Talk ranges marked: a command that asks for its end frame runs over
+        // each of them, for each character marked, instead of once here.
+        if answers.is_none() && asks_for_end_frame(&source) && !self.editor.talk_ranges_here().is_empty() {
+            self.talk_ranges_start(name, source);
+            return;
+        }
         let asked = answers.is_some();
         let outcome = self.editor.run_script_source(name, &source, answers.unwrap_or_default(), true);
         if !asked && !outcome.prompts.is_empty() && outcome.error.is_none() {
@@ -7572,6 +7634,237 @@ impl App {
         {
             self.lip_sync_range(start, end);
         }
+    }
+
+    /// The talk ranges as the ruler draws them: on the scene's main timeline
+    /// only, whose frames they count.
+    fn talk_range_bands(&self) -> Vec<buzz_ui::TalkRangeBand> {
+        if !self.editor.doc.scene().edit_path().is_empty() {
+            return Vec::new();
+        }
+        self.editor
+            .talk_ranges_here()
+            .into_iter()
+            .map(|(_, r)| buzz_ui::TalkRangeBand { start: r.start, end: r.end, label: r.who.join(", ") })
+            .collect()
+    }
+
+    /// **Mark Talk Range…**: the frames selected in the timeline if there are
+    /// some, else from the playhead to the end of the line spoken there; the
+    /// character picked on the stage ticked (or the only one there is).
+    fn open_talk_range_dialog(&mut self) {
+        let picked = self.editor.selection.ids();
+        let selected = self.editor.selection.timeline().filter(|t| t.last_frame > t.first_frame).map(|t| (t.first_frame, t.last_frame));
+        if !self.editor.doc.scene().edit_path().is_empty() {
+            self.editor.doc.edit_view(|scene| scene.edit_document());
+            self.editor.after_context_change();
+        }
+        let scene = self.editor.doc.scene();
+        let talkers = crate::scene_life::talkers(scene);
+        if talkers.is_empty() {
+            self.editor.status = Some("Mark Talk Range: there is no character on the stage".into());
+            return;
+        }
+        let frame = self.editor.current_frame;
+        let (first, last) = selected.unwrap_or_else(|| (frame, self.editor.spoken_line_end(frame).filter(|e| *e > frame).unwrap_or(frame + 48)));
+        let who = talkers
+            .iter()
+            .map(|t| {
+                let on = talkers.len() == 1 || crate::scene_life::character_instance_at(scene, t, first).is_some_and(|id| picked.contains(&id));
+                (t.name.clone(), on)
+            })
+            .collect();
+        self.talk_range_dialog = Some(TalkRangeDialog { first: first + 1, last: last + 1, who });
+    }
+
+    /// Draw Mark Talk Range…, and mark the range once it is accepted.
+    fn talk_range_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.talk_range_dialog.take() else {
+            return;
+        };
+        let end = self.editor.doc.scene().frame_count().max(1);
+        let mut open = true;
+        let (mut mark, mut cancel) = (false, false);
+        egui::Window::new("Mark Talk Range")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label("The frames a talking command (Shift+A) runs over, and who talks in them.");
+                egui::Grid::new("talk-range-grid").num_columns(2).show(ui, |ui| {
+                    ui.label("From frame");
+                    ui.add(egui::DragValue::new(&mut state.first).range(1..=end));
+                    ui.end_row();
+                    ui.label("To frame");
+                    ui.add(egui::DragValue::new(&mut state.last).range(state.first..=end.max(state.first)));
+                    ui.end_row();
+                });
+                ui.add_space(4.0);
+                ui.label("Who:");
+                egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                    for (name, on) in &mut state.who {
+                        ui.checkbox(on, name.as_str());
+                    }
+                });
+                let any = state.who.iter().any(|(_, on)| *on);
+                ui.label(
+                    egui::RichText::new("Not saved with the document. Right-click the ruler to remove one, or Clear Talk Ranges.")
+                        .small()
+                        .weak(),
+                );
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(any, egui::Button::new("Mark")).clicked() || (any && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        mark = true;
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        cancel = true;
+                    }
+                });
+            });
+        if mark {
+            let who: Vec<String> = state.who.into_iter().filter(|(_, on)| *on).map(|(name, _)| name).collect();
+            let first = state.first.max(1) - 1;
+            self.editor.mark_talk_range(first, state.last.max(state.first).max(1) - 1, who);
+        } else if open && !cancel {
+            self.talk_range_dialog = Some(state);
+        }
+    }
+
+    /// **A talking command over the talk ranges**: the dialogue under them is
+    /// heard by Rhubarb first, off the UI thread, then
+    /// [`Self::talk_ranges_run`] runs the command on each. With no Rhubarb or
+    /// no dialogue it runs at once, without the lip sync.
+    fn talk_ranges_start(&mut self, name: &str, source: String) {
+        if !self.editor.doc.scene().edit_path().is_empty() {
+            self.editor.doc.edit_view(|scene| scene.edit_document());
+            self.editor.after_context_change();
+        }
+        let ranges: Vec<crate::editor::TalkRange> = self.editor.talk_ranges_here().into_iter().map(|(_, r)| r.clone()).collect();
+        let mut pending = PendingTalkRanges { name: name.to_string(), source, ranges, note: None };
+        let track = self.editor.sound.stage_track_trimmed(self.editor.doc.scene());
+        let Some((_, sound_start, clip)) = track else {
+            pending.note = Some("no lip sync: there is no sound on the main timeline".into());
+            self.talk_ranges_run(pending, None, None);
+            return;
+        };
+        if crate::rhubarb::binary().is_none() {
+            pending.note = Some("no lip sync: Rhubarb is not installed".into());
+            self.talk_ranges_run(pending, None, None);
+            return;
+        }
+        // Heard once, over every range at once; each range takes its slice.
+        let fps = self.editor.doc.scene().stage().frame_rate.max(1.0);
+        let from = pending.ranges.iter().map(|r| r.start).min().unwrap_or(0).max(sound_start);
+        let to = pending.ranges.iter().map(|r| r.end + 1).max().unwrap_or(0);
+        if to <= from {
+            pending.note = Some("no lip sync: the ranges are before the sound starts".into());
+            self.talk_ranges_run(pending, None, None);
+            return;
+        }
+        let seconds = |frame: u32| ((frame - sound_start) as f64 / fps) as f32;
+        let clip = std::sync::Arc::new(clip.trimmed(seconds(from), Some(seconds(to))));
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "Talk Ranges (Rhubarb)", move |ctx| {
+            let cancel = ctx.cancel.clone();
+            let began = std::time::Instant::now();
+            match crate::rhubarb::cues(&clip, &|| cancel.is_cancelled()) {
+                Ok(cues) => {
+                    let keys = crate::rhubarb::keys_closing_silence(&cues, fps, &clip.frame_levels(fps));
+                    let secs = began.elapsed().as_secs_f64();
+                    let _ = send.send(AiResult::TalkRangesHeard { pending, keys, start: from, secs });
+                    crate::tasks::TaskOutcome::Finished(String::new())
+                }
+                Err(e) => crate::tasks::TaskOutcome::Failed(format!("Talk Ranges: {e}")),
+            }
+        });
+        self.track_ai(id, receive);
+        self.editor.status = Some(format!("{name}: listening to the dialogue under the talk ranges with Rhubarb\u{2026}"));
+    }
+
+    /// **The command, run over every talk range** for each character marked
+    /// on it — the playhead on the range's first frame, the character
+    /// picked, the end frame its question asks for answered with the range's
+    /// last — and the mouth lip-synced over the same frames from what Rhubarb
+    /// heard (`heard`: keys and the frame they count from). One undo step.
+    fn talk_ranges_run(&mut self, pending: PendingTalkRanges, heard: Option<(Vec<(u32, usize)>, u32)>, secs: Option<f64>) {
+        let PendingTalkRanges { name, source, ranges, note } = pending;
+        let to_main = |app: &mut Self| {
+            if !app.editor.doc.scene().edit_path().is_empty() {
+                app.editor.doc.edit_view(|scene| scene.edit_document());
+                app.editor.after_context_change();
+            }
+        };
+        to_main(self);
+        let talkers = crate::scene_life::talkers(self.editor.doc.scene());
+        let frame = self.editor.current_frame;
+        let checkpoint = self.editor.doc.run_checkpoint();
+        let mut warnings: Vec<String> = note.into_iter().collect();
+        let (mut runs, mut mouthed) = (0usize, 0usize);
+        for range in &ranges {
+            for who in &range.who {
+                let at = format!("{who}, frames {}\u{2013}{}", range.start + 1, range.end + 1);
+                let Some(talker) = talkers.iter().find(|t| &t.name == who) else {
+                    warnings.push(format!("{at}: not on the stage any more"));
+                    continue;
+                };
+                to_main(self);
+                self.editor.set_frame(range.start);
+                let Some(id) = crate::scene_life::character_instance_at(self.editor.doc.scene(), talker, range.start) else {
+                    warnings.push(format!("{at}: not on the stage at frame {}", range.start + 1));
+                    continue;
+                };
+                self.editor.selection.set([id]);
+                let outcome = self.editor.run_script_source(&name, &source, vec![range.end.to_string()], false);
+                if let Some(e) = &outcome.error {
+                    warnings.push(format!("{at}: {name} stopped: {}", e.lines().next().unwrap_or(e)));
+                    continue;
+                }
+                if !outcome.changed {
+                    let why = outcome.alerts.first().map(|a| format!(": {}", a.lines().next().unwrap_or(a))).unwrap_or_default();
+                    warnings.push(format!("{at}: {name} changed nothing{why}"));
+                    continue;
+                }
+                runs += 1;
+                // The mouth, on this range only: where the command left it,
+                // else reached from the character picked.
+                let Some((keys, heard_from)) = &heard else { continue };
+                let (from, to) = outcome.context.lip_sync.unwrap_or((range.start, range.end));
+                if outcome.context.lip_sync.is_none() {
+                    to_main(self);
+                    self.editor.set_frame(range.start);
+                    self.editor.selection.set([id]);
+                }
+                let open = self.editor.lip_sync.open;
+                self.open_lip_sync();
+                self.editor.lip_sync.open = open;
+                match self.editor.lip_sync_inputs() {
+                    Some((_, _, mouth, layer, placement)) => {
+                        let slice = crate::scene_life::rhubarb_slice(keys, *heard_from, from, to);
+                        self.editor.apply_lip_sync_keys(&slice, to.saturating_sub(from), from, mouth, layer, placement);
+                        mouthed += 1;
+                    }
+                    None => warnings.push(format!("{at}: no mouth found, so it is not lip-synced")),
+                }
+            }
+        }
+        to_main(self);
+        self.editor.doc.collapse_run(checkpoint, format!("{name} over talk ranges"));
+        self.editor.set_frame(frame);
+        self.editor.selection.clear();
+
+        let mut say = format!("{name}: ran {runs} time{} over {} talk range{}", if runs == 1 { "" } else { "s" }, ranges.len(), if ranges.len() == 1 { "" } else { "s" });
+        if heard.is_some() {
+            say.push_str(&format!(", {mouthed} lip-synced"));
+        }
+        if let Some(secs) = secs {
+            say.push_str(&format!(" (heard by Rhubarb in {secs:.1} s)"));
+        }
+        if !warnings.is_empty() {
+            say.push_str(&format!(" \u{2014} {}", warnings.join("; ")));
+        }
+        self.commands_ui.status = say.clone();
+        self.editor.status = Some(say);
     }
 
     /// **The lip sync a command asked for**: the mouth it left selected (or
@@ -7735,6 +8028,11 @@ impl App {
         if let Some(on) = response.set_character_shadows {
             editor.doc.edit("Character Shadows", |scene| {
                 scene.lights_mut().no_character_shadows = !on;
+            });
+        }
+        if let Some(light) = response.set_character_light {
+            editor.doc.edit("Character Shadow Settings", |scene| {
+                scene.lights_mut().character_light = Some(light);
             });
         }
         if let Some(only) = response.set_shadows_only {
@@ -8616,6 +8914,9 @@ impl App {
 
     /// Turn timeline interactions into editor actions.
     fn apply_timeline(&mut self, response: buzz_ui::TimelineResponse, commands: &mut Vec<Command>) {
+        if let Some(i) = response.remove_talk_range {
+            self.editor.remove_talk_range(i);
+        }
         if response.toggle_depth {
             let on = !self.editor.workspace.depth_view;
             self.editor.workspace.depth_view = on;
@@ -9599,133 +9900,6 @@ impl App {
         )
     }
 
-    /// The zoom control that sits on the stage itself, top right.
-    ///
-    /// # Why here as well as in the status bar
-    ///
-    /// The status bar is where a *number* belongs, and it is the last place
-    /// anybody looks while drawing. Zoom is used constantly and with the
-    /// pointer already over the artwork, so the control belongs where the eye
-    /// already is — which is what every other creative tool has settled on,
-    /// Animate included.
-    ///
-    /// Drawn as an overlay rather than as another panel: it must float above
-    /// the artwork without taking a strip of the stage away from it.
-    fn stage_zoom_overlay(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
-        if area.width() < 160.0 || area.height() < 80.0 {
-            return;
-        }
-
-        // Inset from the corner, and clear of the ruler along the top edge.
-        let top = area.min.y
-            + if self.editor.view.show_rulers {
-                24.0
-            } else {
-                8.0
-            };
-        let anchor = egui::pos2(area.max.x - 8.0, top);
-
-        egui::Area::new(egui::Id::new("stage-zoom"))
-            .fixed_pos(anchor)
-            .pivot(egui::Align2::RIGHT_TOP)
-            .order(egui::Order::Middle)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style())
-                    .fill(Palette::panel())
-                    .inner_margin(egui::Margin::symmetric(6, 3))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(egui::Button::new("\u{2212}").min_size(egui::vec2(24.0, 24.0)))
-                                .on_hover_text("Zoom out (Ctrl+- or Ctrl+wheel)")
-                                .clicked()
-                            {
-                                self.editor.zoom_by(1.0 / WHEEL_ZOOM_STEP.powi(3));
-                            }
-
-                            // The percentage is also the drag: pulling it is
-                            // the fastest way across a wide range, and the
-                            // speed is proportional so one gesture works at
-                            // 50% and at a trillion.
-                            let mut percent = self.editor.camera.zoom_percent();
-                            let speed = percent.max(1.0) * 0.02;
-                            let response = ui.add(
-                                egui::DragValue::new(&mut percent)
-                                    .speed(speed)
-                                    .range(0.001..=f64::MAX)
-                                    .suffix(" %"),
-                            );
-                            if response.changed() {
-                                self.editor.set_zoom_centred(percent);
-                            }
-
-                            if ui
-                                .add(egui::Button::new("+").min_size(egui::vec2(24.0, 24.0)))
-                                .on_hover_text("Zoom in (Ctrl+= or Ctrl+wheel)")
-                                .clicked()
-                            {
-                                self.editor.zoom_by(WHEEL_ZOOM_STEP.powi(3));
-                            }
-
-                            // `⏷`, not `▾`: egui's bundled fonts have the first and
-                            // not the second, which drew as an empty box in the very
-                            // first screenshot of this control.
-                            //
-                            // `MenuButton::from_button`, not `ui.menu_button`: a
-                            // lone glyph button defaults to a text-tight width —
-                            // under the 24 px hit-target minimum (Stage 6, item
-                            // 3) — and `min_size` is not something the plain
-                            // `menu_button` helper exposes.
-                            let (chevron, _) = egui::containers::menu::MenuButton::from_button(
-                                egui::Button::new("\u{23F7}").min_size(egui::vec2(24.0, 24.0)),
-                            )
-                            .ui(ui, |ui| {
-                                for preset in [25.0, 50.0, 100.0, 200.0, 400.0, 800.0] {
-                                    if ui.button(format!("{preset:.0}%")).clicked() {
-                                        self.editor.set_zoom_centred(preset);
-                                        ui.close();
-                                    }
-                                }
-                                ui.separator();
-                                if ui.button("Fit in Window").clicked() {
-                                    self.editor.run(Command::ZoomFitInWindow);
-                                    ui.close();
-                                }
-                                if ui.button("Show All").clicked() {
-                                    self.editor.run(Command::ZoomShowAll);
-                                    ui.close();
-                                }
-                                if ui.button("Show Frame").clicked() {
-                                    self.editor.run(Command::ZoomShowFrame);
-                                    ui.close();
-                                }
-                            });
-                            chevron.on_hover_text("Zoom presets");
-
-                            ui.separator();
-
-                            // Pan, for anybody who has not met the space bar.
-                            let panning = self.editor.tool() == buzz_ui::ToolId::Hand;
-                            if ui
-                                .selectable_label(panning, "\u{270B}")
-                                .on_hover_text(
-                                    "Pan the view \u{2014} or hold the space bar, or drag with \
-                                     the middle button, whatever the tool",
-                                )
-                                .clicked()
-                            {
-                                let next = if panning {
-                                    buzz_ui::ToolId::Selection
-                                } else {
-                                    buzz_ui::ToolId::Hand
-                                };
-                                self.editor.run(Command::SelectTool(next));
-                            }
-                        });
-                    });
-            });
-    }
-
     /// **The status strip**: zoom, its presets, the precision readout, the
     /// last status message and the frame's cost — at the right end of the
     /// menu row.
@@ -9807,28 +9981,46 @@ impl App {
             );
             ui.separator();
 
-            // Zoom, with Animate's presets plus an unbounded field — in
-            // reverse, since this layout runs right to left.
-            egui::ComboBox::from_id_salt("zoom-preset")
-                .selected_text("Presets")
-                .width(90.0)
-                .show_ui(ui, |ui| {
-                    for preset in [25.0, 50.0, 100.0, 200.0, 400.0, 800.0, 2000.0] {
-                        if ui
-                            .selectable_label(false, format!("{preset:.0}%"))
-                            .clicked()
-                        {
-                            self.editor.set_zoom_centred(preset);
-                        }
+            // Zoom, in line with the document's name: out, the unbounded
+            // field, in, and Animate's presets (user 2026-11-14: the stage's
+            // own corner control moved up here, off the artwork; its hand is
+            // the Hand tool and the space bar). In reverse, since this layout
+            // runs right to left.
+            // `⏷`, not `▾`: egui's bundled fonts have the first and not the
+            // second. A lone glyph rather than a "Presets" box, so the row
+            // keeps the room it had before − and + joined it.
+            let (chevron, _) = egui::containers::menu::MenuButton::from_button(
+                egui::Button::new("\u{23F7}").min_size(egui::vec2(24.0, 0.0)),
+            )
+            .ui(ui, |ui| {
+                for preset in [25.0, 50.0, 100.0, 200.0, 400.0, 800.0, 2000.0] {
+                    if ui.button(format!("{preset:.0}%")).clicked() {
+                        self.editor.set_zoom_centred(preset);
+                        ui.close();
                     }
-                    ui.separator();
-                    if ui.selectable_label(false, "Fit in Window").clicked() {
-                        self.editor.run(Command::ZoomFitInWindow);
-                    }
-                    if ui.selectable_label(false, "Show All").clicked() {
-                        self.editor.run(Command::ZoomShowAll);
-                    }
-                });
+                }
+                ui.separator();
+                if ui.button("Fit in Window").clicked() {
+                    self.editor.run(Command::ZoomFitInWindow);
+                    ui.close();
+                }
+                if ui.button("Show All").clicked() {
+                    self.editor.run(Command::ZoomShowAll);
+                    ui.close();
+                }
+                if ui.button("Show Frame").clicked() {
+                    self.editor.run(Command::ZoomShowFrame);
+                    ui.close();
+                }
+            });
+            chevron.on_hover_text("Zoom presets: 25% to 2000%, Fit in Window, Show All, Show Frame");
+            if ui
+                .add(egui::Button::new("+").min_size(egui::vec2(24.0, 0.0)))
+                .on_hover_text("Zoom in (Ctrl+= or Ctrl+wheel)")
+                .clicked()
+            {
+                self.editor.zoom_by(WHEEL_ZOOM_STEP.powi(3));
+            }
 
             let mut percent = self.editor.camera.zoom_percent();
             // Proportional drag speed, so one gesture is useful at 50% and at
@@ -9843,6 +10035,13 @@ impl App {
             );
             if response.changed() {
                 self.editor.set_zoom_centred(percent);
+            }
+            if ui
+                .add(egui::Button::new("\u{2212}").min_size(egui::vec2(24.0, 0.0)))
+                .on_hover_text("Zoom out (Ctrl+- or Ctrl+wheel)")
+                .clicked()
+            {
+                self.editor.zoom_by(1.0 / WHEEL_ZOOM_STEP.powi(3));
             }
             ui.label("Zoom");
         });
@@ -10644,6 +10843,7 @@ impl App {
                 self.move_stage = Some(MoveStageFrames { first: first + 1, last: last + 1, to: last + 2, copy: false });
             }
             Command::LipSyncAllCharacters => self.lip_sync_all_start(),
+            Command::MarkTalkRange => self.open_talk_range_dialog(),
             Command::ToggleMasterAudioMode => self.toggle_master_audio_mode(),
             Command::ImportCaptions => self.ask_for_path(
                 crate::dialogs::Request::open_file().filter("Subtitles", &["srt", "vtt"]),
@@ -10870,7 +11070,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut match_theme, false, "Custom colour");
                     ui.add_enabled_ui(!match_theme, |ui| {
-                        ui.color_edit_button_srgba_unmultiplied(&mut colour);
+                        buzz_ui::widgets::color_button_unmultiplied(ui, &mut colour);
                     });
                 });
             });
@@ -12631,6 +12831,9 @@ impl App {
                 if let Some(status) = self.editor.status.as_mut() {
                     status.push_str(&format!(" \u{2014} heard by Rhubarb in {secs:.1} s"));
                 }
+            }
+            AiResult::TalkRangesHeard { pending, keys, start, secs } => {
+                self.talk_ranges_run(pending, Some((keys, start)), Some(secs));
             }
             AiResult::LipSyncAllHeard { lines, visemes, rhubarb, scripted, start, notes, secs, model } => {
                 let pending = PendingLipSyncAll { lines, visemes, rhubarb, start, notes, secs, model, had_script: scripted };
@@ -18631,9 +18834,11 @@ impl App {
             self.last_stage_area.unwrap_or(FALLBACK_STAGE_AREA)
         };
         active.stage_area = stage_area;
+        let no_pointer = output.platform_output.cursor_icon == egui::CursorIcon::None;
         active
             .egui_state
             .handle_platform_output(&window, output.platform_output);
+        hide_system_cursor(&mut self.system_cursor_hidden, no_pointer && window.has_focus());
 
         // When egui next wants to be repainted, folded into `wants_frame` so the
         // idle loop honours its animations. A zero delay means "again now"; the
@@ -19605,6 +19810,11 @@ impl ApplicationHandler<UserEvent> for App {
         if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             WAKE_EGUI_EVENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             active.window.request_redraw();
+        }
+        // The pointer back the moment it leaves the window or the app loses
+        // the keys, whatever the next frame says.
+        if matches!(event, WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. }) {
+            hide_system_cursor(&mut self.system_cursor_hidden, false);
         }
 
         match event {
@@ -29979,6 +30189,39 @@ struct WhoIsWho {
 
 /// What Move Stage Frames… is set to while it is open, in frames counted
 /// from 1 as the timeline shows them.
+/// Mark Talk Range… while it is open: frames counted from 1, as the
+/// timeline shows them, and everybody on the stage who can talk with whether
+/// this range is theirs.
+#[derive(Debug, Clone, PartialEq)]
+struct TalkRangeDialog {
+    first: u32,
+    last: u32,
+    who: Vec<(String, bool)>,
+}
+
+/// A talking command waiting to run over the talk ranges while Rhubarb
+/// hears the dialogue: the command, the ranges as they were when it was
+/// pressed, and why there will be no lip sync, when there will not.
+struct PendingTalkRanges {
+    name: String,
+    source: String,
+    ranges: Vec<crate::editor::TalkRange>,
+    note: Option<String>,
+}
+
+/// Does this command ask for the end frame of what it animates — the
+/// talking commands' first question (\u{201c}Confirm the END frame number\u{2026}\u{201d})
+/// — so that it can run over a talk range by being given the range's last?
+fn asks_for_end_frame(source: &str) -> bool {
+    let Some(at) = source.find("prompt(") else {
+        return false;
+    };
+    // Up to where the question closes, so a comment past it does not count.
+    let rest = &source[at..];
+    let question: String = rest[..rest.find(");").unwrap_or(rest.len())].chars().take(600).collect();
+    question.to_lowercase().contains("end frame")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct MoveStageFrames {
     first: u32,
@@ -30110,6 +30353,68 @@ mod camera_row_ui_tests {
         drag_stage(&mut app, &ctx);
         assert_eq!(keys(&app), vec![0, 20]);
         assert_eq!(app.editor.status.as_deref(), Some(crate::editor::CAMERA_LOCKED));
+    }
+}
+
+#[cfg(test)]
+mod tool_follow_tests {
+    use super::*;
+
+    /// **Picking a tool shows its options** where the layout keeps them — the
+    /// far-right strip's pop-out — and they stay open while drawing, until
+    /// closed. The Hand, which only pans, opens nothing; the layout never
+    /// moves.
+    #[test]
+    fn picking_a_tool_brings_its_options_forward() {
+        use buzz_ui::{Dock, PanelId, ToolId};
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        app.editor.workspace = buzz_ui::Workspace::default();
+        app.editor.workspace.icon_strip = true;
+        app.editor.workspace.move_to(PanelId::ToolOptions, Dock::RightOuter);
+        let layout = app.editor.workspace.slots.clone();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                time: Some(t),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            });
+        };
+        frame(&mut app, vec![]);
+        assert!(app.strip_flyout.is_none());
+
+        // A tool picked: its options open from the far-right strip.
+        app.editor.run(Command::SelectTool(ToolId::Brush));
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        assert_eq!(app.strip_flyout.map(|(id, _)| id), Some(PanelId::ToolOptions), "the Brush's options open");
+
+        // Drawing on the stage and Esc leave it open.
+        let stage = egui::pos2(500.0, 400.0);
+        let m = egui::Modifiers::default();
+        frame(&mut app, vec![egui::Event::PointerMoved(stage)]);
+        frame(&mut app, vec![egui::Event::PointerButton { pos: stage, button: egui::PointerButton::Primary, pressed: true, modifiers: m }]);
+        frame(&mut app, vec![egui::Event::PointerButton { pos: stage, button: egui::PointerButton::Primary, pressed: false, modifiers: m }]);
+        frame(&mut app, vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: m }]);
+        frame(&mut app, vec![]);
+        assert_eq!(app.strip_flyout.map(|(id, _)| id), Some(PanelId::ToolOptions), "open until it is closed");
+
+        // The Hand moves nothing, and nothing in the layout has moved.
+        app.strip_flyout = None;
+        app.editor.run(Command::SelectTool(ToolId::Hand));
+        frame(&mut app, vec![]);
+        assert!(app.strip_flyout.is_none(), "the Hand opens nothing");
+        let docks = |slots: &[buzz_ui::Slot]| slots.iter().map(|s| (s.id, s.dock)).collect::<Vec<_>>();
+        assert_eq!(docks(&app.editor.workspace.slots), docks(&layout), "the layout is as it was");
     }
 }
 
@@ -30250,5 +30555,216 @@ fn split_trace_options(look: crate::bg_objects::SplitLook) -> buzz_scene::TraceO
         crate::bg_objects::SplitLook::Bold => buzz_scene::TraceOptions::bold().with_saved_tuning(),
         // Trace Bitmap's look with its gradients kept (a graded wall, a glow) as in the Bold split.
         crate::bg_objects::SplitLook::Normal => buzz_scene::TraceOptions { keep_textures: true, ..crate::editor::quick_trace_options() },
+    }
+}
+
+#[cfg(test)]
+mod talk_range_tests {
+    use super::*;
+
+    /// A stage with two characters (symbols with a head layer), each on a
+    /// layer of its own, 100 frames long.
+    fn two_characters() -> (App, buzz_scene::ObjectId, buzz_scene::ObjectId) {
+        let mut scene = buzz_scene::Scene::default();
+        let mut place = |scene: &mut buzz_scene::Scene, name: &str, layer: Option<buzz_scene::LayerId>| {
+            let symbol = scene.add_symbol(name, buzz_scene::SymbolKind::Graphic, None);
+            scene.library_mut().update(symbol, |s| {
+                let first = s.layers.iter().next().unwrap().id;
+                s.layers.update(first, |l| l.name = "head".into());
+            });
+            let layer = layer.unwrap_or_else(|| scene.add_layer(name, buzz_scene::LayerKind::Normal));
+            let id = scene.next_object_id();
+            scene.add_object_at(layer, 0, buzz_scene::Object::instance_of(id, symbol));
+            scene.update_layer(layer, |l| { l.frames.insert_frame(99); });
+            id
+        };
+        let first = scene.layers().iter().next().map(|l| l.id);
+        let ramesh = place(&mut scene, "Ramesh", first);
+        let sita = place(&mut scene, "Sita", None);
+        let app = App::new(GpuPreference::Automatic).with_document(Document::new(scene));
+        (app, ramesh, sita)
+    }
+
+    /// A stand-in for autoTalkingAnimation: asks for its end frame, and
+    /// leaves a layer saying who it ran on and over which frames.
+    const TALKING: &str = r#"
+        var end = parseInt(prompt("Confirm the END frame number for the talking range:", "0"), 10);
+        var doc = fl.getDocumentDOM();
+        var t = doc.getTimeline();
+        t.addNewLayer("ran " + doc.selection[0].libraryItem.name + " " + t.currentFrame + "-" + end);
+    "#;
+
+    fn ran(app: &App) -> Vec<String> {
+        let mut out: Vec<String> = app.editor.doc.scene().layers().iter().map(|l| l.name.clone()).filter(|n| n.starts_with("ran ")).collect();
+        out.sort();
+        out
+    }
+
+    /// **A talking command runs over every talk range, for every character
+    /// marked on it**, with the playhead on the range's first frame and the
+    /// range's last as its end frame; one undo step takes it all back, and
+    /// the playhead and ranges are where they were.
+    #[test]
+    fn a_talking_command_runs_over_each_range_for_each_character() {
+        let (mut app, _, _) = two_characters();
+        app.editor.set_frame(7);
+        app.editor.mark_talk_range(10, 30, vec!["Ramesh".into()]);
+        app.editor.mark_talk_range(60, 40, vec!["Ramesh".into(), "Sita".into()]);
+        assert_eq!(
+            app.talk_range_bands(),
+            vec![
+                buzz_ui::TalkRangeBand { start: 10, end: 30, label: "Ramesh".into() },
+                buzz_ui::TalkRangeBand { start: 40, end: 60, label: "Ramesh, Sita".into() },
+            ],
+            "drawn in frame order, the far end first or not"
+        );
+        let pending = PendingTalkRanges {
+            name: "talk".into(),
+            source: TALKING.into(),
+            ranges: app.editor.talk_ranges_here().into_iter().map(|(_, r)| r.clone()).collect(),
+            note: None,
+        };
+        app.talk_ranges_run(pending, None, None);
+        assert_eq!(ran(&app), vec!["ran Ramesh 10-30", "ran Ramesh 40-60", "ran Sita 40-60"]);
+        assert_eq!(app.editor.current_frame, 7);
+        assert!(app.editor.status.as_deref().unwrap_or("").contains("ran 3 times over 2 talk ranges"), "{:?}", app.editor.status);
+        assert_eq!(app.editor.talk_ranges_here().len(), 2, "kept until cleared");
+
+        app.editor.run(Command::Undo);
+        assert!(ran(&app).is_empty(), "one undo step: {:?}", ran(&app));
+    }
+
+    /// **Somebody marked who is not on the stage any more is said so**,
+    /// and the others still run.
+    #[test]
+    fn a_character_missing_from_a_range_is_reported() {
+        let (mut app, _, sita) = two_characters();
+        app.editor.doc.edit("gone", |scene| {
+            let layer = scene.layers().iter().find(|l| l.name == "Sita").unwrap().id;
+            scene.update_layer(layer, |l| { l.frames.set_objects(0, Vec::new()); });
+        });
+        let _ = sita;
+        app.editor.mark_talk_range(10, 30, vec!["Ramesh".into(), "Sita".into(), "Nobody".into()]);
+        let pending = PendingTalkRanges {
+            name: "talk".into(),
+            source: TALKING.into(),
+            ranges: app.editor.talk_ranges_here().into_iter().map(|(_, r)| r.clone()).collect(),
+            note: None,
+        };
+        app.talk_ranges_run(pending, None, None);
+        assert_eq!(ran(&app), vec!["ran Ramesh 10-30"]);
+        let status = app.editor.status.clone().unwrap_or_default();
+        assert!(status.contains("Nobody, frames 11\u{2013}31: not on the stage"), "{status}");
+        assert!(status.contains("Sita, frames 11\u{2013}31: not on the stage"), "{status}");
+    }
+
+    /// Ranges belong to their scene, and come off one by one or all at once.
+    #[test]
+    fn talk_ranges_are_per_scene_and_cleared() {
+        let (mut app, _, _) = two_characters();
+        app.editor.mark_talk_range(10, 30, vec!["Ramesh".into()]);
+        app.editor.mark_talk_range(40, 60, vec!["Sita".into()]);
+        app.editor.remove_talk_range(0);
+        assert_eq!(app.talk_range_bands().iter().map(|b| b.start).collect::<Vec<_>>(), vec![40]);
+        app.editor.run(Command::AddScene);
+        assert!(app.talk_range_bands().is_empty(), "another scene has none");
+        app.editor.mark_talk_range(5, 9, vec!["Sita".into()]);
+        app.editor.run(Command::ClearTalkRanges);
+        assert!(app.editor.talk_ranges_here().is_empty());
+        assert_eq!(app.editor.talk_ranges.len(), 1, "the first scene's range is kept");
+    }
+
+    /// Only the commands whose question is the end frame run over ranges:
+    /// the talking ones, not a one-key hand move or Rename Symbol.
+    #[test]
+    fn only_commands_asking_for_an_end_frame_run_over_ranges() {
+        assert!(asks_for_end_frame(TALKING));
+        assert!(asks_for_end_frame("var input = prompt(\n \"Random\" +\n \"Enter the END frame number for the animation range:\", 120);"));
+        assert!(!asks_for_end_frame("var n = prompt(\"New name\", \"x\"); // end frame of the walk"), "the question, not a comment beyond it");
+        assert!(!asks_for_end_frame("// rotates to the end frame\nvar t = fl.getDocumentDOM().getTimeline();"));
+    }
+}
+
+#[cfg(test)]
+mod cast_window_tests {
+    use super::*;
+
+    fn frame(app: &mut App, ctx: &egui::Context, t: &mut f64, events: Vec<egui::Event>) -> Vec<(String, egui::Rect)> {
+        *t += 1.0 / 60.0;
+        let input = egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+            time: Some(*t),
+            predicted_dt: 1.0 / 60.0,
+            ..Default::default()
+        };
+        let out = ctx.run_ui(input, |ui| {
+            app.build_ui(ui);
+        });
+        out.shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(x) => Some((x.galley.text().to_string(), x.visual_bounding_rect())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn click(app: &mut App, ctx: &egui::Context, t: &mut f64, at: egui::Pos2) {
+        let m = egui::Modifiers::default();
+        frame(app, ctx, t, vec![egui::Event::PointerMoved(at)]);
+        frame(app, ctx, t, vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: m }]);
+        frame(app, ctx, t, vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: m }]);
+    }
+
+    /// **Add Pose takes what is typed into its name**, and stays open until
+    /// Add or Cancel. Drawn from inside the docked Cast panel it took no
+    /// pointer: the field never had the focus, the letters went to the tool
+    /// keys (S, I, T, N, G each picked a tool) and the window was useless.
+    #[test]
+    fn add_pose_takes_typing_and_stays_open() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        app.editor.workspace = buzz_ui::Workspace::default();
+        app.editor.workspace.reveal(buzz_ui::PanelId::Cast);
+        let asset = buzz_doc::Asset {
+            name: "Raju".into(),
+            folder: "Cast".into(),
+            path: "/nonexistent/Cast/Raju.buzz".into(),
+            animated: false,
+            rig_kind: None,
+            tags: Vec::new(),
+        };
+        app.editor.cast_panel.add_pose = Some(buzz_ui::AddPoseAsk::for_asset(&asset, None));
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut t = 0.0;
+        let mut texts = Vec::new();
+        for _ in 0..3 {
+            texts = frame(&mut app, &ctx, &mut t, vec![]);
+        }
+        // The name field, right of the character's name.
+        let name = texts.iter().filter(|(s, _)| s == "Raju").last().map(|x| x.1).expect("the window shows the character");
+        click(&mut app, &ctx, &mut t, egui::pos2(name.max.x + 60.0, name.center().y));
+        let tool = app.editor.tool();
+        let m = egui::Modifiers::default();
+        for ch in ["S", "i", "t"] {
+            let key = egui::Key::from_name(&ch.to_uppercase()).unwrap();
+            frame(&mut app, &ctx, &mut t, vec![
+                egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: m },
+                egui::Event::Text(ch.into()),
+                egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: m },
+            ]);
+        }
+        let ask = app.editor.cast_panel.add_pose.as_ref().expect("still open while being filled in");
+        assert_eq!(ask.label, "Sit");
+        assert_eq!(app.editor.tool(), tool, "the letters went into the field, not to the tool keys");
+
+        // Cancel closes it.
+        let texts = frame(&mut app, &ctx, &mut t, vec![]);
+        let cancel = texts.iter().filter(|(s, _)| s == "Cancel").last().map(|x| x.1.center()).expect("Cancel");
+        click(&mut app, &ctx, &mut t, cancel);
+        assert!(app.editor.cast_panel.add_pose.is_none(), "Cancel closes it");
     }
 }

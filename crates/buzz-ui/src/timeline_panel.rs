@@ -2384,6 +2384,20 @@ fn transport_controls(
         if response.secondary_clicked() && marked > 0 {
             out.command = Some(crate::Command::ClearTalkRanges);
         }
+
+        // **Copy / Paste Stage**: one button, two presses — here, then on
+        // the frame to paste at.
+        let (label, tip) = match state.stage_copied {
+            None => ("Copy Stage".to_string(), "Copy everything on the stage at this frame, every layer. Then go to another frame and press again to paste it there.".to_string()),
+            Some(from) => (
+                format!("Paste Stage \u{00b7} {}", from + 1),
+                format!("Paste the stage copied at frame {} here, every symbol set to this frame's number. Press on frame {} to let go of it.", from + 1, from + 1),
+            ),
+        };
+        let button = egui::Button::new(egui::RichText::new(label).small()).selected(state.stage_copied.is_some());
+        if ui.add(button).on_hover_text(tip).clicked() {
+            out.command = Some(crate::Command::CopyPasteStage);
+        }
     }
 }
 
@@ -2672,7 +2686,7 @@ fn ruler(
     let side = crate::theme::Tokens::CONTROL_H;
     let buttons = egui::Rect::from_min_size(
         egui::pos2(name_row.min.x + 4.0, name_row.center().y - side / 2.0),
-        egui::vec2(2.0 * side + 4.0 + 92.0, side),
+        egui::vec2(2.0 * side + 4.0, side),
     );
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(buttons).layout(egui::Layout::left_to_right(egui::Align::Center)),
@@ -2691,19 +2705,6 @@ fn ruler(
                 .clicked()
             {
                 out.command = Some(crate::Command::DeleteLayer);
-            }
-            // **Copy / Paste Stage**: one button, two presses — here, then on
-            // the frame to paste at.
-            let (label, tip) = match state.stage_copied {
-                None => ("Copy Stage".to_string(), "Copy everything on the stage at this frame, every layer. Then go to another frame and press again to paste it there.".to_string()),
-                Some(from) => (
-                    format!("Paste Stage \u{00b7} {}", from + 1),
-                    format!("Paste the stage copied at frame {} here, every symbol set to this frame's number. Press on frame {} to let go of it.", from + 1, from + 1),
-                ),
-            };
-            let button = egui::Button::new(egui::RichText::new(label).small()).selected(state.stage_copied.is_some());
-            if ui.add(button).on_hover_text(tip).clicked() {
-                out.command = Some(crate::Command::CopyPasteStage);
             }
         },
     );

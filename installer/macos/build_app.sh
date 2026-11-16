@@ -3,7 +3,9 @@
 #  Builds BuzzAnimate.app and BuzzAnimate.dmg for macOS (Apple Silicon).
 #
 #      installer/macos/build_app.sh             build the .app and .dmg into dist/
-#      installer/macos/build_app.sh --install   also copy the .app into /Applications
+#      installer/macos/build_app.sh --install   also move the .app into /Applications
+#                                               (none is left in dist/, so Launchpad
+#                                               and Spotlight show one BuzzAnimate)
 #
 #  The bundle is self-contained apart from ffmpeg (video/GIF export), which is
 #  picked up from Homebrew when present. User data that the source checkout
@@ -109,7 +111,8 @@ rm -rf "$STAGE"
 if [ "${1:-}" = "--install" ]; then
     echo "== Installing to /Applications"
     rm -rf /Applications/BuzzAnimate.app
-    cp -R "$APP" /Applications/
+    mv "$APP" /Applications/
+    APP=/Applications/BuzzAnimate.app
 fi
 
 echo "Done:"

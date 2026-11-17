@@ -61,6 +61,10 @@ pub enum CastAction {
     },
     /// Keep the current selection as a new character in the cast.
     AddSelection,
+    /// **Cast as Layers** (the Cast button's right-click): a character with
+    /// poses unpacked into a layer folder on the timeline, breathing and
+    /// blinking — where plain Cast places it as one symbol.
+    CastLayers(Asset),
     Rename {
         asset: Asset,
         name: String,
@@ -88,9 +92,29 @@ pub enum CastAction {
     RemovePose { asset: Asset, pose: String },
     /// Rename a pose (full symbol name) to `<Character> <label>`.
     RenamePose { asset: Asset, pose: String, label: String },
+    /// **Tag a pose** to one of the [`POSE_SLOTS`]: it becomes
+    /// `<Character> <label>`. A pose already tagged there swaps names with it
+    /// (from one of the character's poses) or is replaced (from the stage).
+    TagPose { asset: Asset, label: String, from: TagFrom },
+    /// **An extra pose tag** of the user's own (`Sit`, `Run`...), kept with
+    /// the character beyond the six.
+    AddTag { asset: Asset, label: String },
+    /// Take an extra pose tag away; a pose tagged there stays a pose.
+    RemoveTag { asset: Asset, label: String },
     /// **Save changes to <name>** (C2 e2): write the placed character that was
     /// edited on the stage back over its Cast asset, backup first.
     SaveChanges(Asset),
+    /// **Update** (user 2026-11-17: the Cast is the one place a character
+    /// lives, and "update is done there"): a copy changed in the open film
+    /// goes back to the Cast file first; then every film open here takes the
+    /// character as the Cast now draws it.
+    Update(Asset),
+    /// **Duplicate** the character in the Cast as `<Name> copy`, to rename and
+    /// change on its own.
+    Duplicate(Asset),
+    /// **Edit** the character's own Cast file in a tab of its own: what is
+    /// saved there is the Cast's, and Update takes it into the films.
+    Edit(Asset),
     /// Read the cast folder again.
     Rescan,
     /// **Start Fresh** was confirmed: clear every keyframe of this character
@@ -111,6 +135,40 @@ pub enum PoseSource {
     Picture(std::path::PathBuf),
     /// One symbol of an FLA, by name.
     FlaSymbol { fla: std::path::PathBuf, symbol: String },
+}
+
+/// **The six poses** a character is given in the Cast panel: what the slot
+/// reads, and the label its pose is saved under (`<Character> <label>`), in the
+/// names the rest of the app looks a pose up by (`Back`, `Side`, `Walk Front`).
+/// Until a Front is tagged, the character's main pose is its front.
+pub const POSE_SLOTS: [(&str, &str); 6] = [
+    ("Front", "Front"),
+    ("Front Walk", "Walk Front"),
+    ("Back", "Back"),
+    ("Back Walk", "Walk Back"),
+    ("Side", "Side"),
+    ("Side Walk", "Walk Side"),
+];
+
+/// What a pose is tagged from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TagFrom {
+    /// One of the character's poses, by full name.
+    Pose(String),
+    /// The symbol selected on the stage, by name.
+    Selected(String),
+}
+
+/// Whether `pose`'s name reads like the slot saved as `label`: the same view
+/// (back, side, else front) and walking or not.
+fn suits_slot(pose: &str, label: &str) -> bool {
+    // An extra tag of the user's own: the poses whose names hold it.
+    if !POSE_SLOTS.iter().any(|(_, l)| *l == label) {
+        return pose.to_lowercase().contains(&label.to_lowercase());
+    }
+    let view = |n: &str| if n.contains("back") { 1 } else if n.contains("side") { 2 } else { 0 };
+    let (n, l) = (pose.to_lowercase(), label.to_lowercase());
+    view(&n) == view(&l) && n.contains("walk") == l.contains("walk")
 }
 
 /// The Add Pose window, open while the user fills it in.
@@ -201,6 +259,10 @@ pub struct CastPanelState {
     /// **Add Selected as Pose** adds.
     pub selected_symbol: Option<String>,
     pub character_poses: Vec<String>,
+    /// The open character's extra pose tags, beyond the six (filled by the shell).
+    pub character_tags: Vec<String>,
+    /// The extra pose tag being typed.
+    pub new_tag: String,
     pub save_target: Option<Asset>,
     /// "Add breath + blinks" is ticked by default: this is its inverse, so a default panel has it on.
     pub life_off: bool,
@@ -270,6 +332,35 @@ pub fn cast_panel(
                 });
             }
         });
+    });
+
+    // **Add to Cast at the top**, where an open character's long sheet
+    // cannot push it out of sight.
+    ui.horizontal_wrapped(|ui| {
+        let add = ui.add_enabled(can_add, egui::Button::new("Add to Cast").small());
+        if add
+            .on_hover_text("Keep the selected character here, ready to direct into any film")
+            .on_disabled_hover_text("Select a character on the stage first")
+            .clicked()
+        {
+            action = Some(CastAction::AddSelection);
+        }
+        if let Some(target) = state.save_target.clone()
+            && ui
+                .add(egui::Button::new(format!("Save changes to {}", target.name)).small())
+                .on_hover_text("Write the edited character on the stage back over its Cast asset (the old file is kept in _cast_backup)")
+                .clicked()
+        {
+            action = Some(CastAction::SaveChanges(target));
+        }
+        if !can_add {
+            ui.label(
+                RichText::new("select a character to add")
+                    .small()
+                    .weak()
+                    .italics(),
+            );
+        }
     });
 
     ui.horizontal(|ui| {
@@ -354,33 +445,6 @@ pub fn cast_panel(
             state.open = None;
         }
     }
-
-    ui.separator();
-    ui.horizontal_wrapped(|ui| {
-        let add = ui.add_enabled(can_add, egui::Button::new("Add to Cast").small());
-        if add
-            .on_hover_text("Keep the selected character here, ready to direct into any film")
-            .clicked()
-        {
-            action = Some(CastAction::AddSelection);
-        }
-        if let Some(target) = state.save_target.clone()
-            && ui
-                .add(egui::Button::new(format!("Save changes to {}", target.name)).small())
-                .on_hover_text("Write the edited character on the stage back over its Cast asset (the old file is kept in _cast_backup)")
-                .clicked()
-        {
-            action = Some(CastAction::SaveChanges(target));
-        }
-        if !can_add {
-            ui.label(
-                RichText::new("select a character to add")
-                    .small()
-                    .weak()
-                    .italics(),
-            );
-        }
-    });
 
     action
 }
@@ -505,12 +569,24 @@ fn character_row(
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
+            let cast = ui
                 .small_button("Cast")
-                .on_hover_text("Put a copy of this character into the shot")
-                .clicked()
-            {
+                .on_hover_text("Put a copy of this character into the shot, as one symbol whose poses switch from the playhead \u{b7} right-click: as layers");
+            if cast.clicked() {
                 *action = Some(CastAction::Cast(asset.clone()));
+            }
+            cast.context_menu(|ui| {
+                if ui
+                    .button("Cast as Layers")
+                    .on_hover_text("Unpack the character into a layer folder on this timeline, breathing and blinking")
+                    .clicked()
+                {
+                    *action = Some(CastAction::CastLayers(asset.clone()));
+                    ui.close();
+                }
+            });
+            if ui.small_button("Update").on_hover_text(UPDATE_HINT).clicked() {
+                *action = Some(CastAction::Update(asset.clone()));
             }
             if ui
                 .small_button("Start Fresh")
@@ -535,6 +611,9 @@ fn character_row(
 const START_FRESH_HINT: &str =
     "Clear every keyframe of this character, keeping one pose, so it starts clean in a new file";
 
+const UPDATE_HINT: &str = "Update this character everywhere: changes made to it in this film go into the Cast first, \
+     then every open film takes the Cast's version (where it stands and its animation are kept; \u{2318}Z undoes it in a film)";
+
 /// The Start Fresh confirmation: which pose to keep, OK / Cancel. Nothing is
 /// written until OK; the shell backs the files up first.
 fn fresh_window(ctx: &egui::Context, state: &mut CastPanelState, action: &mut Option<CastAction>) {
@@ -543,6 +622,8 @@ fn fresh_window(ctx: &egui::Context, state: &mut CastPanelState, action: &mut Op
     };
     let mut decided = false;
     egui::Window::new("Start Fresh")
+        // In front of the Cast pop-out that opened it.
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -587,6 +668,8 @@ fn delete_window(ctx: &egui::Context, state: &mut CastPanelState, action: &mut O
     };
     let mut decided = false;
     egui::Window::new("Delete characters")
+        // In front of the Cast pop-out that opened it.
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -630,6 +713,8 @@ fn add_pose_window(ctx: &egui::Context, state: &mut CastPanelState, action: &mut
     let library = state.library_symbols.clone();
     let mut decided = false;
     egui::Window::new("Add Pose")
+        // In front of the Cast pop-out that opened it.
+        .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -716,6 +801,116 @@ fn add_pose_window(ctx: &egui::Context, state: &mut CastPanelState, action: &mut
     }
 }
 
+/// **Six poses**: Front, Front Walk, Back, Back Walk, Side, Side Walk — each
+/// with the pose tagged to it, **Tag Selected** for the symbol selected on the
+/// stage, and a menu of the character's other poses, the likely ones first.
+/// **Extra poses** below them work the same way, under tags the user names
+/// (user 2026-11-17: "add extra poses to the cast and tag them"): Sit, Run,
+/// Angry... An empty tag's **Add…** adds a new pose straight into it.
+fn six_poses(ui: &mut Ui, asset: &Asset, state: &mut CastPanelState, action: &mut Option<CastAction>) {
+    let poses = state.character_poses.clone();
+    let main = poses.first().cloned().unwrap_or_else(|| asset.name.clone());
+    let extra = state.character_tags.clone();
+    let slots: Vec<(String, String, bool)> = POSE_SLOTS
+        .iter()
+        .map(|(shown, label)| (shown.to_string(), label.to_string(), false))
+        .chain(extra.iter().map(|t| (t.clone(), t.clone(), true)))
+        .collect();
+    let tagged = |label: &str| {
+        let full = format!("{main} {label}");
+        poses.iter().skip(1).find(|p| p.eq_ignore_ascii_case(&full)).cloned()
+    };
+    // Poses in no slot, for the menus.
+    let free: Vec<&String> = poses
+        .iter()
+        .skip(1)
+        .filter(|p| !slots.iter().any(|(_, l, _)| p.eq_ignore_ascii_case(&format!("{main} {l}"))))
+        .collect();
+    ui.add_space(4.0);
+    ui.label(RichText::new("Six poses").strong());
+    let mut add_into: Option<String> = None;
+    egui::Grid::new(("six-poses", &asset.path)).num_columns(3).spacing([6.0, 2.0]).show(ui, |ui| {
+        for (i, (shown, label, removable)) in slots.iter().enumerate() {
+            if i == POSE_SLOTS.len() {
+                ui.label(RichText::new("Extra poses").strong());
+                ui.end_row();
+            }
+            ui.label(RichText::new(shown).small());
+            let here = tagged(label);
+            match &here {
+                Some(pose) => ui.label(RichText::new(pose).small()),
+                // Untagged, Front is the main pose.
+                None if label == "Front" => ui
+                    .label(RichText::new(format!("{main} (main)")).small().weak())
+                    .on_hover_text("The main pose shows as Front until a Front pose is tagged"),
+                None => ui.label(RichText::new("\u{2014}").small().weak()),
+            };
+            ui.horizontal(|ui| {
+                if let Some(symbol) = &state.selected_symbol
+                    && ui
+                        .small_button("Tag Selected")
+                        .on_hover_text(format!("Tag {symbol} (selected on the stage) as {}'s {shown}", asset.name))
+                        .clicked()
+                {
+                    *action = Some(CastAction::TagPose { asset: asset.clone(), label: label.clone(), from: TagFrom::Selected(symbol.clone()) });
+                }
+                if !free.is_empty() {
+                    let mut ranked = free.clone();
+                    ranked.sort_by_key(|p| !suits_slot(p, label));
+                    ui.menu_button(RichText::new("Pose \u{25b8}").small(), |ui| {
+                        for pose in ranked {
+                            let text = if suits_slot(pose, label) { format!("{pose}  \u{2605}") } else { pose.clone() };
+                            if ui.button(text).clicked() {
+                                *action = Some(CastAction::TagPose { asset: asset.clone(), label: label.clone(), from: TagFrom::Pose(pose.clone()) });
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(format!("Tag one of {}'s poses as {shown} (\u{2605} reads like one)", asset.name));
+                }
+                if here.is_none()
+                    && ui
+                        .small_button("Add\u{2026}")
+                        .on_hover_text(format!("Add a new pose to {} as its {shown}: from a Library symbol, a picture or an FLA symbol", asset.name))
+                        .clicked()
+                {
+                    add_into = Some(label.clone());
+                }
+                if *removable
+                    && ui
+                        .small_button("\u{d7}")
+                        .on_hover_text(format!("Take the {shown} tag away (a pose tagged there stays one of {}'s poses)", asset.name))
+                        .clicked()
+                {
+                    *action = Some(CastAction::RemoveTag { asset: asset.clone(), label: label.clone() });
+                }
+            });
+            ui.end_row();
+        }
+    });
+    if let Some(label) = add_into {
+        let mut ask = AddPoseAsk::for_asset(asset, state.selected_symbol.as_deref());
+        ask.label = label;
+        state.add_pose = Some(ask);
+    }
+
+    // A tag of the user's own, for a pose beyond the six.
+    ui.horizontal(|ui| {
+        let field = ui.add(egui::TextEdit::singleline(&mut state.new_tag).hint_text("New tag: Sit, Run, Angry\u{2026}").desired_width(130.0));
+        let typed = !state.new_tag.trim().is_empty();
+        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let add = ui
+            .add_enabled(typed, egui::Button::new("Add Tag").small())
+            .on_hover_text(format!("Give {} an extra pose tag, to fill with Tag Selected, Pose \u{25b8} or Add\u{2026}", asset.name))
+            .clicked();
+        if typed && (add || entered) {
+            *action = Some(CastAction::AddTag { asset: asset.clone(), label: state.new_tag.trim().to_string() });
+            state.new_tag.clear();
+        }
+    });
+}
+
 /// The open character's sheet: their wardrobe and the poses they know.
 fn character_sheet(
     ui: &mut Ui,
@@ -726,7 +921,16 @@ fn character_sheet(
     action: &mut Option<CastAction>,
 ) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(&asset.name).heading());
+        // **The name folds the whole sheet away** — wardrobe, poses and all
+        // (the same as clicking the open character in the list).
+        // Drawn open, with Wardrobe's arrow; a click on it closes the sheet.
+        let header = egui::CollapsingHeader::new(RichText::new(&asset.name).heading())
+            .id_salt(("cast-sheet", &asset.path))
+            .open(Some(true))
+            .show(ui, |_| {});
+        if header.header_response.on_hover_text("Fold this character's sheet away").clicked() {
+            state.open = None;
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Two clicks: a character is a file on disk with no undo.
             let armed = state.confirm_delete.as_deref() == Some(asset.path.as_path());
@@ -740,6 +944,23 @@ fn character_sheet(
                 .clicked()
             {
                 *action = Some(CastAction::Delete(asset.clone()));
+            }
+            if ui
+                .small_button("Duplicate")
+                .on_hover_text("Make a copy of this character in the Cast, to rename and change on its own")
+                .clicked()
+            {
+                *action = Some(CastAction::Duplicate(asset.clone()));
+            }
+            if ui
+                .small_button("Edit")
+                .on_hover_text("Open this character's Cast file in a tab of its own: change its drawing, save, then Update")
+                .clicked()
+            {
+                *action = Some(CastAction::Edit(asset.clone()));
+            }
+            if ui.small_button("Update").on_hover_text(UPDATE_HINT).clicked() {
+                *action = Some(CastAction::Update(asset.clone()));
             }
         });
     });
@@ -810,6 +1031,9 @@ fn character_sheet(
             }
         });
     }
+
+    // -- the six poses: tag the selection on the stage, or one of its poses --
+    six_poses(ui, asset, state, action);
 
     // -- the character's own poses (its symbol set): add, rename, remove --
     ui.add_space(4.0);
@@ -966,6 +1190,62 @@ mod tests {
             rig_kind: None,
             tags: Vec::new(),
         }
+    }
+
+    /// **Extra poses** (user 2026-11-17): the character's own tags show under
+    /// the six, an empty one with Add… and a × to take it away, and a tag
+    /// typed into the field is asked for as one.
+    #[test]
+    fn extra_pose_tags_show_under_the_six_and_a_new_one_can_be_typed() {
+        let ana = a_character();
+        let mut state = CastPanelState {
+            character_poses: vec!["Ana".into(), "Ana Sit".into()],
+            character_tags: vec!["Sit".into(), "Run".into()],
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let texts = |ctx: &egui::Context, state: &mut CastPanelState| -> Vec<String> {
+            let out = ctx.run_ui(Default::default(), |ui| {
+                let mut action = None;
+                six_poses(ui, &ana, state, &mut action);
+            });
+            out.shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let shown = texts(&ctx, &mut state);
+        for wanted in ["Extra poses", "Sit", "Ana Sit", "Run", "Add\u{2026}", "\u{d7}", "Add Tag"] {
+            assert!(shown.iter().any(|t| t == wanted), "{wanted} is shown: {shown:?}");
+        }
+        assert_eq!(shown.iter().filter(|t| *t == "\u{d7}").count(), 2, "only the extra tags can be taken away");
+
+        // Typed, then Add Tag: clicked where its label is drawn.
+        state.new_tag = " Angry ".into();
+        let out = ctx.run_ui(Default::default(), |ui| {
+            six_poses(ui, &ana, &mut state, &mut None);
+        });
+        let at = out.shapes.iter().find_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) if t.galley.text() == "Add Tag" => Some(t.pos + t.galley.rect.center().to_vec2()),
+            _ => None,
+        });
+        let clicked = at.is_some();
+        let mut action = None;
+        if let Some(at) = at {
+            let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+            for events in [vec![egui::Event::PointerMoved(at), press(true)], vec![press(false)]] {
+                let input = egui::RawInput { events, ..Default::default() };
+                let _ = ctx.run_ui(input, |ui| {
+                    six_poses(ui, &ana, &mut state, &mut action);
+                });
+            }
+        }
+        assert!(clicked, "the Add Tag button was found");
+        assert_eq!(action, Some(CastAction::AddTag { asset: ana.clone(), label: "Angry".into() }));
+        assert!(state.new_tag.is_empty(), "the field empties for the next one");
     }
 
     /// **Add Selected as Pose** starts from the stage selection's symbol, the

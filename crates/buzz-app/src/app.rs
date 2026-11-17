@@ -1359,6 +1359,11 @@ pub struct App {
     /// character back over its Cast asset only when its print has moved, so a
     /// shot that never touched it cannot undo what another shot saved.
     cast_prints: std::collections::HashMap<(u64, usize, buzz_scene::LayerId), u64>,
+    /// **The same for a character placed as one symbol**: `(document, scene,
+    /// Cast/<Series>/<Name>)` → [`crate::cast_pose_edit::character_print`] of
+    /// the film's copy when it arrived, or when Update last brought it in.
+    /// Update writes the copy back to the Cast only when this has moved.
+    cast_copy_prints: std::collections::HashMap<(u64, usize, String), u64>,
     /// The Rig panel's body slots of each timeline worked on, by edit path
     /// (`rig_slots_path` is the one showing).
     rig_slots_kept: std::collections::HashMap<Vec<u64>, (usize, Vec<Option<buzz_scene::ObjectId>>)>,
@@ -1772,6 +1777,7 @@ impl App {
             arrange_rx: None,
             cast_sheet: None,
             cast_prints: std::collections::HashMap::new(),
+            cast_copy_prints: std::collections::HashMap::new(),
             rig_slots_kept: std::collections::HashMap::new(),
             rig_slots_path: None,
             rig_slots_seen: Vec::new(),
@@ -5049,12 +5055,20 @@ impl App {
         state.library_symbols = self.editor.doc.scene().library().iter().map(|s| s.name.clone()).collect();
         state.selected_symbol = {
             let scene = self.editor.doc.scene();
-            self.editor.selection.iter().find_map(|id| match &scene.find_object(id)?.1.kind {
-                buzz_scene::ObjectKind::Instance(i) => scene.library().get(i.symbol).map(|s| s.name.clone()),
-                _ => None,
+            self.editor.selection.iter().find_map(|id| {
+                let (layer, object) = scene.find_object(id)?;
+                // A part of a character unpacked onto the stage is not a pose.
+                if buzz_act::pose::character_folder_of(scene, layer).is_some() {
+                    return None;
+                }
+                match &object.kind {
+                    buzz_scene::ObjectKind::Instance(i) => scene.library().get(i.symbol).map(|s| s.name.clone()),
+                    _ => None,
+                }
             })
         };
         state.character_poses = self.cast_sheet.as_ref().map(|s| crate::cast_pose_edit::pose_names(&s.scene)).unwrap_or_default();
+        state.character_tags = self.cast_sheet.as_ref().map(|s| crate::cast_pose_edit::extra_tags(&s.scene)).unwrap_or_default();
         state.save_target =
             crate::cast_pose_edit::source_of(self.editor.doc.scene(), &self.editor.assets, self.editor.selection.iter().next());
         let thumbs = &mut self.asset_thumbnails;
@@ -5090,6 +5104,28 @@ impl App {
     /// **Cast into the shot** for a combined Cast character (E2): [`crate::scene_life::cast_into_shot`] in
     /// one undo step, the character arriving selected; with "Add breath + blinks" ticked it breathes and
     /// blinks from the playhead to the scene's end.
+    /// **A character with poses, just placed as one symbol**: its poses, in
+    /// this film's copy, made as tall as its main pose and stood on its feet
+    /// (`cast_combine::normalise_poses`), so a switch does not make it jump or
+    /// shrink. Folded into the placing's undo step.
+    fn line_up_placed_poses(&mut self, asset: &buzz_doc::Asset) {
+        let scene = self.editor.doc.scene();
+        let main = self
+            .editor
+            .selection
+            .iter()
+            .find_map(|id| scene.find_object(id)?.1.instance().map(|i| i.symbol))
+            .filter(|s| scene.library().symbol_set(*s).len() > 1);
+        let Some(main) = main else { return };
+        self.editor.doc.edit("Place Asset", |scene| {
+            crate::cast_combine::normalise_poses(scene, main);
+        });
+        self.editor.status = Some(format!(
+            "Cast {} as one symbol: right-click \u{25b8} Pose (or Option+] / Option+[) switches the pose from the playhead; double-click it to edit a pose's layers",
+            asset.name
+        ));
+    }
+
     fn cast_into_shot(&mut self, asset: buzz_doc::Asset) {
         let library = self.editor.assets.clone();
         let life = !self.editor.cast_panel.life_off;
@@ -5177,17 +5213,42 @@ impl App {
             // state; the sheet loads on the next frame.
             Open(_) => {}
             Cast(asset) => {
-                // A combined character (a set of poses) is unpacked as a layer rig with its own head and
-                // given breath and blinks (E2); any other asset is placed as it always was.
+                // A combined character (a set of poses) is placed as one symbol whose poses
+                // switch from the playhead and are edited inside it (user 2026-11-16); any
+                // other asset is placed as it always was.
                 let combined = self.editor.assets.load(&asset).ok().and_then(|s| crate::cast_combine::main_symbol(&s)).is_some();
+                self.apply_asset_action(buzz_ui::AssetAction::Place(asset.clone()));
                 if combined {
-                    self.cast_into_shot(asset);
-                } else {
-                    self.apply_asset_action(buzz_ui::AssetAction::Place(asset));
+                    self.line_up_placed_poses(&asset);
                 }
             }
+            // Unpacked as a layer rig with its own head, given breath and blinks (E2).
+            CastLayers(asset) => self.cast_into_shot(asset),
             AddSelection => self.add_to_cast(),
-            AddPose { asset, label, source } => self.cast_add_pose(asset, label, source),
+            AddPose { asset, label, source } => {
+                self.cast_add_pose(asset, label, source);
+            }
+            TagPose { asset, label, from } => self.cast_tag_pose(asset, label, from),
+            AddTag { asset, label } => {
+                let stamp = crate::cast_fresh::backup_stamp();
+                let six: Vec<&str> = buzz_ui::POSE_SLOTS.iter().flat_map(|(shown, label)| [*shown, *label]).collect();
+                self.editor.status = Some(match crate::cast_pose_edit::add_extra_tag(&mut self.editor.assets, &asset, &label, &six, &stamp) {
+                    Ok(label) => format!(
+                        "{} has a {label} tag \u{2014} fill it with Tag Selected, Pose \u{25b8} or Add\u{2026} in Extra poses",
+                        asset.name
+                    ),
+                    Err(e) => format!("Could not add the tag: {e}"),
+                });
+                self.cast_pose_edited();
+            }
+            RemoveTag { asset, label } => {
+                let stamp = crate::cast_fresh::backup_stamp();
+                self.editor.status = Some(match crate::cast_pose_edit::remove_extra_tag(&mut self.editor.assets, &asset, &label, &stamp) {
+                    Ok(()) => format!("Took the {label} tag away from {} (its pose is kept)", asset.name),
+                    Err(e) => format!("Could not take the tag away: {e}"),
+                });
+                self.cast_pose_edited();
+            }
             RemovePose { asset, pose } => {
                 let stamp = crate::cast_fresh::backup_stamp();
                 let status = match crate::cast_pose_edit::remove_pose(&mut self.editor.assets, &asset, &pose, &stamp) {
@@ -5212,6 +5273,21 @@ impl App {
                 };
                 self.cast_pose_edited();
                 self.editor.status = Some(status);
+            }
+            Update(asset) => self.update_cast(asset, false),
+            Duplicate(asset) => self.duplicate_cast(asset),
+            Edit(asset) => {
+                // Opened in the background; Save there writes the Cast file.
+                let path = asset.path.clone();
+                self.open_path(&path);
+                self.editor.status = Some(format!(
+                    "Opening {}'s Cast file \u{2014} change it, save (\u{2318}S), then Cast \u{25b8} Update puts it in your films",
+                    asset.name
+                ));
+            }
+            // Placed as one symbol: that copy goes back, and out to every open film.
+            SaveChanges(asset) if self.placed_copy_print(self.editor.doc.scene(), &format!("{}/{}", asset.folder, asset.name)).is_some() => {
+                self.update_cast(asset, true);
             }
             SaveChanges(asset) => {
                 let stamp = crate::cast_fresh::backup_stamp();
@@ -5359,6 +5435,13 @@ impl App {
     /// Cast's poses under the Cast's names — as one undo step. `renamed` is
     /// a pose renamed there, `(old, new)` by full name.
     fn sync_shot_with_cast(&mut self, asset: &buzz_doc::Asset, renamed: Option<(&str, &str)>) -> bool {
+        let renames: Vec<(String, String)> = renamed.map(|(old, new)| (old.to_string(), new.to_string())).into_iter().collect();
+        self.sync_shot_with_cast_renaming(asset, &renames)
+    }
+
+    /// [`Self::sync_shot_with_cast`] after poses renamed in the Cast, `(old,
+    /// new)` by full name, made here in that order.
+    fn sync_shot_with_cast_renaming(&mut self, asset: &buzz_doc::Asset, renames: &[(String, String)]) -> bool {
         if !crate::cast_pose_edit::is_placed(self.editor.doc.scene(), &asset.folder, &asset.name) {
             return false;
         }
@@ -5369,14 +5452,211 @@ impl App {
             return false;
         };
         let (folder, name) = (asset.folder.clone(), asset.name.clone());
+        let sync = |scene: &mut buzz_scene::Scene| {
+            let mut changed = false;
+            for (old, new) in renames {
+                changed |= crate::cast_pose_edit::rename_placed_pose(scene, &folder, &name, old, new);
+            }
+            crate::cast_pose_edit::sync_placed_character(scene, &cast, &folder, &name, None) | changed
+        };
         let mut probe = self.editor.doc.scene().clone();
-        if !crate::cast_pose_edit::sync_placed_character(&mut probe, &cast, &folder, &name, renamed) {
+        if !sync(&mut probe) {
             return false;
         }
         self.editor.doc.edit("Poses from the Cast", |scene| {
-            crate::cast_pose_edit::sync_placed_character(scene, &cast, &folder, &name, renamed);
+            sync(scene);
         });
         true
+    }
+
+    /// **Tag a pose** as one of the Cast panel's six (`label`, e.g. `Walk
+    /// Back`): one of the character's poses — picked from the menu, or
+    /// selected on the stage — is renamed to it; any other symbol selected on
+    /// the stage is added as that pose. The pose tagged there before is let go
+    /// as `<label> old` — and, once a new one from the stage is in, removed
+    /// (backed up), so a failed add never leaves the slot empty. The shot's
+    /// copy follows.
+    fn cast_tag_pose(&mut self, asset: buzz_doc::Asset, label: String, from: buzz_ui::TagFrom) {
+        let shown = buzz_ui::POSE_SLOTS.iter().find(|(_, l)| *l == label).map_or(label.as_str(), |(s, _)| *s).to_string();
+        let poses = self.editor.assets.load(&asset).map(|s| crate::cast_pose_edit::pose_names(&s)).unwrap_or_default();
+        let (pose, symbol) = match from {
+            buzz_ui::TagFrom::Pose(pose) => (Some(pose), None),
+            buzz_ui::TagFrom::Selected(symbol) if poses.contains(&symbol) => (Some(symbol), None),
+            buzz_ui::TagFrom::Selected(symbol) => (None, Some(symbol)),
+        };
+        let stamp = crate::cast_fresh::backup_stamp();
+        if let Some(pose) = pose {
+            let status = match crate::cast_pose_edit::tag_pose(&mut self.editor.assets, &asset, &label, &pose, &stamp) {
+                Ok((full, renames)) => {
+                    let here = self.sync_shot_with_cast_renaming(&asset, &renames);
+                    let let_go = renames.first().filter(|_| renames.len() == 2).map(|(taken, old)| format!("; {taken} is kept as {old}")).unwrap_or_default();
+                    format!("Tagged {pose} as {}'s {shown}: {full}{let_go}{}", asset.name, if here { ", in this shot too" } else { "" })
+                }
+                Err(e) => format!("Could not tag the pose: {e}"),
+            };
+            self.cast_pose_edited();
+            self.editor.status = Some(status);
+            return;
+        }
+        let Some(symbol) = symbol else { return };
+        let old = match crate::cast_pose_edit::untag_pose(&mut self.editor.assets, &asset, &label, &stamp) {
+            Ok(old) => old,
+            Err(e) => {
+                self.editor.status = Some(format!("Could not tag {symbol}: {e}"));
+                return;
+            }
+        };
+        if let Some((was, now)) = &old {
+            self.sync_shot_with_cast(&asset, Some((was, now)));
+        }
+        let added = self.cast_add_pose(asset.clone(), label, buzz_ui::PoseSource::LibrarySymbol(symbol));
+        let Some((was, now)) = old else { return };
+        if !added {
+            let failed = self.editor.status.take().unwrap_or_default();
+            self.editor.status = Some(format!("{failed} \u{2014} {was} is kept as {now}"));
+            return;
+        }
+        // The new pose is in: the old one goes (its file is in _cast_backup).
+        let added = self.editor.status.take().unwrap_or_default();
+        let asset = self.editor.assets.assets().iter().find(|a| a.path == asset.path).cloned().unwrap_or(asset);
+        self.editor.status = Some(match crate::cast_pose_edit::remove_pose(&mut self.editor.assets, &asset, &now, &stamp) {
+            Ok(()) => {
+                self.sync_shot_with_cast(&asset, None);
+                format!("{added}; it replaces the last one")
+            }
+            Err(e) => format!("{added}; the last one is kept as {now} ({e})"),
+        });
+        self.cast_pose_edited();
+    }
+
+    /// **Update** (the Cast panel; user 2026-11-17: "a universal cast area
+    /// ... update is done there"). The Cast file is where a character lives:
+    ///
+    /// 1. its own tab (Cast panel ▸ Edit), if it has unsaved changes, is saved;
+    /// 2. a copy changed in the open film since it arrived — or since the
+    ///    last Update — is written back over the Cast file (backup first), or
+    ///    `from_here` writes it whatever its print says (Save changes);
+    /// 3. every scene of every film open here takes the character as the Cast
+    ///    now draws it ([`crate::cast_pose_edit::refresh_placed_character`]),
+    ///    one undo step per scene, its placements and animation kept.
+    ///
+    /// A film on disk that is not open takes it the next time it is opened
+    /// and updated.
+    fn update_cast(&mut self, asset: buzz_doc::Asset, from_here: bool) {
+        let key = format!("{}/{}", asset.folder, asset.name);
+        let stamp = crate::cast_fresh::backup_stamp();
+        let mut notes: Vec<String> = Vec::new();
+
+        if let Some(i) = (0..self.documents.len()).find(|&i| self.tab_document(i).path() == Some(asset.path.as_path()))
+            && self.tab_document(i).is_dirty()
+        {
+            let saved = if i == self.active_document { self.editor.doc.save() } else { self.documents[i].doc.save() };
+            if let Err(e) = saved {
+                self.editor.status = Some(format!("Could not save {}'s Cast tab: {e}", asset.name));
+                return;
+            }
+            self.editor.assets.rescan();
+            notes.push("its Cast tab saved".into());
+        }
+
+        // The open film's own edits go into the Cast before the Cast goes out.
+        let uid = self.editor.doc.uid();
+        let index = self.editor.doc.active_scene();
+        let is_cast_tab = self.editor.doc.path() == Some(asset.path.as_path());
+        if !is_cast_tab {
+            let scene = self.editor.doc.scene();
+            let baseline = self.cast_copy_prints.get(&(uid, index, key.clone())).copied().unwrap_or(0);
+            let now = self.placed_copy_print(scene, &key);
+            let edited = now.is_some_and(|now| from_here || (baseline != 0 && now != baseline));
+            if edited {
+                let scene = scene.clone();
+                match crate::cast_pose_edit::save_placed_character(&mut self.editor.assets, &scene, &asset, &stamp) {
+                    Ok(()) => notes.push("this film's changes saved into the Cast".into()),
+                    Err(e) => {
+                        self.editor.status = Some(format!("Could not update {}: {e}", asset.name));
+                        return;
+                    }
+                }
+            }
+            // A character lifted into layers: as ⌘S would write it.
+            let scene = self.editor.doc.scene().clone();
+            for (folder, _) in Self::lifted_characters(&scene).into_iter().filter(|(_, k)| *k == key) {
+                let before = self.cast_prints.get(&(uid, index, folder)).copied().unwrap_or(0);
+                let Some((_, main)) = self.cast_main_name(&key) else { continue };
+                let now = crate::cast_pose_edit::lifted_character_print(&scene, folder, &main);
+                if before != 0 && now.is_some_and(|now| now != before) {
+                    match crate::cast_pose_edit::save_lifted_character(&mut self.editor.assets, &scene, folder, &asset, &stamp) {
+                        Ok(()) => notes.push("this film's changes saved into the Cast".into()),
+                        Err(e) => notes.push(format!("this film's layers were not saved: {e}")),
+                    }
+                }
+            }
+        }
+
+        let asset = self.editor.assets.assets().iter().find(|a| a.path == asset.path).cloned().unwrap_or(asset);
+        let cast = match self.editor.assets.load(&asset) {
+            Ok(cast) => cast,
+            Err(e) => {
+                self.editor.status = Some(format!("Could not read {}: {e}", asset.name));
+                return;
+            }
+        };
+        let mut films: Vec<String> = Vec::new();
+        for i in 0..self.documents.len() {
+            let doc = if i == self.active_document { &mut self.editor.doc } else { &mut self.documents[i].doc };
+            if doc.path() == Some(asset.path.as_path()) {
+                continue;
+            }
+            let mut touched = false;
+            for s in 0..doc.scene_names().len() {
+                doc.edit_scene_at(s, "Update Cast", |scene| {
+                    touched |= crate::cast_pose_edit::refresh_placed_character(scene, &cast, &asset.folder, &asset.name);
+                });
+            }
+            if touched {
+                films.push(doc.display_name());
+            }
+            // What the films now hold is the new starting point.
+            let doc_uid = doc.uid();
+            let lifted: Vec<(usize, buzz_scene::LayerId)> = doc
+                .film()
+                .iter()
+                .enumerate()
+                .flat_map(|(s, scene)| Self::lifted_characters(scene).into_iter().filter(|(_, k)| *k == key).map(move |(f, _)| (s, f)))
+                .collect();
+            self.cast_copy_prints.retain(|(u, _, k), _| !(*u == doc_uid && *k == key));
+            self.cast_prints.retain(|(u, s, f), _| !(*u == doc_uid && lifted.contains(&(*s, *f))));
+            // Redrawn symbols lose the master-audio guide; it is put back.
+            self.master_guided.retain(|(u, _)| *u != doc_uid);
+        }
+        self.note_cast_prints();
+        self.cast_pose_edited();
+
+        let mut said = format!("Updated {}", asset.name);
+        if !notes.is_empty() {
+            said.push_str(&format!(" \u{2014} {}", notes.join(", ")));
+        }
+        said.push_str(&if films.is_empty() {
+            "; no open film needed it".to_string()
+        } else {
+            format!("; now in {} (\u{2318}Z undoes it in a film)", films.join(", "))
+        });
+        self.editor.status = Some(said);
+    }
+
+    /// **Duplicate** a Cast character as `<Name> copy`, its sheet opened.
+    fn duplicate_cast(&mut self, asset: buzz_doc::Asset) {
+        match crate::cast_pose_edit::duplicate_character(&mut self.editor.assets, &asset) {
+            Ok(copy) => {
+                self.editor.cast_panel.open = Some(copy.path.clone());
+                self.cast_pose_edited();
+                self.editor.status = Some(format!(
+                    "Duplicated {} as {} in the Cast \u{2014} double-click its name to rename it",
+                    asset.name, copy.name
+                ));
+            }
+            Err(e) => self.editor.status = Some(format!("Could not duplicate {}: {e}", asset.name)),
+        }
     }
 
     /// Every Cast character placed in the document just opened, brought up to
@@ -5394,8 +5674,9 @@ impl App {
     }
 
     /// **Add Pose** (CAST_POSES_PLAN C2 e1): build the pose from its source, add it
-    /// to the character's set and save the asset back, backup first.
-    fn cast_add_pose(&mut self, asset: buzz_doc::Asset, label: String, source: buzz_ui::PoseSource) {
+    /// to the character's set and save the asset back, backup first. Whether
+    /// it was added.
+    fn cast_add_pose(&mut self, asset: buzz_doc::Asset, label: String, source: buzz_ui::PoseSource) -> bool {
         let stamp = crate::cast_fresh::backup_stamp();
         let doc = self.editor.doc.scene().clone();
         let result = match &source {
@@ -5419,6 +5700,7 @@ impl App {
             }),
         };
         let here = result.is_ok() && self.sync_shot_with_cast(&asset, None);
+        let added = result.is_ok();
         self.cast_pose_edited();
         self.editor.status = Some(match result {
             Ok(full) => format!(
@@ -5428,6 +5710,7 @@ impl App {
             ),
             Err(e) => format!("Could not add the pose: {e}"),
         });
+        added
     }
 
     fn add_to_cast(&mut self) {
@@ -5601,6 +5884,16 @@ impl App {
                     scene.update_layer(id, |l| l.depth = 0.0);
                 }
             });
+        }
+
+        if let Some(on) = response.auto_depth {
+            // Turned on, the depths are set in this same step (see `Document::edit`).
+            self.editor.doc.edit("Auto Depth", |scene| {
+                scene.stage_mut().auto_depth = on;
+            });
+            if on {
+                self.editor.status = Some("Auto Depth on: each layer's depth now follows its name and its place in the timeline".into());
+            }
         }
 
         if response.distribute {
@@ -6004,7 +6297,8 @@ impl App {
     /// is kept for next time. Its header docks it into the right column or
     /// floats it free. A click anywhere but the window, the strip or a menu
     /// the panel itself opened closes it; so does Esc, or its icon again —
-    /// except Tool Options, which only its Close button or its icon closes.
+    /// except Tool Options and Cast, which only their Close button or their
+    /// icon closes.
     fn draw_strip_flyout(&mut self, ctx: &egui::Context, workspace: &buzz_ui::Workspace, commands: &mut Vec<Command>) {
         let Some((id, anchor)) = self.strip_flyout else {
             return;
@@ -6080,7 +6374,9 @@ impl App {
         // **Tool Options stays open until it is closed** (user 2026-11-15):
         // it is open beside the stage to be used while drawing on it, so a
         // click on the stage — or Esc, which the tools use — leaves it.
-        let pinned = id == buzz_ui::PanelId::ToolOptions;
+        // **So does Cast** (user 2026-11-16): Add Selected as Pose wants a
+        // pose picked on the stage, and its Add Pose window is typed into.
+        let pinned = matches!(id, buzz_ui::PanelId::ToolOptions | buzz_ui::PanelId::Cast);
         if close || (!pinned && (pressed_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)))) {
             self.strip_flyout = None;
         }
@@ -18153,6 +18449,36 @@ impl App {
             // remembered as unprintable and never written.
             self.cast_prints.insert((uid, index, folder), print.unwrap_or(0));
         }
+        let fresh: Vec<String> = Self::symbol_characters(self.editor.doc.scene())
+            .into_iter()
+            .filter(|key| !self.cast_copy_prints.contains_key(&(uid, index, key.clone())))
+            .collect();
+        for key in fresh {
+            let print = self.placed_copy_print(self.editor.doc.scene(), &key);
+            self.cast_copy_prints.insert((uid, index, key), print.unwrap_or(0));
+        }
+    }
+
+    /// The Cast characters placed in `scene` as one symbol (not lifted into a
+    /// folder): their `Cast/<Series>/<Name>` keys.
+    fn symbol_characters(scene: &buzz_scene::Scene) -> Vec<String> {
+        let mut keys: Vec<String> = scene
+            .stage_layers()
+            .iter()
+            .filter(|l| l.kind != buzz_scene::LayerKind::Folder)
+            .filter_map(|l| l.cast_source.clone().filter(|s| !s.contains('|')))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// [`crate::cast_pose_edit::character_print`] of the copy of Cast
+    /// character `key` placed in `scene` as one symbol with poses.
+    fn placed_copy_print(&self, scene: &buzz_scene::Scene, key: &str) -> Option<u64> {
+        let (_, main) = self.cast_main_name(key)?;
+        let here = scene.library().find_by_name(&main).filter(|s| !s.set.is_empty())?.id;
+        Some(crate::cast_pose_edit::character_print(scene, here))
     }
 
     /// **⌘S also saves the Cast**: every Cast character a shot of this
@@ -18198,6 +18524,23 @@ impl App {
                 // snapshot must not offer to restore what is now on disk.
                 buzz_doc::autosave::forget_crash_snapshot();
                 self.remember_document_directory(&path);
+                // A Cast character's own file (Cast panel ▸ Edit): the Cast
+                // lists it as it now is, and Update takes it into the films.
+                let in_library = self.editor.assets.root().is_some_and(|root| path.starts_with(root));
+                if in_library {
+                    self.editor.assets.rescan();
+                }
+                let character = in_library
+                    .then(|| crate::cast_fresh::cast_characters(&self.editor.assets).into_iter().find(|a| a.path == path))
+                    .flatten();
+                if let Some(character) = character {
+                    self.cast_pose_edited();
+                    self.editor.status = Some(format!(
+                        "Saved {} in the Cast \u{2014} Cast \u{25b8} Update puts it in your open films",
+                        character.name
+                    ));
+                    return;
+                }
                 self.editor.status = Some(if cast.is_empty() {
                     format!("Saved {}", path.display())
                 } else {
@@ -30413,6 +30756,192 @@ mod tool_follow_tests {
         app.editor.run(Command::SelectTool(ToolId::Hand));
         frame(&mut app, vec![]);
         assert!(app.strip_flyout.is_none(), "the Hand opens nothing");
+        let docks = |slots: &[buzz_ui::Slot]| slots.iter().map(|s| (s.id, s.dock)).collect::<Vec<_>>();
+        assert_eq!(docks(&app.editor.workspace.slots), docks(&layout), "the layout is as it was");
+    }
+
+    /// **Cast places a character with poses as one symbol** (user 2026-11-16):
+    /// one instance whose set holds every pose, the poses lined up on the main
+    /// pose's feet; right-click ▸ Cast as Layers still unpacks it into a folder.
+    #[test]
+    fn cast_places_a_character_with_poses_as_one_symbol() {
+        use kurbo::Shape as _;
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = buzz_doc::AssetLibrary::at(dir.path());
+        for (name, x) in [("Raju", 0.0), ("Raju Side", 400.0)] {
+            let mut scene = buzz_scene::Scene::default();
+            let layer = scene.add_stage_layer("Body", buzz_scene::LayerKind::Normal);
+            scene.add_shape(layer, buzz_scene::ShapeData::filled(kurbo::Rect::new(x, 0.0, x + 10.0, 30.0).to_path(1e-9), peniko::Color::WHITE));
+            library.save(name, "Cast/Series", &scene).expect("saved");
+        }
+        let (done, failed) = crate::cast_combine::combine_many(&mut library, None, "2026-11-17_000000");
+        assert!(failed.is_empty() && done.len() == 1, "{failed:?}");
+
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.editor.assets = buzz_doc::AssetLibrary::at(dir.path());
+        let raju = app.editor.assets.assets().iter().find(|a| a.name == "Raju").cloned().expect("Raju");
+        app.apply_cast_action(buzz_ui::CastAction::Cast(raju.clone()));
+        let ids = app.editor.selection.ids();
+        assert_eq!(ids.len(), 1, "one instance: {:?}", app.editor.status);
+        let scene = app.editor.doc.scene();
+        let symbol = scene.find_object(ids[0]).and_then(|(_, o)| o.instance().map(|i| i.symbol)).expect("an instance");
+        let set = scene.library().symbol_set(symbol);
+        assert_eq!(set.len(), 2, "both poses in its set");
+        let (main, side) = (crate::cast_combine::pose_box(scene, set[0], 0).unwrap(), crate::cast_combine::pose_box(scene, set[1], 0).unwrap());
+        assert!((main.center().x - side.center().x).abs() < 0.5 && (main.y1 - side.y1).abs() < 0.5, "the side pose stands where the main one does");
+        assert!(!scene.layers().iter().any(|l| l.kind == buzz_scene::LayerKind::Folder), "no layer folder");
+
+        app.apply_cast_action(buzz_ui::CastAction::CastLayers(raju));
+        assert!(
+            app.editor.doc.scene().layers().iter().any(|l| l.kind == buzz_scene::LayerKind::Folder && l.cast_source.is_some()),
+            "Cast as Layers unpacks it: {:?}",
+            app.editor.status
+        );
+    }
+
+    /// **Update Cast** (user 2026-11-17): a pose edited in one film goes into
+    /// the Cast file and into every other open film; a change made in the
+    /// Cast reaches them all; where each film's character stands is kept;
+    /// a film that changed nothing writes nothing back; Duplicate makes
+    /// `<Name> copy` with its poses renamed.
+    #[test]
+    fn update_cast_takes_a_character_everywhere() {
+        use kurbo::Shape as _;
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = buzz_doc::AssetLibrary::at(dir.path());
+        for (name, x) in [("Raju", 0.0), ("Raju Side", 400.0)] {
+            let mut scene = buzz_scene::Scene::default();
+            let layer = scene.add_stage_layer("Body", buzz_scene::LayerKind::Normal);
+            scene.add_shape(layer, buzz_scene::ShapeData::filled(kurbo::Rect::new(x, 0.0, x + 10.0, 30.0).to_path(1e-9), peniko::Color::WHITE));
+            library.save(name, "Cast/Series", &scene).expect("saved");
+        }
+        let (done, failed) = crate::cast_combine::combine_many(&mut library, None, "2026-11-17_000001");
+        assert!(failed.is_empty() && done.len() == 1, "{failed:?}");
+
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.editor.assets = buzz_doc::AssetLibrary::at(dir.path());
+        let raju = app.editor.assets.assets().iter().find(|a| a.name == "Raju").cloned().expect("Raju");
+        let key = format!("{}/{}", raju.folder, raju.name);
+        // Two films, each with Raju cast as one symbol; the first moves him.
+        app.apply_cast_action(buzz_ui::CastAction::Cast(raju.clone()));
+        let placed = app.editor.selection.ids()[0];
+        app.editor.doc.edit("Move", |scene| {
+            scene.update_object(placed, |o| o.transform = kurbo::Affine::translate((120.0, 40.0)) * o.transform);
+        });
+        let stands = |app: &App| app.editor.doc.scene().find_object(placed).map(|(_, o)| o.transform);
+        let moved = stands(&app);
+        app.note_cast_prints();
+        app.open_document_in_new_tab(Document::new(buzz_scene::Scene::default()));
+        app.apply_cast_action(buzz_ui::CastAction::Cast(raju.clone()));
+        app.note_cast_prints();
+        app.switch_to_tab(0);
+        app.note_cast_prints();
+
+        let shapes = |scene: &buzz_scene::Scene, pose: &str| -> usize {
+            scene.library().find_by_name(pose).map_or(0, |s| s.layers.iter().map(|l| l.objects_at(0).len()).sum())
+        };
+        let film = |app: &App, i: usize| app.tab_document(i).scene().clone();
+        let cast = |app: &App| app.editor.assets.load(&raju).expect("the Cast file");
+        assert_eq!(shapes(&cast(&app), "Raju Side"), 1);
+
+        // Nothing edited: Update writes nothing back.
+        let before = std::fs::read(&raju.path).unwrap();
+        app.apply_cast_action(buzz_ui::CastAction::Update(raju.clone()));
+        assert_eq!(std::fs::read(&raju.path).unwrap(), before, "an untouched film writes nothing: {:?}", app.editor.status);
+
+        // A pose edited in film 1 (a second shape inside Raju Side)...
+        app.editor.doc.edit("Draw", |scene| {
+            let side = scene.library().find_by_name("Raju Side").map(|s| s.id).unwrap();
+            let layer = scene.library().get(side).unwrap().layers.iter().next().unwrap().id;
+            let mut objects: Vec<_> = scene.library().get(side).unwrap().layers.get(layer).unwrap().objects_at(0).to_vec();
+            let id = scene.next_object_id();
+            objects.push(std::sync::Arc::new(buzz_scene::Object::shape(id, buzz_scene::ShapeData::filled(kurbo::Rect::new(0.0, 0.0, 5.0, 5.0).to_path(1e-9), peniko::Color::BLACK))));
+            scene.library_mut().update(side, |s| {
+                s.layers.update(layer, |l| {
+                    l.frames.set_objects(0, objects);
+                });
+            });
+        });
+        app.apply_cast_action(buzz_ui::CastAction::Update(raju.clone()));
+        assert_eq!(shapes(&cast(&app), "Raju Side"), 2, "the edit went into the Cast: {:?}", app.editor.status);
+        assert_eq!(shapes(&film(&app, 1), "Raju Side"), 2, "and into the other open film");
+        assert_eq!(stands(&app), moved, "film 1's Raju stands where he was moved to");
+        let written = cast(&app);
+        let instance = written.stage_layers().iter().flat_map(|l| l.all_objects().map(|o| o.transform).collect::<Vec<_>>()).next();
+        assert_eq!(instance, Some(kurbo::Affine::IDENTITY), "where film 1 moved him is not written into the Cast");
+        let side_count = |scene: &buzz_scene::Scene| scene.library().iter().filter(|s| s.name.starts_with("Raju Side")).count();
+        assert_eq!(side_count(&film(&app, 1)), 1, "no second copy of the pose left behind");
+
+        // ...and a change made in the Cast itself reaches both films.
+        let mut changed = cast(&app);
+        let side = changed.library().find_by_name("Raju Side").map(|s| s.id).unwrap();
+        let layer = changed.library().get(side).unwrap().layers.iter().next().unwrap().id;
+        changed.library_mut().update(side, |s| {
+            s.layers.update(layer, |l| {
+                l.frames.set_objects(0, Vec::new());
+            });
+        });
+        buzz_doc::format::save(&changed, &raju.path).expect("written");
+        app.editor.assets.rescan();
+        app.apply_cast_action(buzz_ui::CastAction::Update(raju.clone()));
+        assert_eq!(shapes(&film(&app, 0), "Raju Side"), 0, "film 1 follows the Cast: {:?}", app.editor.status);
+        assert_eq!(shapes(&film(&app, 1), "Raju Side"), 0, "film 2 too");
+        assert_eq!(shapes(&cast(&app), "Raju Side"), 0, "film 1 did not write its old copy back");
+        let set = |scene: &buzz_scene::Scene| {
+            let main = scene.library().find_by_name("Raju").map(|s| s.id).unwrap();
+            scene.library().symbol_set(main).len()
+        };
+        assert_eq!(set(&film(&app, 0)), 2, "the pose menu is intact");
+        assert!(app.cast_copy_prints.contains_key(&(app.editor.doc.uid(), 0, key)), "a fresh starting point");
+
+        app.apply_cast_action(buzz_ui::CastAction::Duplicate(raju.clone()));
+        let copy = app.editor.assets.assets().iter().find(|a| a.name == "Raju copy").cloned().expect("Raju copy in the Cast");
+        assert_eq!(crate::cast_pose_edit::pose_names(&app.editor.assets.load(&copy).unwrap()), vec!["Raju copy", "Raju copy Side"]);
+        assert!(raju.path.exists(), "the original stays");
+    }
+
+    /// **The Cast pop-out stays open while a pose is picked on the stage**
+    /// (Add Selected as Pose), until its Close button or its icon.
+    #[test]
+    fn the_cast_flyout_stays_open_while_picking_on_the_stage() {
+        use buzz_ui::{Dock, PanelId};
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        app.editor.workspace = buzz_ui::Workspace::default();
+        app.editor.workspace.icon_strip = true;
+        app.editor.workspace.move_to(PanelId::Cast, Dock::RightOuter);
+        let layout = app.editor.workspace.slots.clone();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                time: Some(t),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            });
+        };
+        frame(&mut app, vec![]);
+        app.editor.workspace.scroll_to = Some(PanelId::Cast);
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        assert_eq!(app.strip_flyout.map(|(id, _)| id), Some(PanelId::Cast), "Cast opens from the strip");
+
+        let stage = egui::pos2(500.0, 400.0);
+        let m = egui::Modifiers::default();
+        frame(&mut app, vec![egui::Event::PointerMoved(stage)]);
+        frame(&mut app, vec![egui::Event::PointerButton { pos: stage, button: egui::PointerButton::Primary, pressed: true, modifiers: m }]);
+        frame(&mut app, vec![egui::Event::PointerButton { pos: stage, button: egui::PointerButton::Primary, pressed: false, modifiers: m }]);
+        frame(&mut app, vec![]);
+        assert_eq!(app.strip_flyout.map(|(id, _)| id), Some(PanelId::Cast), "a click on the stage leaves it open");
         let docks = |slots: &[buzz_ui::Slot]| slots.iter().map(|s| (s.id, s.dock)).collect::<Vec<_>>();
         assert_eq!(docks(&app.editor.workspace.slots), docks(&layout), "the layout is as it was");
     }

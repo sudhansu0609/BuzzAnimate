@@ -1401,7 +1401,14 @@ pub fn timeline_panel_with_tools_slot(
             // Where the rows start, left and top, for the playhead line drawn
             // down through all of them once they are laid out (below).
             let rows_left = ui.cursor().min.x;
-            ruler(ui, scene, columns, *scene.looping(), state, &mut response);
+            // **The ruler stays in sight** (user 2026-11-17): its place is
+            // kept here, above the rows, but it is drawn last, pinned to the
+            // top of the view, so the frame numbers stay as the layers scroll
+            // up under it — as the layer names stay when they scroll sideways.
+            let (ruler_slot, _) = ui.allocate_exact_size(
+                egui::vec2(LAYER_COLUMN + columns as f32 * state.frame_width, RULER_HEIGHT),
+                Sense::hover(),
+            );
             let rows_top = ui.cursor().min.y;
 
             // The camera sits above every layer, as it does in Animate — but
@@ -1553,6 +1560,11 @@ pub fn timeline_panel_with_tools_slot(
                     egui::Stroke::new(2.0, Palette::warning()),
                 );
             }
+
+            // The ruler, last: over the rows scrolled up under it, and the
+            // one a click there reaches.
+            let pinned = ruler_slot.translate(egui::vec2(0.0, (ui.clip_rect().min.y - ruler_slot.min.y).max(0.0)));
+            ruler(ui, pinned, scene, columns, *scene.looping(), state, &mut response);
         });
 
     ui.spacing_mut().scroll = theme_scroll;
@@ -2471,6 +2483,7 @@ fn loop_controls(ui: &mut Ui, scene: &Scene, out: &mut TimelineResponse) {
 /// The frame-number strip, which also scrubs.
 fn ruler(
     ui: &mut Ui,
+    rect: egui::Rect,
     scene: &Scene,
     columns: u32,
     region: LoopRegion,
@@ -2478,11 +2491,8 @@ fn ruler(
     out: &mut TimelineResponse,
 ) {
     let cell_width = state.frame_width;
-    let width = columns as f32 * cell_width;
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(LAYER_COLUMN + width, RULER_HEIGHT),
-        Sense::click_and_drag(),
-    );
+    // `rect` is pinned to the top of the view (see the caller), not laid out.
+    let response = ui.interact(rect, ui.id().with("timeline-ruler"), Sense::click_and_drag());
     let grid_left = rect.min.x + LAYER_COLUMN;
     let pinned_left = ui.clip_rect().min.x;
     let font = FontId::proportional(9.0);
@@ -5558,6 +5568,55 @@ mod tests {
         );
     }
 
+    /// **The frame numbers stay in sight** while the layers scroll up under
+    /// them (user 2026-11-17): after scrolling down to the last layer, the
+    /// ruler's "10" is where it was, above that row.
+    #[test]
+    fn the_ruler_stays_on_top_while_the_layers_scroll() {
+        let mut scene = Scene::empty();
+        let names: Vec<String> = (0..40).map(|i| format!("Row {}", (b'A' + (i % 26) as u8) as char)).collect();
+        for name in &names {
+            scene.add_layer(name, LayerKind::Normal);
+        }
+        let last = scene.layers().iter().last().map(|l| l.id).expect("a layer");
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut time = 0.0;
+        let mut drive = |st: &TimelineState| -> Option<f32> {
+            time += 0.1;
+            let input = egui::RawInput {
+                time: Some(time),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 400.0))),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(input, |ui| {
+                let _ = timeline_panel(ui, &scene, st);
+            });
+            out.shapes.iter().find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text() == "10" => Some(t.pos.y),
+                _ => None,
+            })
+        };
+        // Rows out of view are not drawn, so the last row is read: it
+        // comes into view only once the layers have scrolled.
+        let row_top = |ctx: &egui::Context| -> Option<f32> {
+            ctx.data(|d| d.get_temp::<(egui::Rect, f32, f32)>(egui::Id::new((ROW_GEOMETRY, last)))).map(|r| r.0.min.y)
+        };
+        let still = state();
+        drive(&still);
+        let before = drive(&still).expect("the ruler's 10");
+        assert!(row_top(&ctx).is_none_or(|y| y > 400.0), "the last row starts out of view");
+        // Scrolled down to the last layer, as picking it on the stage does.
+        let mut down = state();
+        down.reveal_layer = Some(last);
+        drive(&down);
+        let after = (0..10).filter_map(|_| drive(&still)).last().expect("the ruler's 10, still drawn");
+        let row_after = row_top(&ctx).expect("the last row is drawn");
+        assert!(row_after < 400.0, "the layers scrolled the last row into view: {row_after}");
+        assert!(row_after > after, "below the ruler: {row_after} vs {after}");
+        assert!((after - before).abs() < 0.5, "the frame numbers stayed: {before} -> {after}");
+    }
+
     /// Right-clicking a frame cell must not freeze the app. Capturing the
     /// menu's frame used to read the pointer inside `ctx.data_mut`, and
     /// egui's context lock is not re-entrant, so the UI thread waited on
@@ -6325,8 +6384,13 @@ mod tests {
             };
             let out = ctx.run_ui(input, |ui| {
                 let mut response = TimelineResponse::default();
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(LAYER_COLUMN + columns as f32 * st.frame_width, RULER_HEIGHT),
+                    Sense::hover(),
+                );
                 ruler(
                     ui,
+                    rect,
                     &scene,
                     columns,
                     LoopRegion::default(),

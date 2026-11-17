@@ -300,6 +300,16 @@ fn symbols_of(object: &Object, out: &mut Vec<SymbolId>) {
 /// Drop every library symbol nothing on the stage needs (directly, nested in
 /// another symbol on any frame, or in the set of one that is).
 pub(crate) fn prune_library(scene: &mut Scene) {
+    let keep = used_symbols(scene);
+    let drop: Vec<SymbolId> = scene.library().iter().map(|s| s.id).filter(|id| !keep.contains(id)).collect();
+    for id in drop {
+        scene.library_mut().remove(id);
+    }
+}
+
+/// Every symbol the stage reaches — through nested artwork and through sets,
+/// whose members a pose switch can show.
+pub(crate) fn used_symbols(scene: &Scene) -> HashSet<SymbolId> {
     let mut keep: HashSet<SymbolId> = HashSet::new();
     let mut todo: Vec<SymbolId> = Vec::new();
     for layer in scene.stage_layers().iter() {
@@ -323,10 +333,7 @@ pub(crate) fn prune_library(scene: &mut Scene) {
             }
         }
     }
-    let drop: Vec<SymbolId> = scene.library().iter().map(|s| s.id).filter(|id| !keep.contains(id)).collect();
-    for id in drop {
-        scene.library_mut().remove(id);
-    }
+    keep
 }
 
 /// A copy of `scene` holding only the stage `keep` layers, with only the symbols they need.

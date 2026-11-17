@@ -155,6 +155,64 @@ pub struct StageProperties {
     /// of one always drawing wholly in front. A mask and the layers it clips move
     /// together, or the mask would stop meaning anything.
     pub sort_by_depth: bool,
+    /// **Auto Depth**: every stage layer's depth is set from its name and its
+    /// place in the timeline ([`Scene::auto_depths`]) after every edit, until
+    /// it is turned off. Off by default; it changes no paint order.
+    pub auto_depth: bool,
+}
+
+/// The bands [`Scene::auto_depths`] puts a layer in, by its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthBand {
+    /// Foreground: in front of the stage, a little larger.
+    Near,
+    /// On the stage, at its natural size: characters, and every name not
+    /// recognised.
+    Stage,
+    /// Midground: trees, buildings, hills.
+    Mid,
+    /// Sky and background.
+    Far,
+}
+
+impl DepthBand {
+    /// The band's span, front to back, in focal distances.
+    fn range(self) -> (f64, f64) {
+        match self {
+            Self::Near => (-0.12, -0.05),
+            Self::Stage => (0.0, 0.0),
+            Self::Mid => (0.1, 0.2),
+            Self::Far => (0.25, 0.35),
+        }
+    }
+}
+
+/// The band a layer called `name` belongs in, if its name says: any word of
+/// it (case and trailing numbers aside — `BG2`, `fg_1`, `Sky Day`) naming
+/// one. `None` for a name that says nothing about depth.
+pub fn depth_band_of(name: &str) -> Option<DepthBand> {
+    const FAR: &[&str] = &[
+        "sky", "bg", "bkg", "bgd", "background", "backgrounds", "backdrop", "cloud", "clouds", "mountain", "mountains", "horizon",
+        "distance", "far", "scenery",
+    ];
+    const MID: &[&str] = &["mid", "midground", "middle", "mg", "tree", "trees", "building", "buildings", "house", "houses", "hill", "hills"];
+    const NEAR: &[&str] = &["fg", "foreground", "foregrounds", "near", "overlay"];
+    let lower = name.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.trim_end_matches(|c: char| c.is_ascii_digit()))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let says = |list: &[&str]| words.iter().any(|w| list.contains(w));
+    if says(NEAR) {
+        Some(DepthBand::Near)
+    } else if says(FAR) {
+        Some(DepthBand::Far)
+    } else if says(MID) {
+        Some(DepthBand::Mid)
+    } else {
+        None
+    }
 }
 
 impl Default for StageProperties {
@@ -165,6 +223,7 @@ impl Default for StageProperties {
             frame_rate: 24.0,
             post: PostSettings::default(),
             sort_by_depth: false,
+            auto_depth: false,
         }
     }
 }
@@ -1051,6 +1110,83 @@ impl Scene {
         for id in squeezed {
             self.update_layer(id, |l| l.depth = nearest);
         }
+    }
+
+    /// **Auto Depth** (user 2026-11-17: "an auto layer depth feature based on
+    /// the layers"): the depth every stage layer would be given.
+    ///
+    /// The name decides the band — sky and background far back, midground
+    /// (trees, buildings, hills) between, foreground in front of the stage,
+    /// and everything else, characters among them, on the stage itself, where
+    /// artwork keeps its size — and the timeline's order spaces the layers
+    /// out inside their band, the higher one nearer. A folder (a character, a
+    /// puppet) is one layer here: everything filed in it takes its depth, so
+    /// a character never comes apart. A mask and the layers it clips, and a
+    /// guide and the layers following it, go together. The bands are kept
+    /// shallow, so a background shrinks by a quarter at most.
+    pub fn auto_depths(&self) -> Vec<(LayerId, f64)> {
+        let layers = self.stage_layers();
+        let focal = self.camera().focal_distance;
+        let nearest = self.camera().nearest_depth();
+        // Units front first: the layers of each, and the band its lead's name gives.
+        let mut units: Vec<(Vec<LayerId>, DepthBand)> = Vec::new();
+        for layer in layers.iter().filter(|l| l.parent.is_none()) {
+            let follows = matches!(layer.kind, LayerKind::Masked | LayerKind::Guided);
+            match units.last_mut() {
+                Some((unit, _)) if follows => unit.push(layer.id),
+                _ => {
+                    let band = if layer.cast_source.is_some() || layer.puppet {
+                        DepthBand::Stage
+                    } else {
+                        depth_band_of(&layer.name).unwrap_or(DepthBand::Stage)
+                    };
+                    units.push((vec![layer.id], band));
+                }
+            }
+        }
+        let mut depth_of: std::collections::HashMap<LayerId, f64> = std::collections::HashMap::new();
+        for band in [DepthBand::Near, DepthBand::Stage, DepthBand::Mid, DepthBand::Far] {
+            let (front, back) = band.range();
+            let members: Vec<&Vec<LayerId>> = units.iter().filter(|(_, b)| *b == band).map(|(u, _)| u).collect();
+            let n = members.len();
+            for (i, unit) in members.into_iter().enumerate() {
+                let t = if n == 1 { 0.5 } else { i as f64 / (n - 1) as f64 };
+                let depth = ((front + (back - front) * t) * focal).max(nearest * 0.5);
+                for id in unit {
+                    depth_of.insert(*id, depth);
+                }
+            }
+        }
+        // Filed layers take their top folder's depth.
+        let root = |mut id: LayerId| {
+            for _ in 0..64 {
+                match layers.get(id).and_then(|l| l.parent) {
+                    Some(p) => id = p,
+                    None => break,
+                }
+            }
+            id
+        };
+        layers
+            .iter()
+            .filter_map(|l| Some((l.id, *depth_of.get(&root(l.id))?)))
+            .collect()
+    }
+
+    /// Give every stage layer its [`Self::auto_depths`] depth. Whether any
+    /// moved; a layer already there is not touched, so this is free to run
+    /// after every edit. Nothing happens while a symbol is open for editing.
+    pub fn apply_auto_depth(&mut self) -> bool {
+        if !self.edit_path().is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for (id, depth) in self.auto_depths() {
+            if self.stage_layers().get(id).is_some_and(|l| (l.depth - depth).abs() > 1e-9) {
+                changed |= self.update_layer(id, |l| l.depth = depth);
+            }
+        }
+        changed
     }
 
     pub fn library(&self) -> &Library {
@@ -3855,6 +3991,42 @@ mod tests {
     use super::*;
     use buzz_geom::{BezPath, Point, Shape as _};
     use kurbo::Rect as KRect;
+
+    /// **Auto Depth** (user 2026-11-17): names pick the band, order spaces
+    /// the layers inside it (higher nearer), a character's folder moves as
+    /// one with what is filed in it, and running it again changes nothing.
+    #[test]
+    fn auto_depth_bands_layers_by_name_and_spaces_them_by_order() {
+        assert_eq!(depth_band_of("BG2"), Some(DepthBand::Far));
+        assert_eq!(depth_band_of("Sky Day"), Some(DepthBand::Far));
+        assert_eq!(depth_band_of("fg_1"), Some(DepthBand::Near));
+        assert_eq!(depth_band_of("Trees"), Some(DepthBand::Mid));
+        assert_eq!(depth_band_of("Raju"), None);
+        assert_eq!(depth_band_of("Background trees"), Some(DepthBand::Far), "far wins over mid");
+
+        let mut scene = Scene::default(); // "Layer 1": says nothing, so on the stage
+        let sky = scene.add_stage_layer("Sky", LayerKind::Normal);
+        let bg = scene.add_stage_layer("BG 2", LayerKind::Normal);
+        let trees = scene.add_stage_layer("Trees", LayerKind::Normal);
+        let raju = scene.add_stage_layer("Raju", LayerKind::Folder);
+        scene.update_layer(raju, |l| l.cast_source = Some("Cast/Series/Raju".into()));
+        let arm = scene.add_stage_layer("BG arm", LayerKind::Normal);
+        scene.update_layer(arm, |l| l.parent = Some(raju));
+        let fg = scene.add_stage_layer("FG", LayerKind::Normal);
+        let focal = scene.camera().focal_distance;
+
+        assert!(scene.apply_auto_depth());
+        let depth = |scene: &Scene, id: LayerId| scene.stage_layers().get(id).unwrap().depth;
+        assert!((depth(&scene, bg) - 0.25 * focal).abs() < 1e-6, "the higher background is the nearer of the two");
+        assert!((depth(&scene, sky) - 0.35 * focal).abs() < 1e-6);
+        assert!((depth(&scene, trees) - 0.15 * focal).abs() < 1e-6, "one midground layer sits mid-band");
+        assert_eq!(depth(&scene, raju), 0.0, "a character stays on the stage");
+        assert_eq!(depth(&scene, arm), 0.0, "and its parts with it, whatever they are called");
+        assert!(depth(&scene, fg) < 0.0 && depth(&scene, fg) >= scene.camera().nearest_depth() * 0.5, "the foreground comes forward");
+        let first = scene.stage_layers().iter().last().unwrap().id;
+        assert_eq!(depth(&scene, first), 0.0);
+        assert!(!scene.apply_auto_depth(), "already there: nothing moves");
+    }
 
     /// F7.6: an armature whose part is an *instance* measures the symbol's
     /// real extent (placed by the part and the armature transforms), not the

@@ -86,7 +86,7 @@ pub use assets_panel::{AssetAction, AssetPanelState, assets_panel};
 pub use brush::{BrushKind, BrushSettings, BrushTips, PatternShape};
 pub use camera_panel::{CameraPanelState, CameraResponse, camera_hud, camera_panel};
 pub use character_panel::{
-    CAST_FOLDER, AddPoseAsk, CastAction, DeleteAsk, CastPanelState, PoseSource, FreshAsk, CastThumbnailSource, cast_panel, cast_windows,
+    CAST_FOLDER, AddPoseAsk, CastAction, POSE_SLOTS, TagFrom, DeleteAsk, CastPanelState, PoseSource, FreshAsk, CastThumbnailSource, cast_panel, cast_windows,
 };
 pub use command::Command;
 pub use command_palette::{CommandPaletteState, command_palette};

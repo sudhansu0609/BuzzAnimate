@@ -202,18 +202,8 @@ pub fn sync_placed_character(scene: &mut Scene, cast: &Scene, folder: &str, name
     }
     let mut changed = false;
 
-    if let Some((old, new)) = renamed
-        && old != new
-        && scene.library().find_by_name(new).is_none()
-        && let Some(id) = scene.library().find_by_name(old).map(|s| s.id)
-    {
-        changed |= scene.library_mut().update(id, |s| s.name = new.to_string());
-        let (from, to) = (format!("{folder}/{name}|{old}"), format!("{folder}/{name}|{new}"));
-        let relinked: Vec<LayerId> =
-            scene.layers().iter().filter(|l| l.cast_source.as_deref() == Some(from.as_str())).map(|l| l.id).collect();
-        for id in relinked {
-            changed |= scene.update_layer(id, |l| l.cast_source = Some(to.clone()));
-        }
+    if let Some((old, new)) = renamed {
+        changed |= rename_placed_pose(scene, folder, name, old, new);
     }
 
     // The Cast's poses, main first.
@@ -247,6 +237,135 @@ pub fn sync_placed_character(scene: &mut Scene, cast: &Scene, folder: &str, name
         changed |= scene.library_mut().update(main, |s| s.set = members);
     }
     changed
+}
+
+/// **Rename one pose of the placed `<folder>/<name>`** from `old` to `new`
+/// (full names), with the layers that show it. Refused when `new` is taken.
+pub fn rename_placed_pose(scene: &mut Scene, folder: &str, name: &str, old: &str, new: &str) -> bool {
+    if old == new || scene.library().find_by_name(new).is_some() {
+        return false;
+    }
+    let Some(id) = scene.library().find_by_name(old).map(|s| s.id) else {
+        return false;
+    };
+    let mut changed = scene.library_mut().update(id, |s| s.name = new.to_string());
+    let (from, to) = (format!("{folder}/{name}|{old}"), format!("{folder}/{name}|{new}"));
+    let relinked: Vec<LayerId> =
+        scene.layers().iter().filter(|l| l.cast_source.as_deref() == Some(from.as_str())).map(|l| l.id).collect();
+    for id in relinked {
+        changed |= scene.update_layer(id, |l| l.cast_source = Some(to.clone()));
+    }
+    changed
+}
+
+/// The pose of `asset` tagged as `label` (`<Character> <label>`, any case),
+/// if one is.
+pub fn tagged_pose(library: &AssetLibrary, asset: &Asset, label: &str) -> Option<String> {
+    let scene = library.load(asset).ok()?;
+    let main = main_symbol(&scene)?;
+    let full = format!("{} {label}", name_of(&scene, main));
+    scene.library().symbol_set(main).into_iter().skip(1).map(|id| name_of(&scene, id)).find(|n| n.eq_ignore_ascii_case(&full))
+}
+
+/// **Tag one of `asset`'s poses as `label`** (one of the Cast panel's six):
+/// it is renamed `<Character> <label>`. A pose already tagged there is let go
+/// as `<Character> <label> old` ([`untag_pose`]), its artwork kept. Returns
+/// the full name and the renames to make, in order, in a shot holding the
+/// character.
+pub fn tag_pose(library: &mut AssetLibrary, asset: &Asset, label: &str, pose: &str, stamp: &str) -> Result<(String, Vec<(String, String)>), String> {
+    let mut scene = library.load(asset).map_err(|e| format!("could not read {}: {e}", asset.name))?;
+    let main = main_symbol(&scene).ok_or_else(|| format!("{} has only one pose", asset.name))?;
+    let full = format!("{} {}", name_of(&scene, main), label.trim());
+    let set = scene.library().symbol_set(main);
+    let id = set
+        .iter()
+        .copied()
+        .find(|id| name_of(&scene, *id) == pose)
+        .ok_or_else(|| format!("{} has no pose called {pose}", asset.name))?;
+    if id == main {
+        return Err(format!("{pose} is {}'s main pose, its Front", asset.name));
+    }
+    if pose == full {
+        return Ok((full, Vec::new()));
+    }
+    // The pose in the slot is let go under a name that says what it was —
+    // never the tagged pose's old name, which describes other artwork.
+    let mut renames = Vec::new();
+    if let Some(other) = set.iter().copied().find(|other| *other != id && name_of(&scene, *other).eq_ignore_ascii_case(&full)) {
+        let (taken, old) = (name_of(&scene, other), scene.library().unique_name(&format!("{full} old")));
+        scene.library_mut().update(other, |s| s.name = old.clone());
+        renames.push((taken, old));
+    }
+    scene.library_mut().update(id, |s| s.name = full.clone());
+    renames.push((pose.to_string(), full.clone()));
+    write_back(library, asset, &scene, stamp, "tag_pose")?;
+    Ok((full, renames))
+}
+
+/// How an extra pose tag is kept on the main symbol's `tags`.
+const EXTRA_TAG: &str = "pose-tag:";
+
+/// **The extra pose tags** the user gave `scene`'s character beyond the six
+/// (user 2026-11-17: "add extra poses to the cast and tag them") — `Sit`,
+/// `Run`, `Angry`... — in the order they were added. Kept on the main symbol.
+pub fn extra_tags(scene: &Scene) -> Vec<String> {
+    let Some(main) = main_symbol(scene) else {
+        return Vec::new();
+    };
+    scene
+        .library()
+        .get(main)
+        .map(|s| s.tags.iter().filter_map(|t| t.strip_prefix(EXTRA_TAG).map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// **Add an extra pose tag** `label` to `asset`'s character. Refused when it
+/// is empty, one of the six, or already there.
+pub fn add_extra_tag(library: &mut AssetLibrary, asset: &Asset, label: &str, six: &[&str], stamp: &str) -> Result<String, String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("the tag needs a name".into());
+    }
+    if six.iter().any(|s| s.eq_ignore_ascii_case(&label)) {
+        return Err(format!("{label} is already one of the six poses"));
+    }
+    let mut scene = library.load(asset).map_err(|e| format!("could not read {}: {e}", asset.name))?;
+    let main = main_symbol(&scene).ok_or_else(|| format!("give {} a second pose first (Add Pose\u{2026})", asset.name))?;
+    if extra_tags(&scene).iter().any(|t| t.eq_ignore_ascii_case(&label)) {
+        return Err(format!("{} already has a {label} tag", asset.name));
+    }
+    scene.library_mut().update(main, |s| s.tags.push(format!("{EXTRA_TAG}{label}")));
+    write_back(library, asset, &scene, stamp, "tag")?;
+    Ok(label)
+}
+
+/// **Take an extra pose tag away**: the slot goes; a pose tagged there keeps
+/// its name and stays one of the character's poses.
+pub fn remove_extra_tag(library: &mut AssetLibrary, asset: &Asset, label: &str, stamp: &str) -> Result<(), String> {
+    let mut scene = library.load(asset).map_err(|e| format!("could not read {}: {e}", asset.name))?;
+    let main = main_symbol(&scene).ok_or_else(|| format!("{} has no extra tags", asset.name))?;
+    let tag = format!("{EXTRA_TAG}{label}");
+    if !scene.library().get(main).is_some_and(|s| s.tags.contains(&tag)) {
+        return Err(format!("{} has no {label} tag", asset.name));
+    }
+    scene.library_mut().update(main, |s| s.tags.retain(|t| *t != tag));
+    write_back(library, asset, &scene, stamp, "untag")?;
+    Ok(())
+}
+
+/// **Let go of the pose tagged as `label`**, keeping it: it is renamed
+/// `<Character> <label> old`. Returns `(was, now)`, or `None` when nothing is
+/// tagged there.
+pub fn untag_pose(library: &mut AssetLibrary, asset: &Asset, label: &str, stamp: &str) -> Result<Option<(String, String)>, String> {
+    let Some(was) = tagged_pose(library, asset, label) else {
+        return Ok(None);
+    };
+    let mut scene = library.load(asset).map_err(|e| format!("could not read {}: {e}", asset.name))?;
+    let id = scene.library().find_by_name(&was).map(|s| s.id).ok_or_else(|| format!("{} has no pose called {was}", asset.name))?;
+    let now = scene.library().unique_name(&format!("{was} old"));
+    scene.library_mut().update(id, |s| s.name = now.clone());
+    write_back(library, asset, &scene, stamp, "untag_pose")?;
+    Ok(Some((was, now)))
 }
 
 /// **Rename a character everywhere `scene` keeps its name**: the main symbol
@@ -572,6 +691,246 @@ pub fn source_of(doc: &Scene, library: &AssetLibrary, selected: Option<ObjectId>
     library.assets().iter().find(|a| format!("{}/{}", a.folder, a.name) == key).cloned()
 }
 
+/// The symbols a character is made of: its main symbol, every pose in its
+/// set, and whatever their artwork nests, to any depth.
+fn character_symbols(scene: &Scene, main: SymbolId) -> std::collections::BTreeSet<SymbolId> {
+    let mut out = std::collections::BTreeSet::new();
+    for id in std::iter::once(main).chain(scene.library().symbol_set(main)) {
+        out.extend(scene.symbol_closure(id));
+    }
+    out
+}
+
+/// `text` with every `SymbolId(n)` written as that symbol's name and every
+/// other `…Id(n)` as `_`: ids differ between a Cast file and a film's copy of
+/// the same drawing, names do not.
+fn without_ids(scene: &Scene, text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("Id(") {
+        let ident_start = rest[..at].rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_').map_or(0, |i| i + 1);
+        let digits = rest[at + 3..].chars().take_while(char::is_ascii_digit).count();
+        let closes = rest[at + 3 + digits..].starts_with(')');
+        if digits == 0 || !closes {
+            out.push_str(&rest[..at + 3]);
+            rest = &rest[at + 3..];
+            continue;
+        }
+        out.push_str(&rest[..ident_start]);
+        let ident = &rest[ident_start..at];
+        if ident == "SymbolId" {
+            let id = SymbolId(rest[at + 3..at + 3 + digits].parse().unwrap_or(0));
+            out.push_str(&format!("S<{}>", name_of(scene, id)));
+        } else {
+            out.push('_');
+        }
+        rest = &rest[at + 4 + digits..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// **A fingerprint of a character as it is drawn**: every symbol it is made
+/// of, by name, ids left out — so a film's copy and its Cast file print the
+/// same when they draw the same, and a copy edited in a film prints
+/// differently from the one it was given. Master-audio guides are left out
+/// (each film has its own).
+pub fn character_print(scene: &Scene, main: SymbolId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut symbols: Vec<buzz_scene::Symbol> = character_symbols(scene, main)
+        .into_iter()
+        .filter_map(|id| scene.library().get(id).map(|s| (**s).clone()))
+        .collect();
+    symbols.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for mut symbol in symbols {
+        let mut kept = buzz_scene::LayerStack::new();
+        for l in symbol.layers.iter().filter(|l| !l.audio_guide) {
+            kept.insert(kept.len(), (**l).clone());
+        }
+        symbol.layers = kept;
+        symbol.folder = None;
+        without_ids(scene, &format!("{symbol:?}")).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// **Bring the copy of `<folder>/<name>` placed in `scene` up to date with its
+/// Cast file `cast` — artwork and all** (the Cast panel's Update, user
+/// 2026-11-17). [`sync_placed_character`] first, for the poses the Cast has
+/// and their names; then every symbol of the character that the Cast also
+/// has is redrawn as the Cast draws it, **keeping this film's symbol**: its
+/// id, so the instances on every keyframe, the Pose menu and the set still
+/// point at it, and the placements (where the character stands, its size,
+/// its tint) are left as they are. Symbols the character no longer uses are
+/// removed; a pose placed as one symbol is stood on the main pose's feet
+/// again, as casting it did. Whether anything changed.
+pub fn refresh_placed_character(scene: &mut Scene, cast: &Scene, folder: &str, name: &str) -> bool {
+    let before = scene.clone();
+    let changed = sync_placed_character(scene, cast, folder, name, None);
+    // Only the symbol that owns the character's poses is redrawn: an
+    // unrelated `Raju` of the film's own (the cast one then came in as
+    // `Raju 2`) is never touched.
+    let Some(main) = scene.library().find_by_name(name).filter(|s| !s.set.is_empty()).map(|s| s.id) else {
+        return changed;
+    };
+    let Some(cast_main) = main_symbol(cast).or_else(|| cast.library().find_by_name(name).map(|s| s.id)) else {
+        return changed;
+    };
+    let lifted = scene
+        .stage_layers()
+        .iter()
+        .any(|l| l.kind == buzz_scene::LayerKind::Folder && l.cast_source.as_deref() == Some(format!("{folder}/{name}").as_str()));
+    // A film already drawing what the Cast draws — once stood on its feet as
+    // casting it did — has nothing to take.
+    let mut stood = cast.clone();
+    if !lifted {
+        crate::cast_combine::normalise_poses(&mut stood, cast_main);
+    }
+    if character_print(scene, main) == character_print(&stood, cast_main) {
+        return changed;
+    }
+
+    let mut ours: std::collections::BTreeSet<SymbolId> = character_symbols(scene, main);
+    // Parts new to this film's copy, by the Cast's name, so a later pose that
+    // uses one too shares it.
+    let mut fresh: std::collections::HashMap<String, SymbolId> = std::collections::HashMap::new();
+    for cast_id in std::iter::once(cast_main).chain(cast.library().symbol_set(cast_main)) {
+        let pose = name_of(cast, cast_id);
+        if !scene.library().find_by_name(&pose).is_some_and(|s| ours.contains(&s.id)) {
+            continue;
+        }
+        let had: std::collections::HashSet<SymbolId> = scene.library().iter().map(|s| s.id).collect();
+        let Some((_, report)) = scene.import_symbol(cast, cast_id) else { continue };
+        // Each symbol that came in, matched to this film's own of that name.
+        let mut pairs: Vec<(SymbolId, SymbolId)> = Vec::new();
+        let arrived: Vec<SymbolId> = scene.library().iter().map(|s| s.id).filter(|id| !had.contains(id)).collect();
+        for copy in arrived {
+            let given = name_of(scene, copy);
+            let asked = report.renamed.iter().find(|(_, g)| *g == given).map_or(given.clone(), |(a, _)| a.clone());
+            let here = fresh
+                .get(&asked)
+                .copied()
+                .or_else(|| scene.library().iter().find(|s| s.name == asked && ours.contains(&s.id)).map(|s| s.id));
+            match here {
+                Some(here) => pairs.push((copy, here)),
+                // New to this film's copy (a part the Cast added): kept.
+                None => {
+                    ours.insert(copy);
+                    fresh.insert(asked, copy);
+                }
+            }
+        }
+        for (copy, here) in &pairs {
+            let Some(drawn) = scene.library().get(*copy).map(|s| (**s).clone()) else { continue };
+            scene.library_mut().update(*here, |s| {
+                s.kind = drawn.kind.clone();
+                s.layers = drawn.layers.clone();
+                s.registration = drawn.registration;
+                s.tags = drawn.tags.clone();
+            });
+        }
+        for (copy, here) in &pairs {
+            scene.swap_symbol(*copy, *here);
+        }
+        for (copy, _) in &pairs {
+            scene.library_mut().remove(*copy);
+        }
+    }
+
+    // What the character drew with before and no longer does goes, unless
+    // something else in the film still uses it.
+    let now = character_symbols(scene, main);
+    let candidates: std::collections::BTreeSet<SymbolId> = ours.difference(&now).copied().collect();
+    if !candidates.is_empty() {
+        let mut alive = crate::asset_index::used_symbols(scene);
+        for s in scene.library().iter().filter(|s| !candidates.contains(&s.id)) {
+            alive.extend(scene.symbol_closure(s.id));
+        }
+        for id in candidates.into_iter().filter(|id| !alive.contains(id)) {
+            scene.library_mut().remove(id);
+        }
+    }
+
+    // Placed as one symbol, its poses stand where the main pose does.
+    if !lifted {
+        crate::cast_combine::normalise_poses(scene, main);
+    }
+
+    if !changed && character_print(scene, main) == character_print(&before, main) {
+        *scene = before;
+        return false;
+    }
+    true
+}
+
+/// **A character placed as one symbol, as a Cast asset**: the film's main
+/// symbol `main` and its poses, everything as the film draws them, on one
+/// stage layer named `layer` — a fresh instance, so where the film moved or
+/// scaled it is not written into the Cast. Master-audio guides are left out.
+pub fn placed_character_scene(doc: &Scene, main: SymbolId, layer: &str) -> Result<Scene, String> {
+    let mut out = crate::asset_index::symbol_scene(doc, main, layer).ok_or("the character's symbol is gone")?;
+    let ids: Vec<SymbolId> = out.library().iter().map(|s| s.id).collect();
+    for id in ids {
+        if out.library().get(id).is_some_and(|s| s.layers.iter().any(|l| l.audio_guide)) {
+            out.library_mut().update(id, |s| {
+                let mut kept = buzz_scene::LayerStack::new();
+                for l in s.layers.iter().filter(|l| !l.audio_guide) {
+                    kept.insert(kept.len(), (**l).clone());
+                }
+                s.layers = kept;
+            });
+        }
+    }
+    if out.library().symbol_set(main).is_empty() && main_symbol(&out).is_none() {
+        return Err("the character has no poses".into());
+    }
+    Ok(out)
+}
+
+/// **Write the copy of `asset` placed in `doc` as one symbol back over its
+/// Cast file** (backup first). The symbol is found by the Cast's main name.
+pub fn save_placed_character(library: &mut AssetLibrary, doc: &Scene, asset: &Asset, stamp: &str) -> Result<(), String> {
+    let cast = library.load(asset).map_err(|e| format!("could not read {}: {e}", asset.name))?;
+    let main_name = main_symbol(&cast).map(|m| name_of(&cast, m)).unwrap_or_else(|| asset.name.clone());
+    let main = doc
+        .library()
+        .find_by_name(&main_name)
+        .map(|s| s.id)
+        .ok_or_else(|| format!("{} is not in this film", asset.name))?;
+    let layer = cast.stage_layers().iter().next().map(|l| l.name.clone()).unwrap_or_else(|| asset.name.clone());
+    let mut scene = placed_character_scene(doc, main, &layer)?;
+    // The Cast's pose tags are the Cast's: a film cast before a tag was added
+    // does not take it away.
+    let cast_tags: Vec<String> = cast.library().get(main_symbol(&cast).unwrap_or(main)).map(|s| s.tags.clone()).unwrap_or_default();
+    if let Some(here) = scene.library().find_by_name(&main_name).map(|s| s.id) {
+        scene.library_mut().update(here, |s| {
+            for tag in cast_tags.iter().filter(|t| t.starts_with(EXTRA_TAG)) {
+                if !s.tags.contains(tag) {
+                    s.tags.push(tag.clone());
+                }
+            }
+        });
+    }
+    write_back(library, asset, &scene, stamp, "update")?;
+    Ok(())
+}
+
+/// **Duplicate a character** in the Cast: a copy of its file beside it,
+/// `<Name> copy` (or `<Name> copy 2`...), its main symbol and poses renamed
+/// to match, ready to be renamed and changed on its own. Returns the copy.
+pub fn duplicate_character(library: &mut AssetLibrary, asset: &Asset) -> Result<Asset, String> {
+    let taken = |name: &str| {
+        library.assets().iter().any(|a| a.folder == asset.folder && a.name.eq_ignore_ascii_case(name))
+            || asset.path.with_file_name(format!("{name}.{}", buzz_doc::format::EXTENSION)).exists()
+    };
+    let base = format!("{} copy", asset.name);
+    let new = std::iter::once(base.clone()).chain((2..).map(|n| format!("{base} {n}"))).find(|n| !taken(n)).unwrap_or(base);
+    let mut scene = library.load(asset).map_err(|e| format!("could not read {}: {e}", asset.name))?;
+    rename_character_in(&mut scene, &asset.folder, &asset.name, &new);
+    library.save(&new, &asset.folder, &scene).map_err(|e| format!("could not save {new}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +1072,94 @@ mod tests {
         let mut other = Scene::default();
         other.add_symbol("Raju", SymbolKind::Graphic, None);
         assert!(!sync_placed_character(&mut other, &cast, &asset.folder, "Raju", None));
+    }
+
+    /// **Extra pose tags** (user 2026-11-17): a character with poses takes
+    /// tags of the user's own beyond the six, kept in its Cast file in order;
+    /// empty, repeated or six-pose names are refused; a pose tagged there is
+    /// renamed `<Character> <tag>`; taking the tag away keeps the pose.
+    #[test]
+    fn extra_pose_tags_are_kept_with_the_character_and_take_poses() {
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = AssetLibrary::at(dir.path());
+        let asset = saved(&mut library, "Raju");
+        let six = ["Front", "Walk Front", "Back"];
+        assert!(add_extra_tag(&mut library, &asset, "Sit", &six, "2026-11-17_070700").is_err(), "one pose: a second first");
+
+        let mut doc = Scene::default();
+        doc.add_symbol("Sitting", SymbolKind::Graphic, None);
+        add_pose(&mut library, &asset, "Sitting", PoseInput::LibrarySymbol(&doc, "Sitting"), "2026-11-17_070701").expect("added");
+        let asset = library.assets().iter().find(|a| a.name == "Raju").cloned().unwrap();
+        assert_eq!(add_extra_tag(&mut library, &asset, " Sit ", &six, "2026-11-17_070702").unwrap(), "Sit");
+        add_extra_tag(&mut library, &asset, "Run", &six, "2026-11-17_070703").expect("a second tag");
+        assert!(add_extra_tag(&mut library, &asset, "sit", &six, "2026-11-17_070704").is_err(), "no duplicate, any case");
+        assert!(add_extra_tag(&mut library, &asset, "back", &six, "2026-11-17_070705").is_err(), "not one of the six");
+        assert!(add_extra_tag(&mut library, &asset, "  ", &six, "2026-11-17_070706").is_err());
+        assert_eq!(extra_tags(&library.load(&asset).unwrap()), vec!["Sit", "Run"], "kept in the Cast file, in order");
+
+        let (full, _) = tag_pose(&mut library, &asset, "Sit", "Raju Sitting", "2026-11-17_070707").expect("tagged");
+        assert_eq!(full, "Raju Sit");
+        assert_eq!(tagged_pose(&library, &asset, "Sit").as_deref(), Some("Raju Sit"));
+
+        remove_extra_tag(&mut library, &asset, "Sit", "2026-11-17_070708").expect("removed");
+        let scene = library.load(&asset).unwrap();
+        assert_eq!(extra_tags(&scene), vec!["Run"]);
+        assert!(pose_names(&scene).contains(&"Raju Sit".to_string()), "its pose stays");
+    }
+
+    /// **Tagging the six poses**: a pose tagged Back is renamed `Raju Back`;
+    /// another tagged Back after it lets the first go as `Raju Back old`
+    /// (untagging does the same, keeping it); the main pose cannot
+    /// be tagged; a pose tagged Front is the front view in place of the main
+    /// pose; a placed copy follows every rename.
+    #[test]
+    fn a_pose_tagged_to_a_slot_takes_its_name_and_lets_the_last_go() {
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = AssetLibrary::at(dir.path());
+        let asset = saved(&mut library, "Raju");
+        let mut doc = Scene::default();
+        for name in ["BackStanding", "SideWalking"] {
+            doc.add_symbol(name, SymbolKind::Graphic, None);
+            add_pose(&mut library, &asset, name, PoseInput::LibrarySymbol(&doc, name), "2026-11-16_060601").expect("added");
+        }
+        let asset = library.assets().iter().find(|a| a.name == "Raju").cloned().unwrap();
+        let mut shot = Scene::default();
+        let (_, folder) = crate::episode::place_cast(&mut shot, &library, &asset).expect("cast");
+        let folder = folder.expect("lifted into a folder");
+        let names = |shot: &Scene| -> Vec<String> { buzz_act::pose::poses_of(shot, folder).into_iter().map(|(_, n)| n).collect() };
+        let follow = |shot: &mut Scene, library: &AssetLibrary, renames: &[(String, String)]| {
+            for (old, new) in renames {
+                rename_placed_pose(shot, &asset.folder, "Raju", old, new);
+            }
+            sync_placed_character(shot, &library.load(&asset).unwrap(), &asset.folder, "Raju", None);
+        };
+
+        let (full, renames) = tag_pose(&mut library, &asset, "Back", "Raju BackStanding", "2026-11-16_060602").expect("tagged");
+        assert_eq!(full, "Raju Back");
+        follow(&mut shot, &library, &renames);
+        assert_eq!(pose_names(&library.load(&asset).unwrap()), vec!["Raju", "Raju Back", "Raju SideWalking"]);
+        assert_eq!(names(&shot), vec!["Raju", "Raju Back", "Raju SideWalking"], "the shot follows");
+        assert_eq!(tagged_pose(&library, &asset, "Back").as_deref(), Some("Raju Back"));
+
+        let (_, renames) = tag_pose(&mut library, &asset, "Back", "Raju SideWalking", "2026-11-16_060603").expect("tagged");
+        follow(&mut shot, &library, &renames);
+        assert_eq!(pose_names(&library.load(&asset).unwrap()), vec!["Raju", "Raju Back old", "Raju Back"], "the last Back is let go as Back old");
+        assert_eq!(names(&shot), vec!["Raju", "Raju Back old", "Raju Back"], "and in the shot");
+        assert_eq!(untag_pose(&mut library, &asset, "Back", "2026-11-16_060606").unwrap(), Some(("Raju Back".into(), "Raju Back old 1".into())));
+        assert_eq!(untag_pose(&mut library, &asset, "Side", "2026-11-16_060607").unwrap(), None, "nothing tagged Side");
+        let (_, renames) = tag_pose(&mut library, &asset, "Back", "Raju Back old 1", "2026-11-16_060608").expect("tagged");
+        follow(&mut shot, &library, &renames);
+
+        assert!(tag_pose(&mut library, &asset, "Walk Front", "Raju", "2026-11-16_060604").is_err(), "the main pose cannot be tagged");
+
+        // Front: the main pose until a pose is tagged Front, then that one.
+        let main = buzz_act::pose::poses_of(&shot, folder)[0].0;
+        assert_eq!(buzz_act::pose::pose_for_view(&shot, folder, "Front"), Some(main));
+        let (_, renames) = tag_pose(&mut library, &asset, "Front", "Raju Back old", "2026-11-16_060605").expect("tagged");
+        follow(&mut shot, &library, &renames);
+        let front = buzz_act::pose::poses_of(&shot, folder).into_iter().find(|(_, n)| n == "Raju Front").map(|(id, _)| id);
+        assert!(front.is_some(), "Raju Front in the shot");
+        assert_eq!(buzz_act::pose::pose_for_view(&shot, folder, "front"), front, "the tagged Front is the front view");
     }
 
     /// **A character emptied in the shot is not written back.** Every part

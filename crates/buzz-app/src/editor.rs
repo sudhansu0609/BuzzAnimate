@@ -446,6 +446,10 @@ pub struct Editor {
     /// The copy is made when the pointer has gone far enough to be a drag, not
     /// at the press, so an Alt-click copies nothing. See [`AltCopy`].
     alt_copy: Option<AltCopy>,
+    /// How far the selection has been moved in the drag under way, so Alt
+    /// pressed partway through it can put the original back and make the
+    /// copy there instead (`Self::alt_copy_midway`).
+    drag_moved: Vec2,
     /// **The box a Free Transform turn left a mixed selection with** — see
     /// [`BoxSession`]. View state, like `group_pivot`: it is not saved.
     ///
@@ -893,6 +897,7 @@ impl Editor {
             light_gesture: None,
             shape_gesture: None,
             alt_copy: None,
+            drag_moved: Vec2::ZERO,
             box_session: std::cell::RefCell::new(None),
             sound: crate::sound::SoundBank::new(stage_fps),
             scrub_until: None,
@@ -2819,6 +2824,7 @@ impl Editor {
         // A fresh press starts with no copy in hand, whatever became of the
         // last gesture (a release outside the window never arrives).
         self.alt_copy = None;
+        self.drag_moved = Vec2::ZERO;
         // Capture the visible circle before snapping or picking artwork under
         // it. A pivot can be outside its selection or over another object.
         if self.pointer_on_pivot(screen) && let Some(pivot) = self.pivot() {
@@ -3047,6 +3053,8 @@ impl Editor {
         let action = self
             .machine
             .pointer_move_at(doc, screen, mods, time, pressure);
+        // Alt pressed partway through a move makes it a copy from there on.
+        self.alt_copy_midway(screen, mods);
         // An Alt-drag drags a copy: hold the move back until it is a drag, then
         // make the copy and let the move through.
         let action = self.alt_copy_step(action, screen);
@@ -3139,6 +3147,7 @@ impl Editor {
         // The copy, if there was one, was made and carried step by step; its
         // release is what ends the one undo step it shares with the drag.
         self.alt_copy = None;
+        self.drag_moved = Vec2::ZERO;
         self.doc.end_gesture();
         // The release may have chosen another object; the anchors chosen on
         // the last one go with it.
@@ -3205,6 +3214,29 @@ impl Editor {
         copy.copied = true;
         self.alt_copy = Some(copy);
         ToolAction::MoveSelection { delta }
+    }
+
+    /// **Alt pressed partway through a move** (user 2026-11-17: "copy an
+    /// object by pressing Alt and dragging it" — Alt is often pressed once
+    /// the drag is under way, as Illustrator allows): the original goes back
+    /// to where the drag started and a copy is made where it had got to, and
+    /// the rest of the drag carries the copy. Before anything has moved it
+    /// is an ordinary Alt-drag.
+    fn alt_copy_midway(&mut self, screen: Point, mods: Mods) {
+        if !mods.alt
+            || self.alt_copy.is_some()
+            || !matches!(self.machine.tool(), ToolId::Selection | ToolId::FreeTransform)
+            || !self.machine.is_moving()
+        {
+            return;
+        }
+        let moved = std::mem::replace(&mut self.drag_moved, Vec2::ZERO);
+        let copied = moved != Vec2::ZERO;
+        if copied {
+            self.transform_selection(Affine::translate(-moved), "Move");
+            self.duplicate_selection_at(ALT_COPY_LABEL, moved);
+        }
+        self.alt_copy = Some(AltCopy { origin_screen: screen, pending: Vec2::ZERO, copied });
     }
 
     /// Snap a point for the *active* tool, which for the freehand tools and the
@@ -3415,6 +3447,7 @@ impl Editor {
                 let label = if self.alt_copy.is_some_and(|c| c.copied) {
                     ALT_COPY_LABEL
                 } else {
+                    self.drag_moved += delta;
                     "Move"
                 };
                 self.transform_selection(Affine::translate(delta), label);
@@ -22580,6 +22613,45 @@ mod tests {
             e.run(Command::Undo);
             assert_eq!(e.scene().shape_count(), 1, "[{tool:?}] one Undo removes the copy");
             assert_eq!(transform_of(&e, id), before, "[{tool:?}] and the original is as it was");
+        }
+    }
+
+    /// **Alt pressed partway through a drag makes it a copy** (user
+    /// 2026-11-17): the original goes back to where the drag began, the copy
+    /// ends where the pointer does, and nothing is copied twice.
+    #[test]
+    fn alt_pressed_partway_through_a_drag_copies() {
+        let alt = Mods {
+            alt: true,
+            ..Mods::default()
+        };
+        for tool in [ToolId::Selection, ToolId::FreeTransform] {
+            let mut e = editor();
+            let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+            e.selection.select_one(id);
+            e.set_tool(tool);
+            let before = transform_of(&e, id);
+            let camera = e.camera.clone();
+            let screen = |x: f64, y: f64| camera.doc_to_screen(Point::new(x, y));
+
+            e.pointer_down(screen(130.0, 130.0), Mods::default());
+            for x in [140.0, 150.0, 160.0] {
+                e.pointer_move(screen(x, 130.0), Mods::default());
+            }
+            for x in [170.0, 180.0] {
+                e.pointer_move(screen(x, 130.0), alt);
+            }
+            e.pointer_up(screen(180.0, 130.0));
+
+            assert_eq!(e.scene().shape_count(), 2, "[{tool:?}] one copy");
+            assert_eq!(transform_of(&e, id), before, "[{tool:?}] the original went back");
+            let copy = e.selection.iter().next().expect("the copy is selected");
+            assert_ne!(copy, id);
+            assert!(
+                is_translation(transform_of(&e, copy), Vec2::new(50.0, 0.0)),
+                "[{tool:?}] the copy is where the pointer ended, got {:?}",
+                transform_of(&e, copy).as_coeffs()
+            );
         }
     }
 

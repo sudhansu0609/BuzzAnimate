@@ -222,7 +222,11 @@ use serde::{Deserialize, Serialize};
 /// * **50** — a brush stroke carries `brush`: the samples and profile it was
 ///   drawn from, so it can be re-widthed and re-smoothed later. Absent for
 ///   everything else, which is every object of every older document.
-pub const FORMAT_VERSION: u32 = 50;
+/// * **51** — the stage carries `auto_depth`: **Auto Depth**, every layer's
+///   depth set from its name and its place in the timeline. Absent when off,
+///   which is every older document, so a document without it is written
+///   exactly as version 50 wrote it.
+pub const FORMAT_VERSION: u32 = 51;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -1077,6 +1081,10 @@ pub struct StageDto {
     /// off, which is every older file and most documents.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sort_by_depth: bool,
+    /// **Auto Depth** on. Version 51. Absent when off, which is every older
+    /// file and most documents.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_depth: bool,
 }
 
 /// The compositor settings. Written flat, like [`LightDto`], so the runtime
@@ -2939,6 +2947,7 @@ impl DocumentDto {
                 frame_rate: scene.stage().frame_rate,
                 post: PostDto::from_settings(&scene.stage().post),
                 sort_by_depth: scene.stage().sort_by_depth,
+                auto_depth: scene.stage().auto_depth,
             },
             layers,
             max_id,
@@ -3173,6 +3182,7 @@ impl DocumentDto {
                 None => buzz_scene::PostSettings::default(),
             },
             sort_by_depth: self.stage.sort_by_depth,
+            auto_depth: self.stage.auto_depth,
         };
 
         // The rig-part table is resolved before anything that refers to it. A
@@ -6112,6 +6122,17 @@ mod layer_alpha_tests {
         on.stage_mut().sort_by_depth = true;
         let back = DocumentDto::from_scene(&on).to_scene().expect("round trip");
         assert!(back.stage().sort_by_depth);
+    }
+
+    /// **Auto Depth** is not written while off, and survives a save when on.
+    #[test]
+    fn auto_depth_survives_the_round_trip_and_defaults_off() {
+        let json = serde_json::to_value(DocumentDto::from_scene(&Scene::default())).expect("serialise");
+        assert!(json["stage"].as_object().expect("stage").get("auto_depth").is_none(), "a default document must not write auto_depth");
+        let mut on = Scene::default();
+        on.stage_mut().auto_depth = true;
+        let back = DocumentDto::from_scene(&on).to_scene().expect("round trip");
+        assert!(back.stage().auto_depth);
     }
 
     /// A whole turnaround survives, and each drawing stays at its own angle.

@@ -126,8 +126,8 @@ impl AssetPanelState {
 
 /// Draw the Assets panel.
 ///
-/// **Pictures, and Animated or Static** — nothing else on show. The panel
-/// used to stack a heading and count, a search box, three size buttons, the
+/// **Pictures, Animated or Static, and a search box** — nothing else on
+/// show. The panel used to stack a heading and count, three size buttons, the
 /// motion switch, a row of five buttons, the folder path on disk and Place
 /// and Delete on every asset, which buried the assets themselves. The
 /// pictures grow and shrink with Cmd+scroll or a pinch over the panel; what
@@ -247,6 +247,14 @@ fn filter_bar(ui: &mut Ui, library: &AssetLibrary, state: &mut AssetPanelState, 
             if ui.selectable_label(on, label).clicked() {
                 state.motion = if on { MotionFilter::All } else { option };
             }
+        }
+    });
+    // **Search** (user 2026-11-17: put back): by name, in the folder shown.
+    ui.horizontal(|ui| {
+        ui.label("\u{1F50D}");
+        ui.add(egui::TextEdit::singleline(&mut state.search).hint_text("Search assets"));
+        if !state.search.is_empty() && ui.small_button("x").on_hover_text("Clear").clicked() {
+            state.search.clear();
         }
     });
 }
@@ -598,6 +606,25 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// **The search box is there** (user 2026-11-17), and what is typed in it
+    /// leaves only the assets whose names hold it, any case.
+    #[test]
+    fn the_search_box_is_shown_and_narrows_the_list() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let (_dir, library) = library_with_an_asset();
+        let mut state = AssetPanelState::default();
+        let out = ctx.run_ui(Default::default(), |ui| {
+            let _ = assets_panel(ui, &library, &mut state, true, &mut |_| None);
+        });
+        let shown = out.shapes.iter().any(|s| matches!(&s.shape, egui::epaint::Shape::Text(t) if t.galley.text() == "Search assets"));
+        assert!(shown, "the search box, with its hint");
+        state.search = "OA".into();
+        assert!(state.matches("Oak"), "any case");
+        state.search = "pine".into();
+        assert!(!state.matches("Oak"));
     }
 
     /// The panel decides nothing: it says what the user asked for, and the

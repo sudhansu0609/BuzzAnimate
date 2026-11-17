@@ -34,7 +34,14 @@ pub struct DepthResponse {
     pub flatten: bool,
     /// Space the layers out evenly, front to back.
     pub distribute: bool,
+    /// **Auto Depth** turned on (`Some(true)`) or off.
+    pub auto_depth: Option<bool>,
 }
+
+const AUTO_HINT: &str = "Auto Depth: names decide the band (sky / BG far back, trees / buildings / mid between, \
+     FG / foreground in front, characters and the rest on the stage), timeline order spaces the layers inside it, \
+     higher nearer. Kept up to date as layers are added, renamed or moved; a depth set by hand is replaced while it is on. \
+     Paint order stays the timeline's.";
 
 /// How far behind the stage the panel will drag a layer.
 ///
@@ -104,6 +111,18 @@ pub fn depth_panel(ui: &mut Ui, scene: &Scene, active: Option<LayerId>) -> Depth
             response.distribute = true;
         }
     });
+    // A line of its own: beside the buttons it runs past the narrowest column.
+    let mut auto = scene.stage().auto_depth;
+    if ui
+        .checkbox(&mut auto, "Auto Depth")
+        .on_hover_text(AUTO_HINT)
+        .changed()
+    {
+        response.auto_depth = Some(auto);
+    }
+    if scene.stage().auto_depth {
+        ui.label(RichText::new("Auto Depth is on: depths follow the layers' names and order").small().weak());
+    }
 
     ui.separator();
 

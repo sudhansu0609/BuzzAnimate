@@ -138,9 +138,12 @@ pub fn poses_of(scene: &Scene, folder: LayerId) -> Vec<(SymbolId, String)> {
 /// The pose symbol for a view word (`Front`, `Side`, `Back`, `3-4`, `Walk Side`...).
 pub fn pose_for_view(scene: &Scene, folder: LayerId, view: &str) -> Option<SymbolId> {
     let poses = poses_of(scene, folder);
-    let main = poses.first()?.0;
+    let (main, main_name) = poses.first()?.clone();
     if view.eq_ignore_ascii_case("front") {
-        return Some(main);
+        // A pose tagged Front (`<Character> Front`, Cast panel ▸ Six poses),
+        // else the main pose.
+        let front = format!("{} front", main_name.to_lowercase());
+        return Some(poses.iter().skip(1).find(|(_, n)| n.to_lowercase() == front).map_or(main, |(id, _)| *id));
     }
     let suffix = format!(" {}", view.to_lowercase());
     poses.iter().skip(1).find(|(_, n)| n.to_lowercase().ends_with(&suffix)).map(|(id, _)| *id)

@@ -1042,6 +1042,12 @@ impl Document {
         if self.equal_layer_lengths {
             slot.scene.equalize_layer_lengths();
         }
+        // Auto Depth: a layer added, renamed or moved takes its depth, inside
+        // this same undo step. (`edit_scene_at` does not: nothing that adds
+        // or moves stage layers goes through it.)
+        if slot.scene.stage().auto_depth {
+            slot.scene.apply_auto_depth();
+        }
         // Protect Other Keyframes: an edit inside a shared symbol opened in
         // place forks the path, inside this same undo step.
         if let Some(scope) = self.protect_keyframes
@@ -1408,6 +1414,27 @@ mod tests {
     use buzz_scene::{LayerKind, ShapeData};
     use kurbo::Rect;
     use peniko::Color;
+
+    /// **Auto Depth stays live**: with it on, a layer added later takes its
+    /// depth in the same undo step, and one undo takes both away.
+    #[test]
+    fn auto_depth_follows_every_edit_in_the_same_undo_step() {
+        let mut doc = Document::new(Scene::default());
+        doc.edit("Auto Depth", |scene| scene.stage_mut().auto_depth = true);
+        doc.edit("New Layer", |scene| {
+            scene.add_layer("Sky", LayerKind::Normal);
+        });
+        let sky = doc.scene().stage_layers().iter().find(|l| l.name == "Sky").map(|l| l.depth);
+        assert!(sky.is_some_and(|d| d > 0.0), "the sky went back: {sky:?}");
+        doc.undo();
+        assert!(doc.scene().stage_layers().iter().all(|l| l.name != "Sky"));
+        doc.edit("Auto Depth", |scene| scene.stage_mut().auto_depth = false);
+        doc.edit("New Layer", |scene| {
+            scene.add_layer("Sky", LayerKind::Normal);
+        });
+        let sky = doc.scene().stage_layers().iter().find(|l| l.name == "Sky").map(|l| l.depth);
+        assert_eq!(sky, Some(0.0), "off, a layer keeps the depth it is given");
+    }
 
     fn add_shape(scene: &mut Scene) {
         let layer = scene

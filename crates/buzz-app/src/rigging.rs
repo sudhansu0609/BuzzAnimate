@@ -1003,6 +1003,146 @@ pub fn rig_character_layers_named(
     place_layer_rig(scene, RigHome::Active, frame, home, parts, &parents, true)
 }
 
+/// **Rigged as it is tagged** (Rig kind: Layers): what the Rig panel does
+/// each time a slot is filled, so the character poses by layer parenting
+/// without waiting for Rig Character.
+///
+/// Every filled slot's drawing ends up alone on a layer named
+/// `name_of(slot)` — the user's tag — split off a layer it shares (the copy
+/// keeps every keyframe, just in front of it). Each slot in `fresh` gets its
+/// transformation point on its joint, fitted as [`rig_character_layers`]
+/// fits it. And each layer follows the layer of its nearest filled ancestor
+/// in `parents` (the naming profile's table, else the pattern's); one with
+/// none follows the rig's root with `join_roots`, so the character moves as
+/// one, or stands alone without (the user's convention: thighs and body are
+/// roots). Nothing moves. On the timeline being edited; the caller wraps it in one
+/// `Document::edit`. The layers by slot, or `None` with nothing filled.
+pub fn link_tagged_parts(
+    scene: &mut Scene,
+    frame: u32,
+    pattern: &RigPattern,
+    slots: &[Option<ObjectId>],
+    fresh: &[usize],
+    name_of: &dyn Fn(usize) -> String,
+    parents: &[Option<usize>],
+    join_roots: bool,
+) -> Option<Vec<(usize, LayerId)>> {
+    let mut layers: Vec<(usize, LayerId)> = Vec::new();
+    for (slot, held) in slots.iter().enumerate().take(pattern.slots.len()) {
+        let Some(object) = *held else { continue };
+        let Some(layer) = own_layer(scene, object) else { continue };
+        let name = name_of(slot);
+        scene.edit_layers().update(layer, |l| {
+            if l.name != name {
+                l.name = name;
+            }
+        });
+        layers.push((slot, layer));
+    }
+    if layers.is_empty() {
+        return None;
+    }
+
+    // The joints, fitted on every filled part as it stands, so a part tagged
+    // later is measured against the ones already in.
+    if !fresh.is_empty() {
+        let stack = scene.layers();
+        let taken: Vec<(usize, Arc<Object>)> = layers
+            .iter()
+            .filter_map(|&(slot, layer)| {
+                let id = slots[slot]?;
+                let mut placed = stack.get(layer)?.frames.resolved_at(frame).iter().find(|o| o.id == id)?.clone();
+                placed.transform = stack.inherited_transform(layer, frame) * placed.transform;
+                Some((slot, Arc::new(placed)))
+            })
+            .collect();
+        let fitted = buzz_act::autorig::fit_slots(pattern, &taken);
+        let pivots: Vec<(LayerId, ObjectId, Point)> = taken
+            .iter()
+            .filter(|(slot, _)| fresh.contains(slot))
+            .filter_map(|(slot, art)| {
+                let joint = fitted
+                    .get(*slot)
+                    .copied()
+                    .flatten()
+                    .map_or_else(|| art.bounds().center(), |(head, _)| head);
+                let layer = layers.iter().find(|(s, _)| s == slot)?.1;
+                // In the object's own coordinates, as `Object::pivot` is stored.
+                Some((layer, art.id, invert(art.transform)? * joint))
+            })
+            .collect();
+        let stack = scene.edit_layers();
+        for (layer, id, pivot) in pivots {
+            stack.update(layer, |l| {
+                for key in l.frames.keyframes_mut() {
+                    for each in Arc::make_mut(&mut key.objects).iter_mut() {
+                        if each.id == id {
+                            Arc::make_mut(each).pivot = Some(pivot);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // The parenting, as `place_layer_rig` links a rig it builds.
+    let layer_of = |slot: usize| layers.iter().find(|(s, _)| *s == slot).map(|(_, l)| *l);
+    let ancestor_layer = |slot: usize| {
+        let mut current = parents.get(slot).copied().flatten();
+        // Bounded by the slot count, against a parent cycle.
+        for _ in 0..parents.len() {
+            let parent = current?;
+            if let Some(layer) = layer_of(parent) {
+                return Some(layer);
+            }
+            current = parents.get(parent).copied().flatten();
+        }
+        None
+    };
+    let root = layers
+        .iter()
+        .map(|(slot, _)| *slot)
+        .filter(|slot| ancestor_layer(*slot).is_none())
+        .min()
+        .and_then(layer_of);
+    let stack = scene.edit_layers();
+    for &(slot, layer) in &layers {
+        let parent = ancestor_layer(slot).or(root.filter(|r| join_roots && *r != layer));
+        if stack.get(layer).is_some_and(|l| l.follows != parent) {
+            set_follows_in(stack, layer, parent, frame);
+        }
+    }
+    Some(layers)
+}
+
+/// The layer `object` is on in the timeline being edited, made its own: a
+/// layer it shares with other artwork is split, a copy holding only `object`
+/// on every keyframe going just in front of it, the rest staying behind.
+fn own_layer(scene: &mut Scene, object: ObjectId) -> Option<LayerId> {
+    let (layer, shared) = {
+        let l = scene.layers().iter().find(|l| l.find_object(object).is_some())?;
+        (l.id, l.all_objects().any(|o| o.id != object))
+    };
+    if !shared {
+        return Some(layer);
+    }
+    let fresh = LayerId(scene.next_object_id().0);
+    let stack = scene.edit_layers();
+    let mut copy = (**stack.get(layer)?).clone();
+    copy.id = fresh;
+    for key in copy.frames.keyframes_mut() {
+        key.objects = Arc::new(key.objects.iter().filter(|o| o.id == object).cloned().collect());
+    }
+    stack.update(layer, |l| {
+        for key in l.frames.keyframes_mut() {
+            key.objects = Arc::new(key.objects.iter().filter(|o| o.id != object).cloned().collect());
+        }
+    });
+    let index = stack.index_of(layer)?;
+    stack.insert(index, copy);
+    Some(fresh)
+}
+
 /// **Bones → Layers.** Take a bone rig apart into a layer rig: each rigidly
 /// bound part on its own layer named after its bone, standing where the pose
 /// shows it (the pose becomes the layers' rest), its pivot on the bone's head,

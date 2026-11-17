@@ -8998,30 +8998,25 @@ impl App {
         let mut built = None;
 
         if self.editor.rig_panel.kind == buzz_rig::RigKind::Layers {
-            let mut layered = None;
-            // Each part's layer is named as it was tagged (the user's names).
-            let names: Vec<String> = pattern.slots.iter().map(|s| buzz_ui::rig_panel::slot_label(&self.editor.rig_panel, &s.name)).collect();
-            self.editor.doc.edit("Rig Character (Layers)", |scene| {
-                layered = rigging::rig_character_layers_named(scene, frame, &pattern, slots, &|slot| names[slot].clone());
-            });
-            match layered {
-                Some(rig) => {
-                    self.editor.rig_panel.armed = None;
-                    self.editor.rig_panel.note = None;
-                    let parts = self.layer_rig_parts(&rig.layers);
-                    self.editor.selection.set(parts);
-                    self.editor.status = Some(format!(
-                        "Rigged {} part{} as a {} by layer parenting.",
-                        rig.layers.len(),
-                        if rig.layers.len() == 1 { "" } else { "s" },
-                        pattern.name
-                    ));
-                }
-                None => {
-                    self.editor.status =
-                        Some("Nothing to rig: put a drawing in at least one slot first.".into());
-                }
+            // The same rigging that filling each slot already did (the parts
+            // tagged so far are on their own layers, linked), run over every
+            // filled slot — so pressing it after tagging changes nothing that
+            // is right, and never builds a second set of layers.
+            let fresh: Vec<usize> = slots.iter().enumerate().filter(|(_, s)| s.is_some()).map(|(i, _)| i).collect();
+            let rigged = self.link_tagged_layers(slots, &fresh, "Rig Character (Layers)");
+            if rigged == 0 {
+                self.editor.status = Some("Nothing to rig: put a drawing in at least one slot first.".into());
+                return;
             }
+            self.rig_slots_seen = slots.to_vec();
+            self.editor.rig_panel.armed = None;
+            self.editor.rig_panel.note = None;
+            self.editor.selection.set(slots.iter().flatten().copied());
+            self.editor.status = Some(format!(
+                "Rigged {rigged} part{} as a {} by layer parenting.",
+                if rigged == 1 { "" } else { "s" },
+                pattern.name
+            ));
             return;
         }
 
@@ -9166,10 +9161,36 @@ impl App {
     /// (`leftArm`, `leftWrist`) — so the timeline reads like the rig and the
     /// shelf's commands find the layers. Only a layer that holds that drawing
     /// alone: one holding several parts is left as it is. One undo step.
+    ///
+    /// **With Rig kind: Layers it rigs as well** (user 2026-11-17: "mapping
+    /// shall set layer parenting and rename the layers based on the rig
+    /// tagging"): the part is split onto a layer of its own if it shares one,
+    /// its pivot goes on its joint and its layer follows its parent part's —
+    /// see `rigging::link_tagged_parts`.
     fn name_tagged_layers(&mut self) {
         let slots = self.editor.rig_panel.slots.clone();
         let seen = std::mem::replace(&mut self.rig_slots_seen, slots.clone());
         if seen.len() != slots.len() {
+            return;
+        }
+        if self.editor.rig_panel.kind == buzz_rig::RigKind::Layers {
+            let fresh: Vec<usize> = slots
+                .iter()
+                .enumerate()
+                .filter(|(i, held)| held.is_some() && seen.get(*i) != Some(held))
+                .map(|(i, _)| i)
+                .collect();
+            if !fresh.is_empty() {
+                // Named for the part: two mappings in a row under one label
+                // would merge into one undo step.
+                let pattern = self.editor.rig_panel.pattern();
+                let tags: Vec<String> = fresh
+                    .iter()
+                    .filter_map(|i| pattern.slots.get(*i))
+                    .map(|s| buzz_ui::rig_panel::slot_label(&self.editor.rig_panel, &s.name))
+                    .collect();
+                self.link_tagged_layers(&slots, &fresh, &format!("Rig {}", tags.join(", ")));
+            }
             return;
         }
         let pattern = self.editor.rig_panel.pattern();
@@ -9196,6 +9217,33 @@ impl App {
             }
         });
         self.editor.status = Some(format!("Layer named {}", said.join(", ")));
+    }
+
+    /// `rigging::link_tagged_parts` on the Rig panel's pattern and names, as
+    /// one undo step called `label`. The number of parts rigged.
+    fn link_tagged_layers(&mut self, slots: &[Option<buzz_scene::ObjectId>], fresh: &[usize], label: &str) -> usize {
+        let pattern = self.editor.rig_panel.pattern();
+        let names: Vec<String> = pattern.slots.iter().map(|s| buzz_ui::rig_panel::slot_label(&self.editor.rig_panel, &s.name)).collect();
+        // The naming profile's parenting when one is chosen (its thighs and
+        // body can be roots), else the pattern's, every part joined to one root.
+        let (parents, join_roots) = match &self.editor.rig_panel.profile {
+            Some(profile) => (profile.parents(&pattern), profile.join_roots),
+            None => (pattern.slots.iter().map(|s| s.parent).collect(), true),
+        };
+        let frame = self.editor.frame();
+        let mut linked = None;
+        self.editor.doc.edit(label, |scene| {
+            linked = rigging::link_tagged_parts(scene, frame, &pattern, slots, fresh, &|slot| names[slot].clone(), &parents, join_roots);
+        });
+        let Some(layers) = linked else { return 0 };
+        let said: Vec<&str> = fresh.iter().filter_map(|slot| names.get(*slot).map(String::as_str)).collect();
+        self.editor.status = Some(format!(
+            "{} on its own layer, following its parent part ({} part{} rigged).",
+            said.join(", "),
+            layers.len(),
+            if layers.len() == 1 { "" } else { "s" }
+        ));
+        layers.len()
     }
 
     fn pick_part_for_slot(&mut self, slot: usize, screen: buzz_geom::Point) {
@@ -29628,6 +29676,63 @@ mod layer_rig_ui_tests {
         app.rig_character(&pattern.name, &slots);
         let followed = links(&app).into_iter().find(|(n, _)| n == "Dupatta").and_then(|(_, f)| f);
         assert_eq!(followed.as_deref(), Some(chest_name.as_str()), "the added part follows the part it is on: {:?}", links(&app));
+    }
+
+    /// **Mapping a part rigs it** (Rig kind: Layers): each part put in a slot
+    /// is split onto a layer of its own named by its tag, its pivot on its
+    /// joint, following the nearest part above it already mapped — re-linked
+    /// as the parts in between arrive. One undo step each, nothing moves, and
+    /// Rig Character afterwards builds no second set of layers.
+    #[test]
+    fn mapping_a_part_rigs_it_by_layer_parenting() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let slots = three_parts(&mut app);
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        assert_eq!(app.editor.rig_panel.kind, buzz_rig::RigKind::Layers);
+        let _ = painted_text(&mut app);
+        let pattern = app.editor.rig_panel.pattern();
+        let label = |app: &App, slot: &str| buzz_ui::rig_panel::slot_label(&app.editor.rig_panel, slot);
+        let bounds = |app: &App| -> Vec<buzz_geom::Rect> {
+            slots.iter().flatten().map(|id| {
+                let (layer, object) = app.editor.scene().find_object(*id).unwrap();
+                let t = app.editor.scene().layers().inherited_transform(layer, app.editor.frame());
+                (t * object.transform).transform_rect_bbox(object.bounds())
+            }).collect()
+        };
+        let before = bounds(&app);
+        let map = |app: &mut App, slot: &str| {
+            let i = pattern.slot_named(slot).unwrap();
+            let depth = app.editor.doc.history().undo_depth();
+            app.editor.rig_panel.assign(i, slots[i].unwrap());
+            let _ = painted_text(app);
+            assert_eq!(app.editor.doc.history().undo_depth(), depth + 1, "mapping {slot} is one undo step");
+            let (layer, object) = app.editor.scene().find_object(slots[i].unwrap()).unwrap();
+            let layer = app.editor.scene().layers().get(layer).unwrap();
+            assert_eq!(layer.name, label(app, slot), "{slot}'s layer takes its tag");
+            assert_eq!(layer.objects_at(app.editor.frame()).len(), 1, "{slot} is alone on its layer");
+            assert!(object.pivot.is_some(), "{slot} has its pivot on its joint");
+        };
+
+        map(&mut app, "Elbow L");
+        assert!(links(&app).is_empty(), "a lone part follows nothing: {:?}", links(&app));
+        map(&mut app, "Chest");
+        assert_eq!(links(&app), vec![(label(&app, "Chest"), None), (label(&app, "Elbow L"), Some(label(&app, "Chest")))]);
+        map(&mut app, "Shoulder L");
+        let mut want = vec![
+            (label(&app, "Chest"), None),
+            (label(&app, "Elbow L"), Some(label(&app, "Shoulder L"))),
+            (label(&app, "Shoulder L"), Some(label(&app, "Chest"))),
+        ];
+        want.sort();
+        assert_eq!(links(&app), want, "the forearm moves under the upper arm once it is mapped");
+        assert_eq!(bounds(&app), before, "mapping moved a part");
+
+        // Rig Character now: the same rig, no new layers.
+        let layers = app.editor.scene().layers().len();
+        let filled = app.editor.rig_panel.slots.clone();
+        app.rig_character(&pattern.name, &filled);
+        assert_eq!(app.editor.scene().layers().len(), layers, "Rig Character made more layers");
+        assert_eq!(links(&app), want);
     }
 
     /// **The Rig panel keeps what was put in it**: opening the head inside

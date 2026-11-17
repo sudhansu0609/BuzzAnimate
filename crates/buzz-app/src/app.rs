@@ -269,6 +269,91 @@ fn is_animate_file(path: &std::path::Path) -> bool {
         || path.join("DOMDocument.xml").is_file()
 }
 
+/// **A tool cursor whose tip is the point** — the Paint Bucket's stream, the
+/// Eyedropper's fine point — drawn so that `pos` is exactly that tip and
+/// nothing covers it. `peek` is, for the Eyedropper, what it would take there
+/// (shown in its barrel and a chip with the hex code), and for the bucket the
+/// fill it pours.
+fn paint_tip_cursor(painter: &egui::Painter, pos: egui::Pos2, tool: buzz_ui::ToolId, peek: Option<(peniko::Color, bool)>) {
+    // The glyph in a 20-point box whose bottom-left corner is the tip.
+    const S: f32 = 20.0;
+    let at = |u: f32, v: f32| egui::pos2(pos.x + u * S, pos.y + (v - 1.0) * S);
+    let white = egui::Color32::WHITE;
+    let edge = egui::Stroke::new(1.0, egui::Color32::BLACK);
+    let shape = |points: &[(f32, f32)], fill: egui::Color32| {
+        egui::Shape::convex_polygon(points.iter().map(|(u, v)| at(*u, *v)).collect(), fill, edge)
+    };
+    if tool == buzz_ui::ToolId::PaintBucket {
+        // A bucket tipped over, its open mouth towards the tip, its handle
+        // behind it, and the paint — in the fill colour it will lay — poured
+        // in a thin stream down to the tip.
+        let paint = peek.map_or(white, |(c, _)| {
+            let [r, g, b, _] = c.to_rgba8().to_u8_array();
+            egui::Color32::from_rgb(r, g, b)
+        });
+        let handle = vec![at(0.734, 0.563), at(0.939, 0.23), at(0.77, 0.061), at(0.437, 0.266)];
+        painter.line(handle.clone(), egui::Stroke::new(3.0, egui::Color32::BLACK));
+        painter.line(handle, egui::Stroke::new(1.2, white));
+        painter.add(shape(&[(0.614, 0.697), (0.303, 0.386), (0.649, 0.138), (0.862, 0.351)], white));
+        let mouth = [
+            (0.303, 0.386), (0.34, 0.38), (0.4, 0.406), (0.472, 0.459), (0.541, 0.528), (0.594, 0.6), (0.62, 0.66),
+            (0.614, 0.697), (0.577, 0.703), (0.517, 0.677), (0.445, 0.624), (0.376, 0.555), (0.323, 0.483), (0.297, 0.423),
+        ];
+        painter.add(shape(&mouth, egui::Color32::from_gray(55)));
+        // The stream ends in a round drop, not a needle (user 2026-11-17:
+        // "too sharp, make it slightly blunt"), centred on the point.
+        painter.add(shape(&[(0.40, 0.57), (0.49, 0.65), (0.06, 0.97), (0.03, 0.94)], paint));
+        painter.circle(pos, 1.7, paint, edge);
+    } else {
+        let ink = peek.map_or(egui::Color32::from_gray(140), |(c, _)| {
+            let [r, g, b, a] = c.to_rgba8().to_u8_array();
+            egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+        });
+        // **A dropper** (user 2026-11-17: "instead of the big circle, an
+        // eyedropper with one end a small pointed pipe and the other the
+        // dropper's end"): a thin glass pipe, holding what it will take,
+        // narrowing to a point on the tip; a collar; and a rubber bulb with a
+        // rounded end. Laid along the diagonal from the tip, in a 22-point box.
+        const L: f32 = 22.0 / S;
+        let along = |t: f32, w: f32| {
+            let (t, w) = (t * L, w * L);
+            (std::f32::consts::FRAC_1_SQRT_2 * (t + w), 1.0 - std::f32::consts::FRAC_1_SQRT_2 * (t - w))
+        };
+        let piece = |points: &[(f32, f32)], fill: egui::Color32| {
+            let points: Vec<(f32, f32)> = points.iter().map(|(t, w)| along(*t, *w)).collect();
+            shape(&points, fill)
+        };
+        // The pipe.
+        painter.add(piece(&[(0.0, 0.0), (0.24, 0.035), (0.80, 0.042), (0.80, -0.042), (0.24, -0.035)], ink));
+        // The collar.
+        painter.add(piece(&[(0.78, 0.075), (0.90, 0.075), (0.90, -0.075), (0.78, -0.075)], egui::Color32::from_gray(80)));
+        // The bulb: straight sides and a round end.
+        let mut bulb = vec![(0.90, 0.088), (1.20, 0.088)];
+        for i in 1..8 {
+            let a = std::f32::consts::FRAC_PI_2 - i as f32 / 8.0 * std::f32::consts::PI;
+            bulb.push((1.20 + 0.088 * a.cos(), 0.088 * a.sin()));
+        }
+        bulb.extend([(1.20, -0.088), (0.90, -0.088)]);
+        painter.add(piece(&bulb, white));
+        // The chip: the colour and its code, clear of the tip.
+        let text = match peek {
+            Some((c, is_fill)) => {
+                let [r, g, b, a] = c.to_rgba8().to_u8_array();
+                let hex = if a == 255 { format!("#{r:02X}{g:02X}{b:02X}") } else { format!("#{r:02X}{g:02X}{b:02X}{a:02X}") };
+                format!("{hex} {}", if is_fill { "fill" } else { "stroke" })
+            }
+            None => "nothing here".to_string(),
+        };
+        let galley = painter.layout_no_wrap(text, egui::FontId::monospace(10.0), egui::Color32::WHITE);
+        let chip = egui::Rect::from_min_size(egui::pos2(pos.x + 10.0, pos.y + 6.0), egui::vec2(12.0, 12.0));
+        let label = egui::Rect::from_min_size(egui::pos2(chip.right() + 4.0, chip.center().y - galley.size().y / 2.0), galley.size());
+        painter.rect_filled(chip.union(label).expand(3.0), 3.0, egui::Color32::from_black_alpha(190));
+        egui::color_picker::show_color_at(&painter, ink, chip);
+        painter.rect_stroke(chip, 1.0, egui::Stroke::new(1.0, white), egui::StrokeKind::Inside);
+        painter.galley(label.min, galley, egui::Color32::WHITE);
+    }
+}
+
 /// The resize arrow that lies along `direction` on screen — horizontal,
 /// vertical, or one of the two diagonals, whichever the line is nearest.
 ///
@@ -1364,6 +1449,13 @@ pub struct App {
     /// the film's copy when it arrived, or when Update last brought it in.
     /// Update writes the copy back to the Cast only when this has moved.
     cast_copy_prints: std::collections::HashMap<(u64, usize, String), u64>,
+    /// What the Eyedropper's cursor last read under its tip: (pointer,
+    /// drawing revision, frame) and the colour. See [`Self::eyedropper_peek`].
+    #[allow(clippy::type_complexity)]
+    eyedropper_peek: std::cell::RefCell<Option<((egui::Pos2, u64, u32), Option<(peniko::Color, bool)>)>>,
+    /// **A swatch's Pick is under way**: the swatch (by its id) the stage
+    /// eyedropper's next click goes to. See `handle_stage_input`.
+    dropper_pick: Option<egui::Id>,
     /// The Rig panel's body slots of each timeline worked on, by edit path
     /// (`rig_slots_path` is the one showing).
     rig_slots_kept: std::collections::HashMap<Vec<u64>, (usize, Vec<Option<buzz_scene::ObjectId>>)>,
@@ -1778,6 +1870,8 @@ impl App {
             cast_sheet: None,
             cast_prints: std::collections::HashMap::new(),
             cast_copy_prints: std::collections::HashMap::new(),
+            eyedropper_peek: std::cell::RefCell::new(None),
+            dropper_pick: None,
             rig_slots_kept: std::collections::HashMap::new(),
             rig_slots_path: None,
             rig_slots_seen: Vec::new(),
@@ -3187,6 +3281,9 @@ pub const KEYBOARD_COMMANDS: &[Command] = &[
     // flips to the menu.
     Command::RotateClockwise,
     Command::RotateAnticlockwise,
+    // Modify ▸ Shape: Animate's Advanced Smooth and Advanced Straighten keys.
+    Command::SmoothSelection,
+    Command::StraightenSelection,
     Command::NewLayer,
     Command::NewLayerFolder,
     Command::MoveLayerUp,
@@ -6376,7 +6473,10 @@ impl App {
         // click on the stage — or Esc, which the tools use — leaves it.
         // **So does Cast** (user 2026-11-16): Add Selected as Pose wants a
         // pose picked on the stage, and its Add Pose window is typed into.
-        let pinned = matches!(id, buzz_ui::PanelId::ToolOptions | buzz_ui::PanelId::Cast);
+        // **And Color, while the Eyedropper is picking on the stage** (user
+        // 2026-11-17): each pick shows up in it.
+        let pinned = matches!(id, buzz_ui::PanelId::ToolOptions | buzz_ui::PanelId::Cast)
+            || (id == buzz_ui::PanelId::Color && self.editor.tool() == buzz_ui::ToolId::Eyedropper);
         if close || (!pinned && (pressed_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)))) {
             self.strip_flyout = None;
         }
@@ -6557,11 +6657,30 @@ impl App {
                     &mut editor.workspace.rig,
                     &mut editor.workspace.pan_speed,
                 );
+                // **Smooth, Straighten and Curvier** with the Selection tool,
+                // as Animate has them: raised as the commands, so the buttons,
+                // Modify ▸ Shape and the keys are one thing.
+                let strength_before = self.editor.workspace.reshape_strength;
+                if matches!(tool, buzz_ui::ToolId::Selection | buzz_ui::ToolId::Subselection) {
+                    let mut strength = strength_before;
+                    let has_selection = !self.editor.selection.is_empty();
+                    let workspace = &self.editor.workspace;
+                    let ctx = ui.ctx().clone();
+                    let keys = |c: Command| -> String {
+                        workspace.shortcuts_for(c).iter().map(|s| ctx.format_shortcut(s)).collect::<Vec<_>>().join(", ")
+                    };
+                    ui.add_space(6.0);
+                    if let Some(c) = panels::reshape_properties(ui, &mut strength, has_selection, &keys) {
+                        commands.push(c);
+                    }
+                    self.editor.workspace.reshape_strength = strength;
+                }
                 let modes_changed = self.editor.remember_drawing_modes();
                 if self.editor.remember_brush_tips()
                     || modes_changed
                     || self.editor.workspace.pan_speed != pan_speed_before
                     || self.editor.workspace.rig != rig_before
+                    || self.editor.workspace.reshape_strength != strength_before
                 {
                     self.editor.workspace.save();
                 }
@@ -9366,8 +9485,9 @@ impl App {
                 LayerIcon::Outline => "Outline Layer",
             };
             self.editor.doc.edit(label, |scene| {
+                let in_symbol = !scene.edit_path().is_empty();
                 let on = |l: &buzz_scene::Layer| match icon {
-                    LayerIcon::Eye => l.visible,
+                    LayerIcon::Eye => l.shown(),
                     LayerIcon::Lock => l.locked,
                     LayerIcon::Outline => l.outline,
                 };
@@ -9384,7 +9504,8 @@ impl App {
                 }
                 for id in ids {
                     scene.update_layer(id, |l| match icon {
-                        LayerIcon::Eye => l.visible = target,
+                        // Inside a symbol, hidden for editing only.
+                        LayerIcon::Eye => l.set_shown(target, in_symbol),
                         LayerIcon::Lock => l.locked = target,
                         LayerIcon::Outline => l.outline = target,
                     });
@@ -9401,9 +9522,10 @@ impl App {
                 LayerIcon::Outline => "Outline All Layers",
             };
             self.editor.doc.edit(label, |scene| {
+                let in_symbol = !scene.edit_path().is_empty();
                 let ids: Vec<_> = scene.layers().iter().map(|l| l.id).collect();
                 let on = |l: &buzz_scene::Layer| match icon {
-                    LayerIcon::Eye => l.visible,
+                    LayerIcon::Eye => l.shown(),
                     LayerIcon::Lock => l.locked,
                     LayerIcon::Outline => l.outline,
                 };
@@ -9413,7 +9535,8 @@ impl App {
                 let target = !all_on;
                 for id in ids {
                     scene.update_layer(id, |l| match icon {
-                        LayerIcon::Eye => l.visible = target,
+                        // Inside a symbol, hidden for editing only.
+                        LayerIcon::Eye => l.set_shown(target, in_symbol),
                         LayerIcon::Lock => l.locked = target,
                         LayerIcon::Outline => l.outline = target,
                     });
@@ -9774,9 +9897,26 @@ impl App {
     /// Animate's tool cursor: over the stage, the active drawing tool shows its
     /// own icon at the pointer — with a size ring for the brush-like tools — in
     /// place of the system arrow, so what you are about to do is under your hand.
+    /// What the Eyedropper would take at `pos` on the stage `area` — the
+    /// colour and whether it is a fill — re-read only when the pointer, the
+    /// frame or the drawing has changed.
+    fn eyedropper_peek(&self, area: egui::Rect, pos: egui::Pos2) -> Option<(peniko::Color, bool)> {
+        let key = (pos, self.editor.doc.scene().revision(), self.editor.current_frame);
+        if let Some((k, peek)) = self.eyedropper_peek.borrow().as_ref()
+            && *k == key
+        {
+            return *peek;
+        }
+        let local = buzz_geom::Point::new((pos.x - area.min.x) as f64, (pos.y - area.min.y) as f64);
+        let peek = self.editor.sampled_paint_at(self.editor.screen_to_edit(local));
+        *self.eyedropper_peek.borrow_mut() = Some((key, peek));
+        peek
+    }
+
     fn draw_tool_cursor(&self, ui: &egui::Ui, area: egui::Rect) {
         use buzz_ui::ToolId::*;
-        let tool = self.editor.tool();
+        // A swatch's Pick turns the pointer into the eyedropper, whatever tool is in hand.
+        let tool = if self.dropper_pick.is_some() { Eyedropper } else { self.editor.tool() };
         // The pointer, transform and navigation tools keep the system cursor
         // Animate gives them (an arrow, a hand, a magnifier).
         if matches!(
@@ -9827,6 +9967,34 @@ impl App {
             return;
         };
         if !area.contains(pos) {
+            return;
+        }
+
+        // **The click-to-act tools point with their own tip** (user 2026-11-17:
+        // "make the paint bucket tip as the arrow"; the eyedropper "is so large
+        // that I am not able to understand what it is picking, be very
+        // precise"). The Paint Bucket pours a thin stream and the Eyedropper
+        // has a fine point, and each one's tip is exactly the point it acts
+        // on — nothing is drawn over it. The Eyedropper says what it will take
+        // there: its barrel and a chip beside it, with the hex code. The Ink
+        // Bottle keeps the system arrow, whose tip is its point.
+        if matches!(tool, PaintBucket | InkBottle | Eyedropper) {
+            if tool == InkBottle {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                return;
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+            let painter = ui
+                .ctx()
+                .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("stage-tool-cursor")))
+                .with_clip_rect(area);
+            let peek = if tool == Eyedropper {
+                self.eyedropper_peek(area, pos)
+            } else {
+                // The bucket pours the fill it will lay.
+                Some((self.editor.style.fill_color, true))
+            };
+            paint_tip_cursor(&painter, pos, tool, peek);
             return;
         }
 
@@ -10470,6 +10638,12 @@ impl App {
                 item(ui, Command::SendBackward, has_selection);
                 item(ui, Command::SendToBack, has_selection);
             });
+            // The stroke that was just right-clicked is the one to even out.
+            ui.menu_button("Shape", |ui| {
+                item(ui, Command::SmoothSelection, has_selection);
+                item(ui, Command::StraightenSelection, has_selection);
+                item(ui, Command::CurveSelection, has_selection);
+            });
             item(ui, Command::GroupSelection, has_selection);
             item(ui, Command::UngroupSelection, has_selection);
             item(ui, Command::BreakApart, has_selection);
@@ -10653,6 +10827,10 @@ impl App {
 
     /// Route pointer input over the stage to the active tool.
     fn handle_stage_input(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        if let Some(target) = buzz_ui::screen_color::dropper_request() {
+            self.dropper_pick = Some(target);
+            self.editor.status = Some("Eyedropper: click the artwork to take its colour \u{2014} Esc to stop".into());
+        }
         let id = ui.id().with("stage");
         let response = ui.interact(area, id, egui::Sense::click_and_drag());
         // Remembered so the menu can turn a pointer position into a document
@@ -10825,8 +11003,7 @@ impl App {
             let (zoom, scroll) = ctx.input(|i| (i.zoom_delta() as f64, i.smooth_scroll_delta));
 
             if zoom != 1.0 {
-                // About the selection when it is in view, else about the
-                // pointer: what is in focus stays where it is.
+                // About the pointer: what is under it stays there.
                 match ctx.input(|i| i.pointer.hover_pos()) {
                     Some(pos) => self.editor.zoom_by_at(zoom, local(pos)),
                     None => self.editor.zoom_by(zoom),
@@ -10846,6 +11023,34 @@ impl App {
         // every editor a user will have come from.
         let pan_override =
             ctx.input(|i| i.key_down(egui::Key::Space)) || ctx.input(|i| i.pointer.middle_down());
+
+        // **A swatch's Pick: the eyedropper on the stage** (user 2026-11-17:
+        // macOS's sampler opened "a large circle ... it shall be in the shape
+        // of an eyedropper"). The pointer is the dropper, saying what it will
+        // take; a click takes the colour of the artwork under its tip into
+        // that swatch, exactly as the Eyedropper tool reads it. Nothing else
+        // reaches the tools meanwhile; Esc leaves.
+        if let Some(target) = self.dropper_pick {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.dropper_pick = None;
+                self.editor.status = None;
+                return;
+            }
+            if response.clicked()
+                && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
+            {
+                match self.editor.sampled_paint_at(self.editor.screen_to_edit(local(pos))) {
+                    Some((colour, _)) => {
+                        buzz_ui::screen_color::deliver(target, colour);
+                        let [r, g, b, _] = colour.to_rgba8().to_u8_array();
+                        self.editor.status = Some(format!("Picked #{r:02X}{g:02X}{b:02X}"));
+                        self.dropper_pick = None;
+                    }
+                    None => self.editor.status = Some("Nothing there to pick \u{2014} click the artwork, or Esc to stop".into()),
+                }
+            }
+            return;
+        }
 
         // One clock for the whole gesture: the press, every move in it and the
         // release are all stamped from egui's own time, so a brush measuring
@@ -30702,6 +30907,160 @@ mod camera_row_ui_tests {
 #[cfg(test)]
 mod tool_follow_tests {
     use super::*;
+
+    /// **A swatch's Pick is the eyedropper on the stage** (user 2026-11-17:
+    /// no more of macOS's large circle): whatever tool is in hand the pointer
+    /// becomes the dropper, a click on the artwork sends its exact colour to
+    /// that swatch and nothing to the tool, and the mode ends.
+    #[test]
+    fn a_swatch_pick_is_the_eyedropper_on_the_stage() {
+        use buzz_ui::ToolId;
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        app.editor.run(Command::SelectTool(ToolId::Rectangle));
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                time: Some(t),
+                ..Default::default()
+            };
+            let mut area = egui::Rect::NOTHING;
+            let cursor = ctx
+                .run_ui(input, |ui| {
+                    area = app.build_ui(ui);
+                })
+                .platform_output
+                .cursor_icon;
+            (cursor, area)
+        };
+        let area = frame(&mut app, vec![]).1;
+        let at = area.center();
+        let under = app.editor.screen_to_edit(buzz_geom::Point::new((at.x - area.min.x) as f64, (at.y - area.min.y) as f64));
+        let red = peniko::Color::from_rgba8(0xC0, 0x20, 0x30, 255);
+        app.editor.apply(ToolAction::AddShape {
+            shape: buzz_scene::ShapeData::filled(
+                buzz_geom::Shape::to_path(&buzz_geom::Rect::from_center_size(under, (80.0, 80.0)), 0.1),
+                red,
+            ),
+            label: "Draw",
+        });
+        let shapes = app.editor.scene().shape_count();
+
+        let swatch = egui::Id::new("a-swatch-awaiting-a-pick");
+        buzz_ui::screen_color::pick(&ctx, swatch);
+        frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+        assert!(app.dropper_pick.is_some(), "the dropper is on");
+        assert_eq!(frame(&mut app, vec![egui::Event::PointerMoved(at)]).0, egui::CursorIcon::None, "drawn as the dropper");
+        let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&mut app, vec![press(true)]);
+        frame(&mut app, vec![press(false)]);
+        assert_eq!(buzz_ui::screen_color::take(swatch).map(|c| c.to_rgba8()), Some(red.to_rgba8()), "the swatch gets the red");
+        assert!(app.dropper_pick.is_none(), "and the dropper is put away");
+        assert_eq!(app.editor.scene().shape_count(), shapes, "the Rectangle tool drew nothing");
+    }
+
+    /// **The Paint Bucket and the Eyedropper point with their own tip**
+    /// (user 2026-11-17: "make the paint bucket tip as the arrow"): over the
+    /// stage the system pointer is hidden and the tool's glyph drawn with its
+    /// tip on the point; the Ink Bottle keeps the system arrow; the Brush its
+    /// ring.
+    #[test]
+    fn the_paint_bucket_points_with_its_tip() {
+        use buzz_ui::ToolId;
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                time: Some(t),
+                ..Default::default()
+            };
+            let mut area = egui::Rect::NOTHING;
+            let cursor = ctx
+                .run_ui(input, |ui| {
+                    area = app.build_ui(ui);
+                })
+                .platform_output
+                .cursor_icon;
+            (cursor, area)
+        };
+        let stage = frame(&mut app, vec![]).1.center();
+        for (tool, cursor) in [
+            (ToolId::PaintBucket, egui::CursorIcon::None),
+            (ToolId::Eyedropper, egui::CursorIcon::None),
+            (ToolId::InkBottle, egui::CursorIcon::Default),
+        ] {
+            app.editor.run(Command::SelectTool(tool));
+            frame(&mut app, vec![egui::Event::PointerMoved(stage)]);
+            assert_eq!(frame(&mut app, vec![egui::Event::PointerMoved(stage)]).0, cursor, "{tool:?}");
+        }
+        app.editor.run(Command::SelectTool(ToolId::Brush));
+        frame(&mut app, vec![egui::Event::PointerMoved(stage)]);
+        assert_eq!(frame(&mut app, vec![egui::Event::PointerMoved(stage)]).0, egui::CursorIcon::None, "the brush draws its ring");
+    }
+
+    /// **The Eyedropper opens the Color panel** (user 2026-11-17) from the
+    /// far-right strip, and picking on the stage leaves it open; the layout
+    /// never moves.
+    #[test]
+    fn the_eyedropper_opens_the_color_panel_and_keeps_it_open_while_picking() {
+        use buzz_ui::{Dock, PanelId, ToolId};
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        app.editor.workspace = buzz_ui::Workspace::default();
+        app.editor.workspace.icon_strip = true;
+        app.editor.workspace.move_to(PanelId::Color, Dock::RightOuter);
+        app.editor.workspace.move_to(PanelId::ToolOptions, Dock::RightOuter);
+        let layout = app.editor.workspace.slots.clone();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                time: Some(t),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            });
+        };
+        frame(&mut app, vec![]);
+        app.editor.run(Command::SelectTool(ToolId::Eyedropper));
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        assert_eq!(app.strip_flyout.map(|(id, _)| id), Some(PanelId::Color), "the Color panel opens");
+
+        let stage = egui::pos2(500.0, 400.0);
+        let m = egui::Modifiers::default();
+        frame(&mut app, vec![egui::Event::PointerMoved(stage)]);
+        frame(&mut app, vec![egui::Event::PointerButton { pos: stage, button: egui::PointerButton::Primary, pressed: true, modifiers: m }]);
+        frame(&mut app, vec![egui::Event::PointerButton { pos: stage, button: egui::PointerButton::Primary, pressed: false, modifiers: m }]);
+        frame(&mut app, vec![]);
+        assert_eq!(app.strip_flyout.map(|(id, _)| id), Some(PanelId::Color), "a pick on the stage leaves it open");
+
+        app.editor.run(Command::SelectTool(ToolId::Brush));
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        assert_eq!(app.strip_flyout.map(|(id, _)| id), Some(PanelId::ToolOptions), "another tool shows its options as before");
+        let docks = |slots: &[buzz_ui::Slot]| slots.iter().map(|s| (s.id, s.dock)).collect::<Vec<_>>();
+        assert_eq!(docks(&app.editor.workspace.slots), docks(&layout), "the layout is as it was");
+    }
 
     /// **Picking a tool shows its options** where the layout keeps them — the
     /// far-right strip's pop-out — and they stay open while drawing, until

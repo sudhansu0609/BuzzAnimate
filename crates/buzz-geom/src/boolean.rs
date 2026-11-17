@@ -377,6 +377,35 @@ pub fn boolean(a: &BezPath, b: &BezPath, op: BoolOp, opts: BooleanOptions) -> Be
     }
 }
 
+/// [`boolean`], **each separate piece of the result on its own**: one path
+/// per outer contour, holding the holes inside it. For a caller that wants
+/// one region out of several — the paint bucket keeps the piece the click is
+/// in. Never refitted: the pieces are exact polygons.
+pub fn boolean_parts(a: &BezPath, b: &BezPath, op: BoolOp, opts: BooleanOptions) -> Vec<BezPath> {
+    let tolerance = if opts.tolerance.is_finite() && opts.tolerance > 0.0 {
+        opts.tolerance
+    } else {
+        BooleanOptions::default().tolerance
+    };
+    let subj = to_contours(a, tolerance);
+    let clip = to_contours(b, tolerance);
+    if subj.is_empty() || (clip.is_empty() && op == BoolOp::Intersect) {
+        return Vec::new();
+    }
+    // With nothing to combine, the subject alone, its pieces sorted out.
+    let shapes = if clip.is_empty() {
+        let empty: Vec<Vec<[f64; 2]>> = Vec::new();
+        subj.overlay(&empty, OverlayRule::Subject, opts.fill.to_fill_rule())
+    } else {
+        subj.overlay(&clip, op.to_overlay_rule(), opts.fill.to_fill_rule())
+    };
+    shapes
+        .iter()
+        .map(|shape| from_shapes(std::slice::from_ref(shape)))
+        .filter(|p| !p.elements().is_empty())
+        .collect()
+}
+
 /// Fold an operation across many paths, in parallel.
 ///
 /// Uses a tree reduction rather than a left fold, so `n` paths combine in

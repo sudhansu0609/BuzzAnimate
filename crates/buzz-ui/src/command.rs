@@ -213,6 +213,11 @@ pub enum Command {
     ExpandFill,
     SmoothSelection,
     StraightenSelection,
+    /// **Curvier** (Modify ▸ Shape, and the Selection tool's options): the
+    /// selected lines and brush strokes bowed further from the straight line
+    /// between their ends — the opposite of Straighten. Animate has no such
+    /// command; there a line is curved by dragging it.
+    CurveSelection,
     /// **Even Out Lines…** (Modify ▸ Shape): filled ink shapes turned into
     /// even-width strokes, face lines and body lines each at their own width
     /// (`docs/EVEN_LINES_PLAN.md` E2).
@@ -849,6 +854,7 @@ command_table! {
             ExpandFill => "expand_fill",
             SmoothSelection => "smooth_selection",
             StraightenSelection => "straighten_selection",
+            CurveSelection => "curve_selection",
             EvenLines => "even_lines",
             OptimizeShapes => "optimize_shapes",
             RemoveBackgroundSpecks => "remove_background_specks",
@@ -1322,6 +1328,7 @@ impl Command {
             ExpandFill => "Expand Fill…",
             SmoothSelection => "Smooth",
             StraightenSelection => "Straighten",
+            CurveSelection => "Curvier",
             EvenLines => "Even Out Lines\u{2026}",
             OptimizeShapes => "Optimize Shapes\u{2026}",
             RemoveBackgroundSpecks => "Remove Background Specks",
@@ -1607,9 +1614,14 @@ impl Command {
             ThinStroke => sc(Modifiers::NONE, Key::OpenBracket),
             TraceBitmap | TraceLineArt | TraceBitmapOptions | TraceBoldSplit | TraceSplit => None,
             ConvertLinesToFills => None,
-            SmoothSelection => None,
+            // Animate's chords for Advanced Smooth and Advanced Straighten,
+            // which these are: both go as far as the Selection tool's
+            // Strength says. Curvier is not Animate's, and no key is invented
+            // for it.
+            SmoothSelection => sc(ctrl_alt.plus(Modifiers::SHIFT), Key::M),
             RecogniseShape => None,
-            StraightenSelection => None,
+            StraightenSelection => sc(ctrl_alt.plus(Modifiers::SHIFT), Key::N),
+            CurveSelection => None,
             EvenLines => None,
             OptimizeShapes => None,
             RemoveBackgroundSpecks => None,
@@ -1838,6 +1850,7 @@ impl Command {
                 | SmoothSelection
                 | RecogniseShape
                 | StraightenSelection
+                | CurveSelection
                 | ConvertToSymbol
                 | NextPose
                 | PreviousPose
@@ -1927,6 +1940,7 @@ pub fn palette_commands() -> Vec<Command> {
         ExpandFill,
         SmoothSelection,
         StraightenSelection,
+        CurveSelection,
         EvenLines,
         OptimizeShapes,
         RemoveBackgroundSpecks,
@@ -2198,6 +2212,7 @@ mod tests {
             ExpandFill,
             SmoothSelection,
             StraightenSelection,
+            CurveSelection,
             EvenLines,
             OptimizeShapes,
             RemoveBackgroundSpecks,
@@ -2438,7 +2453,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            259
+            260
         );
     }
 

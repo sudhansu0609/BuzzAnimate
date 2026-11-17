@@ -16,9 +16,10 @@ pub mod hit;
 pub mod path_edit;
 pub mod projection;
 pub mod recognise;
+pub mod stroke_fill;
 pub mod warp;
 
-pub use boolean::{BoolOp, BooleanOptions, FillMode, boolean, boolean_many, union_all};
+pub use boolean::{BoolOp, BooleanOptions, FillMode, boolean, boolean_many, boolean_parts, union_all};
 pub use brush::{
     BrushBudget, BrushOutput, BrushProfile, BrushSpine, Conditioning, PatternFit, StampPlan, StrokeSample,
     TaperEnds, TipShape, WidthResponse, catmull_rom, catmull_rom_tense, centreline, fluid_outline,
@@ -27,8 +28,8 @@ pub use brush::{
 pub use camera::{Camera, RebasedTransform, RenderSplit};
 pub use clip::RenderClip;
 pub use edit::{
-    StrokeStyle, expand_fill, optimize_path, outline_stroke, smooth, split_disjoint, straighten, turns_backwards,
-    wound_forward,
+    StrokeStyle, curvier, expand_fill, optimize_path, outline_stroke, smooth, smoother, split_disjoint,
+    straighten, straighter, turns_backwards, wound_forward,
 };
 pub use hit::{
     Hit, HitPart, HitTarget, NearestPoint, fill_contains, hit_test_all, hit_test_topmost,
@@ -40,6 +41,7 @@ pub use path_edit::{
 };
 pub use projection::Projection;
 pub use recognise::{Recognised, Tolerance, recognise};
+pub use stroke_fill::FillSpine;
 pub use warp::{BilinearWarp, bilinear_warp, drag_corner, map_points, subdivide};
 
 /// Re-exported so downstream crates share one `kurbo` and one notion of `Point`.

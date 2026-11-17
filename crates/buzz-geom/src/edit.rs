@@ -6,6 +6,7 @@
 //! | [`expand_fill`] | Modify ▸ Shape ▸ Expand Fill |
 //! | [`smooth`] | Modify ▸ Shape ▸ Smooth (and the Selection tool's Smooth) |
 //! | [`straighten`] | Modify ▸ Shape ▸ Straighten |
+//! | [`curvier`] | — (Animate bends a line by dragging it) |
 //!
 //! These are **document edits at authoring scale**, like [`crate::boolean`] and
 //! unlike [`crate::clip`]. They are never applied to render-space geometry.
@@ -203,7 +204,7 @@ pub fn optimize_path(path: &BezPath, accuracy: f64) -> BezPath {
 
 /// Douglas-Peucker over `points` (an open run, or a closed ring split at its
 /// farthest point from the first).
-fn douglas_peucker(points: &[Point], closed: bool, eps: f64) -> Vec<Point> {
+pub(crate) fn douglas_peucker(points: &[Point], closed: bool, eps: f64) -> Vec<Point> {
     let n = points.len();
     if n < 3 {
         return points.to_vec();
@@ -255,7 +256,7 @@ fn dist_to_segment(p: Point, a: Point, b: Point) -> f64 {
 
 /// Cubics through `pts`, smooth at every point but where the outline turns
 /// sharply (and at the ends of an open run).
-fn rebuild_smooth(out: &mut BezPath, pts: &[Point], closed: bool) {
+pub(crate) fn rebuild_smooth(out: &mut BezPath, pts: &[Point], closed: bool) {
     let n = pts.len();
     if n < 2 {
         return;
@@ -330,6 +331,249 @@ pub fn straighten(path: &BezPath, tolerance: f64) -> BezPath {
         }
     }
     out
+}
+
+/// **Smoother**, by `strength` (`0`–`1`) — Animate's Smooth, for an outline
+/// that is not a brush stroke (a long thin fill is reshaped down its middle
+/// instead: see [`crate::FillSpine`]). **Every press goes further**: each
+/// line and each outline is averaged along its length over a stretch a
+/// fortieth of an open line's length, or a two-hundred-and-fiftieth of an
+/// outline's, so bumps go a size bigger every time. An outline shrinks a
+/// little, as a fill does under Animate's Smooth; one smaller than the
+/// stretch is left alone rather than shrunk away.
+pub fn smoother(path: &BezPath, strength: f64) -> BezPath {
+    let mut out = BezPath::new();
+    let subs = flat_subpaths(path);
+    let width = shape_width(path, &subs);
+    for (points, closed) in subs {
+        let length = run_length(&points, closed);
+        let sigma = if closed {
+            // No more than a quarter of the shape's width, or a thin part
+            // of it — the rim round a hole — is averaged away to nothing.
+            crate::brush::smooth_sigma((length / 250.0).clamp(0.25, 20.0), strength).min(width / 4.0)
+        } else {
+            crate::brush::smooth_sigma((length / 40.0).clamp(1.0, 60.0), strength)
+        };
+        if !(length > 6.0 * sigma) {
+            push_run(&mut out, &points, closed);
+            continue;
+        }
+        let even = resample_run(&points, closed, (sigma / 4.0).max(length / 4000.0));
+        let smooth = if closed {
+            crate::brush::gaussian_ring(&even, sigma)
+        } else {
+            crate::brush::gaussian_along(&even, sigma)
+        };
+        let kept = douglas_peucker(&smooth, closed, (sigma * 0.02).max(length / 20_000.0));
+        rebuild_smooth(&mut out, &kept, closed);
+    }
+    out
+}
+
+/// **Straighter**, by `strength` (`0`–`1`) — Animate's Straighten, for an
+/// outline that is not a brush stroke. **Every press goes further.** Each
+/// line and each outline has its wobble pulled part of the way onto the
+/// straight runs between its corners (see
+/// [`crate::brush::straighten_points`]), so curves turn into straight
+/// segments a share at a time, as they do there.
+///
+/// What counts as wobble on an outline is held under a quarter of the
+/// shape's width (see [`shape_width`]), so the two sides of a thin part are
+/// never mistaken for one wobbly line and pulled together.
+pub fn straighter(path: &BezPath, strength: f64) -> BezPath {
+    let mut out = BezPath::new();
+    let subs = flat_subpaths(path);
+    let width = shape_width(path, &subs);
+    for (points, closed) in subs {
+        let length = run_length(&points, closed);
+        let even = resample_run(&points, closed, (length / 400.0).max(1e-3));
+        if even.len() < 4 {
+            push_run(&mut out, &points, closed);
+            continue;
+        }
+        let straight = if closed {
+            let scale = (length / 80.0).min(width / 4.0).max(1e-3);
+            let (size, pull) = crate::brush::straighten_step(scale, strength);
+            // Walked from the point farthest from the middle, which is a
+            // corner if the outline has one, and back to it.
+            let middle = even.iter().fold(Vec2::ZERO, |sum, p| sum + p.to_vec2()) / even.len() as f64;
+            let start = (0..even.len())
+                .max_by(|&a, &b| {
+                    (even[a].to_vec2() - middle).hypot2().total_cmp(&(even[b].to_vec2() - middle).hypot2())
+                })
+                .unwrap_or(0);
+            let mut walk: Vec<Point> = (0..=even.len()).map(|i| even[(start + i) % even.len()]).collect();
+            walk = crate::brush::straighten_points(&walk, size, pull);
+            walk.pop();
+            walk
+        } else {
+            let (size, pull) = crate::brush::straighten_step((length / 40.0).clamp(1.0, 60.0), strength);
+            crate::brush::straighten_points(&even, size, pull)
+        };
+        let kept = douglas_peucker(&straight, closed, (length / 4000.0).max(1e-3));
+        rebuild_smooth(&mut out, &kept, closed);
+    }
+    out
+}
+
+/// Every subpath of `path` flattened finely, with whether it is closed. A
+/// closed one does not repeat its first point at the end.
+fn flat_subpaths(path: &BezPath) -> Vec<(Vec<Point>, bool)> {
+    let bb = path.bounding_box();
+    let accuracy = (bb.width().hypot(bb.height()) / 4000.0).clamp(1e-3, 0.25);
+    let mut subs: Vec<(Vec<Point>, bool)> = Vec::new();
+    kurbo::flatten(path.iter(), accuracy, |el| match el {
+        PathEl::MoveTo(p) => subs.push((vec![p], false)),
+        PathEl::LineTo(p) => {
+            if let Some((points, _)) = subs.last_mut()
+                && points.last() != Some(&p)
+            {
+                points.push(p);
+            }
+        }
+        PathEl::ClosePath => {
+            if let Some((points, closed)) = subs.last_mut() {
+                *closed = true;
+                if points.len() > 1 && points.first() == points.last() {
+                    points.pop();
+                }
+            }
+        }
+        _ => {}
+    });
+    subs.retain(|(points, _)| points.len() > 1);
+    subs
+}
+
+/// **How wide a shape is** where it is thin: twice its area over its whole
+/// perimeter, holes and all — a disc's radius, a stroke's width, the rim of a
+/// ring rather than the size of its hole.
+fn shape_width(path: &BezPath, subs: &[(Vec<Point>, bool)]) -> f64 {
+    let perimeter: f64 = subs.iter().map(|(points, closed)| run_length(points, *closed)).sum();
+    if perimeter > 0.0 { 2.0 * path.area().abs() / perimeter } else { 0.0 }
+}
+
+fn run_length(points: &[Point], closed: bool) -> f64 {
+    let open: f64 = points.windows(2).map(|w| w[0].distance(w[1])).sum();
+    match (closed, points.first(), points.last()) {
+        (true, Some(a), Some(b)) => open + a.distance(*b),
+        _ => open,
+    }
+}
+
+/// Points every `step` along a run, its ends kept; a closed run goes round.
+fn resample_run(points: &[Point], closed: bool, step: f64) -> Vec<Point> {
+    let mut walk = points.to_vec();
+    if closed && let Some(&first) = points.first() {
+        walk.push(first);
+    }
+    let mut out = vec![walk[0]];
+    let mut carried = 0.0;
+    for w in walk.windows(2) {
+        let length = w[0].distance(w[1]);
+        let mut along = step - carried;
+        while along < length {
+            out.push(w[0].lerp(w[1], along / length));
+            along += step;
+        }
+        carried = length - (along - step);
+    }
+    let end = *walk.last().unwrap_or(&walk[0]);
+    if closed {
+        if out.len() > 1 && out[out.len() - 1].distance(end) < step * 0.5 {
+            out.pop();
+        }
+    } else if out.last() != Some(&end) {
+        out.push(end);
+    }
+    out
+}
+
+fn push_run(out: &mut BezPath, points: &[Point], closed: bool) {
+    out.move_to(points[0]);
+    for p in &points[1..] {
+        out.line_to(*p);
+    }
+    if closed {
+        out.close_path();
+    }
+}
+
+/// **Curvier**: the open lines of a path bowed further from the chord between
+/// their ends.
+///
+/// Animate has no such command — a line is curved there by dragging it with
+/// the Selection tool. This is that bend done to a whole line at once, and
+/// repeatable: every point goes `amount` more of the way it already is from
+/// the straight line between the line's ends (`0.4` is 40 % further), so an
+/// arc rounds out and an S deepens. The ends stay put and a straight line
+/// stays straight. The opposite of [`straighten`].
+///
+/// A closed outline — the edge of a fill — and a line that loops back to
+/// where it began are left as they are: neither has a chord to bow away from.
+pub fn curvier(path: &BezPath, amount: f64) -> BezPath {
+    let mut out = BezPath::new();
+    let mut run: Vec<PathEl> = Vec::new();
+    let flush = |run: &mut Vec<PathEl>, out: &mut BezPath| {
+        for el in bow_subpath(run, amount.max(0.0)).unwrap_or_else(|| run.clone()) {
+            out.push(el);
+        }
+        run.clear();
+    };
+    for el in path.elements() {
+        if matches!(el, PathEl::MoveTo(_)) && !run.is_empty() {
+            flush(&mut run, &mut out);
+        }
+        run.push(*el);
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// One subpath of [`curvier`]: `None` when it is closed, loops back, or has
+/// nothing to bend. Each point is placed by its share of the length — an
+/// anchor at the length up to it, a control a third and two thirds of the
+/// way along its segment — which is exact for a segment walked at an even
+/// pace and close for any other.
+fn bow_subpath(elements: &[PathEl], amount: f64) -> Option<Vec<PathEl>> {
+    if elements.iter().any(|el| matches!(el, PathEl::ClosePath)) {
+        return None;
+    }
+    let PathEl::MoveTo(start) = *elements.first()? else {
+        return None;
+    };
+    // The length to the end of each element, the move counting none.
+    let mut at = start;
+    let mut lengths = vec![0.0];
+    for el in &elements[1..] {
+        let segment = match *el {
+            PathEl::LineTo(p) => PathSeg::Line(Line::new(at, p)),
+            PathEl::QuadTo(c, p) => PathSeg::Quad(kurbo::QuadBez::new(at, c, p)),
+            PathEl::CurveTo(c1, c2, p) => PathSeg::Cubic(kurbo::CubicBez::new(at, c1, c2, p)),
+            PathEl::MoveTo(_) | PathEl::ClosePath => return None,
+        };
+        lengths.push(lengths.last().copied().unwrap_or(0.0) + segment.arclen(1e-3));
+        at = segment.end();
+    }
+    let (end, total) = (at, *lengths.last()?);
+    if lengths.len() < 2 || total <= 0.0 || (end - start).hypot() < total * 0.15 {
+        return None;
+    }
+    let bow = |q: kurbo::Point, length: f64| q + (q - start.lerp(end, length / total)) * amount;
+    let mut out = vec![PathEl::MoveTo(start)];
+    for (i, el) in elements.iter().enumerate().skip(1) {
+        let (from, to) = (lengths[i - 1], lengths[i]);
+        let part = |f: f64| from + (to - from) * f;
+        out.push(match *el {
+            PathEl::LineTo(p) => PathEl::LineTo(bow(p, to)),
+            PathEl::QuadTo(c, p) => PathEl::QuadTo(bow(c, part(0.5)), bow(p, to)),
+            PathEl::CurveTo(c1, c2, p) => {
+                PathEl::CurveTo(bow(c1, part(1.0 / 3.0)), bow(c2, part(2.0 / 3.0)), bow(p, to))
+            }
+            PathEl::MoveTo(_) | PathEl::ClosePath => return None,
+        });
+    }
+    Some(out)
 }
 
 /// Greatest distance from the control points to the chord, which bounds how
@@ -737,6 +981,75 @@ mod tests {
             area(&smoothed),
             area(&circle)
         );
+    }
+
+    /// A blob with a wobbly edge, and a thin ring round a hole.
+    fn wobbly_blob() -> BezPath {
+        let mut blob = BezPath::new();
+        for i in 0..=180 {
+            let a = f64::from(i) / 180.0 * std::f64::consts::TAU;
+            let r = 60.0 + 4.0 * (a * 9.0).sin() + 1.5 * (a * 31.0).sin();
+            let p = Point::new(r * a.cos(), r * a.sin());
+            if i == 0 { blob.move_to(p) } else { blob.line_to(p) }
+        }
+        blob.close_path();
+        blob
+    }
+
+    /// **Every press of Smooth and Straighten does something** to an
+    /// outline, as Animate's do, and three of them leave the shape its size.
+    #[test]
+    fn smoother_and_straighter_go_further_each_press() {
+        for (name, op) in [
+            ("smoother", smoother as fn(&BezPath, f64) -> BezPath),
+            ("straighter", straighter as fn(&BezPath, f64) -> BezPath),
+        ] {
+            let mut path = wobbly_blob();
+            for press in 1..=3 {
+                let next = op(&path, 0.5);
+                assert!(next != path, "{name}: press {press} changed nothing");
+                path = next;
+            }
+            let ratio = area(&path) / area(&wobbly_blob());
+            assert!((0.9..1.05).contains(&ratio), "{name}: area {ratio} of what it was");
+
+            // A ring 6 wide round a hole 100 across is not pulled to nothing.
+            let mut ring = Circle::new((0.0, 0.0), 56.0).to_path(0.05);
+            ring.extend(Circle::new((0.0, 0.0), 50.0).to_path(0.05).reverse_subpaths());
+            let before = ring.area().abs();
+            for _ in 0..3 {
+                ring = op(&ring, 1.0);
+            }
+            assert!(ring.area().abs() > before * 0.8, "{name}: the rim went from {before} to {}", ring.area().abs());
+        }
+    }
+
+    /// **Curvier deepens an arc and keeps its ends**; a straight line has no
+    /// bend to grow, and a closed outline is no line at all.
+    #[test]
+    fn curvier_bows_open_lines_and_leaves_the_rest() {
+        let mut arc = BezPath::new();
+        arc.move_to(Point::new(0.0, 0.0));
+        arc.curve_to(Point::new(30.0, -40.0), Point::new(70.0, -40.0), Point::new(100.0, 0.0));
+        let sag = |p: &BezPath| -p.bounding_box().y0;
+        let out = curvier(&arc, 0.4);
+        assert!(
+            (sag(&out) / sag(&arc) - 1.4).abs() < 0.05,
+            "40% further from the chord: {} against {}",
+            sag(&out),
+            sag(&arc)
+        );
+        let ends = |p: &BezPath| (p.segments().next().unwrap().start(), p.segments().last().unwrap().end());
+        assert_eq!(ends(&out), ends(&arc), "the ends stay where they were drawn");
+
+        let mut line = BezPath::new();
+        line.move_to(Point::new(0.0, 0.0));
+        line.line_to(Point::new(100.0, 50.0));
+        assert_eq!(curvier(&line, 0.4), line);
+
+        let circle = Circle::new(Point::new(0.0, 0.0), 20.0).to_path(1e-6);
+        assert_eq!(curvier(&circle, 0.4), circle);
+        assert!(curvier(&BezPath::new(), 0.4).elements().is_empty());
     }
 
     #[test]

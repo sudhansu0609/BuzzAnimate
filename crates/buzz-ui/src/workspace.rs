@@ -531,6 +531,12 @@ pub struct Workspace {
     /// Ctrl+wheel zoom. A person's own preference, not part of any one film.
     #[serde(default = "default_pan_speed")]
     pub pan_speed: f32,
+    /// **How far Smooth, Straighten and Curvier go** in one press, `0`–`1` —
+    /// the Strength under the Selection tool's buttons, and what Animate asks
+    /// for in Advanced Smooth and Advanced Straighten. Pressing again goes
+    /// further, as it does there. A person's preference, not any one film's.
+    #[serde(default = "default_reshape_strength")]
+    pub reshape_strength: f32,
     /// **File ▸ Auto-Save**: a document that has a file of its own is
     /// written back to it a moment after each change, so it never needs
     /// saving by hand. On unless switched off; a person's preference, like the
@@ -1053,6 +1059,11 @@ fn default_pan_speed() -> f32 {
     1.0
 }
 
+/// Halfway: a wobbly stroke comes out even in one press, and its bend stays.
+fn default_reshape_strength() -> f32 {
+    0.5
+}
+
 fn default_auto_save() -> bool {
     true
 }
@@ -1489,6 +1500,7 @@ impl Workspace {
             depth_view: false,
             rig: RigOptions::default(),
             pan_speed: default_pan_speed(),
+            reshape_strength: default_reshape_strength(),
             auto_save: default_auto_save(),
             auto_keyframe: default_auto_keyframe(),
             frames_on_locked_layers: true,

@@ -3700,7 +3700,13 @@ fn draw_layers(
     // either way, so the mask machinery below is untouched; only the order the
     // layers arrive in changes. With every depth equal, the two orders are
     // identical — see `LayerStack::depth_paint_order`.
-    let ordered: Vec<&Arc<buzz_scene::Layer>> = if scene.stage().sort_by_depth {
+    // **The symbol being edited leaves out what is hidden for editing**
+    // (`Layer::edit_hidden`); every other stack — the stage behind it, an
+    // instance of the symbol anywhere, a thumbnail — draws those layers.
+    let editing = !scene.edit_path().is_empty() && std::ptr::eq(layers, scene.layers());
+    let ordered: Vec<&Arc<buzz_scene::Layer>> = if editing {
+        layers.drawable_while_editing(frame, scene.stage().sort_by_depth)
+    } else if scene.stage().sort_by_depth {
         layers.drawable_at_by_depth(frame)
     } else {
         layers.drawable_at(frame).collect()

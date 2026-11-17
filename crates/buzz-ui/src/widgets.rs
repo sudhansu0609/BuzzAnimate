@@ -116,6 +116,39 @@ pub fn toggle_icon_button(
 mod tests {
     use super::*;
 
+    /// **The compact picker is small and exact** (user 2026-11-17): it is
+    /// under 160 points wide; every colour survives the trip through its hue,
+    /// saturation and value unchanged; typing a hex code sets that colour to
+    /// the digit.
+    #[test]
+    fn the_compact_picker_is_narrow_and_keeps_colours_exact() {
+        for r in (0..=255u16).step_by(17) {
+            for g in (0..=255u16).step_by(15) {
+                for b in (0..=255u16).step_by(51) {
+                    let c = [r as u8, g as u8, b as u8];
+                    assert_eq!(hsv_to_rgb(rgb_to_hsv(c)), c, "{c:?}");
+                }
+            }
+        }
+        assert_eq!(parse_hex_text("#1a2B3c"), Some([0x1a, 0x2b, 0x3c, 255]));
+        assert_eq!(parse_hex_text("f0c"), Some([255, 0, 204, 255]));
+        assert_eq!(parse_hex_text("#12345678"), Some([0x12, 0x34, 0x56, 0x78]));
+        assert_eq!(parse_hex_text("#12"), None);
+        assert_eq!(hex_text([0x1a, 0x2b, 0x3c, 255]), "#1A2B3C");
+
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut color = egui::Color32::from_rgb(200, 40, 90);
+        let id = egui::Id::new("picker-test");
+        let mut width = 0.0;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let r = ui.scope(|ui| compact_color_picker(ui, id, &mut color, true)).response;
+            width = r.rect.width();
+        });
+        assert!(width < 160.0, "the picker is {width} points wide");
+        assert_eq!(color, egui::Color32::from_rgb(200, 40, 90), "drawing it changes nothing");
+    }
+
     /// The button draws without panicking, hands back a click, and the
     /// tooltip carries both the name and the shortcut — the whole contract
     /// Stage 2, item 3 asks for.
@@ -147,12 +180,14 @@ mod tests {
 }
 
 /// **How big a colour picker opens**: the colour field this many points
-/// square, the hue and opacity strips this wide. egui's own colour button
-/// opens at 275 and the swatches' at 220, which covered a good part of the
-/// stage for a choice the eye makes at a glance (user 2026-11-15: too big).
-pub const PICKER_SIZE: f32 = 150.0;
+/// square. egui's own colour button opens at 275 and the swatches' at 220,
+/// which covered a good part of the stage for a choice the eye makes at a
+/// glance (user 2026-11-15: too big; 2026-11-17: still too big and wide).
+pub const PICKER_SIZE: f32 = 120.0;
+/// The hue strip beside the field.
+const HUE_WIDTH: f32 = 12.0;
 
-/// **A colour button** — a swatch that opens the picker — at [`PICKER_SIZE`].
+/// **A colour button** — a swatch that opens the [`compact_color_picker`].
 /// In place of egui's `color_edit_button_srgba`, whose picker size is fixed.
 /// The response is marked changed when the colour was edited.
 pub fn color_button(ui: &mut Ui, color: &mut egui::Color32) -> Response {
@@ -168,11 +203,11 @@ pub fn color_button(ui: &mut Ui, color: &mut egui::Color32) -> Response {
         ui.painter().rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
     }
     let mut changed = false;
+    let id = response.id;
     egui::Popup::menu(&response)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            compact_picker_style(ui);
-            changed = egui::color_picker::color_picker_color32(ui, color, egui::color_picker::Alpha::BlendOrAdditive);
+            changed = compact_color_picker(ui, id, color, true);
         });
     if changed {
         response.mark_changed();
@@ -180,16 +215,227 @@ pub fn color_button(ui: &mut Ui, color: &mut egui::Color32) -> Response {
     response
 }
 
-/// **The picker's own row of numbers and buttons made small** with it: egui
-/// sizes that row from the body text and the standard control size, and it
-/// alone held the popup at 300 points wide once the colour field was smaller.
+/// The picker's rows made small with it: small text, small controls.
 pub fn compact_picker_style(ui: &mut Ui) {
     let style = ui.style_mut();
-    style.spacing.slider_width = PICKER_SIZE;
     style.override_text_style = Some(egui::TextStyle::Small);
     style.spacing.interact_size = egui::vec2(24.0, 16.0);
     style.spacing.button_padding = egui::vec2(3.0, 1.0);
     style.spacing.item_spacing = egui::vec2(4.0, 3.0);
+}
+
+/// `[r, g, b]` (0–255, as stored) as hue, saturation and value, each 0–1.
+fn rgb_to_hsv([r, g, b]: [u8; 3]) -> [f32; 3] {
+    let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        ((g - b) / d).rem_euclid(6.0) / 6.0
+    } else if max == g {
+        ((b - r) / d + 2.0) / 6.0
+    } else {
+        ((r - g) / d + 4.0) / 6.0
+    };
+    let s = if max == 0.0 { 0.0 } else { d / max };
+    [h, s, max]
+}
+
+/// Hue, saturation and value (each 0–1) as `[r, g, b]`, 0–255.
+fn hsv_to_rgb([h, s, v]: [f32; 3]) -> [u8; 3] {
+    let h = h.rem_euclid(1.0) * 6.0;
+    let c = v * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    let byte = |f: f32| ((f + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    [byte(r), byte(g), byte(b)]
+}
+
+fn opaque([r, g, b]: [u8; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb(r, g, b)
+}
+
+/// `#RRGGBB`, or `#RRGGBBAA` when not opaque.
+fn hex_text([r, g, b, a]: [u8; 4]) -> String {
+    if a == 255 { format!("#{r:02X}{g:02X}{b:02X}") } else { format!("#{r:02X}{g:02X}{b:02X}{a:02X}") }
+}
+
+/// `#RGB`, `#RRGGBB` or `#RRGGBBAA`, the hash optional.
+fn parse_hex_text(text: &str) -> Option<[u8; 4]> {
+    let t = text.trim().trim_start_matches('#');
+    if !t.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&t[i..i + 2], 16).ok();
+    match t.len() {
+        3 => {
+            let d = |i: usize| u8::from_str_radix(&t[i..i + 1], 16).ok().map(|v| v * 17);
+            Some([d(0)?, d(1)?, d(2)?, 255])
+        }
+        6 => Some([byte(0)?, byte(2)?, byte(4)?, 255]),
+        8 => Some([byte(0)?, byte(2)?, byte(4)?, byte(6)?]),
+        _ => None,
+    }
+}
+
+/// **The compact colour picker** (user 2026-11-17: "smaller, and able to
+/// pick exact colours"): a [`PICKER_SIZE`] colour field (saturation across,
+/// brightness up) with a thin hue strip beside it, then the colour exactly —
+/// its hex code, and red, green and blue 0–255, typed or dragged — and its
+/// opacity when `alpha`. About 140 points wide, where egui's picker was
+/// twice that. `id` keeps the hue while the colour is grey, which has none.
+/// Whether the colour changed.
+pub fn compact_color_picker(ui: &mut Ui, id: egui::Id, color: &mut egui::Color32, alpha: bool) -> bool {
+    color_picker_sized(ui, id, color, alpha, PICKER_SIZE)
+}
+
+/// [`compact_color_picker`] with a colour field `field` points square — the
+/// Color panel's large mixer.
+pub fn color_picker_sized(ui: &mut Ui, id: egui::Id, color: &mut egui::Color32, alpha: bool, field: f32) -> bool {
+    compact_picker_style(ui);
+    let [r, g, b, a] = color.to_srgba_unmultiplied();
+    let key = id.with("compact-picker-hsv");
+    // The hue and saturation last shown, while they still make this colour:
+    // a grey or black has no hue of its own to come back to.
+    let mut hsv = ui
+        .memory(|m| m.data.get_temp::<[f32; 3]>(key))
+        .filter(|kept| hsv_to_rgb(*kept) == [r, g, b])
+        .unwrap_or_else(|| rgb_to_hsv([r, g, b]));
+    let mut rgb = [r, g, b];
+    let mut a = a;
+    let mut changed = false;
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        // -- the field: saturation across, value up --
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(field, field), Sense::click_and_drag());
+        if ui.is_rect_visible(rect) {
+            const N: usize = 12;
+            let mut mesh = egui::Mesh::default();
+            for j in 0..=N {
+                for i in 0..=N {
+                    let (s, v) = (i as f32 / N as f32, 1.0 - j as f32 / N as f32);
+                    let pos = egui::pos2(rect.left() + rect.width() * i as f32 / N as f32, rect.top() + rect.height() * j as f32 / N as f32);
+                    mesh.colored_vertex(pos, opaque(hsv_to_rgb([hsv[0], s, v])));
+                }
+            }
+            for j in 0..N as u32 {
+                for i in 0..N as u32 {
+                    let at = j * (N as u32 + 1) + i;
+                    mesh.add_triangle(at, at + 1, at + N as u32 + 1);
+                    mesh.add_triangle(at + 1, at + N as u32 + 2, at + N as u32 + 1);
+                }
+            }
+            ui.painter().add(mesh);
+            let mark = egui::pos2(rect.left() + hsv[1] * rect.width(), rect.top() + (1.0 - hsv[2]) * rect.height());
+            let ring = if hsv[2] > 0.5 && hsv[1] < 0.5 { egui::Color32::BLACK } else { egui::Color32::WHITE };
+            ui.painter().circle_stroke(mark, 4.0, egui::Stroke::new(1.5, ring));
+        }
+        if (response.dragged() || response.clicked())
+            && let Some(p) = response.interact_pointer_pos()
+        {
+            hsv[1] = ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            hsv[2] = 1.0 - ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+            rgb = hsv_to_rgb(hsv);
+            changed = true;
+        }
+
+        // -- the hue strip --
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(HUE_WIDTH, field), Sense::click_and_drag());
+        if ui.is_rect_visible(rect) {
+            const N: usize = 24;
+            let mut mesh = egui::Mesh::default();
+            for j in 0..=N {
+                let t = j as f32 / N as f32;
+                let c = opaque(hsv_to_rgb([t, 1.0, 1.0]));
+                let y = rect.top() + rect.height() * t;
+                mesh.colored_vertex(egui::pos2(rect.left(), y), c);
+                mesh.colored_vertex(egui::pos2(rect.right(), y), c);
+            }
+            for j in 0..N as u32 {
+                let at = j * 2;
+                mesh.add_triangle(at, at + 1, at + 2);
+                mesh.add_triangle(at + 1, at + 3, at + 2);
+            }
+            ui.painter().add(mesh);
+            let y = rect.top() + hsv[0] * rect.height();
+            ui.painter().line_segment(
+                [egui::pos2(rect.left() - 2.0, y), egui::pos2(rect.right() + 2.0, y)],
+                egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+            );
+        }
+        if (response.dragged() || response.clicked())
+            && let Some(p) = response.interact_pointer_pos()
+        {
+            hsv[0] = ((p.y - rect.top()) / rect.height()).clamp(0.0, 0.9999);
+            rgb = hsv_to_rgb(hsv);
+            changed = true;
+        }
+    });
+
+    // -- exactly: the hex code, then each channel --
+    ui.horizontal(|ui| {
+        let (swatch, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+        egui::color_picker::show_color_at(ui.painter(), egui::Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], a), swatch);
+        let text_key = id.with("compact-picker-hex");
+        let mut text = ui.memory(|m| m.data.get_temp::<String>(text_key)).unwrap_or_else(|| hex_text([rgb[0], rgb[1], rgb[2], a]));
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .desired_width(field - 4.0)
+                .font(egui::TextStyle::Monospace)
+                .hint_text("#RRGGBB"),
+        );
+        let field = field.on_hover_text("The exact colour: type or paste #RRGGBB (or #RGB, #RRGGBBAA)");
+        if field.has_focus() {
+            if let Some(parsed) = parse_hex_text(&text)
+                && parsed != [rgb[0], rgb[1], rgb[2], a]
+            {
+                rgb = [parsed[0], parsed[1], parsed[2]];
+                if alpha {
+                    a = parsed[3];
+                }
+                hsv = rgb_to_hsv(rgb);
+                changed = true;
+            }
+            ui.memory_mut(|m| m.data.insert_temp(text_key, text));
+        } else {
+            ui.memory_mut(|m| m.data.remove::<String>(text_key));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let mut channel = |ui: &mut Ui, name: &str, value: &mut u8, what: &str| {
+            ui.label(name);
+            ui.add(egui::DragValue::new(value).range(0..=255).speed(0.5)).on_hover_text(what).changed()
+        };
+        let mut moved = false;
+        moved |= channel(ui, "R", &mut rgb[0], "Red, 0\u{2013}255");
+        moved |= channel(ui, "G", &mut rgb[1], "Green, 0\u{2013}255");
+        moved |= channel(ui, "B", &mut rgb[2], "Blue, 0\u{2013}255");
+        if moved {
+            hsv = rgb_to_hsv(rgb);
+            changed = true;
+        }
+        if alpha {
+            changed |= channel(ui, "A", &mut a, "Opacity, 0 (clear) \u{2013} 255 (solid)");
+        }
+    });
+
+    ui.memory_mut(|m| m.data.insert_temp(key, hsv));
+    if changed {
+        *color = egui::Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], a);
+    }
+    changed
 }
 
 /// [`color_button`] for an unmultiplied `[r, g, b, a]`.

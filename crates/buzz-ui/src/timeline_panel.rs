@@ -2650,7 +2650,7 @@ fn ruler(
         // text colour) rather than any one layer's, since the heading is not
         // about a layer.
         let all_on = scene.layers().iter().all(|l| match icon {
-            crate::panels::LayerIcon::Eye => l.visible,
+            crate::panels::LayerIcon::Eye => l.shown(),
             crate::panels::LayerIcon::Lock => l.locked,
             crate::panels::LayerIcon::Outline => l.outline,
         });
@@ -3889,7 +3889,7 @@ fn layer_row(
             FontId::proportional(11.0),
             // On the selected row's blue, the ink made to be read against
             // it; the ordinary text colour vanished into it in Light.
-            match (current, layer.visible) {
+            match (current, layer.shown()) {
                 (true, true) => Palette::accent_text(),
                 (true, false) => Palette::accent_text().gamma_multiply(0.6),
                 (false, true) => Palette::text(),
@@ -3905,7 +3905,7 @@ fn layer_row(
     let switches = switch_columns(name_row);
     for (column, icon) in switches.iter().zip(crate::panels::LayerIcon::ALL) {
         let on = match icon {
-            crate::panels::LayerIcon::Eye => layer.visible,
+            crate::panels::LayerIcon::Eye => layer.shown(),
             crate::panels::LayerIcon::Lock => layer.locked,
             crate::panels::LayerIcon::Outline => layer.outline,
         };
@@ -4220,7 +4220,7 @@ fn depth_cell(
             Align2::LEFT_CENTER,
             layer.name.clone(),
             FontId::proportional(11.0),
-            if layer.visible {
+            if layer.shown() {
                 Palette::text()
             } else {
                 Palette::text_dim()
@@ -4569,7 +4569,7 @@ fn layer_context_menu(
     for (icon, label) in [
         (
             crate::panels::LayerIcon::Eye,
-            if layer.visible {
+            if layer.shown() {
                 "Hide Layer"
             } else {
                 "Show Layer"
@@ -6023,6 +6023,7 @@ mod tests {
     #[test]
     fn the_frame_grid_canvas_tracks_the_panel_role() {
         use crate::theme::{self, Theme};
+        let _theme = crate::theme::lock_theme_for_test();
 
         fn luminance(c: Color32) -> f32 {
             0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
@@ -6130,6 +6131,7 @@ mod tests {
     /// ordered the other way round.
     #[test]
     fn the_footer_never_overlaps_the_layer_list() {
+        let _theme = crate::theme::lock_theme_for_test();
         let mut scene = Scene::empty();
         for i in 0..10 {
             scene.add_layer(format!("Layer {i}"), LayerKind::Normal);

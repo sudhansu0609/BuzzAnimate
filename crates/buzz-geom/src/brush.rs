@@ -511,20 +511,56 @@ impl BrushSpine {
         decimate(&self.samples, &budget)
     }
 
-    /// **Smoother**: the centreline evened out by `strength` (`0`–`1`), the
-    /// width response and tapers kept. Applying it again smooths further, as
-    /// Animate's Smooth does.
+    /// **Smoother**: the centreline evened out by `strength` (`0`–`1`), and
+    /// the width along it with it, tapers kept. **Every press goes further**,
+    /// as Animate's Smooth does: the first takes out the hand's wobble, the
+    /// next the bumps a size up, and the swelling and thinning a fast or slow
+    /// hand gave the width evens out a little more each time.
+    ///
+    /// A Gaussian along the stroke rather than a neighbour average: the
+    /// neighbour average works in samples, so it barely touched a wobble a
+    /// few samples long. This one works in distance — see [`smooth_sigma`].
     pub fn smoothed(&self, strength: f64) -> (Self, BezPath) {
-        let samples = smooth_samples(&self.spaced_samples(), strength);
-        Self::rebuilt(samples, self.profile)
+        let before = self.spaced_samples();
+        let points: Vec<Point> = before.iter().map(|s| s.point).collect();
+        let sigma = smooth_sigma(reshape_scale(self.profile.width, &points), strength);
+        let mut after = moved_samples(&before, &gaussian_along(&points, sigma));
+        even_out_width(&mut after, sigma);
+        Self::rebuilt(after, self.profile)
     }
 
-    /// **Straighter**: runs that are within `tolerance` of a line become one,
-    /// walked at an even pace so the width along them stays settled.
-    pub fn straightened(&self, tolerance: f64) -> (Self, BezPath) {
-        let kept = simplify_samples(&self.spaced_samples(), tolerance);
-        let step = (self.profile.width * 0.5).clamp(1.5, 12.0);
-        Self::rebuilt(resample_samples(&kept, step), self.profile)
+    /// **Curvier**: the stroke bowed further from the straight line between
+    /// its ends — every point moved `amount` more of the way it already is
+    /// from that line (`0.4` is 40 % further), so a gentle arc becomes a
+    /// rounder one and an S deepens both its turns. The ends stay where they
+    /// were drawn, and a straight stroke stays straight: there is no bend in
+    /// it to grow. The opposite of [`Self::straightened`].
+    ///
+    /// The hand's wobble is evened out a little first, so it is the bend that
+    /// grows and not the jitter.
+    ///
+    /// A stroke that comes back on itself — a loop, a circle — has no line
+    /// between its ends to bow away from, and comes back unchanged.
+    pub fn curvier(&self, amount: f64) -> (Self, BezPath) {
+        let before = self.spaced_samples();
+        let points: Vec<Point> = before.iter().map(|s| s.point).collect();
+        let calm = gaussian_along(&points, reshape_scale(self.profile.width, &points) * 0.5);
+        let Some(bent) = bend_from_chord(&calm, amount.max(0.0)) else {
+            return Self::rebuilt(self.samples.clone(), self.profile);
+        };
+        Self::rebuilt(moved_samples(&before, &bent), self.profile)
+    }
+
+    /// **Straighter**, by `strength` (`0`–`1`): the wobble between the
+    /// stroke's corners pulled part of the way onto straight runs — see
+    /// [`straighten_points`]. **Every press goes further**, as Animate's
+    /// Straighten does, until the runs are straight; the width along them is
+    /// kept as drawn.
+    pub fn straightened(&self, strength: f64) -> (Self, BezPath) {
+        let before = self.spaced_samples();
+        let points: Vec<Point> = before.iter().map(|s| s.point).collect();
+        let (size, pull) = straighten_step(reshape_scale(self.profile.width, &points), strength);
+        Self::rebuilt(moved_samples(&before, &straighten_points(&points, size, pull)), self.profile)
     }
 
     /// The stroke following `path` instead — a recognised circle or line, say
@@ -580,6 +616,313 @@ impl BrushSpine {
             &BrushBudget::default(),
         ))
     }
+}
+
+/// Distance along `points` to each of them, the first at `0`.
+pub(crate) fn arc_lengths(points: &[Point]) -> Vec<f64> {
+    let mut total = 0.0;
+    let mut out = Vec::with_capacity(points.len());
+    for (i, p) in points.iter().enumerate() {
+        if i > 0 {
+            total += (*p - points[i - 1]).hypot();
+        }
+        out.push(total);
+    }
+    out
+}
+
+/// How long a wobble is, on a line `points` drawn `width` wide, for one
+/// press at middle strength to even it out: the width, or a fortieth of the
+/// length for a long thin line, whichever is more. A fixed size would be
+/// nothing on a long sweep and everything on a short flick.
+pub(crate) fn reshape_scale(width: f64, points: &[Point]) -> f64 {
+    let length = arc_lengths(points).last().copied().unwrap_or(0.0);
+    width.max(length / 40.0).clamp(1.0, 60.0)
+}
+
+/// **One press of Smooth at `strength`**: how far along the line each point
+/// is averaged over. Pressing twice is one press `√2` as far, so each press
+/// reaches bumps a size bigger than the last.
+pub(crate) fn smooth_sigma(scale: f64, strength: f64) -> f64 {
+    scale * (0.4 + 2.0 * strength.clamp(0.0, 1.0))
+}
+
+/// **One press of Straighten at `strength`**: how big a bump is wobble to be
+/// taken out rather than a corner of the drawing, and how much of the way to
+/// straight one press goes. Three presses at middle strength leave a tenth.
+pub(crate) fn straighten_step(scale: f64, strength: f64) -> (f64, f64) {
+    let strength = strength.clamp(0.0, 1.0);
+    (scale * (0.5 + strength), 0.35 + 0.4 * strength)
+}
+
+/// **A Gaussian along the line**, `sigma` long, measured in distance rather
+/// than in samples, so a stroke sampled densely and one sampled sparsely are
+/// smoothed alike.
+///
+/// The ends are held. Past each end the line is mirrored *through* it — a
+/// point reflection, not a mirror image — so an end is its own average, the
+/// direction the line was heading in carries on, and the last stretch is
+/// evened out like the rest instead of being left as drawn.
+pub fn gaussian_along(points: &[Point], sigma: f64) -> Vec<Point> {
+    let values: Vec<Vec2> = points.iter().map(|p| p.to_vec2()).collect();
+    gaussian_at(&values, &arc_lengths(points), sigma)
+        .into_iter()
+        .map(Vec2::to_point)
+        .collect()
+}
+
+/// [`gaussian_along`] for any values laid out at the distances `at` — the
+/// offsets of a stroke's edges from its middle, say. The ends are held the
+/// same way, so a taper that comes to a point still does.
+pub(crate) fn gaussian_at(values: &[Vec2], at: &[f64], sigma: f64) -> Vec<Vec2> {
+    let n = values.len().min(at.len());
+    if n < 3 || !(sigma > 0.0) {
+        return values.to_vec();
+    }
+    let s = &at[..n];
+    let total = s[n - 1] - s[0];
+    if !(total > 0.0) {
+        return values.to_vec();
+    }
+    // Each value stands for half the gap on either side of it, which is what
+    // keeps an unevenly spaced line from leaning towards its dense parts.
+    let share: Vec<f64> = (0..n)
+        .map(|i| {
+            let before = if i > 0 { s[i] - s[i - 1] } else { 0.0 };
+            let after = if i + 1 < n { s[i + 1] - s[i] } else { 0.0 };
+            0.5 * (before + after)
+        })
+        .collect();
+    let (first, last) = (values[0], values[n - 1]);
+    let (s0, s1) = (s[0], s[n - 1]);
+    let reach = 3.0 * sigma;
+    let mut out = values[..n].to_vec();
+    for i in 1..n - 1 {
+        let mut sum = Vec2::ZERO;
+        let mut weight = 0.0;
+        let mut take = |pos: f64, v: Vec2, share: f64| {
+            let d = pos - s[i];
+            if d.abs() <= reach {
+                let w = (-(d * d) / (2.0 * sigma * sigma)).exp() * share;
+                sum += v * w;
+                weight += w;
+            }
+        };
+        let lo = s.partition_point(|&x| x < s[i] - reach);
+        let hi = s.partition_point(|&x| x <= s[i] + reach);
+        for j in lo..hi {
+            take(s[j], values[j], share[j]);
+        }
+        // The stretch mirrored through the start, at 2·s0 − s[j], and through
+        // the end, at 2·s1 − s[j]. The ends themselves are not mirrored: they
+        // are already counted, and counting them twice would pin them harder.
+        for j in 1..s.partition_point(|&x| x <= 2.0 * s0 - s[i] + reach) {
+            take(2.0 * s0 - s[j], first * 2.0 - values[j], share[j]);
+        }
+        for j in s.partition_point(|&x| x < 2.0 * s1 - s[i] - reach)..n - 1 {
+            take(2.0 * s1 - s[j], last * 2.0 - values[j], share[j]);
+        }
+        if weight > 0.0 {
+            out[i] = sum / weight;
+        }
+    }
+    out
+}
+
+/// **A Gaussian round a closed outline**, `sigma` long: [`gaussian_along`]
+/// for a ring, which has no ends to hold. An outline shrinks a little under
+/// it, as a fill does under Animate's Smooth.
+pub fn gaussian_ring(points: &[Point], sigma: f64) -> Vec<Point> {
+    let n = points.len();
+    if n < 4 || !(sigma > 0.0) {
+        return points.to_vec();
+    }
+    let gaps: Vec<f64> = (0..n).map(|i| (points[(i + 1) % n] - points[i]).hypot()).collect();
+    let perimeter: f64 = gaps.iter().sum();
+    if !(perimeter > 0.0) {
+        return points.to_vec();
+    }
+    let reach = (3.0 * sigma).min(perimeter / 2.0);
+    let share = |i: usize| 0.5 * (gaps[(i + n - 1) % n] + gaps[i]);
+    let weigh = |d: f64| (-(d * d) / (2.0 * sigma * sigma)).exp();
+    (0..n)
+        .map(|i| {
+            let mut sum = points[i].to_vec2() * share(i);
+            let mut weight = share(i);
+            for forward in [true, false] {
+                let (mut j, mut d) = (i, 0.0);
+                for _ in 0..n / 2 {
+                    d += if forward { gaps[j] } else { gaps[(j + n - 1) % n] };
+                    j = if forward { (j + 1) % n } else { (j + n - 1) % n };
+                    if d > reach {
+                        break;
+                    }
+                    let w = weigh(d) * share(j);
+                    sum += points[j].to_vec2() * w;
+                    weight += w;
+                }
+            }
+            (sum / weight).to_point()
+        })
+        .collect()
+}
+
+/// **Straighten a line part of the way**: its corners found with
+/// Douglas–Peucker at `size` — a bump smaller than that is wobble, a bigger
+/// one is a corner of the drawing — and every point between two corners
+/// moved `pull` (`0`–`1`) of the way onto the straight run joining them, at
+/// the same share of its length. Pressed again it goes further, the wobble
+/// shrinking by the same share each time, until the runs are straight; the
+/// ends and the corners stay where they are.
+pub fn straighten_points(points: &[Point], size: f64, pull: f64) -> Vec<Point> {
+    let n = points.len();
+    if n < 3 || !(size > 0.0) {
+        return points.to_vec();
+    }
+    let keep = douglas_peucker_open(points, size);
+    let s = arc_lengths(points);
+    let pull = pull.clamp(0.0, 1.0);
+    let mut out = points.to_vec();
+    let mut a = 0;
+    for b in 1..n {
+        if !keep[b] {
+            continue;
+        }
+        let span = s[b] - s[a];
+        for i in a + 1..b {
+            let f = if span > 0.0 { (s[i] - s[a]) / span } else { 0.5 };
+            out[i] = points[i].lerp(points[a].lerp(points[b], f), pull);
+        }
+        a = b;
+    }
+    out
+}
+
+/// Which of `points` Douglas–Peucker keeps at `tolerance`, the ends always.
+fn douglas_peucker_open(points: &[Point], tolerance: f64) -> Vec<bool> {
+    let n = points.len();
+    let mut keep = vec![false; n];
+    if n == 0 {
+        return keep;
+    }
+    keep[0] = true;
+    keep[n - 1] = true;
+    let mut stack = vec![(0usize, n - 1)];
+    while let Some((a, b)) = stack.pop() {
+        if b <= a + 1 {
+            continue;
+        }
+        let (pa, pb) = (points[a], points[b]);
+        let chord = pb - pa;
+        let length = chord.hypot();
+        let mut worst = (0.0, a);
+        for (i, p) in points.iter().enumerate().take(b).skip(a + 1) {
+            let d = if length > 1e-12 {
+                (chord.cross(*p - pa) / length).abs()
+            } else {
+                (*p - pa).hypot()
+            };
+            if d > worst.0 {
+                worst = (d, i);
+            }
+        }
+        if worst.0 > tolerance {
+            keep[worst.1] = true;
+            stack.push((a, worst.1));
+            stack.push((worst.1, b));
+        }
+    }
+    keep
+}
+
+/// **The width evened out too**, over `sigma` of the stroke: the pressure,
+/// and the pace each stretch was drawn at, which is what a fluid brush's
+/// width follows. A hand that sped up and slowed down left the stroke
+/// swelling and thinning; this is what smooths the edges, not only the line.
+fn even_out_width(samples: &mut [StrokeSample], sigma: f64) {
+    let n = samples.len();
+    if n < 3 {
+        return;
+    }
+    let points: Vec<Point> = samples.iter().map(|s| s.point).collect();
+    let at = arc_lengths(&points);
+    let pressure: Vec<Vec2> = samples.iter().map(|s| Vec2::new(s.pressure, 0.0)).collect();
+    for (s, p) in samples.iter_mut().zip(gaussian_at(&pressure, &at, sigma)) {
+        s.pressure = p.x.clamp(0.0, 1.0);
+    }
+    // Seconds per unit of length, one for each stretch, at its middle. A
+    // stretch with no length has no pace and keeps its own time.
+    let mut middles = Vec::with_capacity(n - 1);
+    let mut paces = Vec::with_capacity(n - 1);
+    for i in 1..n {
+        let length = at[i] - at[i - 1];
+        if length > 1e-9 {
+            middles.push(0.5 * (at[i] + at[i - 1]));
+            paces.push(Vec2::new((samples[i].time - samples[i - 1].time) / length, 0.0));
+        }
+    }
+    if paces.len() < 3 {
+        return;
+    }
+    let even = gaussian_at(&paces, &middles, sigma);
+    let mut k = 0;
+    let mut time = samples[0].time;
+    for i in 1..n {
+        let length = at[i] - at[i - 1];
+        let dt = if length > 1e-9 {
+            let pace = even[k].x.max(0.0);
+            k += 1;
+            pace * length
+        } else {
+            samples[i].time - samples[i - 1].time
+        };
+        time += dt;
+        samples[i].time = time;
+    }
+}
+
+/// **Bow a line further from the chord between its ends**: each point moved
+/// `amount` more of the way it already is from where the chord would put it
+/// at the same fraction of the length. `None` for a line that comes back on
+/// itself, which has no chord worth bowing away from — growing one would
+/// only swell the loop.
+pub fn bend_from_chord(points: &[Point], amount: f64) -> Option<Vec<Point>> {
+    let s = arc_lengths(points);
+    let total = *s.last()?;
+    let (start, end) = (*points.first()?, *points.last()?);
+    if points.len() < 3 || total <= 0.0 || (end - start).hypot() < total * 0.15 {
+        return None;
+    }
+    Some(
+        points
+            .iter()
+            .zip(&s)
+            .map(|(p, at)| {
+                let on_chord = start.lerp(end, at / total);
+                *p + (*p - on_chord) * amount
+            })
+            .collect(),
+    )
+}
+
+/// `before` moved to `points`, **each piece still crossed at the speed it was
+/// drawn at**. The width of a fluid stroke answers to speed, and moved points
+/// with their old times would be a stroke that thickens wherever it got
+/// shorter and thins wherever it got longer — smoothing that also re-weighs
+/// the line.
+fn moved_samples(before: &[StrokeSample], points: &[Point]) -> Vec<StrokeSample> {
+    let mut out = before.to_vec();
+    for i in 0..out.len().min(points.len()) {
+        out[i].point = points[i];
+        if i > 0 {
+            let dt = before[i].time - before[i - 1].time;
+            let was = (before[i].point - before[i - 1].point).hypot();
+            let now = (points[i] - points[i - 1]).hypot();
+            let dt = if was > 1e-9 { dt * now / was } else { dt };
+            out[i].time = out[i - 1].time + dt;
+        }
+    }
+    out
 }
 
 /// Samples laid every `step` along the polyline through `samples`, with
@@ -2737,5 +3080,98 @@ mod tests {
         let samples = drag(Point::ZERO, Point::new(50.0, 0.0), 20);
         let out = fluid_outline(&samples, &profile, &BrushBudget::default());
         assert!(out.path.bounding_box().height() < 1e-6);
+    }
+
+    /// A 400-unit arc sagging 60, drawn with a 4-unit hand wobble every 35
+    /// and a finer 1.5 one every 9, sampled the way a pointer is.
+    fn wobbly_arc() -> Vec<StrokeSample> {
+        use std::f64::consts::{PI, TAU};
+        (0..=600)
+            .map(|i| {
+                let t = f64::from(i) / 600.0;
+                let x = 400.0 * t;
+                let wobble = 4.0 * (x / 35.0 * TAU).sin() + 1.5 * (x / 9.0 * TAU).sin();
+                StrokeSample {
+                    point: Point::new(x, -60.0 * (PI * t).sin() + wobble),
+                    pressure: 1.0,
+                    time: t * 0.6,
+                }
+            })
+            .collect()
+    }
+
+    /// How far, on average, a spine strays from the arc it was meant to be.
+    fn off_the_arc(spine: &BrushSpine) -> f64 {
+        let sum: f64 = spine
+            .samples
+            .iter()
+            .map(|s| (s.point.y + 60.0 * (std::f64::consts::PI * s.point.x / 400.0).sin()).powi(2))
+            .sum();
+        (sum / spine.samples.len() as f64).sqrt()
+    }
+
+    fn sag(spine: &BrushSpine) -> f64 {
+        -spine.samples.iter().map(|s| s.point.y).fold(f64::MAX, f64::min)
+    }
+
+    /// **One press of Smooth takes the wobble out and leaves the bend**, and
+    /// **every press after it still does something**, as Animate's does —
+    /// the line rounds out a little more each time, and the arc is still an
+    /// arc after five.
+    #[test]
+    fn smoothing_a_spine_removes_wobble_and_keeps_the_arc() {
+        let spine = BrushSpine::new(wobbly_arc(), BrushProfile { width: 8.0, ..Default::default() });
+        let raw = off_the_arc(&spine);
+        let once = spine.smoothed(0.5).0;
+        assert!(off_the_arc(&once) < raw * 0.25, "{} left of {raw}", off_the_arc(&once));
+        let mut again = once.clone();
+        for press in 2..=5 {
+            let next = again.smoothed(1.0).0;
+            assert!(next.outline() != again.outline(), "press {press} changed nothing");
+            again = next;
+        }
+        assert!(sag(&again) > 50.0, "the arc sags only {} after five presses", sag(&again));
+        assert!(spine.smoothed(0.0).0.samples.len() > 2);
+        let (first, last) = (spine.samples[0].point, spine.samples.last().unwrap().point);
+        assert_eq!(once.samples[0].point, first);
+        assert_eq!(once.samples.last().unwrap().point, last);
+        assert!(once.describes(&once.outline()));
+    }
+
+    /// **Curvier bows the arc further and keeps the ends**, and the stroke is
+    /// as wide as it was: moved points keep the pace they were drawn at.
+    #[test]
+    fn curvier_deepens_a_spine_and_keeps_its_ends_and_width() {
+        let profile = BrushProfile { width: 8.0, ..Default::default() };
+        let spine = BrushSpine::new(wobbly_arc(), profile).smoothed(1.0).0;
+        let bowed = spine.curvier(0.4).0;
+        assert!(
+            (sag(&bowed) / sag(&spine) - 1.4).abs() < 0.08,
+            "{} from {}",
+            sag(&bowed),
+            sag(&spine)
+        );
+        assert_eq!(bowed.samples[0].point, spine.samples[0].point);
+        assert_eq!(bowed.samples.last().unwrap().point, spine.samples.last().unwrap().point);
+        // Width: the outline's area over the centreline's length.
+        let width = |s: &BrushSpine| {
+            s.outline().area().abs() / s.centreline().segments().map(|g| g.arclen(0.1)).sum::<f64>()
+        };
+        assert!(
+            (width(&bowed) / width(&spine) - 1.0).abs() < 0.1,
+            "{} against {}",
+            width(&bowed),
+            width(&spine)
+        );
+
+        // A loop has no chord to bow away from.
+        let circle: Vec<StrokeSample> = (0..=100)
+            .map(|i| {
+                let a = f64::from(i) / 100.0 * std::f64::consts::TAU;
+                StrokeSample { point: Point::new(a.cos() * 50.0, a.sin() * 50.0), pressure: 1.0, time: f64::from(i) * 0.01 }
+            })
+            .collect();
+        let ring = BrushSpine::new(circle, profile);
+        assert_eq!(ring.curvier(0.4).0.samples, ring.samples);
     }
 }

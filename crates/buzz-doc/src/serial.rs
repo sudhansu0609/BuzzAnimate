@@ -226,7 +226,10 @@ use serde::{Deserialize, Serialize};
 ///   depth set from its name and its place in the timeline. Absent when off,
 ///   which is every older document, so a document without it is written
 ///   exactly as version 50 wrote it.
-pub const FORMAT_VERSION: u32 = 51;
+/// * **52** — a layer carries `edit_hidden`: hidden while its symbol is
+///   edited, and drawn wherever the symbol is shown. Absent for every other
+///   layer, which is every layer of every older document.
+pub const FORMAT_VERSION: u32 = 52;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -1275,6 +1278,10 @@ pub struct LayerDto {
     /// every older document.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unlit: bool,
+    /// Hidden only while its symbol is edited. Version 52; absent means not,
+    /// which is every layer of every older document.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edit_hidden: bool,
     /// Cast shadow. Version 49; absent means the layer casts, which is every
     /// layer of every older document.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
@@ -2734,6 +2741,7 @@ impl LayerDto {
             outline: layer.outline,
             highlight: layer.highlight.map(color_to_hex),
             unlit: layer.unlit,
+            edit_hidden: layer.edit_hidden,
             casts_shadow: layer.casts_shadow,
             alpha: layer.alpha,
             brightness: layer.brightness,
@@ -2794,6 +2802,7 @@ impl LayerDto {
         layer.locked = self.locked;
         layer.outline = self.outline;
         layer.unlit = self.unlit;
+        layer.edit_hidden = self.edit_hidden;
         layer.casts_shadow = self.casts_shadow;
         layer.highlight = match &self.highlight {
             Some(h) => Some(color_from_hex(h)?),
@@ -6122,6 +6131,19 @@ mod layer_alpha_tests {
         on.stage_mut().sort_by_depth = true;
         let back = DocumentDto::from_scene(&on).to_scene().expect("round trip");
         assert!(back.stage().sort_by_depth);
+    }
+
+    /// **Hidden for editing** survives a save, and is not written for a layer
+    /// that is not.
+    #[test]
+    fn a_layer_hidden_for_editing_survives_the_round_trip() {
+        let mut scene = Scene::default();
+        let id = scene.layers().iter().next().expect("a layer").id;
+        let json = serde_json::to_string(&DocumentDto::from_scene(&scene)).expect("serialise");
+        assert!(!json.contains("edit_hidden"), "not written when off");
+        scene.update_layer(id, |l| l.edit_hidden = true);
+        let back = DocumentDto::from_scene(&scene).to_scene().expect("round trip");
+        assert!(back.layers().get(id).expect("the layer").edit_hidden);
     }
 
     /// **Auto Depth** is not written while off, and survives a save when on.

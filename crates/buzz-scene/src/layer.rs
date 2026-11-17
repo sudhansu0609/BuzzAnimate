@@ -203,6 +203,14 @@ pub struct Layer {
     /// that sit on the screen rather than in the world. `false` for every layer
     /// of every older document.
     pub unlit: bool,
+    /// **Hidden while its symbol is being edited, and only then** (user
+    /// 2026-11-17: "if I make layers invisible in a symbol, outside the
+    /// symbol every layer shall still be visible"). The eye clicked inside a
+    /// symbol sets this, not [`Self::visible`]: the layer drops out of the
+    /// timeline being worked on, while every instance of the symbol — on the
+    /// stage, in other symbols, in the film — still draws it. `visible`
+    /// stays what hides a layer everywhere (a split picture's source, say).
+    pub edit_hidden: bool,
     /// **Cast shadow**: whether this layer throws a cast shadow under the
     /// scene's lights. A layer with it off is still shaded, tinted and rimmed
     /// like any lit layer — only the shadow it would lay on the ground is
@@ -313,6 +321,28 @@ const DEFAULT_COLORS: [Color; 8] = [
 ];
 
 impl Layer {
+    /// What the eye shows: visible, and not hidden for editing.
+    pub fn shown(&self) -> bool {
+        self.visible && !self.edit_hidden
+    }
+
+    /// **The eye clicked**, to `on`. Inside a symbol (`in_symbol`) hiding is
+    /// for editing only ([`Self::edit_hidden`]) — every instance of the
+    /// symbol still draws the layer; on the stage it hides the layer as it
+    /// always did. Showing clears both, so a layer hidden either way comes
+    /// back with one click.
+    pub fn set_shown(&mut self, on: bool, in_symbol: bool) {
+        if on {
+            self.visible = true;
+            self.edit_hidden = false;
+        } else if in_symbol {
+            self.visible = true;
+            self.edit_hidden = true;
+        } else {
+            self.visible = false;
+        }
+    }
+
     pub fn new(id: LayerId, name: impl Into<String>, kind: LayerKind) -> Self {
         Self {
             color: DEFAULT_COLORS[(id.0 as usize) % DEFAULT_COLORS.len()],
@@ -328,6 +358,7 @@ impl Layer {
             outline: false,
             highlight: None,
             unlit: false,
+            edit_hidden: false,
             casts_shadow: true,
             alpha: 1.0,
             brightness: 0.0,
@@ -594,6 +625,34 @@ impl LayerStack {
     /// Animate hides a folder's contents on the stage when the folder itself is
     /// hidden, so visibility has to be resolved through ancestors rather than
     /// read off the layer alone.
+    /// [`Self::is_effectively_visible`], and not hidden for editing
+    /// ([`Layer::edit_hidden`]) itself or through a folder it is filed in:
+    /// what the timeline being worked on shows.
+    pub fn is_shown_while_editing(&self, id: LayerId) -> bool {
+        if !self.is_effectively_visible(id) {
+            return false;
+        }
+        let mut at = self.get(id);
+        for _ in 0..=self.layers.len() {
+            let Some(layer) = at else {
+                return true;
+            };
+            if layer.edit_hidden {
+                return false;
+            }
+            at = layer.parent.and_then(|p| self.get(p));
+        }
+        true
+    }
+
+    /// The layers drawn at `frame` of the timeline being worked on, in paint
+    /// order (`by_depth`: by depth): [`Self::drawable_at`] less the layers
+    /// hidden for editing.
+    pub fn drawable_while_editing(&self, frame: u32, by_depth: bool) -> Vec<&Arc<Layer>> {
+        let all: Vec<&Arc<Layer>> = if by_depth { self.drawable_at_by_depth(frame) } else { self.drawable_at(frame).collect() };
+        all.into_iter().filter(|l| self.is_shown_while_editing(l.id)).collect()
+    }
+
     pub fn is_effectively_visible(&self, id: LayerId) -> bool {
         let Some(mut layer) = self.get(id) else {
             return false;
@@ -1136,7 +1195,7 @@ impl LayerStack {
     pub fn selectable(&self) -> impl Iterator<Item = &Arc<Layer>> {
         self.paint_order().filter(|l| {
             l.is_editable()
-                && self.is_effectively_visible(l.id)
+                && self.is_shown_while_editing(l.id)
                 && !self.is_effectively_locked(l.id)
         })
     }
@@ -1175,7 +1234,7 @@ impl LayerStack {
             .into_iter()
             .filter(|l| {
                 l.is_editable()
-                    && self.is_effectively_visible(l.id)
+                    && self.is_shown_while_editing(l.id)
                     && !self.is_effectively_locked(l.id)
             })
             .collect()

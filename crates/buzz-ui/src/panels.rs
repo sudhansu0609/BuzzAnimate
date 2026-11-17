@@ -1006,6 +1006,7 @@ pub fn build_menus(ui: &mut MenuUi<'_>, state: &MenuState<'_>) -> Vec<Command> {
                 Command::ExpandFill,
                 Command::SmoothSelection,
                 Command::StraightenSelection,
+                Command::CurveSelection,
                 Command::RecogniseShape,
             ] {
                 item(ui, c, has_selection, &mut raised);
@@ -2734,6 +2735,72 @@ fn bone_properties(ui: &mut Ui, rig: &mut crate::workspace::RigOptions) {
 /// see I4b of `docs/INTERACTION_FIXES_PLAN.md`.
 const PAN_SPEED_OPTIONS: [f32; 4] = [1.0, 1.5, 2.0, 3.0];
 
+/// **Smooth, Straighten and Curvier**, under the Selection tool where Animate
+/// keeps its Smooth and Straighten, with the Strength Animate asks for in
+/// Advanced Smooth and Advanced Straighten. Returns the button pressed, for
+/// the app to run as the command — so the buttons, Modify ▸ Shape and the
+/// keys are one thing. `keys` gives a command's shortcut as the keymap has it.
+pub fn reshape_properties(
+    ui: &mut Ui,
+    strength: &mut f32,
+    has_selection: bool,
+    keys: &dyn Fn(Command) -> String,
+) -> Option<Command> {
+    let mut pressed = None;
+    ui.label(RichText::new("Shape").strong());
+    ui.horizontal_wrapped(|ui| {
+        for (command, what) in [
+            (
+                Command::SmoothSelection,
+                "Even out the wobble and the width of the selected strokes, a \
+                 little more each press. The bend of the line stays.",
+            ),
+            (
+                Command::StraightenSelection,
+                "Pull the selected strokes towards straight lines, a little more \
+                 each press. A rough circle or box becomes a true one.",
+            ),
+            (
+                Command::CurveSelection,
+                "Bow the selected strokes further from the straight line between \
+                 their ends, a little more each press. The ends stay put.",
+            ),
+        ] {
+            let key = keys(command);
+            let tip = if key.is_empty() { what.to_string() } else { format!("{what} ({key})") };
+            if ui
+                .add_enabled(has_selection, egui::Button::new(command.label()))
+                .on_hover_text(tip)
+                .on_disabled_hover_text("Click a stroke with this tool to select it first")
+                .clicked()
+            {
+                pressed = Some(command);
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Strength");
+        let mut percent = (*strength * 100.0).round();
+        if ui
+            .add(egui::Slider::new(&mut percent, 0.0..=100.0).step_by(1.0))
+            .on_hover_text("How far one press goes. Press again to go further.")
+            .changed()
+        {
+            *strength = (percent / 100.0).clamp(0.0, 1.0);
+        }
+    });
+    ui.label(
+        RichText::new(if has_selection {
+            "Press again to go further."
+        } else {
+            "Click a stroke to select it, then press a button."
+        })
+        .small()
+        .weak(),
+    );
+    pressed
+}
+
 fn hand_properties(ui: &mut Ui, pan_speed: &mut f32) {
     ui.label(RichText::new("Pan speed").small().weak());
     ui.horizontal(|ui| {
@@ -2818,29 +2885,25 @@ fn bucket_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
     // decision made at one moment. Here they were in different panels: the
     // bucket's only setting was the gap, and the colour it was about to lay
     // down lived in Colour, which might not even be open.
-    fill_paint_properties(ui, scene, style, "bucket");
-
-    ui.add_space(6.0);
-    ui.label(RichText::new("Gaps").strong());
-    egui::Grid::new("bucket-props")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Gap size");
-            egui::ComboBox::from_id_salt("bucket-gap")
-                .selected_text(style.gap_size.label())
-                .show_ui(ui, |ui| {
-                    for gap in buzz_scene::GapSize::ALL {
-                        ui.selectable_value(&mut style.gap_size, gap, gap.label());
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "How large a gap in the outline the bucket will close before it \
-                 fills. Larger settings fill sketchier line art but can spill \
-                 through wider openings.",
-                );
-            ui.end_row();
-        });
+    //
+    // **Gap Size on the colour's own line** (user 2026-11-17), as Animate's
+    // options strip has them side by side.
+    fill_paint_properties_with(ui, scene, style, "bucket", |ui, style| {
+        egui::ComboBox::from_id_salt("bucket-gap")
+            .selected_text(format!("Gaps: {}", style.gap_size.label()))
+            .width(118.0)
+            .show_ui(ui, |ui| {
+                for gap in buzz_scene::GapSize::ALL {
+                    ui.selectable_value(&mut style.gap_size, gap, gap.label());
+                }
+            })
+            .response
+            .on_hover_text(
+                "Gap size: how large a gap in the outline the bucket will close before it \
+                 fills. A closed area always fills exactly; larger settings fill sketchier \
+                 line art but can spill through wider openings.",
+            );
+    });
 }
 
 /// Ink Bottle settings: the line it is about to lay on whatever is clicked.
@@ -2964,6 +3027,9 @@ pub fn tool_options_panel(
         }
         ToolId::Bone => bone_properties(ui, rig),
         ToolId::Hand => hand_properties(ui, pan_speed),
+        // Smooth, Straighten and Curvier are commands, so the app draws them
+        // — see `reshape_properties`.
+        ToolId::Selection | ToolId::Subselection => {}
         _ => anything = false,
     }
 
@@ -4623,6 +4689,12 @@ pub fn stroke_paint_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle
 /// `id` keeps two of these on screen at once from sharing widget state — the
 /// Colour panel's and a tool's.
 pub fn fill_paint_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle, id: &str) {
+    fill_paint_properties_with(ui, scene, style, id, |_, _| {});
+}
+
+/// [`fill_paint_properties`] with `beside` drawn at the end of the colour's
+/// own line (the bucket's Gap Size), or on a line of its own under a gradient.
+fn fill_paint_properties_with(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle, id: &str, beside: impl FnOnce(&mut Ui, &mut DrawStyle)) {
     ui.horizontal(|ui| {
         ui.label("Fill");
         // **No fill is a mode, not a colour.** Animate's swatch with the red
@@ -4656,11 +4728,14 @@ pub fn fill_paint_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle, 
     }
 
     if style.fill_kind == FillKind::Solid {
-        let mut c = style.fill_color;
-        if color_row(ui, &format!("{id}-fill"), &mut c) {
-            style.fill_color = c;
-            style.remember(c);
-        }
+        ui.horizontal(|ui| {
+            let mut c = style.fill_color;
+            if color_row(ui, &format!("{id}-fill"), &mut c) {
+                style.fill_color = c;
+                style.remember(c);
+            }
+            beside(ui, style);
+        });
         if let Some(swatch) = scene.swatches().find_color(style.fill_color) {
             ui.label(RichText::new(&swatch.name).small().weak());
         }
@@ -4684,6 +4759,7 @@ pub fn fill_paint_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle, 
         }
     } else {
         gradient_editor(ui, &mut style.fill_gradient);
+        ui.horizontal(|ui| beside(ui, style));
     }
 
     swatch_strips(ui, scene, style);
@@ -4749,6 +4825,43 @@ fn swatch_strips(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
 
 pub fn color_panel(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
     ui.heading("Color");
+    ui.separator();
+
+    // **The colour mixer, large** (user 2026-11-17: the Eyedropper "shall
+    // open the colour palette, the large one"). Animate's Color panel mixes
+    // the stroke or the fill on a big field with the exact code under it; the
+    // Eyedropper opens this panel, so what it takes is shown here at once and
+    // can be set to the digit.
+    let mixes_stroke = egui::Id::new("color-panel-mixes-stroke");
+    let mut stroke = ui.memory(|m| m.data.get_temp::<bool>(mixes_stroke)).unwrap_or(false);
+    ui.horizontal(|ui| {
+        if ui.selectable_label(!stroke, "Fill").on_hover_text("Mix the fill colour").clicked() {
+            stroke = false;
+        }
+        if ui.selectable_label(stroke, "Stroke").on_hover_text("Mix the stroke colour").clicked() {
+            stroke = true;
+        }
+    });
+    ui.memory_mut(|m| m.data.insert_temp(mixes_stroke, stroke));
+    if stroke || style.fill_kind == FillKind::Solid {
+        let field = (ui.available_width() - 24.0).clamp(120.0, 240.0);
+        let mut c = to_egui(if stroke { style.stroke_color } else { style.fill_color });
+        let changed = ui
+            .scope(|ui| crate::widgets::color_picker_sized(ui, egui::Id::new(("color-panel-mixer", stroke)), &mut c, true, field))
+            .inner;
+        if changed {
+            let c = from_egui(c);
+            if stroke {
+                style.stroke_color = c;
+                style.stroke_enabled = true;
+            } else {
+                style.fill_color = c;
+                style.fill_enabled = true;
+            }
+        }
+    } else {
+        ui.label(RichText::new("The fill is a gradient \u{2014} set its stops below.").small().weak());
+    }
     ui.separator();
 
     ui.horizontal(|ui| {
@@ -5062,20 +5175,21 @@ pub fn color_row(ui: &mut Ui, id: &str, color: &mut Color) -> bool {
     }
     ui.horizontal(|ui| {
         let mut egui_color = to_egui(*color);
-        if color_swatch_picker(ui, target, &mut egui_color) {
+        let (picked, popup) = color_swatch_picker(ui, target, &mut egui_color);
+        if picked {
             *color = from_egui(egui_color);
             changed = true;
         }
-        if crate::screen_color::available()
-            && ui
-                .button("\u{1F4A7}")
-                .on_hover_text(
-                    "Eyedropper: take the exact colour of any pixel on the screen. \
-                     Click to pick, Esc to cancel.",
-                )
-                .clicked()
+        // **The drop opens the whole picker** (user 2026-11-17: "when I click
+        // the drop symbol the whole colour picker shall open and I shall be
+        // able to select"), the same one the swatch opens; Pick in it takes a
+        // pixel from anywhere on the screen.
+        if ui
+            .button("\u{1F4A7}")
+            .on_hover_text("Open the colour picker \u{2014} choose a colour, type its code, or Pick one off the screen")
+            .clicked()
         {
-            crate::screen_color::pick(ui.ctx(), target);
+            egui::Popup::open_id(ui.ctx(), popup);
         }
 
         // The field is authoritative only while it is being typed in: while
@@ -5108,8 +5222,9 @@ pub fn color_row(ui: &mut Ui, id: &str, color: &mut Color) -> bool {
     changed
 }
 
-/// The swatch itself, and the picker it opens when clicked.
-fn color_swatch_picker(ui: &mut Ui, target: egui::Id, color: &mut Color32) -> bool {
+/// The swatch itself, and the picker it opens when clicked: whether the
+/// colour changed, and the picker's popup id (the drop beside it opens it too).
+fn color_swatch_picker(ui: &mut Ui, target: egui::Id, color: &mut Color32) -> (bool, egui::Id) {
     let size = egui::vec2(ui.spacing().interact_size.x, ui.spacing().interact_size.y);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let response = response.on_hover_text("Click to choose a colour");
@@ -5124,38 +5239,34 @@ fn color_swatch_picker(ui: &mut Ui, target: egui::Id, color: &mut Color32) -> bo
     }
 
     let mut changed = false;
+    let popup = egui::Popup::default_response_id(&response);
     egui::Popup::from_toggle_button_response(&response)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            crate::widgets::compact_picker_style(ui);
-            changed |= egui::color_picker::color_picker_color32(
-                ui,
-                color,
-                egui::color_picker::Alpha::OnlyBlend,
-            );
-            if crate::screen_color::available() {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("\u{1F4A7} Pick from screen")
-                        .on_hover_text("Take the exact colour of any pixel on the screen")
-                        .clicked()
-                    {
-                        crate::screen_color::pick(ui.ctx(), target);
-                        ui.close();
-                    }
-                    if ui
+            // Opacity has its own slider under the swatch in the Color panel.
+            changed |= crate::widgets::compact_color_picker(ui, target, color, false);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button("\u{1F4A7} Pick")
+                    .on_hover_text("The eyedropper: click the artwork on the stage to take its colour exactly (Esc to stop)")
+                    .clicked()
+                {
+                    crate::screen_color::pick(ui.ctx(), target);
+                    ui.close();
+                }
+                if crate::screen_color::available()
+                    && ui
                         .button("Colours\u{2026}")
-                        .on_hover_text("Open the macOS Colors window, linked to this swatch")
+                        .on_hover_text("Open the macOS Colors window, linked to this swatch (its own sampler takes a colour from another program)")
                         .clicked()
-                    {
-                        crate::screen_color::open_panel(target, from_egui(*color));
-                        ui.close();
-                    }
-                });
-            }
+                {
+                    crate::screen_color::open_panel(target, from_egui(*color));
+                    ui.close();
+                }
+            });
         });
-    changed
+    (changed, popup)
 }
 
 /// A colour as `#RRGGBB`, or `#RRGGBBAA` when it is not opaque.
@@ -5642,7 +5753,7 @@ pub fn layers_panel_filtered(
         let (name, kind, visible, locked, outline, _view_alpha, color, depth, highlight, collapsed) = (
             layer.name.clone(),
             layer.kind,
-            layer.visible,
+            layer.shown(),
             layer.locked,
             layer.outline,
             layer.alpha,
@@ -6055,8 +6166,11 @@ pub fn layers_panel_filtered(
         }
 
         if set_visible != visible || set_locked != locked || set_outline != outline {
+            let in_symbol = !scene.edit_path().is_empty();
             scene.update_layer(id, |l| {
-                l.visible = set_visible;
+                if set_visible != visible {
+                    l.set_shown(set_visible, in_symbol);
+                }
                 l.locked = set_locked;
                 l.outline = set_outline;
             });
@@ -6467,6 +6581,31 @@ pub fn timeline_placeholder(ui: &mut Ui, scene: &Scene) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The drop beside a colour opens the whole picker** (user
+    /// 2026-11-17), the same one the swatch opens.
+    #[test]
+    fn the_drop_beside_a_colour_opens_the_picker() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut colour = Color::from_rgb8(0x63, 0x35, 0x06);
+        let mut run = |events: Vec<egui::Event>, colour: &mut Color| {
+            let out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                let _ = color_row(ui, "test", colour);
+            });
+            out.shapes.iter().find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text() == "\u{1F4A7}" => Some(t.pos + t.galley.rect.center().to_vec2()),
+                _ => None,
+            })
+        };
+        let at = run(vec![], &mut colour).expect("the drop is drawn");
+        assert!(!egui::Popup::is_any_open(&ctx));
+        let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        run(vec![egui::Event::PointerMoved(at), press(true)], &mut colour);
+        run(vec![press(false)], &mut colour);
+        run(vec![], &mut colour);
+        assert!(egui::Popup::is_any_open(&ctx), "the picker is open");
+    }
 
     #[test]
     fn opaque_colours_round_trip_exactly() {

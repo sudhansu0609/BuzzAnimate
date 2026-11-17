@@ -1,12 +1,12 @@
-//! **A colour from anywhere on the screen**, and the system's own colour panel.
+//! **Picking a colour for a swatch**, and the system's own colour panel.
 //!
-//! The Eyedropper tool reads the paint of the artwork under it, which is the
-//! right thing for vector art but cannot take a colour from a placed picture,
-//! from a reference image open in another program, or from a web page. macOS
-//! has a sampler for exactly that — the magnifying loupe the system Colors
-//! window uses — which reads the real pixel under the pointer anywhere on any
-//! display. [`pick`] starts it; the colour arrives on the main thread a few
-//! frames later and [`take`] hands it to the swatch that asked.
+//! [`pick`] starts the stage eyedropper for one swatch: the shell turns the
+//! pointer into the dropper, and the colour of the artwork under its tip goes
+//! to that swatch ([`deliver`], then [`take`]). It used to start macOS's
+//! screen sampler, whose large magnifying circle hid what was being picked
+//! (user 2026-11-17: "it shall be in the shape of an eyedropper"); a colour
+//! from another program is still to be had from the Colors window's own
+//! sampler.
 //!
 //! [`open_panel`] shows the system Colors window (wheel, sliders, palettes,
 //! its own loupe) linked to one swatch; [`poll_panel`] reads it back each
@@ -23,14 +23,30 @@ pub fn available() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// Start the screen loupe for the swatch `target`. The pick, if one is made,
-/// is collected with [`take`].
+/// Start the stage eyedropper for the swatch `target`. The pick, if one is
+/// made, is collected with [`take`].
 pub fn pick(ctx: &egui::Context, target: Id) {
-    #[cfg(target_os = "macos")]
-    mac::pick(ctx, target);
-    #[cfg(not(target_os = "macos"))]
-    let _ = (ctx, target);
+    if let Ok(mut asked) = DROPPER.lock() {
+        *asked = Some(target);
+    }
+    ctx.request_repaint();
 }
+
+/// The swatch that asked for the stage eyedropper, once — for the shell,
+/// which runs the dropper.
+pub fn dropper_request() -> Option<Id> {
+    DROPPER.lock().ok()?.take()
+}
+
+/// Hand the colour the eyedropper took to the swatch `target`.
+pub fn deliver(target: Id, color: Color) {
+    if let Ok(mut picked) = PICKED.lock() {
+        *picked = Some((target, color));
+    }
+}
+
+/// A swatch waiting for the stage eyedropper.
+static DROPPER: std::sync::Mutex<Option<Id>> = std::sync::Mutex::new(None);
 
 /// The colour picked from the screen for `target`, once.
 pub fn take(target: Id) -> Option<Color> {
@@ -73,10 +89,9 @@ mod mac {
 
     use egui::Id;
     use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSColor, NSColorPanel, NSColorSampler, NSColorSpace};
+    use objc2_app_kit::{NSColor, NSColorPanel, NSColorSpace};
     use peniko::Color;
 
-    use super::PICKED;
 
     /// The swatch the Colors window writes to, and the colour last read from it.
     static LINKED: Mutex<Option<(Id, [u8; 4])>> = Mutex::new(None);
@@ -97,30 +112,6 @@ mod mac {
 
     fn to_color([r, g, b, a]: [u8; 4]) -> Color {
         Color::from_rgba8(r, g, b, a)
-    }
-
-    pub fn pick(ctx: &egui::Context, target: Id) {
-        if MainThreadMarker::new().is_none() {
-            return;
-        }
-        let ctx = ctx.clone();
-        // Called on the main thread when the loupe closes: with the colour,
-        // or with nil when it was cancelled with Escape.
-        let handler = block2::RcBlock::new(move |picked: *mut NSColor| {
-            let Some(picked) = (unsafe { picked.as_ref() }) else {
-                return;
-            };
-            if let Some(bytes) = rgba8(picked)
-                && let Ok(mut slot) = PICKED.lock()
-            {
-                *slot = Some((target, to_color(bytes)));
-                ctx.request_repaint();
-            }
-        });
-        let sampler = NSColorSampler::new();
-        // SAFETY: on the main thread, as AppKit requires; the sampler retains
-        // itself, and the block, until the session ends.
-        unsafe { sampler.showSamplerWithSelectionHandler(&handler) };
     }
 
     pub fn open_panel(target: Id, color: Color) {

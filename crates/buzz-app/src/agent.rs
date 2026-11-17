@@ -150,7 +150,7 @@ pub fn route(command: Command) -> Route {
         | BringForward | SendBackward | SendToBack | RetargetPerformance | SwapSymbol | NextPose | PreviousPose
         | PaintThrough | ExposeOnTwos | ExposeOnThrees | SelectSameColour | ThickenStroke
         | ThinStroke | TraceBitmap | TraceLineArt | ConvertLinesToFills | ExpandFill
-        | SmoothSelection | StraightenSelection | RecogniseShape | FlipHorizontal | FlipVertical
+        | SmoothSelection | StraightenSelection | CurveSelection | RecogniseShape | FlipHorizontal | FlipVertical
         | RotateClockwise | RotateAnticlockwise | ExtendPart | NewLayer | NewLayerFolder | MoveLayerUp
         | MoveLayerDown | NewReferenceLayer | DeleteLayer | ConvertToSymbol | NewSymbol
         | EditSymbol | EditDocument | PlaceInstance | DuplicateSymbol | SymbolToAsset

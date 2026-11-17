@@ -3992,6 +3992,40 @@ mod tests {
     use buzz_geom::{BezPath, Point, Shape as _};
     use kurbo::Rect as KRect;
 
+    /// **A layer hidden inside a symbol is hidden only there** (user
+    /// 2026-11-17): the eye clicked while the symbol is open hides the layer
+    /// from that timeline — not drawn, not selectable — while the symbol's
+    /// instances still draw it; one click shows it again, and on the stage
+    /// the eye hides a layer everywhere, as before.
+    #[test]
+    fn a_layer_hidden_in_a_symbol_still_shows_outside_it() {
+        let mut layer = crate::Layer::new(LayerId(1), "Box", LayerKind::Normal);
+        layer.set_shown(false, true);
+        assert!(layer.visible && layer.edit_hidden && !layer.shown(), "hidden for editing only");
+        layer.set_shown(true, true);
+        assert!(layer.visible && !layer.edit_hidden && layer.shown());
+        layer.set_shown(false, false);
+        assert!(!layer.visible && !layer.shown(), "on the stage it hides the layer");
+        layer.visible = false; // hidden the old way, inside a symbol
+        layer.set_shown(true, true);
+        assert!(layer.shown(), "one click brings it back");
+
+        let mut stack = crate::LayerStack::new();
+        let mut door = crate::Layer::new(LayerId(2), "Door", LayerKind::Normal);
+        door.frames.set_objects(0, vec![std::sync::Arc::new(crate::Object::shape(ObjectId(7), crate::ShapeData::filled(KRect::new(0.0, 0.0, 5.0, 5.0).to_path(0.1), peniko::Color::BLACK)))]);
+        let mut shelf = door.clone();
+        shelf.id = LayerId(3);
+        shelf.name = "Shelf".into();
+        shelf.set_shown(false, true);
+        stack.insert(0, door);
+        stack.insert(1, shelf);
+        let ids = |v: Vec<&std::sync::Arc<crate::Layer>>| v.iter().map(|l| l.id).collect::<Vec<_>>();
+        assert_eq!(ids(stack.drawable_at(0).collect()).len(), 2, "an instance of the symbol draws both");
+        assert_eq!(ids(stack.drawable_while_editing(0, false)), vec![LayerId(2)], "the open symbol shows only the door");
+        assert_eq!(stack.selectable().map(|l| l.id).collect::<Vec<_>>(), vec![LayerId(2)], "and only the door can be picked");
+        assert!(stack.hittable_from_outside().any(|l| l.id == LayerId(3)), "from outside, the shelf is clicked like the rest");
+    }
+
     /// **Auto Depth** (user 2026-11-17): names pick the band, order spaces
     /// the layers inside it (higher nearer), a character's folder moves as
     /// one with what is filed in it, and running it again changes nothing.

@@ -2318,27 +2318,33 @@ impl Editor {
     /// Close button or its icon — see `App::draw_strip_flyout`); in a column,
     /// in front of its section and unrolled; closed, back at its home.
     fn show_tool_options(&mut self) {
-        use buzz_ui::{Dock, PanelId};
+        self.show_panel(buzz_ui::PanelId::ToolOptions);
+    }
+
+    /// `panel` shown where the layout keeps it, the way [`Self::show_tool_options`]
+    /// shows Tool Options.
+    fn show_panel(&mut self, panel: buzz_ui::PanelId) {
+        use buzz_ui::Dock;
         let workspace = &mut self.workspace;
-        if workspace.icon_strip && workspace.dock_of(PanelId::ToolOptions) == Dock::RightOuter {
+        if workspace.icon_strip && workspace.dock_of(panel) == Dock::RightOuter {
             // What a menu's reveal does: the strip opens its pop-out.
-            workspace.scroll_to = Some(PanelId::ToolOptions);
+            workspace.scroll_to = Some(panel);
             return;
         }
-        if !workspace.is_open(PanelId::ToolOptions) {
-            workspace.restore_default_place(PanelId::ToolOptions);
+        if !workspace.is_open(panel) {
+            workspace.restore_default_place(panel);
             // Closed in the default arrangement too: open it at its home, as
             // Window's own toggle does.
-            if !workspace.is_open(PanelId::ToolOptions) && !workspace.locked {
-                workspace.toggle(PanelId::ToolOptions);
+            if !workspace.is_open(panel) && !workspace.locked {
+                workspace.toggle(panel);
             }
-            if workspace.icon_strip && workspace.dock_of(PanelId::ToolOptions) == Dock::RightOuter {
-                workspace.scroll_to = Some(PanelId::ToolOptions);
+            if workspace.icon_strip && workspace.dock_of(panel) == Dock::RightOuter {
+                workspace.scroll_to = Some(panel);
                 return;
             }
         }
-        workspace.select_tab(PanelId::ToolOptions);
-        workspace.set_collapsed(PanelId::ToolOptions, false);
+        workspace.select_tab(panel);
+        workspace.set_collapsed(panel, false);
     }
 
     pub fn set_tool(&mut self, tool: ToolId) {
@@ -2355,7 +2361,12 @@ impl Editor {
             // where it lives if it was closed (user 2026-11-14: rolled up or
             // closed, picking a tool showed nothing). The Hand only pans, so
             // it leaves the panels alone.
-            if changed && tool != ToolId::Hand {
+            // **The Eyedropper brings up the Color panel** (user 2026-11-17):
+            // what it picks lands in the fill (or the stroke) shown there, and
+            // there it can be set exactly.
+            if changed && tool == ToolId::Eyedropper {
+                self.show_panel(buzz_ui::PanelId::Color);
+            } else if changed && tool != ToolId::Hand {
                 self.show_tool_options();
             }
             // Free Transform needs something to put handles on. Picking it up
@@ -3539,27 +3550,32 @@ impl Editor {
             ToolAction::Erase { path, width } => self.erase(path, width),
 
             ToolAction::BucketFill { point } => {
-                let tolerance = self.pick_tolerance();
                 let style = self.style.clone();
                 // Clicking a shape that already has a fill recolours it — the
                 // gradient is refitted to that shape's bounds. Clicking anywhere
                 // else (an empty region between lines, or on a bare outline)
                 // floods the enclosed area with a new fill, which is what a paint
                 // bucket is actually for.
-                let recolour = self
-                    .object_at(point, tolerance)
-                    .filter(|id| self.shape_has_fill(*id));
+                //
+                // **Only a click truly inside the fill**, as Animate's bucket
+                // takes it (user 2026-11-17). It used the selection's pick
+                // tolerance, several screen pixels: a click in a small gap
+                // beside traced line art — itself a black fill — repainted
+                // the line art instead of filling the gap.
+                let recolour = self.object_at(point, 0.0).filter(|id| self.shape_has_fill(*id));
+                // A click right on a line (traced line art is a fill too)
+                // recolours the line, as one on the door's panel does (user
+                // 2026-11-17).
                 if let Some(id) = recolour {
                     let at = self.edit_at();
                     self.doc.edit("Paint Bucket", |scene| {
                         update_shape(scene, at, id, |s| {
                             let bounds = buzz_geom::Shape::bounding_box(&s.path);
+                            // Its own fill rule kept: an even-odd fill's
+                            // holes stay holes.
+                            let rule = s.fill.as_ref().map_or(buzz_geom::FillMode::NonZero, |f| f.rule);
                             if let Some(paint) = style.fill_for_new_shape(bounds) {
-                                s.fill = Some(FillSpec {
-                                    paint,
-                                    rule: buzz_geom::FillMode::NonZero,
-                                    swatch: None,
-                                });
+                                s.fill = Some(FillSpec { paint, rule, swatch: None });
                             }
                         });
                     });
@@ -3650,59 +3666,76 @@ impl Editor {
         )
     }
 
-    /// Flood-fill the enclosed region under `point` on the active layer.
+    /// Flood-fill the enclosed region under `point`.
     ///
-    /// The boundaries are the layer's own shapes; the seed and the boundaries are
-    /// taken in the layer's local space — the space the shape paths are stored in
-    /// — so a layer moved by depth or parenting still fills where it is drawn.
-    fn bucket_flood(&mut self, point: Point, style: &DrawStyle) {
-        let layer = match self.artwork_layer() {
-            Ok(layer) => layer,
-            Err(why) => {
-                self.status = Some(why);
-                return;
-            }
-        };
+    /// The boundaries are a layer's own shapes; the seed and the boundaries
+    /// are taken in the layer's local space — the space the shape paths are
+    /// stored in — so a layer moved by depth or parenting still fills where
+    /// it is drawn.
+    ///
+    /// **On the layer whose lines enclose the click** (user 2026-11-17: the
+    /// door did not fill). The active layer first; when its lines enclose
+    /// nothing there — it may hold only a background symbol, as the user's
+    /// Room layer does — every other layer that shows and is not locked,
+    /// top first. The fill goes behind that layer's lines, and that layer
+    /// becomes the active one.
+    fn bucket_flood(&mut self, point: Point, style: &DrawStyle) -> bool {
         if !style.fill_enabled {
             self.status = Some("Set a fill colour first".into());
-            return;
+            return false;
         }
-
+        let active = self.artwork_layer().ok();
         let frame = self.current_frame;
         let scene = self.doc.scene();
+        let master = self.doc.master_audio().map(|(_, layer)| layer);
+        let mut order: Vec<LayerId> = active.into_iter().collect();
+        let by_depth = scene.stage().sort_by_depth;
+        let mut others: Vec<LayerId> = scene
+            .layers()
+            .selectable_in_paint_order(by_depth)
+            .into_iter()
+            .filter(|l| l.kind.holds_artwork() && Some(l.id) != master && !l.audio_guide)
+            .map(|l| l.id)
+            .collect();
+        others.reverse(); // top first
+        order.extend(others.into_iter().filter(|id| Some(*id) != active));
 
-        // The click, moved into the active layer's local space — the reverse of
-        // the depth and parenting that place the layer's artwork on screen.
-        let Some(depth) = scene.layers().get(layer).map(|l| l.depth) else {
-            return;
-        };
-        let Some(local) = scene.view_to_layer(frame, depth, point) else {
-            return;
-        };
-        let seed = match invert(scene.layers().inherited_transform(layer, frame)) {
-            Some(back) => back * local,
-            None => local,
-        };
-
-        // Every shape on the layer at this frame becomes a wall.
-        let mut boundaries = Vec::new();
-        if let Some(layer_ref) = scene.layers().get(layer) {
+        let mut found: Option<(LayerId, BezPath)> = None;
+        for layer in order {
+            let Some(layer_ref) = scene.layers().get(layer) else { continue };
+            // The click, moved into the layer's local space — the reverse of
+            // the depth and parenting that place its artwork on screen.
+            let Some(local) = scene.view_to_layer(frame, layer_ref.depth, point) else { continue };
+            let seed = match invert(scene.layers().inherited_transform(layer, frame)) {
+                Some(back) => back * local,
+                None => local,
+            };
+            // Every shape on the layer at this frame becomes a wall.
+            let mut boundaries = Vec::new();
             for object in layer_ref.frames.resolved_at(frame).iter() {
                 collect_bucket_boundaries(object, buzz_geom::Affine::IDENTITY, &mut boundaries);
             }
+            // A layer whose drawing is nowhere near the click encloses nothing there.
+            let around = boundaries.iter().map(|b| buzz_geom::Shape::bounding_box(&b.path)).reduce(|a, b| a.union(b));
+            if !around.is_some_and(|r| r.contains(seed)) {
+                continue;
+            }
+            if let Some(path) = buzz_scene::fill_region(&boundaries, seed, style.gap_size) {
+                found = Some((layer, path));
+                break;
+            }
         }
-
-        let Some(path) = buzz_scene::fill_region(&boundaries, seed, style.gap_size) else {
-            self.status = Some(
-                "Nothing enclosed to fill here — raise the Gap Size if the outline has a gap"
-                    .into(),
-            );
-            return;
+        let Some((layer, path)) = found else {
+            self.status = Some(match active {
+                Some(_) => "Nothing enclosed to fill here \u{2014} raise the Gap Size if the outline has a gap".into(),
+                None => "Nothing enclosed to fill here on a layer that can take it (unlock or show its layer)".into(),
+            });
+            return false;
         };
 
         let bounds = buzz_geom::Shape::bounding_box(&path);
         let Some(paint) = style.fill_for_new_shape(bounds) else {
-            return;
+            return false;
         };
         let shape = ShapeData {
             path,
@@ -3720,6 +3753,10 @@ impl Editor {
             ensure_keyframe_for_drawing(scene, layer, frame, auto);
             scene.add_shape_behind_at(layer, frame, shape);
         });
+        if Some(layer) != active {
+            self.selection.set_active_layer(Some(layer));
+        }
+        true
     }
 
     fn add_shape(&mut self, shape: ShapeData, label: &'static str) {
@@ -4472,7 +4509,11 @@ impl Editor {
     pub fn sampled_paint_at(&self, point: Point) -> Option<(Color, bool)> {
         let table = self.symbol_bounds();
         let scene = self.doc.scene();
-        let tolerance = self.pick_tolerance();
+        // **Only what is under the tip** (user 2026-11-17: "I am not able to
+        // understand what it is picking, be very precise"): half a screen
+        // pixel, not the selection's six, which took a neighbouring shape's
+        // colour from a click beside it.
+        let tolerance = self.pick_tolerance() / 12.0;
         let frame = self.current_frame;
         let mut hit = None;
         // Walked in the order the renderer paints, so the last match really is
@@ -6115,6 +6156,7 @@ impl Editor {
             },
             SmoothSelection => self.reshape_selection(Reshape::Smooth),
             StraightenSelection => self.reshape_selection(Reshape::Straighten),
+            CurveSelection => self.reshape_selection(Reshape::Curve),
             EvenLines => self.open_even_lines(),
             OptimizeShapes => self.open_optimize_shapes(),
             RemoveBackgroundSpecks => {
@@ -14938,7 +14980,7 @@ impl Editor {
         });
         let scene = self.doc.scene().clone();
         let usable = |id: LayerId| {
-            scene.layers().get(id).is_some_and(|l| l.is_editable() && scene.layers().is_effectively_visible(id))
+            scene.layers().get(id).is_some_and(|l| l.is_editable() && scene.layers().is_shown_while_editing(id))
         };
         let next = neighbours
             .iter()
@@ -15980,11 +16022,7 @@ impl Editor {
         // What is drawn, back to front, each with where its layer puts it on
         // the timeline being authored and its bounds there.
         let layers = scene.layers();
-        let order: Vec<&Arc<buzz_scene::Layer>> = if scene.stage().sort_by_depth {
-            layers.drawable_at_by_depth(frame)
-        } else {
-            layers.drawable_at(frame).collect()
-        };
+        let order: Vec<&Arc<buzz_scene::Layer>> = layers.drawable_while_editing(frame, scene.stage().sort_by_depth);
         let mut painted: Vec<(LayerId, Object, Affine, Rect)> = Vec::new();
         for layer in order {
             if !layer.kind.paints_to_output() || layer.kind.is_mask() {
@@ -16369,81 +16407,127 @@ impl Editor {
         });
     }
 
+    /// **Smooth, Straighten and Curvier** — the Selection tool's three buttons
+    /// and Modify ▸ Shape — on every selected stroke, as far as the Strength
+    /// under the buttons says. **Every press goes further**, as in Animate:
+    /// Smooth evens out bigger bumps and the width each time, Straighten
+    /// takes the same share of what wobble is left, Curvier bows further.
     fn reshape_selection(&mut self, how: Reshape) {
         let ids = self.selection.ids();
         let at = self.edit_at();
         let label = match how {
             Reshape::Smooth => "Smooth",
             Reshape::Straighten => "Straighten",
+            Reshape::Curve => "Curvier",
         };
+        let strength = f64::from(self.workspace.reshape_strength).clamp(0.0, 1.0);
+        let bow = 0.15 + 0.5 * strength;
         // **Straighten recognises shapes first**, as Animate's does: it is the
         // command an animator reaches for after drawing a rough circle, and
         // easing the curve of a circle that could have *been* a circle is a
-        // worse answer than the one they wanted. Nothing recognisable falls
-        // through to the ordinary straightening.
+        // worse answer than the one they wanted. Not a line, though: a line
+        // recognised is a line finished in one press, and Straighten is
+        // pressed two or three times until the line looks right (user
+        // 2026-11-17: "2-3 times it shall be able to smoother or straighten").
+        // Recognise Shape is the one press that makes it exact.
         let recognise = matches!(how, Reshape::Straighten);
         let tolerance = self.view.shape_tolerance;
+        let as_shape = |path: &BezPath| {
+            buzz_geom::recognise(path, tolerance).filter(|(_, kind)| *kind != buzz_geom::Recognised::Line)
+        };
 
+        let mut touched = 0usize;
         self.doc.edit(label, |scene| {
             for id in ids {
                 // **A brush stroke is reshaped down its middle**, from the
                 // spine it was drawn from, so both edges move together and the
                 // tapers survive. Smoothing the outline instead refits each
                 // edge on its own and rounds the points off the ends.
-                let reshaped = update_brush_stroke(scene, at, id, |spine| {
-                    let bb = spine.centreline().bounding_box();
-                    let amount = (bb.width().hypot(bb.height()) / 200.0).clamp(0.5, 10.0);
-                    match how {
-                        Reshape::Smooth => spine.smoothed(0.8),
-                        Reshape::Straighten => {
-                            match buzz_geom::recognise(&spine.centreline(), tolerance) {
-                                Some((path, _)) => spine.retraced(&path),
-                                None => spine.straightened(amount),
-                            }
-                        }
-                    }
+                let reshaped = update_brush_stroke(scene, at, id, |spine| match how {
+                    Reshape::Smooth => spine.smoothed(strength),
+                    Reshape::Straighten => match as_shape(&spine.centreline()) {
+                        Some((path, _)) => spine.retraced(&path),
+                        None => spine.straightened(strength),
+                    },
+                    Reshape::Curve => spine.curvier(bow),
                 });
                 if reshaped {
+                    touched += 1;
                     continue;
                 }
                 update_shape(scene, at, id, |s| {
-                    if recognise && let Some((path, _)) = buzz_geom::recognise(&s.path, tolerance) {
-                        s.path = path;
+                    // **A brush stroke that has lost its spine** — fused by
+                    // merge paint, or drawn before strokes kept one, which is
+                    // most of a film's strokes — is found again from its
+                    // outline and reshaped down its middle all the same.
+                    if s.stroke.is_none()
+                        && let Some(fill) = buzz_geom::FillSpine::from_outline(&s.path)
+                    {
+                        let path = match how {
+                            Reshape::Smooth => Some(fill.smoother(strength)),
+                            Reshape::Straighten => Some(fill.straighter(strength)),
+                            Reshape::Curve => fill.curvier(bow),
+                        };
+                        if let Some(path) = path {
+                            s.path = path;
+                            touched += 1;
+                        }
                         return;
                     }
-                    let bb = s.path.bounding_box();
-                    let amount = (bb.width().hypot(bb.height()) / 200.0).clamp(0.01, 10.0);
-                    s.path = match how {
-                        Reshape::Smooth => buzz_geom::smooth(&s.path, amount),
-                        Reshape::Straighten => buzz_geom::straighten(&s.path, amount),
+                    if recognise && let Some((path, _)) = as_shape(&s.path) {
+                        s.path = path;
+                        touched += 1;
+                        return;
+                    }
+                    let path = match how {
+                        Reshape::Smooth => buzz_geom::smoother(&s.path, strength),
+                        Reshape::Straighten => buzz_geom::straighter(&s.path, strength),
+                        Reshape::Curve => buzz_geom::curvier(&s.path, bow),
                     };
+                    if path != s.path {
+                        s.path = path;
+                        touched += 1;
+                    }
                 });
             }
+        });
+
+        self.status = Some(match (touched, how) {
+            (0, Reshape::Curve) => "Curvier bends lines and brush strokes with two ends \u{2014} \
+                                    select one with the Selection tool (V)"
+                .to_string(),
+            (0, _) => format!(
+                "Nothing selected that {label} can change \u{2014} select a stroke with the \
+                 Selection tool (V)"
+            ),
+            (1, _) => format!("{label}: one stroke"),
+            (n, _) => format!("{label}: {n} strokes"),
         });
     }
 
     // -- view ----------------------------------------------------------------
 
-    /// Zoom In / Zoom Out, the zoom buttons, Ctrl+wheel and a pinch.
-    /// **Zoom keeping what is in focus where it is on screen**: the selection
-    /// when some of it is in view, else the middle of the view. The view never
-    /// jumps back to the stage, so zooming in on a character's hand, or into a
-    /// symbol's artwork far from the stage, stays on it.
+    /// Zoom In / Zoom Out, the zoom buttons, 100% and the zoom box.
+    /// **What is in the middle of the view stays in the middle** (user
+    /// 2026-11-17: "when I have something in the middle of the screen, on zoom
+    /// it shall still be in the middle"). It used to hold the selection still
+    /// instead, so with a whole background symbol selected the zoom swung
+    /// round its centre and the door being worked on slid away. The view
+    /// never jumps back to the stage either, so zooming in on a character's
+    /// hand, or into a symbol's artwork far from the stage, stays on it.
     pub fn zoom_by(&mut self, factor: f64) {
-        let pivot = self.zoom_focus();
-        self.camera.zoom_by_at(factor, pivot);
+        let middle = Point::new(self.camera.viewport.width / 2.0, self.camera.viewport.height / 2.0);
+        self.camera.zoom_by_at(factor, middle);
     }
 
-    /// Zoom about a point on screen (the pointer's, for a pinch or the
-    /// wheel) — unless something is selected and in view, which then stays
-    /// put instead, as [`Self::zoom_by`] keeps it.
+    /// Zoom about a point on screen — the pointer's, for a pinch or
+    /// Ctrl+scroll — which stays under the pointer, as in Animate.
     pub fn zoom_by_at(&mut self, factor: f64, screen: Point) {
-        let pivot = self.selection_on_screen().unwrap_or(screen);
-        self.camera.zoom_by_at(factor, pivot);
+        self.camera.zoom_by_at(factor, screen);
     }
 
-    /// Set the zoom to `percent`, keeping what is in focus where it is (see
-    /// [`Self::zoom_by`]).
+    /// Set the zoom to `percent`, keeping the middle of the view where it is
+    /// (see [`Self::zoom_by`]).
     pub fn set_zoom_centred(&mut self, percent: f64) {
         let now = self.camera.zoom_percent();
         if now > 0.0 && percent.is_finite() && percent > 0.0 {
@@ -16451,38 +16535,12 @@ impl Editor {
         }
     }
 
-    /// The screen point zooming keeps still: the selection's centre when it is
-    /// in view, else the middle of the view.
-    fn zoom_focus(&self) -> Point {
-        let middle = Point::new(self.camera.viewport.width / 2.0, self.camera.viewport.height / 2.0);
-        self.selection_on_screen().unwrap_or(middle)
-    }
-
-    /// The selection's centre on screen, when some of the selection is in view.
-    ///
-    /// Measured from where each object is **drawn on the stage** — through the
-    /// scene camera — not on the focal plane: at the root the camera moves the
-    /// artwork on screen, and a pivot taken before it zoomed about somewhere
-    /// else, so the object slid away (inside a symbol there is no camera,
-    /// which is why it only went wrong at the root).
-    fn selection_on_screen(&self) -> Option<Point> {
-        let bounds = self
-            .selection
-            .iter()
-            .filter_map(|id| self.object_quad(id))
-            .map(|quad| quad[1..].iter().fold(Rect::from_points(quad[0], quad[0]), |r, p| r.union_pt(*p)))
-            .reduce(|a, b| a.union(b))?;
-        let corners = [bounds.origin(), Point::new(bounds.x1, bounds.y1)].map(|p| self.camera.doc_to_screen(p));
-        let on_screen = Rect::from_points(corners[0], corners[1]);
-        let view = Rect::new(0.0, 0.0, self.camera.viewport.width, self.camera.viewport.height);
-        (on_screen.intersect(view).area() > 0.0 || view.contains(on_screen.center())).then(|| self.camera.doc_to_screen(bounds.center()))
-    }
-
     /// Scroll so the stage's centre is the view's centre, zoom unchanged.
     pub fn centre_on_stage(&mut self) {
         self.camera.center = self.doc.scene().stage().stage_rect().center();
     }
 
+    /// Fit the stage into the view, centred, at whatever zoom that takes.
     pub fn zoom_fit(&mut self) {
         let stage = self.doc.scene().stage().stage_rect();
         self.camera.fit_to_rect(stage, 1.2);
@@ -16518,6 +16576,7 @@ enum Reorder {
 enum Reshape {
     Smooth,
     Straighten,
+    Curve,
 }
 
 /// Frame operations, matching Animate's function keys.
@@ -25904,6 +25963,75 @@ mod tests {
 
     /// Clicking inside a stroke-only outline creates a new fill shape, behind
     /// the lines — the paint bucket's actual job, not just recolouring.
+    /// **The bucket fills where the lines are, as Animate's does** (user
+    /// 2026-11-17: the door did not fill). Line art drawn as a black fill
+    /// with a 2-unit gap in it, on one layer, and another layer active (the
+    /// user's held only a background symbol): a click in the gap — within the
+    /// selection's pick distance of the black — fills the gap, on the line
+    /// art's layer, which becomes active; the black is not repainted.
+    #[test]
+    fn the_bucket_fills_a_small_gap_on_the_layer_whose_lines_enclose_it() {
+        the_bucket_fills_the_slot_from(Point::new(19.3, 20.0));
+    }
+
+    /// **A click right on the line recolours it** (user 2026-11-17: "if I
+    /// click directly on the black lines I shall be able to paint it, the
+    /// same way as the door"): no fill is added, and the black turns red.
+    #[test]
+    fn a_click_right_on_the_line_recolours_it() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 0.0, 0.0, 40.0, Color::BLACK).expect("a black square");
+        e.run(Command::ZoomActual);
+        let before = e.scene().shape_count();
+        e.style.fill_enabled = true;
+        e.style.fill_color = Color::from_rgb8(0xFF, 0x00, 0x00);
+        e.apply(ToolAction::BucketFill { point: Point::new(0.5, 20.0) });
+        assert_eq!(e.scene().shape_count(), before, "nothing added");
+        let (_, object) = e.scene().find_object(id).expect("the square");
+        let ObjectKind::Shape(shape) = &object.kind else { unreachable!() };
+        assert_eq!(shape.fill.as_ref().map(|f| f.color().to_rgba8().to_u8_array()), Some([255, 0, 0, 255]));
+    }
+
+    fn the_bucket_fills_the_slot_from(click: Point) -> Editor {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        // A black square 40 across with a 2-by-20 slot cut out of it.
+        let mut art = square(0.0, 0.0, 40.0);
+        art.move_to(Point::new(19.0, 10.0));
+        art.line_to(Point::new(19.0, 30.0));
+        art.line_to(Point::new(21.0, 30.0));
+        art.line_to(Point::new(21.0, 10.0));
+        art.close_path();
+        e.apply(ToolAction::AddShape {
+            shape: ShapeData { path: art, fill: Some(FillSpec { paint: Paint::Solid(Color::BLACK), rule: buzz_geom::FillMode::NonZero, swatch: None }), stroke: None, blend: buzz_scene::PaintBlend::default() },
+            label: "Draw",
+        });
+        let lines = e.scene().layers().iter().find(|l| !l.frames.resolved_at(0).is_empty()).map(|l| l.id).expect("the line art's layer");
+        let mut other = None;
+        e.doc.edit("New Layer", |scene| other = Some(scene.add_layer("Background", buzz_scene::LayerKind::Normal)));
+        e.selection.set_active_layer(other);
+
+        e.style.fill_enabled = true;
+        e.style.fill_color = Color::from_rgb8(0xFF, 0x00, 0x00);
+        e.run(Command::ZoomActual);
+        e.apply(ToolAction::BucketFill { point: click });
+
+        let on_lines: Vec<_> = e.scene().layers().get(lines).unwrap().objects_at(0).to_vec();
+        assert_eq!(on_lines.len(), 2, "a fill was added beside the line art: {:?}", e.status);
+        let colour = |o: &buzz_scene::Object| match &o.kind {
+            ObjectKind::Shape(s) => s.fill.as_ref().map(|f| f.color().to_rgba8().to_u8_array()),
+            _ => None,
+        };
+        let red = on_lines.iter().find(|o| colour(o) == Some([255, 0, 0, 255])).expect("the red fill");
+        let ObjectKind::Shape(fill) = &red.kind else { unreachable!() };
+        let bounds = buzz_geom::Shape::bounding_box(&fill.path);
+        assert!(bounds.x0 > 18.7 && bounds.x1 < 21.3 && bounds.y0 > 9.7 && bounds.y1 < 30.3, "only the slot: {bounds:?}");
+        assert!(on_lines.iter().any(|o| colour(o) == Some([0, 0, 0, 255])), "the black is not repainted");
+        assert_eq!(e.selection.active_layer(), Some(lines), "the line art's layer is the active one now");
+        e
+    }
+
     #[test]
     fn the_bucket_floods_an_empty_region_bounded_by_lines() {
         let mut e = editor();
@@ -30962,12 +31090,13 @@ mod tests {
         assert_eq!(e.selection.iter().collect::<Vec<_>>(), vec![part], "and a click there selects it");
     }
 
-    /// **Zoom keeps what is in focus in focus.** With nothing selected, Zoom
-    /// In, Zoom Out and 100% keep the middle of the view where it is, wherever
-    /// the view was scrolled to; with something selected, it stays where it is
-    /// on screen however far the zoom goes.
+    /// **What is in the middle of the view stays in the middle** (user
+    /// 2026-11-17). Zoom In, Zoom Out, 100% and the zoom box keep the middle
+    /// where it is, wherever the view was scrolled to — and with something
+    /// selected off to one side too, which used to hold the zoom instead; a
+    /// pinch or Ctrl+scroll keeps the point under the pointer.
     #[test]
-    fn zooming_keeps_the_focus() {
+    fn zooming_keeps_the_middle_of_the_view() {
         let mut e = editor();
         for command in [Command::ZoomIn, Command::ZoomOut, Command::ZoomActual] {
             e.camera.center = Point::new(-3000.0, 4000.0);
@@ -30981,51 +31110,19 @@ mod tests {
         e.run(Command::ZoomActual);
         let id = draw_square(&mut e, 100.0, 100.0, 140.0, Color::WHITE).expect("a square");
         e.selection.select_one(id);
-        let centre = e.selection_bounds_drawn().expect("drawn").center();
-        let before = e.camera.doc_to_screen(centre);
+        let middle = Point::new(e.camera.viewport.width / 2.0, e.camera.viewport.height / 2.0);
+        let shown = e.camera.screen_to_doc(middle);
         for command in [Command::ZoomIn, Command::ZoomIn, Command::ZoomOut, Command::ZoomActual] {
             e.run(command);
-            let after = e.camera.doc_to_screen(centre);
-            assert!((after - before).hypot() < 1e-6, "{command:?} moved the selection on screen");
+            assert!((e.camera.doc_to_screen(shown) - middle).hypot() < 1e-6, "{command:?} slid the middle away");
         }
-        // A pinch or the wheel pivots on the selection too, not the pointer.
-        e.zoom_by_at(1.5, Point::new(5.0, 5.0));
-        assert!((e.camera.doc_to_screen(centre) - before).hypot() < 1e-6);
-        // With nothing selected it pivots on the pointer.
-        e.selection.clear();
+        e.set_zoom_centred(333.0);
+        assert!((e.camera.doc_to_screen(shown) - middle).hypot() < 1e-6, "the zoom box too");
+        // A pinch or the wheel keeps what is under the pointer, selection or not.
         let pointer = Point::new(30.0, 40.0);
         let under = e.camera.screen_to_doc(pointer);
         e.zoom_by_at(2.0, pointer);
         assert!((e.camera.doc_to_screen(under) - pointer).hypot() < 1e-6);
-    }
-
-    /// At the root, **through a moved and zoomed scene camera**: the object is
-    /// drawn somewhere other than its focal-plane spot, and zooming has to hold
-    /// where it is drawn.
-    #[test]
-    fn zooming_keeps_the_focus_through_the_scene_camera() {
-        let mut e = editor();
-        e.run(Command::ZoomActual);
-        let id = draw_square(&mut e, 100.0, 100.0, 140.0, Color::WHITE).expect("a square");
-        e.run(Command::ToggleCamera);
-        e.doc.edit("Frame", |scene| {
-            let stage = scene.stage().size;
-            let mut key = scene.camera().state_at(0).expect("enabling the camera seeds a key");
-            key.frame = 0;
-            key.center = Point::new(stage.width / 2.0 - 90.0, stage.height / 2.0 + 40.0);
-            key.zoom = 1.4;
-            scene.camera_mut().set_key(key);
-        });
-        e.selection.select_one(id);
-        let drawn = |e: &Editor| {
-            let q = e.object_quad(id).expect("drawn");
-            e.camera.doc_to_screen(Point::new((q[0].x + q[2].x) / 2.0, (q[0].y + q[2].y) / 2.0))
-        };
-        let before = drawn(&e);
-        for command in [Command::ZoomIn, Command::ZoomIn, Command::ZoomOut] {
-            e.run(command);
-            assert!((drawn(&e) - before).hypot() < 1e-6, "{command:?} slid the selection off");
-        }
     }
 
     /// The same for a **symbol instance**, which is the case that matters:

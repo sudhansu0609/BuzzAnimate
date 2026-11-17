@@ -128,6 +128,7 @@ impl Remapper<'_> {
             copy.locked = layer.locked;
             copy.outline = layer.outline;
             copy.unlit = layer.unlit;
+            copy.edit_hidden = layer.edit_hidden;
             copy.casts_shadow = layer.casts_shadow;
             copy.alpha = layer.alpha;
             copy.color = layer.color;

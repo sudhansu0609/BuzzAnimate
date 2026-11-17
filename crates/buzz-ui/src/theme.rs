@@ -152,6 +152,19 @@ impl Theme {
 
 static CURRENT: AtomicU8 = AtomicU8::new(0);
 
+/// **Held by every test that switches the theme**, and by a test that reads
+/// colours while one could be running: the theme is process-wide and tests
+/// run in parallel, so without it a test drawing in Dark could read Light's
+/// colours halfway through.
+#[cfg(test)]
+pub(crate) static TEST_THEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`TEST_THEME_LOCK`], taken even after a test holding it failed.
+#[cfg(test)]
+pub(crate) fn lock_theme_for_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_THEME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The theme every colour below is answering for.
 pub fn theme() -> Theme {
     let i = CURRENT.load(Ordering::Relaxed) as usize;
@@ -1192,6 +1205,7 @@ mod tests {
     /// The current theme is process-wide, so a test that changed it and walked
     /// away would make its neighbours fail depending on the order they ran in.
     fn in_each_theme(mut body: impl FnMut(Theme)) {
+        let _theme = lock_theme_for_test();
         let was = theme();
         for t in Theme::ALL {
             set_theme(t);
@@ -1320,6 +1334,7 @@ mod tests {
     /// the dark one.
     #[test]
     fn the_light_theme_is_lighter_than_the_dark_one() {
+        let _theme = lock_theme_for_test();
         set_theme(Theme::Dark);
         let dark_panel = lum(Palette::panel());
         let dark_text = lum(Palette::text());
@@ -1358,6 +1373,7 @@ mod tests {
     /// shows up as one panel in the wrong colours much later.
     #[test]
     fn every_theme_sets_and_reads_back() {
+        let _theme = lock_theme_for_test();
         let was = theme();
         for t in Theme::ALL {
             set_theme(t);

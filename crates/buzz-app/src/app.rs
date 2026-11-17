@@ -29338,32 +29338,9 @@ mod joint_limit_tests {
         );
     }
 
-    /// Every piece of text one whole UI frame painted.
+    /// Every piece of text the UI painted, Tool Options' pop-out included.
     fn painted_text(app: &mut App) -> Vec<String> {
-        fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
-            match shape {
-                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
-                _ => {}
-            }
-        }
-        let ctx = egui::Context::default();
-        buzz_ui::theme::apply(&ctx);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(1600.0, 1000.0),
-            )),
-            ..Default::default()
-        };
-        let output = ctx.run_ui(input, |ui| {
-            app.build_ui(ui);
-        });
-        let mut out = Vec::new();
-        for clipped in &output.shapes {
-            collect(&clipped.shape, &mut out);
-        }
-        out
+        super::layer_rig_ui_tests::painted_text(app)
     }
 
     /// With the Bone tool in hand, pressing a bone puts that bone's joint
@@ -29563,7 +29540,7 @@ mod layer_rig_ui_tests {
         out
     }
 
-    fn painted_text(app: &mut App) -> Vec<String> {
+    pub(super) fn painted_text(app: &mut App) -> Vec<String> {
         fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
             match shape {
                 egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
@@ -29573,18 +29550,35 @@ mod layer_rig_ui_tests {
         }
         let ctx = egui::Context::default();
         buzz_ui::theme::apply(&ctx);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(1600.0, 1000.0),
-            )),
-            ..Default::default()
-        };
-        let output = ctx.run_ui(input, |ui| {
-            app.build_ui(ui);
-        });
+        // The Rig and Cast panels sit on the icon strip and open beside it as
+        // a window, which egui lays out unseen on its first frame — so the
+        // last of a few frames is the one that shows what the user sees.
+        // Autosaves on this machine and the splash would cover them. And the
+        // pop-out is made tall, so the whole panel is on screen rather than
+        // scrolled: a test reads what is painted, not what is scrolled to.
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        for id in [buzz_ui::PanelId::Rig, buzz_ui::PanelId::Cast, buzz_ui::PanelId::ToolOptions] {
+            if let Some(slot) = app.editor.workspace.slot_mut(id) {
+                slot.float_size = (360.0, 2300.0);
+            }
+        }
+        let mut output = None;
+        for frame in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1600.0, 2400.0),
+                )),
+                time: Some(f64::from(frame) / 60.0),
+                ..Default::default()
+            };
+            output = Some(ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            }));
+        }
         let mut out = Vec::new();
-        for clipped in &output.shapes {
+        for clipped in &output.expect("three frames").shapes {
             collect(&clipped.shape, &mut out);
         }
         out

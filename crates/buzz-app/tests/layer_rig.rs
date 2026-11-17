@@ -186,7 +186,13 @@ fn a_layer_rig_cast_asset_round_trips_and_drops_with_follows_intact() {
     stage.place_asset_at(&asset, drop);
     assert_eq!(stage.doc.history().undo_depth(), depth + 1, "the drop is one undo step");
     let scene = stage.doc.scene();
-    assert_eq!(follow_names(scene), wanted, "the drop lost the links");
+    // A placed asset's layers are named after it (`Layered Chest`), so the
+    // timeline says where they came from; the links are what must survive.
+    let placed: Vec<(String, String)> = wanted
+        .iter()
+        .map(|(l, f)| (format!("Layered {l}"), format!("Layered {f}")))
+        .collect();
+    assert_eq!(follow_names(scene), placed, "the drop lost the links");
 
     // Every part moved, and no follower inherits the move as motion.
     for layer in scene.layers().iter().filter(|l| l.follows.is_some()) {
@@ -204,6 +210,32 @@ fn a_layer_rig_cast_asset_round_trips_and_drops_with_follows_intact() {
         let at = object.transform * object.pivot.expect("a pivot");
         assert!((at - Point::new(600.0, 400.0)).hypot() < 200.0, "{} at {at:?}", layer.name);
     }
+
+    // Named after the asset, its layers still read back as their slots:
+    // Convert to bone rig builds every part into the skeleton.
+    let layers: Vec<LayerId> = scene.layers().iter().filter(|l| l.name.starts_with("Layered ")).map(|l| l.id).collect();
+    let mut rig = None;
+    stage.doc.edit("Convert to Bone Rig", |scene| {
+        rig = rigging::layers_to_bones(scene, 0, &pattern, &layers);
+    });
+    let rig = rig.expect("the dropped layer rig converts to bones");
+    // The same skeleton, with the same parts on it, as the rig converted
+    // before it ever went into the Cast.
+    let shape = |scene: &buzz_scene::Scene, rig: ObjectId| match &scene.find_object(rig).unwrap().1.kind {
+        ObjectKind::Armature(data) => {
+            let mut bones: Vec<_> = data.armature.bones.iter().map(|b| b.name.clone()).collect();
+            bones.sort();
+            (bones, data.parts.len())
+        }
+        other => panic!("not an armature: {other:?}"),
+    };
+    let own: Vec<LayerId> = editor.doc.scene().layers().iter().map(|l| l.id).collect();
+    let mut original = None;
+    editor.doc.edit("Convert to Bone Rig", |scene| {
+        original = rigging::layers_to_bones(scene, 0, &pattern, &own);
+    });
+    let original = original.expect("the original converts");
+    assert_eq!(shape(stage.doc.scene(), rig), shape(editor.doc.scene(), original));
 }
 
 /// Bones → Layers → Bones keeps every bone's name, length (within 0.5 px)

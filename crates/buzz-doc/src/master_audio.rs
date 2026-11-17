@@ -149,6 +149,17 @@ fn wants_guide(symbol: &Symbol) -> bool {
         || is_head
 }
 
+/// **Does `symbol` get a Master Audio guide?** A character or a head
+/// ([`wants_guide`]) — or any pose of one, wherever in the Library it is
+/// filed. The rule Enforce and Re-apply use, for anything that wants to know
+/// before running them.
+pub fn wants_master_guide(scene: &Scene, symbol: SymbolId) -> bool {
+    let library = scene.library();
+    let set = library.symbol_set(symbol);
+    let members = if set.is_empty() { vec![symbol] } else { set };
+    members.iter().any(|m| library.get(*m).is_some_and(|s| wants_guide(s)))
+}
+
 /// ~100 Hz RMS envelope of a clip's mono mix, or `None` if it can't be decoded.
 fn decode_envelope(asset: &SoundAsset) -> Option<Vec<f32>> {
     let clip = buzz_audio::Clip::decode(&asset.data, &asset.name).ok()?;
@@ -777,16 +788,8 @@ fn plan_scene(
     // **Every pose of a character**: a symbol in a character's pose set gets
     // the guide too, wherever in the Library it is filed, so every pose shows
     // the dialogue it is animated against.
-    let guided: std::collections::HashSet<SymbolId> = symbol_ids
-        .iter()
-        .copied()
-        .filter(|id| {
-            let library = work.library();
-            let set = library.symbol_set(*id);
-            let members = if set.is_empty() { vec![*id] } else { set };
-            members.iter().any(|m| library.get(*m).is_some_and(|s| wants_guide(s)))
-        })
-        .collect();
+    let guided: std::collections::HashSet<SymbolId> =
+        symbol_ids.iter().copied().filter(|id| wants_master_guide(&work, *id)).collect();
     for id in &symbol_ids {
         let Some(symbol) = work.library().get(*id).cloned() else {
             continue;

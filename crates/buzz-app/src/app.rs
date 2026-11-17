@@ -1454,8 +1454,9 @@ pub struct App {
     #[allow(clippy::type_complexity)]
     eyedropper_peek: std::cell::RefCell<Option<((egui::Pos2, u64, u32), Option<(peniko::Color, bool)>)>>,
     /// **A swatch's Pick is under way**: the swatch (by its id) the stage
-    /// eyedropper's next click goes to. See `handle_stage_input`.
-    dropper_pick: Option<egui::Id>,
+    /// eyedropper's next click goes to, and the tool in hand when it was
+    /// asked for. See `handle_stage_input`.
+    dropper_pick: Option<(egui::Id, buzz_ui::ToolId)>,
     /// The Rig panel's body slots of each timeline worked on, by edit path
     /// (`rig_slots_path` is the one showing).
     rig_slots_kept: std::collections::HashMap<Vec<u64>, (usize, Vec<Option<buzz_scene::ObjectId>>)>,
@@ -2222,6 +2223,8 @@ impl App {
         // The theme itself was settled before the window was created, above;
         // this is where the context is styled from it.
         theme::apply(&egui_ctx);
+        // Hindi typed into the Text tool shows in its box, not as empty boxes.
+        buzz_ui::font_preview::add_hindi_fallback(&egui_ctx);
         // Stage 6, item 4: without this, egui never builds the accesskit
         // tree at all — every widget's role and label (see
         // `buzz_ui::widgets::icon_button`) would exist only for a sighted
@@ -4403,6 +4406,9 @@ impl App {
             // The panel opened from the icon strip, over everything else.
             let ctx = ui.ctx().clone();
             self.draw_strip_flyout(&ctx, &workspace, &mut commands);
+            // Every text editor drawn this frame has asked for the keyboard
+            // for a text just placed; the last of them has it.
+            self.editor.text_to_focus = None;
 
             // **Somewhere to dock on an empty side.** A side with nothing on it
             // draws no column, and with no column there was nothing to drop a
@@ -6392,10 +6398,8 @@ impl App {
     /// **Resizable from any edge** — anchored by its top-right corner, so its
     /// left edge drags out away from the strip — and the size it is left at
     /// is kept for next time. Its header docks it into the right column or
-    /// floats it free. A click anywhere but the window, the strip or a menu
-    /// the panel itself opened closes it; so does Esc, or its icon again —
-    /// except Tool Options and Cast, which only their Close button or their
-    /// icon closes.
+    /// floats it free. Only its Close button or its icon again closes it — a
+    /// click on the stage or Esc leaves it open.
     fn draw_strip_flyout(&mut self, ctx: &egui::Context, workspace: &buzz_ui::Workspace, commands: &mut Vec<Command>) {
         let Some((id, anchor)) = self.strip_flyout else {
             return;
@@ -6454,30 +6458,16 @@ impl App {
             self.editor.workspace.float_at(id, (rect.left(), rect.top()));
             close = true;
         }
-        let strip = self
-            .dock_rects
-            .iter()
-            .find(|(d, _)| *d == buzz_ui::Dock::RightOuter)
-            .map(|(_, r)| *r);
-        let layer = window.response.layer_id;
-        let pressed_outside = ctx.input(|i| i.pointer.any_pressed())
-            && ctx.input(|i| i.pointer.interact_pos()).is_some_and(|p| {
-                let on = ctx.layer_id_at(p);
-                // Its own layer takes in the resize edges, just outside it.
-                let ours = on == Some(layer);
-                let on_popup = on.is_some_and(|l| l != layer && matches!(l.order, egui::Order::Foreground | egui::Order::Tooltip));
-                !ours && !rect.expand(8.0).contains(p) && !strip.is_some_and(|r| r.contains(p)) && !on_popup
-            });
-        // **Tool Options stays open until it is closed** (user 2026-11-15):
-        // it is open beside the stage to be used while drawing on it, so a
-        // click on the stage — or Esc, which the tools use — leaves it.
-        // **So does Cast** (user 2026-11-16): Add Selected as Pose wants a
-        // pose picked on the stage, and its Add Pose window is typed into.
-        // **And Color, while the Eyedropper is picking on the stage** (user
-        // 2026-11-17): each pick shows up in it.
-        let pinned = matches!(id, buzz_ui::PanelId::ToolOptions | buzz_ui::PanelId::Cast)
-            || (id == buzz_ui::PanelId::Color && self.editor.tool() == buzz_ui::ToolId::Eyedropper);
-        if close || (!pinned && (pressed_outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)))) {
+        // **Every pop-out stays open until it is closed** — its Close
+        // button, or its icon in the strip again. A click on the stage, in
+        // another panel, or Esc (which the tools use) leaves it: each is
+        // opened to be used beside the stage. Tool Options while drawing
+        // (user 2026-11-15), Cast while a pose is picked on the stage
+        // (2026-11-16), Color while the Eyedropper picks (2026-11-17), and
+        // Rigging while a slot is filled by clicking the part on the stage —
+        // which closed it under the click — so, all of them (user 2026-11-17:
+        // "all the left hand menu items shall be in keep on list").
+        if close {
             self.strip_flyout = None;
         }
     }
@@ -6627,6 +6617,353 @@ impl App {
         )
     }
 
+    /// **The text editor**: the words, size, font (Hindi faces marked अ),
+    /// bold and italic, the colour of selected characters, and alignment, for
+    /// the selected text object. Drawn in Properties, and in Tool Options with
+    /// the Text tool in hand — where it is reached when Tool Options opens
+    /// over the right-hand column (user 2026-11-17: "the text tool is not
+    /// working, I am not able to add or delete text or change font or size or
+    /// colour"). `salt` keeps the two copies' widgets apart.
+    fn text_editor(&mut self, ui: &mut egui::Ui, salt: &str) {
+        // A text object gets a content/size editor here — regenerating
+        // the glyph outlines needs the font, which lives in the editor.
+        // The current values are pulled out first so the scene borrow is
+        // done before `set_text` takes a mutable one.
+        let text_of = self
+            .editor
+            .selection
+            .iter()
+            .next()
+            .and_then(|id| self.editor.text_of(id).map(|t| (id, t)));
+        if let Some((id, text)) = text_of {
+            let mut content = text.content.clone();
+            let mut size = text.size;
+            let mut font = text.font.clone();
+            let mut style = text.style;
+            let mut align = text.align;
+            let char_len = text.content.chars().count();
+
+            ui.separator();
+            ui.label("Text");
+            let box_id = egui::Id::new("text-props-edit").with(salt).with(id.0);
+            // **A text just placed or clicked takes the keyboard**, its words
+            // selected so typing replaces them. Asked of every copy drawn this
+            // frame; the last drawn — Tool Options, over the column — keeps
+            // it, and the request is spent once the frame is drawn.
+            let focus = self.editor.text_to_focus == Some(id);
+            if focus {
+                let mut state = egui::text_edit::TextEditState::load(ui.ctx(), box_id).unwrap_or_default();
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(char_len),
+                )));
+                state.store(ui.ctx(), box_id);
+            }
+            let output = egui::TextEdit::multiline(&mut content)
+                .id(box_id)
+                .desired_rows(2)
+                .hint_text("Type here \u{2014} Hindi too")
+                .show(ui);
+            if focus {
+                output.response.request_focus();
+            }
+            let mut changed = output.response.changed();
+
+            // **Remember the last non-empty selection across frames.**
+            // Clicking a style button below steals focus from the text
+            // box, which would otherwise drop `cursor_range` at the very
+            // moment it is needed to know which characters the click was
+            // about. Keyed by object id, so switching to another text
+            // object starts fresh rather than reusing a stale range.
+            let selection_key = egui::Id::new("text-props-selection").with(id.0);
+            if let Some(range) = output.cursor_range {
+                let range = range.as_sorted_char_range();
+                if !range.is_empty() {
+                    ui.data_mut(|d| d.insert_temp(selection_key, range));
+                } else if output.response.has_focus() {
+                    // Typing in the box (the caret, nothing selected) means
+                    // the next size or font is for the whole text, not for
+                    // characters selected before — or the words "Text" a
+                    // new text started with.
+                    ui.data_mut(|d| d.remove::<std::ops::Range<usize>>(selection_key));
+                }
+            }
+            let selection: Option<std::ops::Range<usize>> = ui
+                .data_mut(|d| d.get_temp::<std::ops::Range<usize>>(selection_key))
+                .filter(|r| r.start < r.end && r.end <= char_len);
+
+            // What a run covering the selection's first character
+            // already says — enough to show a style button's state and
+            // decide which way a click toggles it; a selection spanning
+            // more than one style is rare, and this is only ever what a
+            // button *shows*, never what it silently overwrites outside
+            // the chosen range.
+            let run_at_selection = selection
+                .as_ref()
+                .and_then(|r| text.runs.iter().find(|run| run.start <= r.start && r.start < run.end));
+            let effective_bold = run_at_selection.and_then(|r| r.bold).unwrap_or(style.bold);
+            let effective_italic =
+                run_at_selection.and_then(|r| r.italic).unwrap_or(style.italic);
+            let effective_font = run_at_selection
+                .and_then(|r| r.font.clone())
+                .or_else(|| font.clone());
+            let mut display_size = run_at_selection.and_then(|r| r.size).unwrap_or(size);
+            let display_color = run_at_selection
+                .and_then(|r| r.color)
+                .unwrap_or_else(|| self.editor.text_base_color(id));
+
+            // **Apply one style change to the selection**, merging it
+            // into `runs` and rebuilding immediately — bypassing the
+            // whole-text `set_text_styled` path below entirely, since a
+            // ranged edit must never touch the base look.
+            let restyle = |editor: &mut Editor, mutate: &dyn Fn(&mut buzz_scene::TextRun)| {
+                if let Some(range) = &selection {
+                    let runs =
+                        buzz_scene::restyle_runs(&text.runs, char_len, range.start, range.end, mutate);
+                    editor.set_text_runs(
+                        id,
+                        buzz_scene::TextData {
+                            runs,
+                            ..text.clone()
+                        },
+                    );
+                }
+            };
+
+            let size_changed = ui
+                .add(
+                    egui::DragValue::new(&mut display_size)
+                        .range(4.0..=400.0)
+                        .prefix("size "),
+                )
+                .changed();
+            if size_changed {
+                if selection.is_some() {
+                    restyle(&mut self.editor, &|r| r.size = Some(display_size));
+                } else {
+                    size = display_size;
+                    changed = true;
+                }
+            }
+
+            // Font picker: "Default" plus every family installed on the
+            // system (Hindi ones flagged), each row **set in its own
+            // face** — a list of names in the interface's own font
+            // answers the one question nobody is asking while scrolling.
+            let current = effective_font.clone().unwrap_or_else(|| "Default".to_string());
+            let previews = &mut self.font_previews;
+            let mut font_pick: Option<Option<String>> = None;
+            egui::ComboBox::from_id_salt(("text-font", salt))
+                .selected_text(current)
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            if ui
+                                .selectable_label(effective_font.is_none(), "Default")
+                                .clicked()
+                            {
+                                font_pick = Some(None);
+                            }
+                            for family in buzz_text::font_families() {
+                                let suffix =
+                                    if family.devanagari { "\u{0905}" } else { "" };
+                                let selected =
+                                    effective_font.as_deref() == Some(family.name.as_str());
+                                // Previewed in the cut being edited, so
+                                // choosing a family while bold is on shows
+                                // that family's bold.
+                                let cut = if family.has(style) {
+                                    style
+                                } else {
+                                    buzz_scene::FontStyle::REGULAR
+                                };
+                                if previews
+                                    .row(ui, &family.name, cut, selected, suffix)
+                                    .clicked()
+                                {
+                                    font_pick = Some(Some(family.name.clone()));
+                                }
+                            }
+                        });
+                });
+            if let Some(picked) = font_pick {
+                if selection.is_some() {
+                    restyle(&mut self.editor, &|r| r.font = picked.clone());
+                } else {
+                    font = picked;
+                    changed = true;
+                }
+            }
+
+            // **Bold and italic are offered only where they exist.** A
+            // family installed without an italic has nothing to draw one
+            // with, and a toggle that changes nothing is worse than no
+            // toggle at all.
+            let family = effective_font.as_deref().and_then(buzz_text::family);
+            let has_bold = family.is_none_or(|f| f.has_bold());
+            let has_italic = family.is_none_or(|f| f.has_italic());
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        has_bold,
+                        egui::Button::new(egui::RichText::new("B").strong())
+                            .small()
+                            .selected(effective_bold),
+                    )
+                    .on_hover_text("Bold")
+                    .on_disabled_hover_text("This family has no bold")
+                    .clicked()
+                {
+                    let next = !effective_bold;
+                    if selection.is_some() {
+                        restyle(&mut self.editor, &move |r| r.bold = Some(next));
+                    } else {
+                        style.bold = next;
+                        changed = true;
+                    }
+                }
+                if ui
+                    .add_enabled(
+                        has_italic,
+                        egui::Button::new(egui::RichText::new("I").italics())
+                            .small()
+                            .selected(effective_italic),
+                    )
+                    .on_hover_text("Italic")
+                    .on_disabled_hover_text("This family has no italic")
+                    .clicked()
+                {
+                    let next = !effective_italic;
+                    if selection.is_some() {
+                        restyle(&mut self.editor, &move |r| r.italic = Some(next));
+                    } else {
+                        style.italic = next;
+                        changed = true;
+                    }
+                }
+
+                // **The colour**: of the selected characters, or with none
+                // selected of the whole text (user 2026-11-17: "not able to
+                // … change … colour"). It used to do nothing without a
+                // selection, leaving the Color panel the only way.
+                let [r, g, b, a] = display_color.to_rgba8().to_u8_array();
+                let mut color32 = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+                let color_response = buzz_ui::widgets::color_button(ui, &mut color32).on_hover_text(
+                    if selection.is_some() { "Colour of the selected characters" } else { "Colour of the whole text" },
+                );
+                if color_response.changed() {
+                    let picked = peniko::Color::from_rgba8(
+                        color32.r(),
+                        color32.g(),
+                        color32.b(),
+                        color32.a(),
+                    );
+                    if selection.is_some() {
+                        restyle(&mut self.editor, &move |r| r.color = Some(picked));
+                    } else {
+                        self.editor.set_text_color(id, picked);
+                    }
+                }
+
+                ui.separator();
+                for option in buzz_scene::TextAlign::ALL {
+                    if ui
+                        .add(
+                            egui::Button::new(option.label())
+                                .small()
+                                .selected(align == option),
+                        )
+                        .on_hover_text("How the lines line up with each other")
+                        .clicked()
+                    {
+                        align = option;
+                        changed = true;
+                    }
+                }
+            });
+
+            if changed {
+                self.editor
+                    .set_text_styled(id, content, size, font, style, align);
+            }
+        } else if salt == "tool" {
+            self.next_text_options(ui);
+        }
+    }
+
+    /// **The Text tool before a click**: how the next text will be set — its
+    /// family (Hindi faces marked अ), size, cut, alignment and colour (the
+    /// fill colour) — so it comes out right first time instead of as 48-point
+    /// "Text" to be fixed afterwards.
+    fn next_text_options(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new("Click the stage to add text, or click a text to edit it. Typing Hindi needs a Hindi keyboard (macOS: System Settings \u{25b8} Keyboard \u{25b8} Input Sources).")
+                .small()
+                .weak(),
+        );
+        let next = &mut self.editor.text_next;
+        let current = next.font.clone().unwrap_or_else(|| "Default".to_string());
+        let previews = &mut self.font_previews;
+        let mut font_pick: Option<Option<String>> = None;
+        ui.horizontal(|ui| {
+            ui.label("Font");
+            egui::ComboBox::from_id_salt("next-text-font")
+                .selected_text(current)
+                .width(200.0)
+                .show_ui(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        if ui.selectable_label(next.font.is_none(), "Default").clicked() {
+                            font_pick = Some(None);
+                        }
+                        for family in buzz_text::font_families() {
+                            let suffix = if family.devanagari { "\u{0905}" } else { "" };
+                            let selected = next.font.as_deref() == Some(family.name.as_str());
+                            if previews.row(ui, &family.name, buzz_scene::FontStyle::REGULAR, selected, suffix).clicked() {
+                                font_pick = Some(Some(family.name.clone()));
+                            }
+                        }
+                    });
+                });
+        });
+        if let Some(picked) = font_pick {
+            next.font = picked;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Size");
+            ui.add(egui::DragValue::new(&mut next.size).range(4.0..=400.0));
+            let family = next.font.as_deref().and_then(buzz_text::family);
+            if ui
+                .add_enabled(family.is_none_or(|f| f.has_bold()), egui::Button::new(egui::RichText::new("B").strong()).small().selected(next.style.bold))
+                .on_hover_text("Bold")
+                .clicked()
+            {
+                next.style.bold = !next.style.bold;
+            }
+            if ui
+                .add_enabled(family.is_none_or(|f| f.has_italic()), egui::Button::new(egui::RichText::new("I").italics()).small().selected(next.style.italic))
+                .on_hover_text("Italic")
+                .clicked()
+            {
+                next.style.italic = !next.style.italic;
+            }
+            for option in buzz_scene::TextAlign::ALL {
+                if ui.add(egui::Button::new(option.label()).small().selected(next.align == option)).clicked() {
+                    next.align = option;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Colour");
+            let mut c = self.editor.style.fill_color;
+            if buzz_ui::panels::color_row(ui, "next-text", &mut c) {
+                self.editor.style.fill_color = c;
+                self.editor.style.remember(c);
+            }
+        });
+    }
+
     fn draw_panel_inner(&mut self, ui: &mut egui::Ui, id: buzz_ui::PanelId, commands: &mut Vec<Command>) {
         use buzz_ui::PanelId::*;
         match id {
@@ -6686,6 +7023,12 @@ impl App {
                 }
                 if tool == buzz_ui::ToolId::Bone {
                     self.bone_tool_joint_options(ui);
+                }
+                // **The text editor, with the Text tool in hand** — where it
+                // can be reached: Tool Options opens over the column that
+                // holds Properties, and the editor there was underneath it.
+                if tool == buzz_ui::ToolId::Text {
+                    self.text_editor(ui, "tool");
                 }
                 if tool == buzz_ui::ToolId::FreeTransform {
                     // **Rotate Mode**, as a button beside the tool it changes.
@@ -6770,245 +7113,9 @@ impl App {
                     });
                 });
 
-                // A text object gets a content/size editor here — regenerating
-                // the glyph outlines needs the font, which lives in the editor.
-                // The current values are pulled out first so the scene borrow is
-                // done before `set_text` takes a mutable one.
-                let text_of = self
-                    .editor
-                    .selection
-                    .iter()
-                    .next()
-                    .and_then(|id| self.editor.text_of(id).map(|t| (id, t)));
-                if let Some((id, text)) = text_of {
-                    let mut content = text.content.clone();
-                    let mut size = text.size;
-                    let mut font = text.font.clone();
-                    let mut style = text.style;
-                    let mut align = text.align;
-                    let char_len = text.content.chars().count();
-
-                    ui.separator();
-                    ui.label("Text");
-                    let output = egui::TextEdit::multiline(&mut content)
-                        .id(egui::Id::new("text-props-edit").with(id.0))
-                        .show(ui);
-                    let mut changed = output.response.changed();
-
-                    // **Remember the last non-empty selection across frames.**
-                    // Clicking a style button below steals focus from the text
-                    // box, which would otherwise drop `cursor_range` at the very
-                    // moment it is needed to know which characters the click was
-                    // about. Keyed by object id, so switching to another text
-                    // object starts fresh rather than reusing a stale range.
-                    let selection_key = egui::Id::new("text-props-selection").with(id.0);
-                    if let Some(range) = output.cursor_range {
-                        let range = range.as_sorted_char_range();
-                        if !range.is_empty() {
-                            ui.data_mut(|d| d.insert_temp(selection_key, range));
-                        }
-                    }
-                    let selection: Option<std::ops::Range<usize>> = ui
-                        .data_mut(|d| d.get_temp::<std::ops::Range<usize>>(selection_key))
-                        .filter(|r| r.start < r.end && r.end <= char_len);
-
-                    // What a run covering the selection's first character
-                    // already says — enough to show a style button's state and
-                    // decide which way a click toggles it; a selection spanning
-                    // more than one style is rare, and this is only ever what a
-                    // button *shows*, never what it silently overwrites outside
-                    // the chosen range.
-                    let run_at_selection = selection
-                        .as_ref()
-                        .and_then(|r| text.runs.iter().find(|run| run.start <= r.start && r.start < run.end));
-                    let effective_bold = run_at_selection.and_then(|r| r.bold).unwrap_or(style.bold);
-                    let effective_italic =
-                        run_at_selection.and_then(|r| r.italic).unwrap_or(style.italic);
-                    let effective_font = run_at_selection
-                        .and_then(|r| r.font.clone())
-                        .or_else(|| font.clone());
-                    let mut display_size = run_at_selection.and_then(|r| r.size).unwrap_or(size);
-                    let display_color = run_at_selection
-                        .and_then(|r| r.color)
-                        .unwrap_or_else(|| self.editor.text_base_color(id));
-
-                    // **Apply one style change to the selection**, merging it
-                    // into `runs` and rebuilding immediately — bypassing the
-                    // whole-text `set_text_styled` path below entirely, since a
-                    // ranged edit must never touch the base look.
-                    let restyle = |editor: &mut Editor, mutate: &dyn Fn(&mut buzz_scene::TextRun)| {
-                        if let Some(range) = &selection {
-                            let runs =
-                                buzz_scene::restyle_runs(&text.runs, char_len, range.start, range.end, mutate);
-                            editor.set_text_runs(
-                                id,
-                                buzz_scene::TextData {
-                                    runs,
-                                    ..text.clone()
-                                },
-                            );
-                        }
-                    };
-
-                    let size_changed = ui
-                        .add(
-                            egui::DragValue::new(&mut display_size)
-                                .range(4.0..=400.0)
-                                .prefix("size "),
-                        )
-                        .changed();
-                    if size_changed {
-                        if selection.is_some() {
-                            restyle(&mut self.editor, &|r| r.size = Some(display_size));
-                        } else {
-                            size = display_size;
-                            changed = true;
-                        }
-                    }
-
-                    // Font picker: "Default" plus every family installed on the
-                    // system (Hindi ones flagged), each row **set in its own
-                    // face** — a list of names in the interface's own font
-                    // answers the one question nobody is asking while scrolling.
-                    let current = effective_font.clone().unwrap_or_else(|| "Default".to_string());
-                    let previews = &mut self.font_previews;
-                    let mut font_pick: Option<Option<String>> = None;
-                    egui::ComboBox::from_id_salt("text-font")
-                        .selected_text(current)
-                        .width(260.0)
-                        .show_ui(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(320.0)
-                                .show(ui, |ui| {
-                                    if ui
-                                        .selectable_label(effective_font.is_none(), "Default")
-                                        .clicked()
-                                    {
-                                        font_pick = Some(None);
-                                    }
-                                    for family in buzz_text::font_families() {
-                                        let suffix =
-                                            if family.devanagari { "\u{0905}" } else { "" };
-                                        let selected =
-                                            effective_font.as_deref() == Some(family.name.as_str());
-                                        // Previewed in the cut being edited, so
-                                        // choosing a family while bold is on shows
-                                        // that family's bold.
-                                        let cut = if family.has(style) {
-                                            style
-                                        } else {
-                                            buzz_scene::FontStyle::REGULAR
-                                        };
-                                        if previews
-                                            .row(ui, &family.name, cut, selected, suffix)
-                                            .clicked()
-                                        {
-                                            font_pick = Some(Some(family.name.clone()));
-                                        }
-                                    }
-                                });
-                        });
-                    if let Some(picked) = font_pick {
-                        if selection.is_some() {
-                            restyle(&mut self.editor, &|r| r.font = picked.clone());
-                        } else {
-                            font = picked;
-                            changed = true;
-                        }
-                    }
-
-                    // **Bold and italic are offered only where they exist.** A
-                    // family installed without an italic has nothing to draw one
-                    // with, and a toggle that changes nothing is worse than no
-                    // toggle at all.
-                    let family = effective_font.as_deref().and_then(buzz_text::family);
-                    let has_bold = family.is_none_or(|f| f.has_bold());
-                    let has_italic = family.is_none_or(|f| f.has_italic());
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                has_bold,
-                                egui::Button::new(egui::RichText::new("B").strong())
-                                    .small()
-                                    .selected(effective_bold),
-                            )
-                            .on_hover_text("Bold")
-                            .on_disabled_hover_text("This family has no bold")
-                            .clicked()
-                        {
-                            let next = !effective_bold;
-                            if selection.is_some() {
-                                restyle(&mut self.editor, &move |r| r.bold = Some(next));
-                            } else {
-                                style.bold = next;
-                                changed = true;
-                            }
-                        }
-                        if ui
-                            .add_enabled(
-                                has_italic,
-                                egui::Button::new(egui::RichText::new("I").italics())
-                                    .small()
-                                    .selected(effective_italic),
-                            )
-                            .on_hover_text("Italic")
-                            .on_disabled_hover_text("This family has no italic")
-                            .clicked()
-                        {
-                            let next = !effective_italic;
-                            if selection.is_some() {
-                                restyle(&mut self.editor, &move |r| r.italic = Some(next));
-                            } else {
-                                style.italic = next;
-                                changed = true;
-                            }
-                        }
-
-                        // The colour of the selected characters — only
-                        // meaningful with a selection, since a text object has
-                        // no colour of its own outside one (its fill, or the
-                        // Color panel, already sets that for the whole text).
-                        let [r, g, b, a] = display_color.to_rgba8().to_u8_array();
-                        let mut color32 = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-                        let color_response = ui
-                            .add_enabled_ui(selection.is_some(), |ui| {
-                                buzz_ui::widgets::color_button(ui, &mut color32)
-                            })
-                            .inner
-                            .on_hover_text("Colour")
-                            .on_disabled_hover_text("Select some characters first");
-                        if color_response.changed() {
-                            let picked = peniko::Color::from_rgba8(
-                                color32.r(),
-                                color32.g(),
-                                color32.b(),
-                                color32.a(),
-                            );
-                            restyle(&mut self.editor, &move |r| r.color = Some(picked));
-                        }
-
-                        ui.separator();
-                        for option in buzz_scene::TextAlign::ALL {
-                            if ui
-                                .add(
-                                    egui::Button::new(option.label())
-                                        .small()
-                                        .selected(align == option),
-                                )
-                                .on_hover_text("How the lines line up with each other")
-                                .clicked()
-                            {
-                                align = option;
-                                changed = true;
-                            }
-                        }
-                    });
-
-                    if changed {
-                        self.editor
-                            .set_text_styled(id, content, size, font, style, align);
-                    }
-                }
+                // A text object gets its editor here — and in Tool Options with
+                // the Text tool in hand: see `text_editor`.
+                self.text_editor(ui, "props");
             }
 
             // **Window ▸ Textures**: its own panel, so it can be rolled up,
@@ -10827,8 +10934,8 @@ impl App {
 
     /// Route pointer input over the stage to the active tool.
     fn handle_stage_input(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
-        if let Some(target) = buzz_ui::screen_color::dropper_request() {
-            self.dropper_pick = Some(target);
+        if let Some(target) = buzz_ui::screen_color::dropper_request(ui.ctx()) {
+            self.dropper_pick = Some((target, self.editor.tool()));
             self.editor.status = Some("Eyedropper: click the artwork to take its colour \u{2014} Esc to stop".into());
         }
         let id = ui.id().with("stage");
@@ -11030,26 +11137,40 @@ impl App {
         // take; a click takes the colour of the artwork under its tip into
         // that swatch, exactly as the Eyedropper tool reads it. Nothing else
         // reaches the tools meanwhile; Esc leaves.
-        if let Some(target) = self.dropper_pick {
+        //
+        // **It never holds the stage** (user 2026-11-17: "whenever I use the
+        // picker it is breaking things, even camera tool"). A click that found
+        // nothing used to leave it waiting, and every click after it — the
+        // Rectangle's, the Camera's — went to the dropper until Esc. Now one
+        // click on the stage puts it away, picked or not; so do Esc, another
+        // tool, and a click anywhere off the stage, which then does what it
+        // always does.
+        if let Some((target, armed_with)) = self.dropper_pick {
+            let pressed_elsewhere = ctx.input(|i| i.pointer.any_pressed()) && !response.hovered();
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.dropper_pick = None;
-                self.editor.status = None;
+                self.editor.status = Some("Eyedropper put away".into());
                 return;
             }
-            if response.clicked()
-                && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
-            {
-                match self.editor.sampled_paint_at(self.editor.screen_to_edit(local(pos))) {
-                    Some((colour, _)) => {
-                        buzz_ui::screen_color::deliver(target, colour);
-                        let [r, g, b, _] = colour.to_rgba8().to_u8_array();
-                        self.editor.status = Some(format!("Picked #{r:02X}{g:02X}{b:02X}"));
-                        self.dropper_pick = None;
-                    }
-                    None => self.editor.status = Some("Nothing there to pick \u{2014} click the artwork, or Esc to stop".into()),
+            if self.editor.tool() != armed_with || pressed_elsewhere {
+                self.dropper_pick = None;
+                self.editor.status = Some("Eyedropper put away".into());
+            } else {
+                if (response.clicked() || response.drag_stopped())
+                    && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
+                {
+                    self.dropper_pick = None;
+                    self.editor.status = Some(match self.editor.sampled_paint_at_with(self.editor.screen_to_edit(local(pos)), true) {
+                        Some((colour, _)) => {
+                            buzz_ui::screen_color::deliver(target, colour);
+                            let [r, g, b, _] = colour.to_rgba8().to_u8_array();
+                            format!("Picked #{r:02X}{g:02X}{b:02X}")
+                        }
+                        None => "Nothing there to pick \u{2014} the eyedropper is put away; press Pick again and click the artwork".into(),
+                    });
                 }
+                return;
             }
-            return;
         }
 
         // One clock for the whole gesture: the press, every move in it and the
@@ -23492,6 +23613,88 @@ mod idle_tests {
         assert_eq!(d.app.editor.doc.scene().revision(), before, "nothing changed");
     }
 
+    /// **The Text tool works where Tool Options is** (user 2026-11-17: "the
+    /// text tool is not working"): its options show before a click; a click
+    /// places a text whose box takes the keyboard with the words selected, so
+    /// typing — Hindi too — replaces them, and Backspace takes a letter, not
+    /// the text.
+    #[test]
+    fn the_text_tool_places_text_that_is_typed_over_at_once() {
+        let mut d = MenuDrive::new();
+        d.frame(vec![]);
+        d.app.editor.run(Command::SelectTool(buzz_ui::ToolId::Text));
+        for _ in 0..3 {
+            d.frame(vec![]);
+        }
+        assert!(d.find("Font").is_some() && d.find("Colour").is_some(), "the next text's options");
+        d.click(egui::pos2(500.0, 400.0), egui::PointerButton::Primary);
+        d.frame(vec![]);
+        d.frame(vec![]);
+        let id = *d.app.editor.selection.ids().first().expect("the text placed and selected");
+        assert_eq!(d.app.editor.text_of(id).map(|t| t.content), Some("Text".into()));
+        d.frame(vec![egui::Event::Text("Hello नमस्ते".into())]);
+        d.frame(vec![]);
+        assert_eq!(d.app.editor.text_of(id).map(|t| t.content), Some("Hello नमस्ते".into()), "typed over");
+        d.frame(vec![egui::Event::Key { key: egui::Key::Backspace, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+        d.frame(vec![]);
+        assert_eq!(d.app.editor.text_of(id).map(|t| t.content), Some("Hello नमस्त".into()), "Backspace takes a letter");
+        assert!(d.app.editor.doc.scene().find_object(id).is_some(), "and not the text");
+    }
+
+    /// **The shape tools set their outline and their fill apart** (user
+    /// 2026-11-17): Tool Options shows a Stroke and a Fill for the
+    /// Rectangle, each with its own None, and one set of swatches.
+    #[test]
+    fn the_rectangle_tool_options_have_a_stroke_and_a_fill() {
+        let mut d = MenuDrive::new();
+        d.app.editor.run(Command::SelectTool(buzz_ui::ToolId::Rectangle));
+        for _ in 0..4 {
+            d.frame(vec![]);
+        }
+        assert!(d.find("Stroke").is_some(), "a Stroke row");
+        assert!(d.find("Fill").is_some(), "a Fill row");
+        assert_eq!(d.texts.iter().filter(|(t, _)| t == "\u{2298} None").count(), 2, "each with its own None");
+        assert_eq!(d.texts.iter().filter(|(t, _)| t == "Swatches").count(), 1, "and one set of swatches");
+    }
+
+    /// **The Copy / Paste Stage button works inside a symbol** opened in
+    /// place, on the symbol's own frames.
+    #[test]
+    fn the_copy_paste_stage_button_works_inside_a_symbol() {
+        let mut d = MenuDrive::new();
+        let mut placed = buzz_scene::ObjectId(0);
+        d.app.editor.doc.edit("fixture", |s| {
+            s.set_frame_count(40);
+            let body = s.add_symbol("Body", buzz_scene::SymbolKind::Graphic, None);
+            s.enter_symbol(body);
+            let b = s.layers().iter().next().unwrap().id;
+            s.update_layer(b, |l| {
+                l.frames.insert_frame(39);
+            });
+            s.add_shape(b, buzz_scene::ShapeData::filled(buzz_geom::Shape::to_path(&buzz_geom::Rect::new(100.0, 100.0, 150.0, 150.0), 1e-9), peniko::Color::BLACK));
+            s.exit_symbol();
+            let stage = s.layers().iter().next().unwrap().id;
+            s.update_layer(stage, |l| {
+                l.frames.insert_frame(39);
+            });
+            placed = s.next_object_id();
+            s.add_object_at(stage, 0, buzz_scene::Object::instance_of(placed, body));
+        });
+        d.app.editor.set_frame(3);
+        d.frame(vec![]);
+        assert!(d.app.editor.enter_instance_in_place(placed));
+        d.frame(vec![]);
+        d.press("Copy Stage");
+        assert_eq!(d.app.editor.stage_clip.as_ref().map(|c| c.0), Some(3), "copied on the symbol's frame 4");
+        d.app.editor.set_frame(10);
+        d.frame(vec![]);
+        d.press("Paste Stage \u{00b7} 4");
+        assert!(d.app.editor.stage_clip.is_none(), "pasted and let go");
+        assert!(d.app.editor.doc.scene().editing_symbol().is_some(), "still inside the symbol");
+        let keys: Vec<u32> = d.app.editor.doc.scene().layers().iter().next().unwrap().frames.keyframes().iter().map(|k| k.start).collect();
+        assert_eq!(keys, vec![0, 10], "keyed on the symbol's frame 11");
+    }
+
     /// **The Copy / Paste Stage button on the timeline**: pressed on one frame
     /// it copies the stage and turns into Paste Stage; pressed on another it
     /// pastes there and turns back.
@@ -30908,6 +31111,88 @@ mod camera_row_ui_tests {
 mod tool_follow_tests {
     use super::*;
 
+    /// **The eyedropper never holds the stage** (user 2026-11-17: "whenever I
+    /// use the picker it is breaking things, even camera tool"): a click on
+    /// empty stage puts it away and the Rectangle draws on the next drag;
+    /// picking up another tool puts it away too; and it takes its colour from
+    /// a locked layer, as the background it is matched to usually is.
+    #[test]
+    fn the_swatch_eyedropper_never_holds_the_stage() {
+        use buzz_ui::ToolId;
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        app.editor.run(Command::SelectTool(ToolId::Rectangle));
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                time: Some(t),
+                ..Default::default()
+            };
+            let mut area = egui::Rect::NOTHING;
+            let _ = ctx.run_ui(input, |ui| {
+                area = app.build_ui(ui);
+            });
+            area
+        };
+        let area = frame(&mut app, vec![]);
+        let press = |at: egui::Pos2, pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let swatch = egui::Id::new("a-swatch-for-the-stuck-dropper");
+
+        // A click on empty stage: nothing picked, and the dropper is put away.
+        let empty = area.left_top() + egui::vec2(40.0, 40.0);
+        buzz_ui::screen_color::pick(&ctx, swatch);
+        frame(&mut app, vec![egui::Event::PointerMoved(empty)]);
+        assert!(app.dropper_pick.is_some(), "the dropper is on");
+        frame(&mut app, vec![press(empty, true)]);
+        frame(&mut app, vec![press(empty, false)]);
+        assert!(app.dropper_pick.is_none(), "a miss puts it away too");
+        assert!(buzz_ui::screen_color::take(swatch).is_none(), "nothing picked");
+
+        // The Rectangle draws again on the next drag.
+        let shapes = app.editor.scene().shape_count();
+        let (from, to) = (area.center(), area.center() + egui::vec2(80.0, 60.0));
+        frame(&mut app, vec![egui::Event::PointerMoved(from)]);
+        frame(&mut app, vec![press(from, true)]);
+        for k in 1..=6 {
+            frame(&mut app, vec![egui::Event::PointerMoved(from + (to - from) * (k as f32 / 6.0))]);
+        }
+        frame(&mut app, vec![press(to, false)]);
+        assert!(app.editor.scene().shape_count() > shapes, "the Rectangle draws after a missed pick");
+
+        // Another tool puts it away, and its clicks are its own.
+        buzz_ui::screen_color::pick(&ctx, swatch);
+        frame(&mut app, vec![]);
+        assert!(app.dropper_pick.is_some());
+        app.editor.run(Command::SelectTool(ToolId::Camera));
+        frame(&mut app, vec![]);
+        assert!(app.dropper_pick.is_none(), "picking up the Camera puts it away");
+
+        // A colour on a locked layer is still picked.
+        let green = peniko::Color::from_rgba8(0x20, 0xA0, 0x40, 255);
+        let at = area.center() + egui::vec2(-200.0, -120.0);
+        let under = app.editor.screen_to_edit(buzz_geom::Point::new((at.x - area.min.x) as f64, (at.y - area.min.y) as f64));
+        let layer = app.editor.scene().layers().iter().next().unwrap().id;
+        app.editor.doc.edit("Background", |scene| {
+            scene.add_shape(
+                layer,
+                buzz_scene::ShapeData::filled(buzz_geom::Shape::to_path(&buzz_geom::Rect::from_center_size(under, (60.0, 60.0)), 0.1), green),
+            );
+            scene.update_layer(layer, |l| l.locked = true);
+        });
+        buzz_ui::screen_color::pick(&ctx, swatch);
+        frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+        frame(&mut app, vec![press(at, true)]);
+        frame(&mut app, vec![press(at, false)]);
+        assert_eq!(buzz_ui::screen_color::take(swatch).map(|c| c.to_rgba8()), Some(green.to_rgba8()), "picked off the locked layer");
+        assert!(app.dropper_pick.is_none());
+    }
+
     /// **A swatch's Pick is the eyedropper on the stage** (user 2026-11-17:
     /// no more of macOS's large circle): whatever tool is in hand the pointer
     /// becomes the dropper, a click on the artwork sends its exact colour to
@@ -31259,6 +31544,65 @@ mod tool_follow_tests {
         let copy = app.editor.assets.assets().iter().find(|a| a.name == "Raju copy").cloned().expect("Raju copy in the Cast");
         assert_eq!(crate::cast_pose_edit::pose_names(&app.editor.assets.load(&copy).unwrap()), vec!["Raju copy", "Raju copy Side"]);
         assert!(raju.path.exists(), "the original stays");
+    }
+
+    /// **Every pop-out stays open through a click on the stage and Esc**
+    /// (user 2026-11-17): Rigging above all, whose slots are filled by
+    /// clicking the part on the stage — that click closed it — and the rest
+    /// of the strip with it. Its icon again still closes it.
+    #[test]
+    fn every_strip_flyout_stays_open_through_a_stage_click() {
+        use buzz_ui::{Dock, PanelId};
+        // Panels the default layout already keeps in the strip, so the layout
+        // this test saves (into the process's shared scratch file) is the
+        // default one every other test expects.
+        for panel in [PanelId::Rig, PanelId::Layers, PanelId::Swatches] {
+            let mut app = App::new(GpuPreference::Automatic);
+            app.recovery.found.clear();
+            app.splash.dismiss();
+            app.editor.workspace = buzz_ui::Workspace::default();
+            assert!(app.editor.workspace.icon_strip && app.editor.workspace.dock_of(panel) == Dock::RightOuter, "{panel:?} is in the default strip");
+            let layout = app.editor.workspace.slots.clone();
+            let ctx = egui::Context::default();
+            buzz_ui::theme::apply(&ctx);
+            let mut t = 0.0;
+            let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+                t += 1.0 / 60.0;
+                let input = egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                    time: Some(t),
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(input, |ui| {
+                    app.build_ui(ui);
+                });
+            };
+            frame(&mut app, vec![]);
+            app.editor.workspace.scroll_to = Some(panel);
+            frame(&mut app, vec![]);
+            frame(&mut app, vec![]);
+            assert_eq!(app.strip_flyout.map(|(id, _)| id), Some(panel), "{panel:?} opens from the strip");
+
+            let stage = egui::pos2(500.0, 400.0);
+            let m = egui::Modifiers::default();
+            frame(&mut app, vec![egui::Event::PointerMoved(stage)]);
+            frame(&mut app, vec![egui::Event::PointerButton { pos: stage, button: egui::PointerButton::Primary, pressed: true, modifiers: m }]);
+            frame(&mut app, vec![egui::Event::PointerButton { pos: stage, button: egui::PointerButton::Primary, pressed: false, modifiers: m }]);
+            frame(&mut app, vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: m }]);
+            frame(&mut app, vec![]);
+            assert_eq!(app.strip_flyout.map(|(id, _)| id), Some(panel), "{panel:?}: a click on the stage and Esc leave it open");
+
+            // Its icon again closes it.
+            let icon = app.strip_flyout.map(|(_, r)| r.center()).unwrap();
+            frame(&mut app, vec![egui::Event::PointerMoved(icon)]);
+            frame(&mut app, vec![egui::Event::PointerButton { pos: icon, button: egui::PointerButton::Primary, pressed: true, modifiers: m }]);
+            frame(&mut app, vec![egui::Event::PointerButton { pos: icon, button: egui::PointerButton::Primary, pressed: false, modifiers: m }]);
+            frame(&mut app, vec![]);
+            assert!(app.strip_flyout.is_none(), "{panel:?}: its icon closes it");
+            let docks = |slots: &[buzz_ui::Slot]| slots.iter().map(|s| (s.id, s.dock)).collect::<Vec<_>>();
+            assert_eq!(docks(&app.editor.workspace.slots), docks(&layout), "the layout is as it was");
+        }
     }
 
     /// **The Cast pop-out stays open while a pose is picked on the stage**

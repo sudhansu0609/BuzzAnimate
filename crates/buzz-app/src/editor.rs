@@ -297,9 +297,20 @@ pub struct Editor {
     pub frame_clipboard: Option<FrameClip>,
     /// Copy Motion's clipboard (C1).
     pub motion_clip: Option<MotionClip>,
-    /// Copy / Paste Stage's clipboard: the frame it was copied at, and each
-    /// layer's drawing there with how many frames it was held from there.
-    pub stage_clip: Option<(u32, Vec<(LayerId, Vec<Arc<Object>>, u32)>)>,
+    /// Copy / Paste Stage's clipboard: the frame it was copied at, each
+    /// layer's drawing there with how many frames it was held from there, and
+    /// the same for every symbol on the stage, all the way down — what each
+    /// showed inside it then ([`StageLayers`] per symbol).
+    pub stage_clip: Option<(u32, StageLayers, Vec<(buzz_scene::SymbolId, StageLayers)>)>,
+    /// **How the Text tool's next text is set**: its size, family (Hindi
+    /// faces among them), cut and alignment, chosen in Tool Options before
+    /// clicking. Its colour is the fill colour. The words are "Text" until
+    /// typed over.
+    pub text_next: buzz_scene::TextData,
+    /// A text object just placed or clicked with the Text tool, whose box is
+    /// to take the keyboard — the words selected, so typing replaces them.
+    /// Spent by the text editor that draws it.
+    pub text_to_focus: Option<ObjectId>,
     /// Where the pointer last was in edit space, while dragging: what turns a
     /// puppet's part about its joint (`Self::puppet_turn`).
     puppet_pointer: Option<Point>,
@@ -861,6 +872,8 @@ impl Editor {
             frame_clipboard: None,
             motion_clip: None,
             stage_clip: None,
+            text_next: buzz_scene::TextData::new("Text", 48.0, None),
+            text_to_focus: None,
             puppet_pointer: None,
             pose_clip: None,
             paste_motion_special_open: false,
@@ -3928,7 +3941,18 @@ impl Editor {
     /// **Place a text object** at `at`. The glyph outlines are shaped here (the
     /// editor holds the font) and stored as an ordinary filled shape; the string
     /// rides along on `Object::text` so it stays editable.
+    ///
+    /// Set as Tool Options says ([`Self::text_next`]: size, family, cut,
+    /// alignment) in the fill colour, and its box takes the keyboard with the
+    /// words selected, so typing replaces them at once. **A click on a text
+    /// already there edits that one** instead of stacking a new "Text" on it.
     pub fn place_text(&mut self, at: Point) {
+        if let Some(id) = self.object_at(at, self.pick_tolerance()).filter(|id| self.text_of(*id).is_some()) {
+            self.selection.select_one(id);
+            self.text_to_focus = Some(id);
+            self.status = Some("Editing the text \u{2014} type in the box in Tool Options".into());
+            return;
+        }
         let layer = match self.artwork_layer() {
             Ok(layer) => layer,
             Err(why) => {
@@ -3936,9 +3960,9 @@ impl Editor {
                 return;
             }
         };
-        const DEFAULT: &str = "Text";
-        let size = 48.0;
-        let Some(path) = buzz_text::outline(DEFAULT, size, None) else {
+        let data = buzz_scene::TextData { content: "Text".into(), runs: Vec::new(), ..self.text_next.clone() };
+        let Some(path) = buzz_text::outline_styled(&data.content, data.size, data.font.as_deref(), data.style, data.align)
+        else {
             self.status = Some("No font available to draw text with".into());
             return;
         };
@@ -3953,14 +3977,47 @@ impl Editor {
             if let Some(id) = created {
                 scene.update_object_at(frame, id, |o| {
                     o.transform = Affine::translate(at.to_vec2());
-                    o.text = Some(buzz_scene::TextData::new(DEFAULT, size, None));
+                    o.text = Some(data.clone());
                 });
             }
         });
         if let Some(id) = created {
             self.selection.select_one(id);
-            self.status = Some("Text placed \u{2014} edit it in Properties".into());
+            self.text_to_focus = Some(id);
+            self.status = Some("Text placed \u{2014} type to replace it; font, size and colour are in Tool Options".into());
         }
+    }
+
+    /// **The colour of a whole text**: every character, any colour given to
+    /// some of them before included, as Animate colours a text selected as a
+    /// whole. One undo step.
+    pub fn set_text_color(&mut self, id: ObjectId, color: Color) {
+        let Some(mut data) = self.text_of(id) else {
+            return;
+        };
+        for run in &mut data.runs {
+            run.color = None;
+        }
+        data.runs.retain(|r| r.size.is_some() || r.font.is_some() || r.bold.is_some() || r.italic.is_some());
+        self.doc.end_gesture();
+        self.doc.edit("Text Colour", |scene| {
+            scene.update_object_across(0, u32::MAX, id, |o| {
+                let paint = |shape: &mut ShapeData| shape.fill = Some(buzz_scene::FillSpec::solid(color));
+                match &mut o.kind {
+                    ObjectKind::Shape(shape) => paint(shape),
+                    ObjectKind::Group(children) => {
+                        for child in children.iter_mut() {
+                            if let ObjectKind::Shape(shape) = &mut Arc::make_mut(child).kind {
+                                paint(shape);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        });
+        self.rebuild_text_object_as(id, data, "Text Colour");
+        self.doc.end_gesture();
     }
 
     /// **Re-type a text object**: re-shape its glyphs from `content`/`size`/`font`
@@ -4057,6 +4114,13 @@ impl Editor {
     /// transform and layer position are untouched — [`Scene::update_object_across`]
     /// only ever replaces `kind` and `text` here.
     fn rebuild_text_object(&mut self, id: ObjectId, data: buzz_scene::TextData) {
+        self.rebuild_text_object_as(id, data, "Edit Text");
+    }
+
+    /// [`Self::rebuild_text_object`] recorded under `label`, so a change made
+    /// of a rebuild and something else ([`Self::set_text_color`]) is one undo
+    /// step: edits with one label, unbroken by a gesture's end, are one.
+    fn rebuild_text_object_as(&mut self, id: ObjectId, data: buzz_scene::TextData, label: &'static str) {
         let Some((_, object)) = self.doc.scene().find_object(id) else {
             return;
         };
@@ -4066,7 +4130,7 @@ impl Editor {
             let path =
                 buzz_text::outline_styled(&data.content, data.size, data.font.as_deref(), data.style, data.align)
                     .unwrap_or_default();
-            self.doc.edit("Edit Text", |scene| {
+            self.doc.edit(label, |scene| {
                 scene.update_object_across(0, u32::MAX, id, |o| {
                     match &mut o.kind {
                         ObjectKind::Shape(shape) => shape.path = path.clone(),
@@ -4102,7 +4166,7 @@ impl Editor {
             }
         }
 
-        self.doc.edit("Edit Text", |scene| {
+        self.doc.edit(label, |scene| {
             let child_ids: Vec<ObjectId> = (0..spans.len()).map(|_| scene.next_object_id()).collect();
             scene.update_object_across(0, u32::MAX, id, |o| {
                 let children: Vec<Arc<Object>> = child_ids
@@ -4507,6 +4571,14 @@ impl Editor {
     /// stroke, found through instances and groups. Mirrors [`Self::object_at`]'s
     /// layer walk, so it samples exactly what a click would select into.
     pub fn sampled_paint_at(&self, point: Point) -> Option<(Color, bool)> {
+        self.sampled_paint_at_with(point, false)
+    }
+
+    /// [`Self::sampled_paint_at`], and with `locked` from locked layers and
+    /// objects too: what a colour picker's Pick reads, since a colour is
+    /// taken from what is seen, and the background it is matched to is
+    /// usually locked (user 2026-11-17).
+    pub fn sampled_paint_at_with(&self, point: Point, locked: bool) -> Option<(Color, bool)> {
         let table = self.symbol_bounds();
         let scene = self.doc.scene();
         // **Only what is under the tip** (user 2026-11-17: "I am not able to
@@ -4519,7 +4591,18 @@ impl Editor {
         // Walked in the order the renderer paints, so the last match really is
         // what is on top. See `LayerStack::selectable_in_paint_order`.
         let by_depth = scene.stage().sort_by_depth;
-        for layer in scene.layers().selectable_in_paint_order(by_depth) {
+        let stack = scene.layers();
+        let layers: Vec<&Arc<buzz_scene::Layer>> = if !locked {
+            stack.selectable_in_paint_order(by_depth)
+        } else {
+            let seen = |l: &&Arc<buzz_scene::Layer>| l.visible && l.kind.holds_artwork() && stack.is_shown_while_editing(l.id);
+            if by_depth {
+                stack.depth_paint_order().into_iter().filter(seen).collect()
+            } else {
+                stack.paint_order().filter(seen).collect()
+            }
+        };
+        for layer in layers {
             let Some(local) = scene.view_to_layer(frame, layer.depth, point) else {
                 continue;
             };
@@ -4529,7 +4612,7 @@ impl Editor {
             };
             let elapsed = elapsed_on(layer, frame);
             for object in layer.objects_at(frame) {
-                if !object.visible || object.locked {
+                if !object.visible || (object.locked && !locked) {
                     continue;
                 }
                 let Some(local) = unturn(scene, object, frame, layer.depth, local) else {
@@ -9415,6 +9498,9 @@ impl Editor {
     }
 
     pub(crate) fn after_context_change(&mut self) {
+        if self.doc.scene().edit_path().len() > self.edit_frames.len() {
+            self.guide_opened_symbol();
+        }
         self.selection.clear();
         self.selection.set_active_layer(None);
         self.selection.ensure_active_layer(self.doc.scene());
@@ -9446,6 +9532,40 @@ impl Editor {
         if let Some(layer) = self.selection.active_layer() {
             self.selection
                 .select_layer(self.doc.scene(), layer, self.current_frame);
+        }
+    }
+
+    /// **A character or head opened has the master audio on top, locked**
+    /// (user 2026-11-17: "in all the cast characters … and in the head
+    /// symbol the top layer shall be sound layer that shall be same as master
+    /// audio and it shall be on top and locked"). A film's characters get it
+    /// when it is first opened, when one is cast and on Re-apply Master
+    /// Audio; one that arrived since — a head duplicated, a pose added, a
+    /// character pasted in — had none until then. Opening one that is missing
+    /// it gives every character and head theirs, as Re-apply does with the
+    /// mode off: nothing removed, whatever Master Audio mode says, and a
+    /// symbol that has it changes nothing.
+    fn guide_opened_symbol(&mut self) {
+        if self.doc.master_audio().is_none() {
+            return;
+        }
+        let scene = self.doc.scene();
+        let Some(open) = scene.editing_symbol() else {
+            return;
+        };
+        let guided = scene
+            .library()
+            .get(open)
+            .and_then(|s| s.layers.iter().next())
+            .is_some_and(|top| top.audio_guide && top.locked);
+        if guided || !buzz_doc::master_audio::wants_master_guide(scene, open) {
+            return;
+        }
+        if let Ok(report) = self.doc.add_master_audio_guides()
+            && report.symbols_given_guide > 0
+        {
+            let scene = self.doc.scene().clone();
+            self.sound.refresh(&scene);
         }
     }
 
@@ -13166,30 +13286,29 @@ impl Editor {
 
     /// **Copy Stage**: everything on the stage at the playhead — what every
     /// layer of the open timeline shows here, and how long it holds from
-    /// here — for [`Self::paste_stage`] at another frame. The master audio
-    /// and folders are left out.
+    /// here — for [`Self::paste_stage`] at another frame. The master audio,
+    /// sound layers and folders are left out.
+    ///
+    /// **And what is inside every symbol on it** (user 2026-11-17: "copy
+    /// paste stage is not working inside the symbol and in head symbol"): a
+    /// body showing its own frame 100 is copied as what its layers show on
+    /// 100, and the head inside it likewise, so the pose comes across whole
+    /// rather than the body showing whatever it already had on the frame it
+    /// is pasted at. See [`capture_inside`].
     pub fn copy_stage(&mut self) {
         let frame = self.current_frame;
         let master = self.script_master_audio();
         let scene = self.doc.scene();
-        let clip: Vec<(LayerId, Vec<Arc<Object>>, u32)> = scene
-            .layers()
-            .iter()
-            .filter(|l| l.kind != buzz_scene::LayerKind::Folder && !l.audio_guide && Some(l.id) != master)
-            .filter(|l| frame < l.frames.length())
-            .map(|l| {
-                let next = l.frames.keyframes().iter().map(|k| k.start).filter(|s| *s > frame).min();
-                let hold = next.unwrap_or(l.frames.length()) - frame;
-                (l.id, l.objects_at(frame).to_vec(), hold.max(1))
-            })
-            .collect();
+        let clip = stage_layers_at(scene.layers(), frame, master, false);
         let drawn = clip.iter().filter(|(_, objects, _)| !objects.is_empty()).count();
+        let mut inside = Vec::new();
+        capture_inside(scene, scene.layers(), &clip, frame, &mut inside, &mut std::collections::HashSet::new());
         self.status = Some(if drawn == 0 {
             format!("Copy Stage: nothing on the stage at frame {}", frame + 1)
         } else {
             format!("Copied the stage at frame {} ({drawn} layers): go to another frame and Paste Stage", frame + 1)
         });
-        self.stage_clip = (drawn > 0).then_some((frame, clip));
+        self.stage_clip = (drawn > 0).then_some((frame, clip, inside));
     }
 
     /// The layers of the selection when **every** selected object is a part of
@@ -13373,13 +13492,14 @@ impl Editor {
     /// (a mouth, an eye) keep the frame they were on, as F leaves them. A
     /// layer that ends here is lengthened by as long as the copy held.
     pub fn paste_stage(&mut self) {
-        let Some((_, clip)) = self.stage_clip.clone() else {
+        let Some((_, clip, symbols)) = self.stage_clip.clone() else {
             self.status = Some("Paste Stage: Copy Stage first, on the frame to copy".into());
             return;
         };
         let at = self.current_frame;
         let mut layers = 0usize;
         let mut renumbered = 0usize;
+        let mut inside_pasted = 0usize;
         self.doc.edit("Paste Stage", |scene| {
             let mut inside: Vec<buzz_scene::SymbolId> = Vec::new();
             for (layer, objects, hold) in &clip {
@@ -13409,18 +13529,28 @@ impl Editor {
                         object
                     })
                     .collect();
-                scene.update_layer(*layer, |l| {
-                    let end = at + hold;
-                    let ends_here = l.frames.length() <= at + 1;
-                    l.frames.insert_blank_keyframe(at);
-                    l.frames.set_objects(at, objects);
-                    if ends_here && l.frames.length() < end {
-                        let length = l.frames.length();
-                        l.frames.insert_frame(end - 1);
-                        debug_assert!(l.frames.length() >= length);
+                scene.update_layer(*layer, |l| paste_held(&mut l.frames, at, objects, *hold));
+                layers += 1;
+            }
+            // **What each symbol showed, pasted inside it** on the frame it
+            // now shows — `at`, for every one set to show it above — before
+            // the symbols inside them are set to `at` in turn, so those are
+            // the pasted ones. A symbol too short to reach `at` keeps its own
+            // frame, as it is not set to `at`, and is left as it is.
+            for (symbol, inner) in &symbols {
+                let reaches = scene
+                    .library()
+                    .get(*symbol)
+                    .is_some_and(|def| def.kind.follows_parent_timeline() && at < def.length());
+                if !reaches {
+                    continue;
+                }
+                scene.library_mut().update(*symbol, |def| {
+                    for (layer, objects, hold) in inner {
+                        def.layers.update(*layer, |l| paste_held(&mut l.frames, at, objects.clone(), *hold));
                     }
                 });
-                layers += 1;
+                inside_pasted += 1;
             }
             let mut seen = std::collections::HashSet::new();
             for symbol in inside {
@@ -13430,8 +13560,9 @@ impl Editor {
         self.doc.end_gesture();
         self.selection.prune(self.doc.scene());
         self.status = Some(format!(
-            "Pasted the stage at frame {} on {layers} layers{}",
+            "Pasted the stage at frame {} on {layers} layers{}{}",
             at + 1,
+            if inside_pasted > 0 { format!(", and inside {inside_pasted} symbols") } else { String::new() },
             if renumbered > 0 { format!("; {renumbered} symbols set to frame {}", at + 1) } else { String::new() }
         ));
     }
@@ -16731,6 +16862,74 @@ fn match_nested_frames(
 /// that frame (the shelf script's own test) to show it, then do the same
 /// inside each of those. A mouth or an eye chart is a few frames long and is
 /// left alone, so a lip sync survives. Each symbol is visited once.
+/// Copy Stage's record of one timeline at a frame: each layer's drawing there
+/// and how many frames it was held from there.
+pub type StageLayers = Vec<(LayerId, Vec<Arc<Object>>, u32)>;
+
+/// **What `stack` shows at `frame`**, for Copy Stage: every layer but
+/// folders, the master audio (`master`) and the master's guide inside
+/// symbols — and **sound layers**, which are no part of the picture: a
+/// keyframe pasted on one cuts its sound off there. Inside a symbol
+/// (`in_symbol`) the **mouth** is left out too: lip sync keys it to the
+/// dialogue, and a pose pasted at another frame must not put the copied
+/// frame's mouth over the line spoken there.
+fn stage_layers_at(stack: &buzz_scene::LayerStack, frame: u32, master: Option<LayerId>, in_symbol: bool) -> StageLayers {
+    stack
+        .iter()
+        .filter(|l| l.kind != LayerKind::Folder && !l.audio_guide && Some(l.id) != master)
+        .filter(|l| frame < l.frames.length())
+        .filter(|l| !(l.objects_at(frame).is_empty() && l.frames.keyframes().iter().any(|k| k.sound.is_some())))
+        .filter(|l| !(in_symbol && is_mouth_layer(&l.name)))
+        .map(|l| {
+            let next = l.frames.keyframes().iter().map(|k| k.start).filter(|s| *s > frame).min();
+            let hold = next.unwrap_or(l.frames.length()) - frame;
+            (l.id, l.objects_at(frame).to_vec(), hold.max(1))
+        })
+        .collect()
+}
+
+/// **What every symbol in `clip` shows**, all the way down, for Copy Stage:
+/// each instance that follows its parent's timeline is recorded as what its
+/// symbol's layers show on the frame it is showing ([`stage_layers_at`]),
+/// then the symbols inside that. Each symbol once, as first met.
+fn capture_inside(
+    scene: &Scene,
+    stack: &buzz_scene::LayerStack,
+    clip: &StageLayers,
+    frame: u32,
+    out: &mut Vec<(buzz_scene::SymbolId, StageLayers)>,
+    seen: &mut std::collections::HashSet<buzz_scene::SymbolId>,
+) {
+    for (layer, objects, _) in clip {
+        let Some(layer) = stack.get(*layer) else { continue };
+        let elapsed = elapsed_on(layer, frame);
+        for object in objects {
+            let Some(instance) = object.instance() else { continue };
+            let Some(def) = scene.library().get(instance.symbol) else { continue };
+            if !def.kind.follows_parent_timeline() || instance.sync_to_root || !seen.insert(instance.symbol) {
+                continue;
+            }
+            let inner = instance.resolve_frame(def.kind, elapsed, def.length());
+            let layers = stage_layers_at(&def.layers, inner, None, true);
+            capture_inside(scene, &def.layers, &layers, inner, out, seen);
+            out.push((instance.symbol, layers));
+        }
+    }
+}
+
+/// One layer of a Paste Stage: `objects` keyed on `at`, replacing what was
+/// keyed there; a layer that ended here lengthened to hold them as long as
+/// the copy did.
+fn paste_held(frames: &mut buzz_scene::LayerTimeline, at: u32, objects: Vec<Arc<Object>>, hold: u32) {
+    let end = at + hold;
+    let ends_here = frames.length() <= at + 1;
+    frames.insert_blank_keyframe(at);
+    frames.set_objects(at, objects);
+    if ends_here && frames.length() < end {
+        frames.insert_frame(end - 1);
+    }
+}
+
 fn match_frames_inside(
     scene: &mut Scene,
     symbol: buzz_scene::SymbolId,
@@ -30815,10 +31014,13 @@ mod tests {
         let body = pasted.objects.iter().find_map(|o| o.instance()).expect("the body");
         let def = scene.library().get(body.symbol).unwrap();
         assert_eq!(body.resolve_frame(def.kind, 0, def.length()), 200, "the body shows its own frame 200 on 200");
-        let inner = def.layers.iter().next().unwrap().objects_at(200).iter().find_map(|o| o.instance()).expect("the head");
+        let inside = def.layers.iter().next().unwrap();
+        let inner = inside.objects_at(200).iter().find_map(|o| o.instance()).expect("the head");
         assert_eq!(inner.symbol, head);
         let head_def = scene.library().get(head).unwrap();
-        assert_eq!(inner.resolve_frame(head_def.kind, 200, head_def.length()), 200, "and the head inside it shows 200 too");
+        // Counted from the keyframe it sits on: the body's own pose is pasted
+        // on 200 now, so the head's keyframe starts there.
+        assert_eq!(inner.resolve_frame(head_def.kind, elapsed_on(inside, 200), head_def.length()), 200, "and the head inside it shows 200 too");
         assert!(scene.layers().get(b).unwrap().frames.keyframe_at(200).is_some_and(|k| k.start == 200 && !k.objects.is_empty()), "the arm too");
         assert_eq!(
             scene.layers().get(audio).unwrap().frames.keyframes().iter().map(|k| k.start).collect::<Vec<_>>(),
@@ -30829,6 +31031,203 @@ mod tests {
 
         e.run(Command::Undo);
         assert!(e.scene().layers().get(a).unwrap().frames.keyframes().iter().all(|k| k.start != 200), "one undo takes it back");
+    }
+
+    /// **The Text tool sets a new text as its options say**, in the fill
+    /// colour; a click on a text already there edits that one rather than
+    /// stacking another; and its colour can be set for the whole text.
+    #[test]
+    fn text_is_set_as_chosen_edited_in_place_and_coloured_whole() {
+        let mut e = editor();
+        let red = Color::from_rgb8(200, 20, 30);
+        e.style.fill_color = red;
+        e.text_next.size = 72.0;
+        e.text_next.align = buzz_scene::TextAlign::Centre;
+        e.place_text(Point::new(100.0, 100.0));
+        let id = *e.selection.ids().first().expect("placed");
+        let text = e.text_of(id).unwrap();
+        assert_eq!((text.content.as_str(), text.size, text.align), ("Text", 72.0, buzz_scene::TextAlign::Centre));
+        assert_eq!(e.text_base_color(id), red);
+        assert_eq!(e.text_to_focus, Some(id), "its box takes the keyboard");
+
+        // Clicked again with the Text tool: that text, not a new one.
+        let count = e.scene().layers().iter().map(|l| l.objects_at(0).len()).sum::<usize>();
+        let on_it = e.scene().find_object(id).unwrap().1.bounds().center();
+        e.selection.clear();
+        e.place_text(on_it);
+        assert_eq!(e.selection.ids(), vec![id]);
+        assert_eq!(e.scene().layers().iter().map(|l| l.objects_at(0).len()).sum::<usize>(), count, "no second text");
+
+        // Some characters coloured, then the whole text: every character.
+        let mut data = e.text_of(id).unwrap();
+        data.runs = buzz_scene::restyle_runs(&data.runs, 4, 0, 2, &|r: &mut buzz_scene::TextRun| r.color = Some(Color::from_rgb8(0, 0, 255)));
+        e.set_text_runs(id, data);
+        let green = Color::from_rgb8(20, 160, 60);
+        e.set_text_color(id, green);
+        assert!(e.text_of(id).unwrap().runs.iter().all(|r| r.color.is_none()), "no character keeps its own colour");
+        assert_eq!(e.text_base_color(id), green);
+        e.run(Command::Undo);
+        assert_ne!(e.text_base_color(id), green, "one undo step");
+    }
+
+    /// **A head opened has the master audio on top, locked** (user
+    /// 2026-11-17), even one made after the film's characters were given
+    /// theirs — a duplicated head. A tree opened gets none.
+    #[test]
+    fn opening_a_head_without_the_master_gives_it_the_master_on_top() {
+        let mut e = editor();
+        let mut ids = (ObjectId(0), ObjectId(0), buzz_scene::SymbolId(0), buzz_scene::SymbolId(0));
+        let mut master = LayerId(0);
+        e.doc.edit("Fixture", |scene| {
+            let layer = scene.add_stage_layer("Master Audio", LayerKind::Normal);
+            let sound = scene.add_sound("Dialogue", Arc::new(vec![0u8; 16]), "wav", 24, 1, 240);
+            scene.update_stage_layer(layer, |l| {
+                l.frames.insert_frame(239);
+            });
+            scene.set_frame_sound(layer, 0, Some(buzz_scene::SoundRef::stream(sound)));
+            master = layer;
+            let head = scene.add_symbol("rajuFaceFront 4", buzz_scene::SymbolKind::Graphic, None);
+            scene.enter_symbol(head);
+            let base = scene.layers().iter().next().unwrap().id;
+            scene.add_shape(base, ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE));
+            for name in ["eyeLid", "eyeBall", "mouth"] {
+                scene.add_layer(name, LayerKind::Normal);
+            }
+            scene.exit_symbol();
+            let tree = scene.add_symbol("Tree", buzz_scene::SymbolKind::Graphic, None);
+            scene.enter_symbol(tree);
+            let trunk = scene.layers().iter().next().unwrap().id;
+            scene.add_shape(trunk, ShapeData::filled(square(0.0, 0.0, 20.0), Color::WHITE));
+            scene.exit_symbol();
+            let stage = scene.layers().iter().find(|l| l.id != layer).unwrap().id;
+            let h = scene.next_object_id();
+            scene.add_object_at(stage, 0, Object::instance_of(h, head));
+            let t = scene.next_object_id();
+            scene.add_object_at(stage, 0, Object::instance_of(t, tree));
+            ids = (h, t, head, tree);
+        });
+        let key = e.doc.scene_key(e.doc.active_scene()).unwrap();
+        e.doc.set_master_audio(key, master);
+        let (h, t, head, tree) = ids;
+
+        assert!(e.enter_instance_in_place(h));
+        let top = e.scene().library().get(head).unwrap().layers.iter().next().cloned().unwrap();
+        assert!(top.audio_guide && top.locked, "the master on top of the head, locked: {}", top.name);
+        assert!(top.frames.keyframes()[0].sound.is_some(), "carrying the master's sound");
+        assert_eq!(e.scene().editing_symbol(), Some(head), "still inside the head");
+
+        e.doc.edit_view(|scene| {
+            scene.exit_symbol();
+        });
+        e.after_context_change();
+        assert!(e.enter_instance_in_place(t));
+        assert!(!e.scene().library().get(tree).unwrap().layers.iter().any(|l| l.audio_guide), "a tree gets no master");
+    }
+
+    /// **Paste Stage carries what is inside the symbols** (user 2026-11-17:
+    /// "copy paste stage is not working inside the symbol and in head
+    /// symbol"): a body and the head inside it, posed on frame 5, show that
+    /// pose on frame 30 where it is pasted — not what they already had there.
+    /// The head's lip-synced mouth, its sound and its master guide on 30 are
+    /// left as they are, and one undo takes it all back.
+    #[test]
+    fn paste_stage_brings_the_pose_inside_the_body_and_the_head() {
+        let mut e = editor();
+        let mut ids = (buzz_scene::SymbolId(0), buzz_scene::SymbolId(0), ObjectId(0), ObjectId(0), ObjectId(0));
+        e.doc.edit("Fixture", |scene| {
+            let chart = scene.add_symbol("mouthChart", buzz_scene::SymbolKind::Graphic, None);
+            let head = scene.add_symbol("Head", buzz_scene::SymbolKind::Graphic, None);
+            let body = scene.add_symbol("Body", buzz_scene::SymbolKind::Graphic, None);
+            scene.enter_symbol(head);
+            let eye = scene.layers().iter().next().unwrap().id;
+            scene.update_layer(eye, |l| {
+                l.name = "eye".into();
+                l.frames.insert_frame(59);
+            });
+            // The eye looks left on frame 5 and right from 20.
+            let left = scene.add_shape(eye, ShapeData::filled(square(0.0, 0.0, 5.0), Color::WHITE)).unwrap();
+            scene.update_layer(eye, |l| {
+                l.frames.insert_keyframe(5);
+                l.frames.insert_keyframe(20);
+            });
+            scene.update_object_at(5, left, |o| o.transform = Affine::translate((-3.0, 0.0)));
+            scene.update_object_at(20, left, |o| o.transform = Affine::translate((3.0, 0.0)));
+            // The mouth, lip-synced: its own key on 30.
+            let mouth = scene.add_layer("mouth", LayerKind::Normal);
+            scene.update_layer(mouth, |l| {
+                l.frames.insert_frame(59);
+            });
+            let mid = scene.next_object_id();
+            scene.add_object_at(mouth, 0, Object::instance_of(mid, chart));
+            scene.update_layer(mouth, |l| {
+                l.frames.insert_keyframe(30);
+            });
+            let sound = scene.add_layer("sound", LayerKind::Normal);
+            scene.update_layer(sound, |l| {
+                l.frames.insert_frame(59);
+                l.frames.keyframe_at_mut(0).unwrap().sound = Some(buzz_scene::SoundRef::stream(buzz_scene::SoundId(1)));
+            });
+            let guide = scene.add_layer("Master Audio", LayerKind::Normal);
+            scene.update_layer(guide, |l| {
+                l.audio_guide = true;
+                l.locked = true;
+                l.frames.insert_frame(59);
+            });
+            scene.exit_symbol();
+            scene.enter_symbol(body);
+            let torso = scene.layers().iter().next().unwrap().id;
+            scene.update_layer(torso, |l| {
+                l.name = "torso".into();
+                l.frames.insert_frame(59);
+            });
+            let chest = scene.add_shape(torso, ShapeData::filled(square(0.0, 0.0, 30.0), Color::WHITE)).unwrap();
+            scene.update_layer(torso, |l| {
+                l.frames.insert_keyframe(5);
+                l.frames.insert_keyframe(20);
+            });
+            scene.update_object_at(5, chest, |o| o.transform = Affine::rotate(0.3));
+            let h = scene.add_layer("head", LayerKind::Normal);
+            scene.update_layer(h, |l| {
+                l.frames.insert_frame(59);
+            });
+            let hid = scene.next_object_id();
+            scene.add_object_at(h, 0, Object::instance_of(hid, head));
+            scene.exit_symbol();
+            let stage = scene.layers().iter().next().unwrap().id;
+            scene.update_layer(stage, |l| {
+                l.frames.insert_frame(59);
+            });
+            let placed = scene.next_object_id();
+            scene.add_object_at(stage, 0, Object::instance_of(placed, body));
+            ids = (head, body, left, chest, mid);
+        });
+        let (head, body, eye_id, chest, mouth_id) = ids;
+        let shown = |e: &Editor, symbol: buzz_scene::SymbolId, layer: &str, frame: u32| -> Vec<Object> {
+            let def = e.scene().library().get(symbol).unwrap();
+            def.layers.iter().find(|l| l.name == layer).unwrap().objects_at(frame).iter().map(|o| (**o).clone()).collect()
+        };
+        let before_mouth = shown(&e, head, "mouth", 30);
+        let sound_keys = |e: &Editor| {
+            let def = e.scene().library().get(head).unwrap();
+            def.layers.iter().find(|l| l.name == "sound").unwrap().frames.keyframes().iter().map(|k| k.start).collect::<Vec<_>>()
+        };
+
+        e.set_frame(5);
+        e.run(Command::CopyPasteStage);
+        e.set_frame(30);
+        e.run(Command::CopyPasteStage);
+
+        let torso_30 = shown(&e, body, "torso", 30);
+        assert_eq!(torso_30.iter().find(|o| o.id == chest).map(|o| o.transform), Some(Affine::rotate(0.3)), "the body's pose from frame 6");
+        let eye_30 = shown(&e, head, "eye", 30);
+        assert_eq!(eye_30.iter().find(|o| o.id == eye_id).map(|o| o.transform), Some(Affine::translate((-3.0, 0.0))), "and the head's");
+        assert_eq!(shown(&e, head, "mouth", 30).iter().map(|o| o.id).collect::<Vec<_>>(), before_mouth.iter().map(|o| o.id).collect::<Vec<_>>(), "the lip-synced mouth stays");
+        assert!(shown(&e, head, "mouth", 30).iter().any(|o| o.id == mouth_id));
+        assert_eq!(sound_keys(&e), vec![0], "the head's sound is not cut");
+        assert!(e.status.as_deref().unwrap_or_default().contains("inside 2 symbols"), "{:?}", e.status);
+
+        e.run(Command::Undo);
+        assert_eq!(shown(&e, body, "torso", 30).iter().find(|o| o.id == chest).map(|o| o.transform), Some(Affine::IDENTITY), "one undo takes it back");
     }
 
     /// **Move Stage Frames**: every layer's frames from one place to
@@ -32476,3 +32875,4 @@ mod tests {
         );
     }
 }
+

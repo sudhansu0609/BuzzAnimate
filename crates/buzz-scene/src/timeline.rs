@@ -726,7 +726,10 @@ impl LayerTimeline {
     /// artwork, label, tween, ease curves and sound — overwriting whatever was
     /// there; the place they left becomes **one blank keyframe** (unless
     /// `copy`, which leaves the source alone); and the frames after both the
-    /// source and the destination keep showing what they showed before.
+    /// source and the destination keep showing the drawing they showed
+    /// before. Frames after the destination that showed nothing become
+    /// **ordinary frames of the moved drawing** rather than a blank keyframe —
+    /// see [`Self::overwrite`].
     ///
     /// `last` is clamped to the layer's last frame. Returns `false`, changing
     /// nothing, when `to == first` or `first` is past the end of the layer.
@@ -792,15 +795,16 @@ impl LayerTimeline {
     }
 
     /// Make frames `first..=last` **one blank keyframe** — what a move leaves
-    /// behind. The frame after the range keeps showing what it showed, by
-    /// being given a keyframe of its own first. `last` is clamped to the
-    /// layer; nothing happens when `first` is past the end.
+    /// behind. The frame after the range keeps showing the drawing it showed,
+    /// by being given a keyframe of its own first; one that showed nothing
+    /// needs none, the blank keyframe already reaching it. `last` is clamped
+    /// to the layer; nothing happens when `first` is past the end.
     pub fn blank_range(&mut self, first: u32, last: u32) {
         if first >= self.length || last < first {
             return;
         }
         let last = last.min(self.length - 1);
-        if last + 1 < self.length {
+        if last + 1 < self.length && !self.shows_nothing(last + 1) {
             self.insert_keyframe(last + 1);
         }
         self.keyframes.retain(|k| k.start <= first || k.start > last);
@@ -812,12 +816,19 @@ impl LayerTimeline {
 
     /// Write `segment` so it starts at `to`, replacing whatever was there.
     ///
-    /// What followed the destination keeps showing what it showed (it is
-    /// given a keyframe of its own first), frames before `to` are only cut at
-    /// `to`, and the layer grows when the segment runs past its end.
+    /// What followed the destination keeps showing the drawing it showed (it
+    /// is given a keyframe of its own first), frames before `to` are only cut
+    /// at `to`, and the layer grows when the segment runs past its end.
+    ///
+    /// **Frames after it that showed nothing are not given a blank keyframe**
+    /// (user 2026-11-17: "after movement the next frame becomes blank
+    /// keyframe … let it be normal frame after the moved frames"): they
+    /// become ordinary frames of the last moved keyframe, up to the layer's
+    /// next keyframe, as frames dragged onto an empty stretch read. A blank
+    /// keyframe the layer already had there stays.
     pub fn overwrite(&mut self, to: u32, segment: &FrameSegment) {
         let end = to.saturating_add(segment.length);
-        if end < self.length {
+        if end < self.length && !self.shows_nothing(end) {
             self.insert_keyframe(end);
         }
         self.keyframes.retain(|k| k.start < to || k.start >= end);
@@ -871,6 +882,12 @@ impl LayerTimeline {
         }
         let length = self.length.saturating_sub(frames).max(1);
         *self = Self::from_parts(kept, length);
+    }
+
+    /// Is `frame` an ordinary frame of a blank keyframe — nothing on it, and
+    /// no keyframe of its own that a move should keep?
+    fn shows_nothing(&self, frame: u32) -> bool {
+        !self.is_keyframe(frame) && self.keyframe_at(frame).is_none_or(Keyframe::is_blank)
     }
 
     /// Rebuild from parts, for the importer and the loader.
@@ -1524,9 +1541,44 @@ mod move_frames_tests {
         assert_eq!(shown(&left, 0), vec![1]);
         assert_eq!(shown(&left, 1), vec![3]);
         assert_eq!(shown(&left, 2), vec![4]);
-        assert!(shown(&left, 3).is_empty(), "the vacated frame is blank");
+        // The vacated frame after the moved ones is an ordinary frame of the
+        // last moved drawing, not a blank keyframe flashing between them.
+        assert_eq!(left.frame_kind(3), FrameKind::Span);
+        assert_eq!(shown(&left, 3), vec![4]);
         assert_eq!(shown(&left, 4), vec![4], "frame 4 still shows what it showed");
         assert_eq!(shown(&left, 5), vec![6]);
+    }
+
+    /// **Frames dropped onto an empty stretch carry on** (user 2026-11-17):
+    /// the frame after them is an ordinary frame of the moved drawing, not a
+    /// blank keyframe — on the same layer and between layers. Frames after
+    /// them that showed a drawing still keep it.
+    #[test]
+    fn frames_dropped_on_an_empty_stretch_carry_on_as_ordinary_frames() {
+        // Drawing 1 on frames 0–1, then a blank keyframe to frame 11.
+        let mut t = drawn(12, &[0]);
+        t.insert_blank_keyframe(2);
+        assert!(t.move_frames(0, 1, 5, false));
+        assert_eq!(t.frame_kind(5), FrameKind::Keyframe);
+        assert_eq!(t.frame_kind(7), FrameKind::Span, "an ordinary frame, not a blank keyframe");
+        assert_eq!(shown(&t, 7), vec![1]);
+        assert_eq!(shown(&t, 11), vec![1]);
+        assert_eq!(starts(&t), vec![0, 2, 5], "no keyframe but the moved one, and the blank one already there");
+
+        // Between layers: lifted off one, written onto another.
+        let source = drawn(12, &[0, 4]);
+        let mut target = drawn(12, &[0]);
+        target.insert_blank_keyframe(1);
+        let segment = source.segment(4, 5).unwrap();
+        target.overwrite(6, &segment);
+        assert_eq!(target.frame_kind(8), FrameKind::Span);
+        assert_eq!(shown(&target, 8), vec![5]);
+
+        // Dropped into the middle of a drawing, what follows keeps it.
+        let mut held = drawn(12, &[0]);
+        held.overwrite(3, &segment);
+        assert_eq!(held.frame_kind(5), FrameKind::Keyframe);
+        assert_eq!(shown(&held, 5), vec![1]);
     }
 
     /// A range starting part-way through a span gets a keyframe of its own

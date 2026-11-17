@@ -236,7 +236,7 @@ pub fn outline_styled(
     if content.is_empty() {
         return None;
     }
-    let data = resolve_font(font, style)?;
+    let data = resolve_font_for(font, style, content)?;
     let font_ref = FontRef::from_index(data.bytes(), data.index).ok()?;
     let size = Size::new(size_px as f32);
     let location = LocationRef::default();
@@ -348,7 +348,7 @@ pub fn outline_clusters(
     if content.is_empty() {
         return Vec::new();
     }
-    let Some(data) = resolve_font(font, style) else {
+    let Some(data) = resolve_font_for(font, style, content) else {
         return Vec::new();
     };
     let Ok(font_ref) = FontRef::from_index(data.bytes(), data.index) else {
@@ -611,7 +611,7 @@ pub fn outline_runs(
             current_line = piece.line;
             cursor_x = align.offset(line_width[current_line], widest);
         }
-        let Some(data) = resolve_font(piece.font, piece.style) else {
+        let Some(data) = resolve_font_for(piece.font, piece.style, &piece.text) else {
             continue;
         };
         let Ok(font_ref) = FontRef::from_index(data.bytes(), data.index) else {
@@ -650,7 +650,7 @@ pub fn outline_runs(
 /// share of a line, measured the same way [`measure_styled`] measures a whole
 /// line.
 fn piece_width(text: &str, size_px: f64, font: Option<&str>, style: FontStyle) -> f64 {
-    let Some(data) = resolve_font(font, style) else {
+    let Some(data) = resolve_font_for(font, style, text) else {
         return 0.0;
     };
     let Ok(font_ref) = FontRef::from_index(data.bytes(), data.index) else {
@@ -681,7 +681,7 @@ pub fn measure_styled(
     font: Option<&str>,
     style: FontStyle,
 ) -> (f64, f64) {
-    let Some(data) = resolve_font(font, style) else {
+    let Some(data) = resolve_font_for(font, style, content) else {
         return (0.0, size_px);
     };
     let Ok(font_ref) = FontRef::from_index(data.bytes(), data.index) else {
@@ -812,6 +812,75 @@ fn resolve_font(name: Option<&str>, style: FontStyle) -> Option<ResolvedFont> {
         data: FontData::Static(b),
         index: 0,
     })
+}
+
+/// **The face to set `content` in**: the one asked for — unless the words
+/// hold Devanagari it has no letters for, as the system default (Arial) and
+/// most Latin faces have none. Then a Hindi face takes over ([`hindi_family`],
+/// in the same cut), so Hindi typed with "Default" chosen comes out as Hindi
+/// rather than a row of empty boxes. A Hindi face sets the Latin letters
+/// beside it too.
+fn resolve_font_for(name: Option<&str>, style: FontStyle, content: &str) -> Option<ResolvedFont> {
+    let chosen = resolve_font(name, style)?;
+    if !has_devanagari(content) || draws_devanagari(&chosen) {
+        return Some(chosen);
+    }
+    hindi_family()
+        .and_then(|family| resolve_font(Some(family), style))
+        .filter(draws_devanagari)
+        .or(Some(chosen))
+}
+
+/// Does `text` hold any Devanagari (the block, and its extension)?
+pub fn has_devanagari(text: &str) -> bool {
+    text.chars()
+        .any(|c| ('\u{0900}'..='\u{097F}').contains(&c) || ('\u{A8E0}'..='\u{A8FF}').contains(&c))
+}
+
+fn draws_devanagari(font: &ResolvedFont) -> bool {
+    FontRef::from_index(font.bytes(), font.index)
+        .ok()
+        .is_some_and(|f| f.charmap().map('\u{0915}').is_some())
+}
+
+/// **The Hindi face text falls back to**: the first of the well-made ones
+/// installed — macOS's Kohinoor Devanagari, Windows's Nirmala UI, Noto on
+/// Linux — else any installed family that has Devanagari, never a hidden
+/// system one (a name starting with a dot). `None` with no Hindi face at all.
+pub fn hindi_family() -> Option<&'static str> {
+    static FAMILY: OnceLock<Option<String>> = OnceLock::new();
+    FAMILY
+        .get_or_init(|| {
+            const PREFERRED: &[&str] = &[
+                "Kohinoor Devanagari",
+                "Devanagari Sangam MN",
+                "ITF Devanagari",
+                "Devanagari MT",
+                "Nirmala UI",
+                "Mangal",
+                "Noto Sans Devanagari",
+                "Lohit Devanagari",
+                "Shree Devanagari 714",
+                "Arial Unicode MS",
+            ];
+            let families = font_families();
+            PREFERRED
+                .iter()
+                .find_map(|want| families.iter().find(|f| f.devanagari && f.name.eq_ignore_ascii_case(want)))
+                .or_else(|| families.iter().find(|f| f.devanagari && !f.name.starts_with('.')))
+                .map(|f| f.name.clone())
+        })
+        .as_deref()
+}
+
+/// **The Hindi face's file**, in its regular cut — its bytes and which face
+/// of the file it is (a `.ttc` holds several) — for an interface that wants
+/// to show Devanagari in its own text boxes. `None` with no Hindi face.
+pub fn hindi_face_bytes() -> Option<(Arc<Vec<u8>>, u32)> {
+    let family = hindi_family()?;
+    let faces = || available_fonts().iter().filter(move |f| f.family == family);
+    let face = faces().find(|f| f.style == FontStyle::REGULAR).or_else(|| faces().next())?;
+    Some((load_bytes(&face.path)?, face.index))
 }
 
 /// Read a font file once and keep its bytes for the process, so re-editing text
@@ -1040,6 +1109,23 @@ mod tests {
             three > one,
             "three lines ({three}) should be taller than one ({one})"
         );
+    }
+
+    /// **Hindi with "Default" chosen comes out as Hindi** (user 2026-11-17),
+    /// not as the row of empty boxes the default Latin face has for it: the
+    /// Hindi face takes over, and sets the Latin letters beside it too.
+    #[test]
+    fn hindi_in_the_default_face_falls_back_to_a_hindi_face() {
+        let Some(hindi) = hindi_family() else {
+            eprintln!("skipping: no Devanagari font on this system");
+            return;
+        };
+        let words = "Hello नमस्ते";
+        assert_eq!(outline(words, 48.0, None), outline(words, 48.0, Some(hindi)));
+        // Latin alone keeps the default face.
+        assert_ne!(outline("Hello", 48.0, None), outline("Hello", 48.0, Some(hindi)));
+        assert!(has_devanagari(words) && !has_devanagari("Hello"));
+        assert!(hindi_face_bytes().is_some(), "the interface can have it too");
     }
 
     #[test]

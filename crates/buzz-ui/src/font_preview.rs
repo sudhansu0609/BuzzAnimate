@@ -167,3 +167,24 @@ fn trace(family: &str, style: buzz_scene::FontStyle) -> Traced {
         strokes,
     }
 }
+
+/// **Hindi in the interface's own text boxes.** egui's built-in faces have no
+/// Devanagari, so Hindi typed into the Text tool's box — or a layer name, or a
+/// caption — showed as empty boxes while the stage drew it properly. The
+/// system's Hindi face ([`buzz_text::hindi_face_bytes`]) is added behind them,
+/// so a character they lack is found there. Letters are shown in the order
+/// typed; the stage is where they are shaped into syllables. Nothing changes
+/// on a machine with no Hindi face.
+pub fn add_hindi_fallback(ctx: &egui::Context) {
+    let Some((bytes, index)) = buzz_text::hindi_face_bytes() else {
+        return;
+    };
+    let mut data = egui::FontData::from_owned(bytes.as_ref().clone());
+    data.index = index;
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("hindi".to_owned(), std::sync::Arc::new(data));
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().push("hindi".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}

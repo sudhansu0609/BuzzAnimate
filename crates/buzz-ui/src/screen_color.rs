@@ -25,17 +25,22 @@ pub fn available() -> bool {
 
 /// Start the stage eyedropper for the swatch `target`. The pick, if one is
 /// made, is collected with [`take`].
+///
+/// Asked of this window's own context, not of a slot every window shares: a
+/// request left in a shared slot was taken by whichever window looked first.
 pub fn pick(ctx: &egui::Context, target: Id) {
-    if let Ok(mut asked) = DROPPER.lock() {
-        *asked = Some(target);
-    }
+    ctx.data_mut(|d| d.insert_temp(dropper_key(), Some(target)));
     ctx.request_repaint();
 }
 
-/// The swatch that asked for the stage eyedropper, once — for the shell,
-/// which runs the dropper.
-pub fn dropper_request() -> Option<Id> {
-    DROPPER.lock().ok()?.take()
+/// The swatch that asked this window for the stage eyedropper, once — for
+/// the shell, which runs the dropper.
+pub fn dropper_request(ctx: &egui::Context) -> Option<Id> {
+    ctx.data_mut(|d| d.remove_temp::<Option<Id>>(dropper_key())).flatten()
+}
+
+fn dropper_key() -> Id {
+    Id::new("screen-color-dropper-request")
 }
 
 /// Hand the colour the eyedropper took to the swatch `target`.
@@ -44,9 +49,6 @@ pub fn deliver(target: Id, color: Color) {
         *picked = Some((target, color));
     }
 }
-
-/// A swatch waiting for the stage eyedropper.
-static DROPPER: std::sync::Mutex<Option<Id>> = std::sync::Mutex::new(None);
 
 /// The colour picked from the screen for `target`, once.
 pub fn take(target: Id) -> Option<Color> {

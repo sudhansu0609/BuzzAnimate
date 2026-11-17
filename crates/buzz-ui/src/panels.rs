@@ -3022,14 +3022,22 @@ pub fn tool_options_panel(
         // **Everything that lays a fill gets to choose it here.** A shape tool
         // is about to draw a filled shape; asking what colour in another panel
         // is the same detour the bucket had.
+        //
+        // **And its outline, apart from it** (user 2026-11-17: "it does not
+        // have fill and outline different option"): Animate's shape tools
+        // have a stroke colour and a fill colour, either of which can be
+        // None — a shape that is only an outline, or only a fill.
         ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar => {
+            stroke_paint_controls(ui, scene, style, "shape");
+            ui.add_space(6.0);
             fill_paint_properties(ui, scene, style, "shape");
         }
         ToolId::Bone => bone_properties(ui, rig),
         ToolId::Hand => hand_properties(ui, pan_speed),
         // Smooth, Straighten and Curvier are commands, so the app draws them
-        // — see `reshape_properties`.
-        ToolId::Selection | ToolId::Subselection => {}
+        // — see `reshape_properties` — and the text editor needs the fonts the
+        // app holds.
+        ToolId::Selection | ToolId::Subselection | ToolId::Text => {}
         _ => anything = false,
     }
 
@@ -4600,6 +4608,16 @@ fn drawn_stroke_properties(
 /// under a heading called "Stroke and Fill" that reads as being about the
 /// selection.
 pub fn stroke_paint_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle, id: &str) {
+    if stroke_paint_controls(ui, scene, style, id) {
+        swatch_strips(ui, scene, style);
+    }
+}
+
+/// [`stroke_paint_properties`] without the swatch strips under it, for a tool
+/// that shows its fill's strips below (the shape tools): one set of strips
+/// answers both, a click for the fill and Shift+click for the stroke. Whether
+/// a stroke is on.
+fn stroke_paint_controls(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle, id: &str) -> bool {
     ui.horizontal(|ui| {
         ui.label("Stroke");
         // Animate's crossed swatch: the tool stays the tool and lays no line.
@@ -4618,7 +4636,7 @@ pub fn stroke_paint_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle
                 .small()
                 .weak(),
         );
-        return;
+        return false;
     }
 
     let mut c = style.stroke_color;
@@ -4672,8 +4690,7 @@ pub fn stroke_paint_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle
                 });
             ui.end_row();
         });
-
-    swatch_strips(ui, scene, style);
+    true
 }
 
 /// **What a fill is painted with**, as a block any tool that lays one can show.
@@ -7424,3 +7441,4 @@ mod layout_tests {
         }
     }
 }
+

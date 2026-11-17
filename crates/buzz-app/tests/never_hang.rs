@@ -191,12 +191,12 @@ fn the_library_panel_is_bounded_on_the_monster() {
     buzz_ui::theme::apply(&ctx);
     for _ in 0..2 {
         let _ = ctx.run_ui(screen(), |ui| {
-            let _ = buzz_ui::library_panel(ui, &mut scene, &mut state, &usage, &mut |_| None);
+            let _ = buzz_ui::library_panel(ui, &mut scene, &mut state, &usage, &mut |_, _| None);
         });
     }
     let start = Instant::now();
     let _ = ctx.run_ui(screen(), |ui| {
-        let _ = buzz_ui::library_panel(ui, &mut scene, &mut state, &usage, &mut |_| None);
+        let _ = buzz_ui::library_panel(ui, &mut scene, &mut state, &usage, &mut |_, _| None);
     });
     let elapsed = start.elapsed();
     assert!(

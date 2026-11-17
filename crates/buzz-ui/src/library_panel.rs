@@ -40,6 +40,24 @@ const DURATION: f32 = 48.0;
 /// [`THUMBNAIL`] points, so this is generous even on a dense display.
 const PICTURE_THUMB: usize = 64;
 
+/// Edge of the big picture shown while a thumbnail is hovered, in points: big
+/// enough to tell two poses of a character apart, small enough to sit beside
+/// the Library without covering the stage.
+pub const PREVIEW: f32 = 160.0;
+
+/// Longest side of a bitmap's hover preview texture, in pixels (2x
+/// [`PREVIEW`]).
+const PICTURE_PREVIEW: usize = 320;
+
+/// Which picture of a symbol a [`ThumbnailSource`] is asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbnailSize {
+    /// The small one on the row.
+    Row,
+    /// The big one in the hover tooltip.
+    Preview,
+}
+
 /// A bitmap or a sound in the document's own libraries — the two things that
 /// are listed beside the symbols (Animate's Library shows them too).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +89,8 @@ pub struct DraggedMedia(pub LibraryMedia);
 struct PictureThumb {
     asset: Arc<ImageAsset>,
     texture: egui::TextureHandle,
+    /// The big hover picture, made the first time the row is hovered.
+    preview: Option<egui::TextureHandle>,
 }
 
 // By hand: the derived `Debug` would print the bitmap's pixels.
@@ -234,7 +254,7 @@ impl LibraryState {
         }
         let texture = ctx.load_texture(
             format!("library-picture-{}", asset.id.0),
-            picture_thumbnail_image(asset),
+            picture_thumbnail_image(asset, PICTURE_THUMB),
             egui::TextureOptions::LINEAR,
         );
         self.picture_thumbs.insert(
@@ -242,21 +262,41 @@ impl LibraryState {
             PictureThumb {
                 asset: Arc::clone(asset),
                 texture: texture.clone(),
+                preview: None,
             },
         );
         texture
     }
+
+    /// The big picture of a bitmap for its hover preview, made on first hover.
+    fn picture_preview(&mut self, ctx: &egui::Context, asset: &Arc<ImageAsset>) -> egui::TextureHandle {
+        let _ = self.picture_thumbnail(ctx, asset);
+        let thumb = self
+            .picture_thumbs
+            .get_mut(&asset.id)
+            .expect("made just above");
+        thumb
+            .preview
+            .get_or_insert_with(|| {
+                ctx.load_texture(
+                    format!("library-picture-preview-{}", asset.id.0),
+                    picture_thumbnail_image(asset, PICTURE_PREVIEW),
+                    egui::TextureOptions::LINEAR,
+                )
+            })
+            .clone()
+    }
 }
 
-/// A bitmap shrunk to at most [`PICTURE_THUMB`] pixels a side, each pixel the
+/// A bitmap shrunk to at most `max` pixels a side, each pixel the
 /// average of up to nine samples of the block it stands for. Averaged with
 /// the alpha as a weight, so a transparent edge does not darken the colour.
-fn picture_thumbnail_image(asset: &ImageAsset) -> egui::ColorImage {
+fn picture_thumbnail_image(asset: &ImageAsset, max: usize) -> egui::ColorImage {
     let (w, h) = (asset.width as usize, asset.height as usize);
     if w == 0 || h == 0 || asset.pixels.len() < w * h * 4 {
         return egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT);
     }
-    let scale = (PICTURE_THUMB as f32 / w.max(h) as f32).min(1.0);
+    let scale = (max as f32 / w.max(h) as f32).min(1.0);
     let tw = ((w as f32 * scale).round() as usize).max(1);
     let th = ((h as f32 * scale).round() as usize).max(1);
     let mut rgba = Vec::with_capacity(tw * th * 4);
@@ -295,7 +335,21 @@ fn picture_thumbnail_image(asset: &ImageAsset) -> egui::ColorImage {
 ///
 /// A closure rather than a type, because the pictures live on the GPU and this
 /// crate has no device — the shell owns them and hands in a way to ask.
-pub type ThumbnailSource<'a> = &'a mut dyn FnMut(SymbolId) -> Option<egui::TextureId>;
+pub type ThumbnailSource<'a> =
+    &'a mut dyn FnMut(SymbolId, ThumbnailSize) -> Option<egui::TextureId>;
+
+/// The hover tooltip of a thumbnail: the picture, big, fitted at its own
+/// proportions, with the drag hint under it. `None` (not drawn yet) shows the
+/// hint alone; the shell repaints until the picture arrives.
+fn preview_tooltip(ui: &mut Ui, texture: Option<(egui::TextureId, egui::Vec2)>, hint: &str) {
+    if let Some((id, [w, h])) = texture.map(|(id, size)| (id, [size.x, size.y])) {
+        let scale = PREVIEW / w.max(h).max(1.0);
+        let size = egui::vec2(w * scale, h * scale);
+        let (slot, _) = ui.allocate_exact_size(egui::vec2(PREVIEW, PREVIEW), egui::Sense::hover());
+        egui::Image::new((id, size)).paint_at(ui, egui::Rect::from_center_size(slot.center(), size));
+    }
+    ui.label(RichText::new(hint).small().weak());
+}
 
 /// Draw the Library panel.
 ///
@@ -783,7 +837,7 @@ fn draw_symbol_row(
         let dragged = ui.dnd_drag_source(drag_id, DraggedSymbol(id), |ui| {
             let (slot, _) =
                 ui.allocate_exact_size(egui::vec2(THUMBNAIL, THUMBNAIL), egui::Sense::hover());
-            match thumbnail(id) {
+            match thumbnail(id, ThumbnailSize::Row) {
                 Some(texture) => {
                     egui::Image::new((texture, egui::vec2(THUMBNAIL, THUMBNAIL)))
                         .paint_at(ui, slot);
@@ -801,9 +855,13 @@ fn draw_symbol_row(
             }
             slot
         });
-        dragged
-            .response
-            .on_hover_text("Drag onto the stage to place an instance");
+        // Hovering shows the picture big, as a tooltip, and leaving shrinks it
+        // back: telling poses apart at 20 points was guesswork.
+        dragged.response.on_hover_ui(|ui| {
+            let texture = thumbnail(id, ThumbnailSize::Preview)
+                .map(|t| (t, egui::vec2(1.0, 1.0)));
+            preview_tooltip(ui, texture, "Drag onto the stage to place an instance");
+        });
 
         // A one-letter kind marker, as Animate's icon column does.
         let mark = match kind {
@@ -940,9 +998,15 @@ fn draw_picture_row(
             );
             slot
         });
-        dragged
-            .response
-            .on_hover_text("Drag onto the stage to place it");
+        dragged.response.on_hover_ui(|ui| {
+            let preview = state.picture_preview(ui.ctx(), &asset);
+            let [w, h] = preview.size();
+            preview_tooltip(
+                ui,
+                Some((preview.id(), egui::vec2(w as f32, h as f32))),
+                "Drag onto the stage to place it",
+            );
+        });
         ui.label(RichText::new("P").small().weak())
             .on_hover_text(format!("Picture, {} x {}", asset.width, asset.height));
         draw_media_name(ui, scene, state, LibraryMedia::Picture(id), name, 0.0);

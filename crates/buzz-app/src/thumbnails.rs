@@ -52,6 +52,9 @@ use buzz_scene::{Scene, SymbolId};
 /// Big enough to tell two characters apart at a glance, small enough that a
 /// hundred of them are a few megabytes of texture.
 pub const SIZE: u32 = 96;
+/// The big picture the Library shows while a thumbnail is hovered. Drawn at
+/// [`buzz_ui::library_panel::PREVIEW`] points, sharp on a 2x screen.
+pub const PREVIEW_SIZE: u32 = 320;
 /// An asset's picture, in pixels: the Assets panel draws them up to
 /// [`buzz_ui::assets_panel::MAX_EDGE`] points across, which this keeps sharp
 /// on a Retina screen down to 1.4x.
@@ -90,9 +93,10 @@ struct Entry {
     used: u64,
 }
 
-/// One picture: a symbol at one of its frames. The Library shows frame 0;
-/// the Frame Picker asks for every frame it has on screen.
-type Key = (SymbolId, u32);
+/// One picture: a symbol at one of its frames, at one size in pixels. The
+/// Library shows frame 0 (and a bigger one on hover); the Frame Picker asks
+/// for every frame it has on screen.
+type Key = (SymbolId, u32, u32);
 
 /// Pictures of symbols, drawn once and kept until the symbol changes.
 #[derive(Default)]
@@ -124,7 +128,7 @@ impl Thumbnails {
     /// compile.
     pub fn invalidate_stale(&mut self, scene: &Scene) {
         let retired = &mut self.retired;
-        self.entries.retain(|(id, _), entry| {
+        self.entries.retain(|(id, _, _), entry| {
             let fresh = scene
                 .library()
                 .get(*id)
@@ -150,7 +154,17 @@ impl Thumbnails {
     /// Every frame is framed on the symbol's whole extent, so a row of them
     /// lines up and only what moves changes from one to the next.
     pub fn get_frame(&mut self, symbol: SymbolId, frame: u32) -> Option<egui::TextureId> {
-        let key = (symbol, frame);
+        self.get_sized(symbol, frame, SIZE)
+    }
+
+    /// The big picture of a symbol, for the Library's hover preview. Kept
+    /// apart from the small one, so hovering does not redraw the row's.
+    pub fn get_preview(&mut self, symbol: SymbolId) -> Option<egui::TextureId> {
+        self.get_sized(symbol, 0, PREVIEW_SIZE)
+    }
+
+    fn get_sized(&mut self, symbol: SymbolId, frame: u32, px: u32) -> Option<egui::TextureId> {
+        let key = (symbol, frame, px);
         let tick = self.tick;
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.used = tick;
@@ -198,7 +212,7 @@ impl Thumbnails {
             self.requested.remove(key);
         }
         for key in batch {
-            let (symbol, frame) = key;
+            let (symbol, frame, px) = key;
             // Gone since it was asked for — a symbol deleted while the panel
             // was being drawn is not an error, it is just nothing to draw.
             let Some(arc) = scene.library().get(symbol).cloned() else {
@@ -207,7 +221,7 @@ impl Thumbnails {
                 }
                 continue;
             };
-            if let Some(entry) = self.draw(gpu, egui_renderer, vello, scene, symbol, frame, arc, cache) {
+            if let Some(entry) = self.draw(gpu, egui_renderer, vello, scene, symbol, frame, px, arc, cache) {
                 self.entries.insert(key, entry);
             }
         }
@@ -261,6 +275,7 @@ impl Thumbnails {
         scene: &Scene,
         symbol: SymbolId,
         frame: u32,
+        px: u32,
         arc: std::sync::Arc<buzz_scene::Symbol>,
         cache: &mut buzz_render::document::DrawCache,
     ) -> Option<Entry> {
@@ -271,7 +286,7 @@ impl Thumbnails {
             return None;
         }
 
-        let camera = fit(bounds, SIZE);
+        let camera = fit(bounds, px);
         vello.reset();
         let mut builder = buzz_render::SceneBuilder::new(vello, &camera);
         buzz_render::document::draw_symbol(
@@ -289,8 +304,8 @@ impl Thumbnails {
             .create_texture(&buzz_render::wgpu::TextureDescriptor {
                 label: Some("thumbnail"),
                 size: buzz_render::wgpu::Extent3d {
-                    width: SIZE,
-                    height: SIZE,
+                    width: px,
+                    height: px,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -306,7 +321,7 @@ impl Thumbnails {
 
         // Transparent, so a thumbnail sits on the panel's own colour and works
         // in both themes without being told which one is on.
-        gpu.render(vello, &view, SIZE, SIZE, peniko::Color::TRANSPARENT)
+        gpu.render(vello, &view, px, px, peniko::Color::TRANSPARENT)
             .ok()?;
 
         let id = egui_renderer.register_native_texture(
@@ -632,10 +647,10 @@ mod tests {
         assert!(thumbs.get(SymbolId(1)).is_none());
         assert!(thumbs.get(SymbolId(1)).is_none());
         assert!(thumbs.get(SymbolId(1)).is_none());
-        assert_eq!(thumbs.wanted, vec![(SymbolId(1), 0)], "queued once, not thrice");
+        assert_eq!(thumbs.wanted, vec![(SymbolId(1), 0, SIZE)], "queued once, not thrice");
 
         assert!(thumbs.get(SymbolId(2)).is_none());
-        assert_eq!(thumbs.wanted, vec![(SymbolId(1), 0), (SymbolId(2), 0)]);
+        assert_eq!(thumbs.wanted, vec![(SymbolId(1), 0, SIZE), (SymbolId(2), 0, SIZE)]);
         assert!(thumbs.pending());
     }
 
@@ -647,7 +662,20 @@ mod tests {
         assert!(thumbs.get(SymbolId(1)).is_none());
         assert!(thumbs.get_frame(SymbolId(1), 0).is_none());
         assert!(thumbs.get_frame(SymbolId(1), 3).is_none());
-        assert_eq!(thumbs.wanted, vec![(SymbolId(1), 0), (SymbolId(1), 3)]);
+        assert_eq!(thumbs.wanted, vec![(SymbolId(1), 0, SIZE), (SymbolId(1), 3, SIZE)]);
+    }
+
+    /// The hover preview is its own, bigger picture: asking for it leaves the
+    /// row's small one alone.
+    #[test]
+    fn the_preview_is_a_separate_bigger_picture() {
+        let mut thumbs = Thumbnails::default();
+        assert!(thumbs.get(SymbolId(1)).is_none());
+        assert!(thumbs.get_preview(SymbolId(1)).is_none());
+        assert_eq!(
+            thumbs.wanted,
+            vec![(SymbolId(1), 0, SIZE), (SymbolId(1), 0, PREVIEW_SIZE)]
+        );
     }
 
     /// Clearing queues every live picture's texture to be freed, and empties the

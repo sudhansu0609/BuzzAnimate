@@ -144,7 +144,7 @@ fn the_library_and_the_assets_panel_fit_side_by_side_in_one_column() {
             &mut scene,
             &mut lib_state,
             &Default::default(),
-            &mut |_| None,
+            &mut |_, _| None,
         );
         ui.separator();
         // No textures in a headless layout test: the thumbnails are what the
@@ -305,7 +305,7 @@ fn the_library_fits_the_narrowest_column() {
     let mut state = LibraryState::default();
 
     let over = column_overflow(narrowest, |ui| {
-        let _ = library_panel(ui, &mut scene, &mut state, &Default::default(), &mut |_| {
+        let _ = library_panel(ui, &mut scene, &mut state, &Default::default(), &mut |_, _| {
             None
         });
     });
@@ -520,7 +520,7 @@ fn clicking_a_library_row_selects_it_even_though_it_can_be_dragged() {
                 .resizable(false)
                 .exact_size(260.0)
                 .show(ui, |ui| {
-                    let _ = buzz_ui::library_panel(ui, &mut scene, state, &usage, &mut |_| None);
+                    let _ = buzz_ui::library_panel(ui, &mut scene, state, &usage, &mut |_, _| None);
                 });
         });
     };

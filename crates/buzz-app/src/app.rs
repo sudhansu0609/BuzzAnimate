@@ -7463,8 +7463,11 @@ impl App {
                 let usage = self.usage_cache.counts();
                 let mut raised = None;
                 editor.doc.edit("Library", |scene| {
-                    raised = buzz_ui::library_panel(ui, scene, library, usage, &mut |id| {
-                        thumbnails.get(id)
+                    raised = buzz_ui::library_panel(ui, scene, library, usage, &mut |id, size| {
+                        match size {
+                            buzz_ui::ThumbnailSize::Row => thumbnails.get(id),
+                            buzz_ui::ThumbnailSize::Preview => thumbnails.get_preview(id),
+                        }
                     });
                 });
                 if let Some(command) = raised {
@@ -18320,7 +18323,7 @@ impl App {
         let mut scene = self.tab_document(source).scene().clone();
         let usage = scene.symbol_usage();
         // Its own thumbnails are not this document's: ids collide.
-        let _ = buzz_ui::library_panel(ui, &mut scene, &mut self.foreign_library, &usage, &mut |_| None);
+        let _ = buzz_ui::library_panel(ui, &mut scene, &mut self.foreign_library, &usage, &mut |_, _| None);
         if egui::DragAndDrop::has_payload_of_type::<buzz_ui::library_panel::DraggedSymbol>(ui.ctx()) {
             self.foreign_drag = Some(source);
         }

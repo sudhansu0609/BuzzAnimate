@@ -99,7 +99,7 @@ pub use filter_panel::{
     FilterPanelState, FilterResponse, FilterTarget, LayerEffects, filter_panel,
 };
 pub use font_preview::FontPreviews;
-pub use library_panel::{LibraryState, MotionFilter, library_panel};
+pub use library_panel::{LibraryState, MotionFilter, ThumbnailSize, library_panel};
 pub use light_panel::{LightPanelState, LightResponse, light_panel};
 pub use lipsync_panel::{Choice, LipSyncResponse, LipSyncState, lip_sync_dialog};
 pub use motion_editor::{MotionEditorResponse, MotionEditorState, motion_editor_panel};

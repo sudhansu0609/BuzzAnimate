@@ -195,6 +195,12 @@ pub struct RigPanelState {
     /// The **Add part** row being filled in: its name and what it hangs off.
     pub new_part_name: String,
     pub new_part_parent: usize,
+    /// Whether `extra_parts` has been filled from `rig_parts.json` yet. Set
+    /// by the app, which owns the file.
+    pub parts_restored: bool,
+    /// `extra_parts` as `rig_parts.json` last had them, so the app writes the
+    /// file only when they differ.
+    pub parts_kept: Vec<ExtraPart>,
 }
 
 /// One part the user added to a pattern (see [`RigPanelState::extra_parts`]).
@@ -247,6 +253,8 @@ impl Default for RigPanelState {
             extra_parts: Vec::new(),
             new_part_name: String::new(),
             new_part_parent: 0,
+            parts_restored: false,
+            parts_kept: Vec::new(),
         }
     }
 }
@@ -254,8 +262,25 @@ impl Default for RigPanelState {
 /// The pattern a fresh panel shows: **Biped Full**, the user's own characters'
 /// parts (Mishra's front rig) — the biped's eleven plus `leftPalm`/`rightPalm`
 /// and `leftFoot`/`rightFoot` — so hands and feet always have a slot.
-fn default_pattern() -> usize {
+pub fn default_pattern() -> usize {
     RigPattern::builtin().iter().position(|p| p.name == "Biped Full").unwrap_or(0)
+}
+
+/// The pattern the panel shows inside a head: **Head**, the user's own head
+/// layers (Mishra's `faceBAseFront1`).
+pub fn head_pattern() -> usize {
+    RigPattern::builtin().iter().position(|p| p.name == "Head").unwrap_or(0)
+}
+
+/// One of the user's parts as `rig_parts.json` keeps it: by names, not by
+/// places in a list, so a pattern growing a slot does not move it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SavedPart {
+    /// The pattern it was added to ("Head", "Biped Full").
+    pub pattern: String,
+    pub name: String,
+    /// The slot it is connected to.
+    pub on: String,
 }
 
 impl RigPanelState {
@@ -307,6 +332,42 @@ impl RigPanelState {
         self.extra_parts.push(ExtraPart { pattern: self.pattern, name: name.to_string(), parent });
         self.slots.push(None);
         true
+    }
+
+    /// The user's parts, as `rig_parts.json` keeps them.
+    pub fn saved_parts(&self) -> Vec<SavedPart> {
+        let patterns = RigPattern::builtin();
+        let mut out = Vec::new();
+        for (index, pattern) in patterns.into_iter().enumerate() {
+            let shown = RigPanelState { pattern: index, extra_parts: self.extra_parts.clone(), ..RigPanelState::default() };
+            let full = shown.with_extras(pattern.clone());
+            for extra in self.extra_parts.iter().filter(|e| e.pattern == index) {
+                let Some(on) = full.slots.get(extra.parent) else { continue };
+                out.push(SavedPart { pattern: pattern.name.clone(), name: extra.name.clone(), on: on.name.clone() });
+            }
+        }
+        out
+    }
+
+    /// Put back the parts `rig_parts.json` kept, in the order they were
+    /// added. One whose pattern or connection is gone is left out.
+    pub fn restore_parts(&mut self, saved: &[SavedPart]) {
+        let shown = self.pattern;
+        let held = std::mem::take(&mut self.slots);
+        self.extra_parts.clear();
+        for part in saved {
+            let Some(index) = RigPattern::builtin().iter().position(|p| p.name == part.pattern) else { continue };
+            self.pattern = index;
+            let Some(on) = self.pattern().slot_named(&part.on) else { continue };
+            self.add_part(&part.name, on);
+        }
+        self.pattern = shown;
+        // What was in the slots on show stays, with an empty slot for each
+        // part of theirs put back after them.
+        self.slots = held;
+        if !self.slots.is_empty() {
+            self.slots.resize(self.pattern().slots.len(), None);
+        }
     }
 
     /// Take out the user's part in slot `slot`, and every part of theirs
@@ -1556,6 +1617,33 @@ mod tests {
         assert_eq!(at("Ankle R"), Some("rightFoot"));
         assert_eq!(at("Hips"), Some("cloth"));
         assert_eq!(state.slots.iter().flatten().count(), names.len(), "every part has a slot");
+    }
+
+    /// The user's parts come back by name from `rig_parts.json`, each on its
+    /// own template and connected to the part it was added on.
+    #[test]
+    fn added_parts_are_kept_by_name_and_come_back() {
+        let mut state = RigPanelState { pattern: head_pattern(), ..RigPanelState::default() };
+        let base = state.pattern().slot_named("base").unwrap();
+        assert!(state.add_part("nose", base));
+        let nose = state.pattern().slot_named("nose").unwrap();
+        assert!(state.add_part("noseRing", nose));
+        state.pattern = default_pattern();
+        let chest = state.pattern().slot_named("Chest").unwrap();
+        assert!(state.add_part("dupatta", chest));
+        let saved = state.saved_parts();
+        assert_eq!(
+            saved.iter().map(|p| (p.pattern.as_str(), p.name.as_str(), p.on.as_str())).collect::<Vec<_>>(),
+            [("Biped Full", "dupatta", "Chest"), ("Head", "nose", "base"), ("Head", "noseRing", "nose")]
+        );
+        let mut back = RigPanelState { pattern: head_pattern(), ..RigPanelState::default() };
+        back.restore_parts(&saved);
+        let head = back.pattern();
+        assert_eq!(head.slots[head.slot_named("noseRing").unwrap()].parent, head.slot_named("nose"));
+        assert_eq!(head.slots[head.slot_named("nose").unwrap()].parent, Some(base));
+        back.pattern = default_pattern();
+        assert!(back.pattern().slot_named("dupatta").is_some());
+        assert!(back.pattern().slot_named("nose").is_none(), "a head's part stays on the head");
     }
 
     /// LR2: a fresh Rig panel builds a layer rig.

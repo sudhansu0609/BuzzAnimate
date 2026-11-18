@@ -618,7 +618,33 @@ impl RigPattern {
         }
     }
 
-    /// Every pattern that ships with the tool.
+    /// **A head**, as the user's own are built (user 2026-11-18: "in the head
+    /// symbol of Mishra, the layers which I have shall be the same rigs inside
+    /// the head"): `faceBAseFront1`'s layers, each slot called exactly what
+    /// the layer is, so tagging one never renames it. The face is the root;
+    /// the brows, the eye, the lid and the mouth ride on it, and the eyeball
+    /// and the eye's mask on the eye white, so the iris stays inside the eye
+    /// when the white is moved.
+    pub fn head() -> Self {
+        const BASE: usize = 0;
+        const EYE_WHITE: usize = 3;
+        Self {
+            name: "Head".into(),
+            slots: vec![
+                slot("base", None, UP, 0.20, Side::Either, true, &["base", "face", "head", "skull"]),
+                slot("leftEyebrow", Some(BASE), 0.0, 0.04, Side::Left, false, &["eyebrow", "brow"]),
+                slot("rightEyebrow", Some(BASE), 0.0, 0.04, Side::Right, false, &["eyebrow", "brow"]),
+                slot("eyeWhite", Some(BASE), 0.0, 0.04, Side::Either, false, &["eye white", "eye whites", "white", "whites", "sclera"]),
+                slot("eyeBall", Some(EYE_WHITE), 0.0, 0.02, Side::Either, false, &["eye ball", "eye balls", "eyeball", "iris", "pupil"]),
+                slot("eyeMask", Some(EYE_WHITE), 0.0, 0.02, Side::Either, false, &["eye mask", "mask"]),
+                slot("eyeLid", Some(BASE), 0.0, 0.04, Side::Either, false, &["eye lid", "eye lids", "eyelid", "lid", "lids"]),
+                slot("mouth", Some(BASE), DOWN, 0.04, Side::Either, false, &["mouth", "lips", "lip", "jaw"]),
+            ],
+        }
+    }
+
+    /// Every pattern that ships with the tool. New ones go on the end: the
+    /// Rig panel keeps the one on show by its place in this list.
     pub fn builtin() -> Vec<RigPattern> {
         vec![
             Self::biped(),
@@ -626,6 +652,7 @@ impl RigPattern {
             Self::bird(),
             Self::prop(),
             Self::biped_full(),
+            Self::head(),
         ]
     }
 
@@ -1387,6 +1414,20 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The Head pattern takes Mishra's head (`faceBAseFront1`) layer for
+    /// layer, each into the slot of its own name.
+    #[test]
+    fn the_head_pattern_takes_mishras_head_layers_by_name() {
+        let pattern = RigPattern::head();
+        let layers = ["leftEyebrow", "rightEyebrow", "eyeLid", "eyeMask", "eyeBall", "eyeWhite", "mouth", "base"];
+        let filled = match_parts(&pattern, &names(&layers));
+        for (index, layer) in layers.iter().enumerate() {
+            let slot = pattern.slot_named(layer).expect("a slot named for the layer");
+            assert_eq!(filled[slot], Some(index), "{layer}");
+        }
+        assert_eq!(RigPattern::named("Head"), Some(pattern));
     }
 
     #[test]

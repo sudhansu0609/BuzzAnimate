@@ -67,6 +67,32 @@ impl TitleBar {
     }
 }
 
+/// **macOS: the inset bar's double-click is the app's, not the OS's** (user
+/// 2026-11-18: "the zoom + − buttons, when I click them the second time the
+/// screen moves"). The app's row sits in the native title bar's strip, so two
+/// quick clicks on + or − were a double-click on the title bar, and macOS
+/// zoomed the window under the pointer. `AppleActionOnDoubleClick` = `None`
+/// in BuzzAnimate's own defaults turns that off for this app alone; the
+/// row's empty drag zone still maximises on a double-click
+/// (`App::queue_title_drag`).
+#[cfg(target_os = "macos")]
+pub fn leave_title_double_click_to_the_app() {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+    // SAFETY: `standardUserDefaults` and `setObject:forKey:` are thread-safe
+    // Foundation calls taking and returning objects.
+    unsafe {
+        let defaults: Option<Retained<AnyObject>> = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        if let Some(defaults) = defaults {
+            let value = NSString::from_str("None");
+            let key = NSString::from_str("AppleActionOnDoubleClick");
+            let _: () = msg_send![&*defaults, setObject: &*value, forKey: &*key];
+        }
+    }
+}
+
 /// A window action asked for from inside the title bar row, queued rather
 /// than acted on immediately — `App::render` drains it after `run_ui`, which
 /// is what lets a test assert the request without a real window to act on.

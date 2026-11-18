@@ -1921,7 +1921,9 @@ impl Scene {
     ///
     /// Stored in the object's own space, so it stays on the artwork.
     pub fn set_pivot_at(&mut self, frame: u32, id: ObjectId, at: Point) -> bool {
-        let Some((_, object)) = self.find_object(id) else {
+        // Measured on the copy `frame` shows: another keyframe's copy of the
+        // same part can stand somewhere else.
+        let Some((_, object)) = self.find_object_at(frame, id).or_else(|| self.find_object(id)) else {
             return false;
         };
         let local = match invert(object.transform) {

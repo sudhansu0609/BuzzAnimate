@@ -935,9 +935,7 @@ pub fn rig_parts_as_layers(scene: &mut Scene, frame: u32, pattern: &RigPattern, 
 /// [`rig_character`], but rigged by **layer parenting** instead of bones.
 ///
 /// One layer per filled slot, named after the slot, with the part alone on
-/// it; the part's transformation point on its joint — the head of the bone
-/// [`buzz_act::autorig::fit_slots`] fits to it, the same fitting
-/// [`rig_character`] uses — and its layer following the layer of the nearest
+/// it; the part's transformation point where it was, and its layer following the layer of the nearest
 /// filled ancestor slot. Posing is Free Transform rotation about the pivot.
 /// The parts leave their own layers; nothing moves. The caller wraps this in
 /// one `Document::edit`.
@@ -979,15 +977,15 @@ pub fn rig_character_layers_named(
         .iter()
         .filter_map(|(slot, id)| scene.find_object(*id).map(|(_, art)| (*slot, art.clone())))
         .collect();
-    let fitted = buzz_act::autorig::fit_slots(pattern, &taken);
     let parts: Vec<LayerPart> = taken
         .iter()
         .map(|(slot, art)| LayerPart {
             slot: *slot,
             name: name_of(*slot),
             artwork: (**art).clone(),
-            // A drawing too small to measure turns about its own middle.
-            joint: fitted[*slot].map_or_else(|| art.bounds().center(), |(head, _)| head),
+            // Its own transformation point, as it was drawn or imported: the
+            // pivots stay where the user put them (see `link_tagged_parts`).
+            joint: scene.pivot_of(art),
             from: None,
             lead: false,
         })
@@ -1009,9 +1007,10 @@ pub fn rig_character_layers_named(
 ///
 /// Every filled slot's drawing ends up alone on a layer named
 /// `name_of(slot)` — the user's tag — split off a layer it shares (the copy
-/// keeps every keyframe, just in front of it). Each slot in `fresh` gets its
-/// transformation point on its joint, fitted as [`rig_character_layers`]
-/// fits it. And each layer follows the layer of its nearest filled ancestor
+/// keeps every keyframe, just in front of it). A part in `fresh` (or joined
+/// to one) turns about **the middle of where it overlaps the part it joins**
+/// ([`joint_between`]); with no overlap its own point stays. A pivot moved by
+/// hand afterwards is never touched again. And each layer follows the layer of its nearest filled ancestor
 /// in `parents` (the naming profile's table, else the pattern's); one with
 /// none follows the rig's root with `join_roots`, so the character moves as
 /// one, or stands alone without (the user's convention: thighs and body are
@@ -1043,34 +1042,32 @@ pub fn link_tagged_parts(
         return None;
     }
 
-    // The joints, fitted on every filled part as it stands, so a part tagged
-    // later is measured against the ones already in.
+    // **Each joint where the two parts meet** (user 2026-11-18: "the pivots
+    // shall be in centre of the intersection of two parts"), measured on the
+    // artwork as drawn — through symbols, so an instance is not taken for its
+    // placeholder box, which put every pivot on the registration corner.
     if !fresh.is_empty() {
-        let stack = scene.layers();
-        let taken: Vec<(usize, Arc<Object>)> = layers
-            .iter()
-            .filter_map(|&(slot, layer)| {
-                let id = slots[slot]?;
-                let mut placed = stack.get(layer)?.frames.resolved_at(frame).iter().find(|o| o.id == id)?.clone();
-                placed.transform = stack.inherited_transform(layer, frame) * placed.transform;
-                Some((slot, Arc::new(placed)))
-            })
-            .collect();
-        let fitted = buzz_act::autorig::fit_slots(pattern, &taken);
-        let pivots: Vec<(LayerId, ObjectId, Point)> = taken
-            .iter()
-            .filter(|(slot, _)| fresh.contains(slot))
-            .filter_map(|(slot, art)| {
-                let joint = fitted
-                    .get(*slot)
-                    .copied()
-                    .flatten()
-                    .map_or_else(|| art.bounds().center(), |(head, _)| head);
-                let layer = layers.iter().find(|(s, _)| s == slot)?.1;
-                // In the object's own coordinates, as `Object::pivot` is stored.
-                Some((layer, art.id, invert(art.transform)? * joint))
-            })
-            .collect();
+        let layer_of = |slot: usize| layers.iter().find(|(s, _)| *s == slot).map(|(_, l)| *l);
+        let filled = |slot: usize| layer_of(slot).is_some();
+        let mut pivots: Vec<(LayerId, ObjectId, Point)> = Vec::new();
+        for &(slot, layer) in &layers {
+            let Some(other) = joined_to(pattern, parents, slot, &filled) else { continue };
+            if !fresh.contains(&slot) && !fresh.contains(&other) {
+                continue;
+            }
+            let (Some(id), Some(other_id), Some(other_layer)) = (slots[slot], slots[other], layer_of(other)) else {
+                continue;
+            };
+            let Some(at) = joint_between(scene, frame, (layer, id), (other_layer, other_id)) else { continue };
+            let stack = scene.layers();
+            let Some(object) = stack.get(layer).and_then(|l| l.frames.resolved_at(frame).iter().find(|o| o.id == id).cloned()) else {
+                continue;
+            };
+            // In the object's own coordinates, as `Object::pivot` is stored.
+            if let Some(back) = invert(stack.inherited_transform(layer, frame) * object.transform) {
+                pivots.push((layer, id, back * at));
+            }
+        }
         let stack = scene.edit_layers();
         for (layer, id, pivot) in pivots {
             stack.update(layer, |l| {
@@ -1115,13 +1112,84 @@ pub fn link_tagged_parts(
     Some(layers)
 }
 
+/// The filled part `slot` joins: its nearest filled ancestor in `parents`;
+/// for a root, the part a body is built around it — a thigh joins the hips,
+/// the chest and the hips join each other (the waist).
+fn joined_to(pattern: &RigPattern, parents: &[Option<usize>], slot: usize, filled: &dyn Fn(usize) -> bool) -> Option<usize> {
+    let mut current = parents.get(slot).copied().flatten();
+    // Bounded by the slot count, against a parent cycle.
+    for _ in 0..parents.len() {
+        let Some(parent) = current else { break };
+        if filled(parent) {
+            return Some(parent);
+        }
+        current = parents.get(parent).copied().flatten();
+    }
+    let name = pattern.slots.get(slot)?.name.as_str();
+    let to = match name.trim_end_matches(" L").trim_end_matches(" R") {
+        "Thigh" | "Chest" => "Hips",
+        "Hips" => "Chest",
+        _ => return None,
+    };
+    pattern.slot_named(to).filter(|s| filled(*s))
+}
+
+/// **The middle of where two parts overlap**, in the timeline's space: the
+/// centre of the artwork both cover on `frame` (each through its symbols and
+/// its layer's parenting), else of where their boxes cross. `None` when they
+/// do not touch.
+pub(crate) fn joint_between(scene: &Scene, frame: u32, a: (LayerId, ObjectId), b: (LayerId, ObjectId)) -> Option<Point> {
+    let table = scene.cached_bounds_table();
+    let placed = |(layer, id): (LayerId, ObjectId)| {
+        let l = scene.layers().get(layer)?;
+        let object = l.frames.resolved_at(frame).iter().find(|o| o.id == id)?.clone();
+        let inherited = scene.layers().inherited_transform(layer, frame);
+        let bounds = inherited.transform_rect_bbox(scene.resolved_bounds_with(&object, &table));
+        Some((object, invert(inherited)?, crate::editor::elapsed_on(l, frame), bounds))
+    };
+    let (a, b) = (placed(a)?, placed(b)?);
+    let cross = a.3.intersect(b.3);
+    if cross.width() <= 0.0 || cross.height() <= 0.0 {
+        return None;
+    }
+    const STEPS: usize = 48;
+    let (mut sum, mut count) = (Vec2::ZERO, 0usize);
+    for row in 0..STEPS {
+        for column in 0..STEPS {
+            let at = Point::new(
+                cross.x0 + cross.width() * (column as f64 + 0.5) / STEPS as f64,
+                cross.y0 + cross.height() * (row as f64 + 0.5) / STEPS as f64,
+            );
+            let inside = |(object, back, elapsed, _): &(Object, Affine, u32, buzz_geom::Rect)| {
+                crate::editor::object_contains(scene, object, *back * at, 0.0, *elapsed, 0, &table)
+            };
+            if inside(&a) && inside(&b) {
+                sum += at.to_vec2();
+                count += 1;
+            }
+        }
+    }
+    Some(if count == 0 { cross.center() } else { (sum / count as f64).to_point() })
+}
+
 /// The layer `object` is on in the timeline being edited, made its own: a
 /// layer it shares with other artwork is split, a copy holding only `object`
 /// on every keyframe going just in front of it, the rest staying behind.
+///
+/// **Shared means on the same keyframe.** A layer whose keyframes each hold
+/// one drawing — a mouth swapped for another every few frames, the user's
+/// lip sync — is already that part's own; splitting it (user 2026-11-18,
+/// Mishra's head) left the tagged mouth on a layer by itself and every other
+/// mouth on a second `mouth` layer behind it.
 fn own_layer(scene: &mut Scene, object: ObjectId) -> Option<LayerId> {
     let (layer, shared) = {
         let l = scene.layers().iter().find(|l| l.find_object(object).is_some())?;
-        (l.id, l.all_objects().any(|o| o.id != object))
+        let shared = l
+            .frames
+            .keyframes()
+            .iter()
+            .any(|key| key.objects.len() > 1 && key.objects.iter().any(|o| o.id == object));
+        (l.id, shared)
     };
     if !shared {
         return Some(layer);

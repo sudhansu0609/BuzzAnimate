@@ -489,6 +489,19 @@ fn pasteboard(workspace: &buzz_ui::Workspace) -> Color {
 /// One wheel notch.
 const WHEEL_ZOOM_STEP: f64 = 1.18;
 
+/// The zoom field's number, never wider than "999999": whole percents from
+/// 100, one decimal below, and a power of ten past a million, so the field's
+/// fixed slot in the title bar always holds it (see `status_strip`).
+fn zoom_percent_text(percent: f64) -> String {
+    if percent >= 1e6 {
+        format!("{percent:.1e}")
+    } else if percent >= 100.0 {
+        format!("{percent:.0}")
+    } else {
+        format!("{percent:.1}")
+    }
+}
+
 /// How often autosave is offered a chance to run.
 ///
 /// Once a second: the check itself compares two integers, and the policy it
@@ -2241,6 +2254,8 @@ impl App {
                 .create_window(attrs)
                 .context("creating the window")?,
         );
+        #[cfg(target_os = "macos")]
+        crate::title_bar::leave_title_double_click_to_the_app();
 
         let gpu = GpuContext::new_blocking(&self.preference)?;
         // P2 (`docs/IMPORT_PERF_PLAN.md`): the budget belongs to this
@@ -8928,16 +8943,45 @@ impl App {
         // empty the moment the head was opened read as the body rig being
         // lost. Only a timeline that is not inside the one the slots were
         // filled on (out to the stage, or another symbol) puts them aside.
+        //
+        // **Except into a head** (user 2026-11-18: "in the head symbol of
+        // Mishra, the layers which I have shall be the same rigs inside the
+        // head"): a head open gets a list of its own on the **Head** template,
+        // its own layers' slots, and the body's waits for the way back out.
         let path: Vec<u64> = self.editor.scene().edit_path().iter().map(|s| s.0).collect();
-        let deeper = self.rig_slots_path.as_ref().is_some_and(|filled| path.starts_with(filled));
+        let open_head = {
+            let scene = self.editor.scene();
+            scene.editing_symbol().is_some_and(|s| crate::rigging::head_symbol_for(scene, s) == Some(s))
+        };
+        let deeper = !open_head && self.rig_slots_path.as_ref().is_some_and(|filled| path.starts_with(filled));
         if self.rig_slots_path.as_ref() != Some(&path) && !deeper {
-            if let Some(old) = self.rig_slots_path.take() {
-                let state = &self.editor.rig_panel;
-                self.rig_slots_kept.insert(old, (state.pattern, state.slots.clone()));
-                let (pattern, slots) = self.rig_slots_kept.remove(&path).unwrap_or((self.editor.rig_panel.pattern, Vec::new()));
-                self.editor.rig_panel.pattern = pattern;
-                self.editor.rig_panel.slots = slots;
-                self.editor.rig_panel.armed = None;
+            let head = buzz_ui::rig_panel::head_pattern();
+            let current = self.editor.rig_panel.pattern;
+            // A timeline met for the first time starts on the template for
+            // what it is: Head in a head, else what the panel was showing
+            // (Biped Full, unless the user chose another), never Head.
+            let fresh = if open_head {
+                head
+            } else if current == head {
+                buzz_ui::rig_panel::default_pattern()
+            } else {
+                current
+            };
+            match self.rig_slots_path.take() {
+                Some(old) => {
+                    let state = &self.editor.rig_panel;
+                    self.rig_slots_kept.insert(old, (state.pattern, state.slots.clone()));
+                    let (pattern, slots) = self.rig_slots_kept.remove(&path).unwrap_or((fresh, Vec::new()));
+                    self.editor.rig_panel.pattern = pattern;
+                    self.editor.rig_panel.slots = slots;
+                    self.editor.rig_panel.armed = None;
+                }
+                None if fresh != current => {
+                    self.editor.rig_panel.pattern = fresh;
+                    self.editor.rig_panel.slots.clear();
+                    self.editor.rig_panel.armed = None;
+                }
+                None => {}
             }
             self.rig_slots_path = Some(path);
         }
@@ -9028,6 +9072,14 @@ impl App {
         let layer_rig = self.selected_layer_rig();
         self.editor.rig_panel.layer_rig = layer_rig.is_some();
 
+        // The parts the user added to the templates, from `rig_parts.json`,
+        // and kept there again whenever one is added or taken out.
+        if !self.editor.rig_panel.parts_restored {
+            self.editor.rig_panel.restore_parts(&crate::rig_parts::load());
+            self.editor.rig_panel.parts_restored = true;
+            self.editor.rig_panel.parts_kept = self.editor.rig_panel.extra_parts.clone();
+        }
+
         let response = buzz_ui::rig_panel(
             ui,
             armature.as_ref(),
@@ -9039,6 +9091,13 @@ impl App {
             &mut self.editor.rig_panel,
             &mut self.editor.workspace.rig,
         );
+
+        if self.editor.rig_panel.extra_parts != self.editor.rig_panel.parts_kept {
+            match crate::rig_parts::save(&self.editor.rig_panel.saved_parts()) {
+                Ok(()) => self.editor.rig_panel.parts_kept = self.editor.rig_panel.extra_parts.clone(),
+                Err(e) => self.editor.status = Some(format!("Could not keep the new part: {e}")),
+            }
+        }
 
         // -- assembling, which does not need anything to be selected --------
 
@@ -9476,7 +9535,8 @@ impl App {
     /// **With Rig kind: Layers it rigs as well** (user 2026-11-17: "mapping
     /// shall set layer parenting and rename the layers based on the rig
     /// tagging"): the part is split onto a layer of its own if it shares one,
-    /// its pivot goes on its joint and its layer follows its parent part's —
+    /// its pivot goes where it overlaps the part it joins and its layer
+    /// follows its parent part's —
     /// see `rigging::link_tagged_parts`.
     fn name_tagged_layers(&mut self) {
         let slots = self.editor.rig_panel.slots.clone();
@@ -10427,6 +10487,17 @@ impl App {
 
     fn draw_tool_cursor(&self, ui: &egui::Ui, area: egui::Rect) {
         use buzz_ui::ToolId::*;
+        // **The hand, whatever tool is in hand, while Space (or the middle
+        // button) pans** (user 2026-11-18: "the pan symbol of the hand is
+        // missing"), on the stage and in a symbol alike: open while held,
+        // closed while dragging — as the Hand tool shows it.
+        let (space, middle, pressed, hover) = ui.ctx().input(|i| {
+            (i.key_down(egui::Key::Space), i.pointer.middle_down(), i.pointer.any_down(), i.pointer.hover_pos())
+        });
+        if (space || middle || self.editor.tool() == Hand) && hover.is_some_and(|p| area.contains(p)) {
+            ui.ctx().set_cursor_icon(if pressed { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+            return;
+        }
         // A swatch's Pick turns the pointer into the eyedropper, whatever tool is in hand.
         let tool = if self.dropper_pick.is_some() { Eyedropper } else { self.editor.tool() };
         // The pointer, transform and navigation tools keep the system cursor
@@ -10703,10 +10774,12 @@ impl App {
         // **Styled as the panels' scroll bars are** (user 2026-11-14): the
         // theme's own thumb colours — resting, hovered, dragged — with no
         // outline, and the track shown only while the pointer is on it.
+        // **Blue under the pointer** (user 2026-11-18: "the scrollbar in the
+        // stage on hover shall turn blue"): the accent, hovered and dragged.
         let widgets = &ui.visuals().widgets;
         let thumb_colour = widgets.inactive.bg_fill;
-        let thumb_hover = widgets.hovered.bg_fill;
-        let thumb_hot = widgets.active.bg_fill;
+        let thumb_hover = buzz_ui::Palette::active();
+        let thumb_hot = buzz_ui::Palette::active();
         let track_hover = ui.visuals().extreme_bg_color.gamma_multiply(0.6);
         let track_colour = egui::Color32::TRANSPARENT;
         let track_edge = egui::Stroke::NONE;
@@ -11002,12 +11075,29 @@ impl App {
             // Proportional drag speed, so one gesture is useful at 50% and at
             // a trillion percent alike. Computed before the mutable borrow.
             let speed = percent.max(1.0) * 0.02;
-            let response = ui.add(
+            // **A fixed-width slot**, as wide as "999999 %" (user 2026-11-18:
+            // "when I click + or − continuously the icons shift and the
+            // screen moves"). Sized to its own text, the field grew and
+            // shrank with every step — "91.3 %", "150 %", "21502 %" — so −
+            // slid from under the pointer, the next click hit the bare bar
+            // beside it, and two of those were the bar's double-click,
+            // maximising the window. The text is kept to that width too:
+            // whole percents from 100, one decimal below, and powers of ten
+            // past a million.
+            let value_width = ui
+                .painter()
+                .layout_no_wrap("999999 %".to_owned(), egui::TextStyle::Button.resolve(ui.style()), Palette::text())
+                .size()
+                .x
+                + 2.0 * ui.spacing().button_padding.x;
+            let response = ui.add_sized(
+                [value_width, ui.spacing().interact_size.y],
                 egui::DragValue::new(&mut percent)
                     .speed(speed)
                     // No upper bound: this is the whole point of the engine.
                     .range(0.001..=f64::MAX)
-                    .suffix(" %"),
+                    .suffix(" %")
+                    .custom_formatter(|value, _| zoom_percent_text(value)),
             );
             if response.changed() {
                 self.editor.set_zoom_centred(percent);
@@ -28559,6 +28649,66 @@ mod title_bar_tests {
         );
         assert_eq!(resize_direction(egui::pos2(10.0, 300.0), size, border), None);
     }
+
+    /// **Clicking + or − over and over never moves them** (user 2026-11-18:
+    /// "when I click + or − continuously the icons shift and the screen
+    /// moves"). The zoom field between them used to be as wide as its
+    /// number, so − slid out from under the pointer, the next clicks landed
+    /// on the bare bar and were its double-click, maximising the window.
+    #[test]
+    fn zoom_buttons_stay_put_and_never_reach_the_bar() {
+        fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+            fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+                match shape {
+                    egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.visual_bounding_rect())),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut out);
+            }
+            out.retain(|(_, r)| r.min.y < 40.0);
+            out
+        }
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut time = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            time += 0.05;
+            let input = egui::RawInput { time: Some(time), ..input(events) };
+            ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            })
+        };
+        for _ in 0..3 {
+            frame(&mut app, vec![]);
+        }
+        for glyph in ["+", "\u{2212}"] {
+            let mut output = frame(&mut app, vec![]);
+            let mut seen = Vec::new();
+            for _ in 0..12 {
+                let (_, rect) = texts(&output)
+                    .into_iter()
+                    .find(|(s, _)| s == glyph)
+                    .expect("the zoom button is in the title bar");
+                seen.push(rect.min.x);
+                let at = rect.center();
+                frame(&mut app, vec![egui::Event::PointerMoved(at), click(at, true)]);
+                output = frame(&mut app, vec![click(at, false)]);
+                assert!(app.window_requests.is_empty(), "{glyph}: a click reached the bar: {:?}", app.window_requests);
+            }
+            assert!(
+                seen.iter().all(|x| (x - seen[0]).abs() < 0.5),
+                "{glyph} moved while clicked at zooms up to {:.0}%: {seen:?}",
+                app.editor.camera.zoom_percent()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -30251,6 +30401,7 @@ mod layer_rig_ui_tests {
         let map = |app: &mut App, slot: &str| {
             let i = pattern.slot_named(slot).unwrap();
             let depth = app.editor.doc.history().undo_depth();
+            let pivot = app.editor.scene().find_object(slots[i].unwrap()).unwrap().1.pivot;
             app.editor.rig_panel.assign(i, slots[i].unwrap());
             let _ = painted_text(app);
             assert_eq!(app.editor.doc.history().undo_depth(), depth + 1, "mapping {slot} is one undo step");
@@ -30258,7 +30409,7 @@ mod layer_rig_ui_tests {
             let layer = app.editor.scene().layers().get(layer).unwrap();
             assert_eq!(layer.name, label(app, slot), "{slot}'s layer takes its tag");
             assert_eq!(layer.objects_at(app.editor.frame()).len(), 1, "{slot} is alone on its layer");
-            assert!(object.pivot.is_some(), "{slot} has its pivot on its joint");
+            assert_eq!(object.pivot, pivot, "{slot} keeps its own pivot");
         };
 
         map(&mut app, "Elbow L");
@@ -30283,11 +30434,142 @@ mod layer_rig_ui_tests {
         assert_eq!(links(&app), want);
     }
 
+    /// **Tagging and Rig Character leave a symbol part's pivot where it was**
+    /// (user 2026-11-18): Mishra's thigh, an instance with its Animate
+    /// transformation point at the hip, keeps it, instead of it landing on
+    /// the symbol's registration corner. And Free Transform grabs a pivot
+    /// that sits on a corner of the box.
+    #[test]
+    fn tagging_keeps_a_symbol_parts_own_pivot_and_a_corner_pivot_can_be_dragged() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let mut thigh = None;
+        app.editor.doc.edit("Thigh", |scene| {
+            let symbol = scene.add_symbol("thighArt", buzz_scene::SymbolKind::Graphic, None);
+            let bar = buzz_geom::Rect::new(0.0, 0.0, 80.0, 200.0);
+            scene.enter_symbol(symbol);
+            let inside = scene.add_layer("art", buzz_scene::LayerKind::Normal);
+            scene.add_shape(inside, buzz_scene::ShapeData::filled(bar.to_path(1e-9), LIMB));
+            scene.exit_symbol();
+            let layer = scene.add_layer("leftThigh", buzz_scene::LayerKind::Normal);
+            let mut placed = buzz_scene::Object::instance_of(scene.next_object_id(), symbol);
+            placed.transform = buzz_geom::Affine::translate((300.0, 400.0));
+            placed.pivot = Some(buzz_geom::Point::new(40.9, 27.0));
+            thigh = scene.add_object(layer, placed);
+        });
+        let thigh = thigh.unwrap();
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        app.editor.rig_panel.profile = Some(buzz_rig::pattern::NamingProfile::animate_convention());
+        let _ = painted_text(&mut app);
+        let pattern = app.editor.rig_panel.pattern();
+        app.editor.rig_panel.assign(pattern.slot_named("Thigh L").unwrap(), thigh);
+        let _ = painted_text(&mut app);
+        let pivot = |app: &App| app.editor.scene().find_object(thigh).unwrap().1.pivot;
+        assert_eq!(pivot(&app), Some(buzz_geom::Point::new(40.9, 27.0)), "tagging kept the pivot");
+        let slots = app.editor.rig_panel.slots.clone();
+        app.rig_character(&pattern.name, &slots);
+        let after = pivot(&app).unwrap();
+        assert!((after - buzz_geom::Point::new(40.9, 27.0)).hypot() < 1e-6, "Rig Character kept the pivot: {after:?}");
+
+        // A pivot on the box's top-left corner is still the pivot.
+        app.editor.set_tool(ToolId::FreeTransform);
+        app.editor.selection.set([thigh]);
+        let corner = app.editor.selection_box().unwrap().corners()[0];
+        app.editor.set_pivot(corner);
+        let projection = app.editor.edit_to_stage();
+        let screen = app.editor.camera.doc_to_screen(projection.map_point(corner).unwrap());
+        let off = buzz_geom::Point::new(screen.x + 2.0, screen.y + 2.0);
+        assert!(app.editor.pointer_on_pivot(off), "a press on the circle grabs the pivot, not the corner");
+    }
+
+    /// **A joint is the middle of where two parts overlap** (user
+    /// 2026-11-18): a thigh symbol tagged with the hips symbol over its top
+    /// turns about the centre of the strip the two share — measured on the
+    /// artwork inside the symbols, not on an instance's placeholder box.
+    #[test]
+    fn a_tagged_parts_pivot_is_the_middle_of_its_overlap_with_the_part_it_joins() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let mut ids = Vec::new();
+        for (name, bar, at) in [
+            ("cloth", buzz_geom::Rect::new(0.0, 0.0, 200.0, 100.0), (200.0, 300.0)),
+            ("leftThigh", buzz_geom::Rect::new(0.0, 0.0, 80.0, 200.0), (220.0, 360.0)),
+        ] {
+            app.editor.doc.edit("Part", |scene| {
+                let symbol = scene.add_symbol(&format!("{name}Art"), buzz_scene::SymbolKind::Graphic, None);
+                scene.enter_symbol(symbol);
+                let inside = scene.add_layer("art", buzz_scene::LayerKind::Normal);
+                scene.add_shape(inside, buzz_scene::ShapeData::filled(bar.to_path(1e-9), LIMB));
+                scene.exit_symbol();
+                let layer = scene.add_layer(name, buzz_scene::LayerKind::Normal);
+                let mut placed = buzz_scene::Object::instance_of(scene.next_object_id(), symbol);
+                placed.transform = buzz_geom::Affine::translate(at);
+                ids.push(scene.add_object(layer, placed).unwrap());
+            });
+        }
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        app.editor.rig_panel.profile = Some(buzz_rig::pattern::NamingProfile::animate_convention());
+        let _ = painted_text(&mut app);
+        let pattern = app.editor.rig_panel.pattern();
+        app.editor.rig_panel.assign(pattern.slot_named("Hips").unwrap(), ids[0]);
+        app.editor.rig_panel.assign(pattern.slot_named("Thigh L").unwrap(), ids[1]);
+        let _ = painted_text(&mut app);
+        app.editor.selection.set([ids[1]]);
+        let pivot = app.editor.pivot().unwrap();
+        // The thigh (220..300, 360..560) under the hips (200..400, 300..400):
+        // they share 220..300 by 360..400, whose middle is (260, 380).
+        assert!((pivot - buzz_geom::Point::new(260.0, 380.0)).hypot() < 2.0, "thigh pivot {pivot:?}");
+
+        // Moved by hand, it stays moved.
+        app.editor.set_pivot(buzz_geom::Point::new(250.0, 370.0));
+        let _ = painted_text(&mut app);
+        assert_eq!(app.editor.pivot(), Some(buzz_geom::Point::new(250.0, 370.0)));
+    }
+
+    /// **Tagging a mouth leaves its swaps together** (user 2026-11-18,
+    /// Mishra's head): a layer holding a different mouth on each keyframe is
+    /// already the mouth's own, so it is linked as it is, not split into a
+    /// layer of the tagged mouth and a second `mouth` layer of the rest.
+    #[test]
+    fn tagging_a_layer_of_swapped_drawings_does_not_split_it() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let mut ids = Vec::new();
+        app.editor.doc.edit("Head", |scene| {
+            let base = scene.add_layer("base", buzz_scene::LayerKind::Normal);
+            ids.push(scene.add_shape(base, buzz_scene::ShapeData::filled(buzz_geom::Rect::new(0.0, 0.0, 200.0, 200.0).to_path(1e-9), LIMB)).unwrap());
+            let mouth = scene.add_layer("mouth", buzz_scene::LayerKind::Normal);
+            let lips = |x: f64| buzz_scene::ShapeData::filled(buzz_geom::Rect::new(x, 150.0, x + 60.0, 170.0).to_path(1e-9), LIMB);
+            ids.push(scene.add_shape(mouth, lips(70.0)).unwrap());
+            scene.update_layer(mouth, |l| {
+                l.frames.insert_keyframe(5);
+            });
+            let open = buzz_scene::Object::shape(scene.next_object_id(), lips(72.0));
+            scene.update_layer(mouth, |l| {
+                if let Some(key) = l.frames.keyframes_mut().iter_mut().find(|k| k.start == 5) {
+                    key.objects = Arc::new(vec![Arc::new(open)]);
+                }
+            });
+        });
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        let _ = painted_text(&mut app);
+        // Chosen by hand: on the stage the panel starts on Biped Full.
+        app.editor.rig_panel.pattern = buzz_ui::rig_panel::head_pattern();
+        let _ = painted_text(&mut app);
+        let pattern = app.editor.rig_panel.pattern();
+        app.editor.rig_panel.assign(pattern.slot_named("base").unwrap(), ids[0]);
+        app.editor.rig_panel.assign(pattern.slot_named("mouth").unwrap(), ids[1]);
+        let _ = painted_text(&mut app);
+        let names: Vec<String> = app.editor.scene().layers().iter().map(|l| l.name.clone()).collect();
+        assert_eq!(names.iter().filter(|n| *n == "mouth").count(), 1, "one mouth layer: {names:?}");
+        let mouth = app.editor.scene().layers().iter().find(|l| l.name == "mouth").unwrap();
+        assert_eq!(mouth.frames.keyframes().len(), 2, "both mouths are still on it");
+        assert_eq!(links(&app), [("base".to_string(), None), ("mouth".to_string(), Some("base".to_string()))]);
+    }
+
     /// **The Rig panel keeps what was put in it**: opening the head inside
-    /// the character (to rig it) leaves the body's slots filled and named; a
-    /// symbol elsewhere has its own list, and coming back finds the body's as
-    /// it was. Clicking something that is not a head keeps the Rig Head
-    /// section on the head it was on.
+    /// the character shows the head's own list on the Head template (user
+    /// 2026-11-18: "the layers which I have shall be the same rigs inside the
+    /// head"), and coming back out finds the body's as it was; a symbol
+    /// elsewhere has its own list too. Clicking something that is not a head
+    /// keeps the Rig Head section on the head it was on.
     #[test]
     fn rig_slots_and_head_survive_going_elsewhere() {
         let mut app = App::new(GpuPreference::Automatic);
@@ -30306,16 +30588,15 @@ mod layer_rig_ui_tests {
             scene.enter_symbol(head);
         });
         let text = painted_text(&mut app);
-        assert_eq!(app.editor.rig_panel.slots, slots, "opening the head keeps the body's slots");
-        let kept = app.editor.rig_panel.kept_names.clone();
-        assert_eq!(kept.len(), slots.iter().flatten().count(), "every kept part has a name: {kept:?}");
-        for (_, name) in &kept {
-            assert!(text.iter().any(|t| t == name), "{name} is not shown with the head open: {text:?}");
-        }
+        let pattern = app.editor.rig_panel.pattern();
+        assert_eq!(pattern.name, "Head", "a head opens on the Head template");
+        assert!(app.editor.rig_panel.slots.iter().all(Option::is_none), "the head starts with a list of its own");
+        assert!(text.iter().any(|t| t == &format!("0/{}", pattern.slots.len())), "the head's list is on show: {text:?}");
         app.editor.doc.edit_view(|scene| {
             scene.exit_symbol();
         });
         let _ = painted_text(&mut app);
+        assert_eq!(app.editor.rig_panel.pattern().name, "Biped Full", "back out, the body's template");
         assert_eq!(app.editor.rig_panel.slots, slots, "back out, the body's slots are as they were");
 
         // Filled inside one symbol, a symbol beside it starts with its own list.

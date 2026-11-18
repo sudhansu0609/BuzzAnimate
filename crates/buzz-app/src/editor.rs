@@ -1154,10 +1154,15 @@ impl Editor {
             // motion as the artwork does. Without it, turning the arm left the
             // wrist's point where the wrist used to be, and turning the wrist
             // then pulled it off the arm.
+            // **The copy on the keyframe under the playhead**: a part keyed
+            // again later (Mishra's, at 0 and 3164) has a copy per keyframe,
+            // and reading the first one drew the point where it was on frame
+            // 0 — a drag stored on this keyframe looked like it snapped back.
             [id] => {
                 let scene = self.doc.scene();
-                scene.find_object(*id).map(|(layer, object)| {
-                    scene.layers().inherited_transform(layer, self.current_frame) * scene.pivot_of(object)
+                let frame = self.current_frame;
+                scene.find_object_at(frame, *id).or_else(|| scene.find_object(*id)).map(|(layer, object)| {
+                    scene.layers().inherited_transform(layer, frame) * scene.pivot_of(object)
                 })
             }
             many => {
@@ -1188,7 +1193,8 @@ impl Editor {
                     // `at` is where it is drawn; stored before the layer
                     // parenting (see `pivot`).
                     let at = scene
-                        .find_object(id)
+                        .find_object_at(frame, id)
+                        .or_else(|| scene.find_object(id))
                         .and_then(|(layer, _)| invert(scene.layers().inherited_transform(layer, frame)))
                         .map_or(at, |back| back * at);
                     scene.set_pivot_at(frame, id, at);
@@ -2825,7 +2831,9 @@ impl Editor {
     }
 
     /// Hit the drawn pivot in logical screen pixels, including shot and
-    /// edit-in-place transforms. Corners keep priority when closer.
+    /// edit-in-place transforms. Corners keep priority when closer, except
+    /// on the circle itself: a pivot sitting on a corner (a limb's joint at
+    /// the end of its box) is still the pivot under the pointer.
     pub(crate) fn pointer_on_pivot(&self, screen: Point) -> bool {
         // Only Free Transform has a transformation point: the Selection tool is
         // Animate's arrow, and draws and grabs nothing of the kind.
@@ -2845,7 +2853,8 @@ impl Editor {
         let nearest = frame.corners().into_iter().filter_map(project).map(|p| (p - screen).hypot())
             .fold(f64::INFINITY, f64::min);
         let distance = (pivot - screen).hypot();
-        distance <= crate::tools::TRANSFORM_GRAB_PX * 1.5 && distance <= nearest
+        let on_circle = distance <= crate::tools::TRANSFORM_GRAB_PX * 0.75;
+        distance <= crate::tools::TRANSFORM_GRAB_PX * 1.5 && (on_circle || distance <= nearest)
     }
 
     pub fn pointer_down(&mut self, screen: Point, mods: Mods) {
@@ -16924,7 +16933,7 @@ pub(crate) fn is_mouth_layer(name: &str) -> bool {
     name.trim().eq_ignore_ascii_case("mouth")
 }
 
-fn elapsed_on(layer: &buzz_scene::Layer, frame: u32) -> u32 {
+pub(crate) fn elapsed_on(layer: &buzz_scene::Layer, frame: u32) -> u32 {
     frame
         - layer
             .frames
@@ -17390,7 +17399,7 @@ fn resolved_local_bounds(
 /// screen (`elapsed_on`), not the timeline frame: it is what an instance
 /// resolves its own frame from, exactly as the renderer does, and an
 /// instance's children are tested with their own elapsed count inside it.
-fn object_contains(
+pub(crate) fn object_contains(
     scene: &Scene,
     object: &Object,
     point: Point,
@@ -24993,6 +25002,34 @@ mod tests {
             drop_ms < budget,
             "placing a dragged asset cost {drop_ms:.2} ms; a single drop must not stutter"
         );
+    }
+
+    /// **A moved point stays moved on a later keyframe** (user 2026-11-18,
+    /// inside Mishra, whose parts are keyed at 0 and 3164): the point is read
+    /// and stored on the copy under the playhead, not on the first keyframe's
+    /// copy — which drew it back where it was on frame 0 after every drag.
+    #[test]
+    fn a_transformation_point_moved_on_a_later_keyframe_stays_there() {
+        let mut e = editor();
+        e.style.drawing_mode = DrawingMode::ObjectDrawing;
+        let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+        let layer = e.doc.scene().find_object(id).unwrap().0;
+        e.doc.edit("Keys", |scene| {
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(20);
+                l.frames.insert_keyframe(10);
+            });
+            // The later keyframe's copy stands elsewhere.
+            scene.update_object_at(10, id, |o| o.transform = Affine::translate((50.0, 0.0)) * o.transform);
+        });
+        e.current_frame = 12;
+        e.selection.select_one(id);
+        e.set_tool(ToolId::FreeTransform);
+        let at = Point::new(210.0, 120.0);
+        e.apply(ToolAction::SetTransformPoint { at });
+        assert!((e.pivot().unwrap() - at).hypot() < 1e-6, "the point is where it was put: {:?}", e.pivot());
+        e.current_frame = 0;
+        assert!((e.pivot().unwrap() - Point::new(150.0, 150.0)).hypot() < 1e-6, "frame 0's copy keeps its own");
     }
 
     /// **A rotation turns about the transformation point the user moved.**

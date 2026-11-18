@@ -36,6 +36,21 @@ fn stamp_of(time: std::time::SystemTime) -> String {
     format!("{date}_{}", clock.replace(':', ""))
 }
 
+/// The newest copy of `asset`'s file kept under `<root>/_cast_backup`
+/// (`<stamp>_<what>/<its path under the root>`; the stamps sort by time), one
+/// that differs from the file as it is now. `None` when none is kept.
+pub fn newest_backup(root: &Path, asset: &buzz_doc::Asset) -> Option<PathBuf> {
+    let rel = asset.path.strip_prefix(root).ok()?;
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root.join(BACKUP_FOLDER))
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    let now = std::fs::read(&asset.path).ok();
+    dirs.into_iter().rev().map(|d| d.join(rel)).find(|p| p.is_file() && std::fs::read(p).ok() != now)
+}
+
 /// Where `asset` is copied before it is rewritten.
 pub fn backup_path(root: &Path, asset: &Asset, stamp: &str) -> PathBuf {
     let relative = asset.path.strip_prefix(root).map(Path::to_path_buf).unwrap_or_else(|_| {

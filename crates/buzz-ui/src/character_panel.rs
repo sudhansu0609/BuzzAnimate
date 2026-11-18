@@ -49,6 +49,12 @@ pub type CastThumbnailSource<'a> = AssetThumbnailSource<'a>;
 pub enum CastAction {
     /// Open this character's sheet — its wardrobe and its poses.
     Open(Asset),
+    /// **Reset**: the character in this film taken back to the Cast's
+    /// version, the changes made to it here thrown away (one undo step).
+    ResetHere(Asset),
+    /// **Restore Previous Version**: the Cast file put back as it was before
+    /// its last change (from `_cast_backup`), and every open film updated.
+    RestorePrevious(Asset),
     /// **Cast this character into the shot**: place a copy on the stage.
     Cast(Asset),
     /// **Re-skin the character**: repaint every part painted `from` with `to`,
@@ -264,6 +270,9 @@ pub struct CastPanelState {
     /// The extra pose tag being typed.
     pub new_tag: String,
     pub save_target: Option<Asset>,
+    /// Cast characters whose copy in the open film has been changed since it
+    /// arrived (or since the last Update): marked, with Keep and Reset.
+    pub edited: std::collections::BTreeSet<std::path::PathBuf>,
     /// "Add breath + blinks" is ticked by default: this is its inverse, so a default panel has it on.
     pub life_off: bool,
 }
@@ -566,6 +575,16 @@ fn character_row(
                 state.open = if open { None } else { Some(asset.path.clone()) };
                 *action = Some(CastAction::Open(asset.clone()));
             }
+            response.context_menu(|ui| {
+                if ui
+                    .button("Restore Previous Version")
+                    .on_hover_text("Put the Cast file back as it was before its last change, and update the open films")
+                    .clicked()
+                {
+                    *action = Some(CastAction::RestorePrevious(asset.clone()));
+                    ui.close();
+                }
+            });
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -587,6 +606,26 @@ fn character_row(
             });
             if ui.small_button("Update").on_hover_text(UPDATE_HINT).clicked() {
                 *action = Some(CastAction::Update(asset.clone()));
+            }
+            // **Changed here**: keep the changes as the Cast's from now on,
+            // or throw them away and take the Cast's version back.
+            if state.edited.contains(&asset.path) {
+                if ui
+                    .small_button("Reset")
+                    .on_hover_text("Throw away the changes made to this character in this film and take the Cast's version back (\u{2318}Z undoes it)")
+                    .clicked()
+                {
+                    *action = Some(CastAction::ResetHere(asset.clone()));
+                }
+                if ui
+                    .small_button("Keep")
+                    .on_hover_text("Make the changes made here the Cast's default, in every open film too (the old file is kept; right-click the name to restore it)")
+                    .clicked()
+                {
+                    *action = Some(CastAction::Update(asset.clone()));
+                }
+                ui.label(RichText::new("\u{25cf} changed here").small().color(egui::Color32::from_rgb(0xE0, 0x9A, 0x30)))
+                    .on_hover_text("This character has been changed in this film since it came from the Cast");
             }
             if ui
                 .small_button("Start Fresh")

@@ -1308,8 +1308,24 @@ impl ToolMachine {
     /// that only need the yes or no: building a brush preview costs real work
     /// per call, and it is already built once a frame to be drawn.
     pub fn painting_preview(&self) -> bool {
-        matches!(self.gesture, Gesture::Freehand { .. })
-            && matches!(self.tool, ToolId::Brush | ToolId::Pencil)
+        match self.gesture {
+            Gesture::Freehand { .. } => matches!(self.tool, ToolId::Brush | ToolId::Pencil),
+            // A shape tool's drag previews the shape itself; see `preview`.
+            Gesture::Dragging {
+                moving: false,
+                transforming: None,
+                ..
+            } => self.is_shape_tool(),
+            _ => false,
+        }
+    }
+
+    /// The tools that drag out a shape from a fixed origin.
+    fn is_shape_tool(&self) -> bool {
+        matches!(
+            self.tool,
+            ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar | ToolId::Line | ToolId::Pen
+        )
     }
 
     /// The current preview, for drawing feedback on the stage.
@@ -1444,9 +1460,23 @@ impl ToolMachine {
                 | ToolId::Oval
                 | ToolId::PolyStar
                 | ToolId::Line
-                | ToolId::Pen => build_shape_path(self.tool, *origin, *current, *mods)
-                    .map(Preview::Shape)
-                    .unwrap_or(Preview::None),
+                | ToolId::Pen => match build_shape_path(self.tool, *origin, *current, *mods) {
+                    // **The shape previews as itself** — its fill, its stroke
+                    // colour and its real stroke width — built by the same
+                    // function the release commits, so nothing changes when
+                    // the pointer lifts. A shape that would paint nothing (no
+                    // fill or stroke enabled) still shows its outline, or the
+                    // drag would be invisible.
+                    Some(path) => {
+                        let shape = new_shape_data(self.tool, path, ctx.style);
+                        if shape_paints(&shape) {
+                            Preview::Artwork(vec![shape])
+                        } else {
+                            Preview::Shape(shape.path)
+                        }
+                    }
+                    None => Preview::None,
+                },
                 ToolId::Zoom => Preview::Marquee(Rect::from_points(*origin, *current)),
 
                 // What the drag *began* on decides what it previews, exactly
@@ -1833,32 +1863,8 @@ impl ToolMachine {
                 let Some(path) = build_shape_path(self.tool, origin, end, mods) else {
                     return ToolAction::None;
                 };
-                let filled = self.tool != ToolId::Line && self.tool != ToolId::Pen;
-                // The shape's own extent is what a gradient fill is laid
-                // across, so it has to be measured before the shape is built.
-                let bounds = buzz_geom::Shape::bounding_box(&path);
                 ToolAction::AddShape {
-                    shape: ShapeData {
-                        path,
-                        fill: filled
-                            .then(|| ctx.style.fill_for_new_shape(bounds))
-                            .flatten()
-                            .map(|paint| buzz_scene::FillSpec {
-                                paint,
-                                rule: buzz_geom::FillMode::NonZero,
-                                swatch: None,
-                            }),
-                        blend: buzz_scene::PaintBlend::Normal,
-                        stroke: ctx
-                            .style
-                            .stroke_for_new_shape()
-                            .map(|(color, width, hairline)| buzz_scene::StrokeSpec {
-                                paint: buzz_scene::Paint::Solid(color),
-                                width,
-                                hairline,
-                                swatch: None,
-                            }),
-                    },
+                    shape: new_shape_data(self.tool, path, ctx.style),
                     label: shape_label(self.tool),
                 }
             }
@@ -1893,6 +1899,45 @@ impl ToolMachine {
             _ => ToolAction::None,
         }
     }
+}
+
+/// **The shape a drag with `tool` lays down along `path`**, in the current
+/// fill and stroke. One function for the preview and the release, so the
+/// shape being dragged out is the one that lands.
+fn new_shape_data(tool: ToolId, path: BezPath, style: &DrawStyle) -> ShapeData {
+    let filled = tool != ToolId::Line && tool != ToolId::Pen;
+    // The shape's own extent is what a gradient fill is laid
+    // across, so it has to be measured before the shape is built.
+    let bounds = buzz_geom::Shape::bounding_box(&path);
+    ShapeData {
+        path,
+        fill: filled
+            .then(|| style.fill_for_new_shape(bounds))
+            .flatten()
+            .map(|paint| buzz_scene::FillSpec {
+                paint,
+                rule: buzz_geom::FillMode::NonZero,
+                swatch: None,
+            }),
+        blend: buzz_scene::PaintBlend::Normal,
+        stroke: style
+            .stroke_for_new_shape()
+            .map(|(color, width, hairline)| buzz_scene::StrokeSpec {
+                paint: buzz_scene::Paint::Solid(color),
+                width,
+                hairline,
+                swatch: None,
+            }),
+    }
+}
+
+/// Does `shape` put any paint down? A stroke of zero width does not.
+fn shape_paints(shape: &ShapeData) -> bool {
+    shape.fill.is_some()
+        || shape
+            .stroke
+            .as_ref()
+            .is_some_and(|s| s.hairline || s.width > 0.0)
 }
 
 fn shape_label(tool: ToolId) -> &'static str {
@@ -4670,10 +4715,33 @@ mod tests {
             &ctx(&style),
         );
         m.pointer_move(Point::new(40.0, 30.0), Point::ORIGIN, Mods::default());
-        assert!(matches!(m.preview(&c), Preview::Shape(_)));
+        assert!(matches!(m.preview(&c), Preview::Artwork(_)));
 
         m.pointer_up(Point::new(40.0, 30.0), Point::ORIGIN, &c);
         assert_eq!(m.preview(&c), Preview::None);
+    }
+
+    #[test]
+    fn a_shape_previews_its_real_stroke_width_and_commits_it_unchanged() {
+        let mut style = DrawStyle::default();
+        style.stroke_enabled = true;
+        style.stroke_width = 12.0;
+        style.hairline = false;
+        let c = ctx(&style);
+        for tool in [ToolId::Rectangle, ToolId::Oval, ToolId::PolyStar, ToolId::Line] {
+            let mut m = ToolMachine::new(tool);
+            m.pointer_down(Point::new(0.0, 0.0), Point::ORIGIN, Mods::default(), &c);
+            m.pointer_move(Point::new(80.0, 60.0), Point::ORIGIN, Mods::default());
+            assert!(m.painting_preview(), "{tool:?}");
+            let Preview::Artwork(previewed) = m.preview(&c) else {
+                panic!("{tool:?} previewed only an outline");
+            };
+            assert_eq!(previewed[0].stroke.as_ref().map(|s| s.width), Some(12.0));
+            match m.pointer_up(Point::new(80.0, 60.0), Point::ORIGIN, &c) {
+                ToolAction::AddShape { shape, .. } => assert_eq!(shape, previewed[0], "{tool:?}"),
+                other => panic!("{tool:?}: {other:?}"),
+            }
+        }
     }
 
     #[test]

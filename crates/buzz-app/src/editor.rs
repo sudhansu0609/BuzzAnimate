@@ -2671,6 +2671,18 @@ impl Editor {
         if !self.machine.painting_preview() {
             return false;
         }
+        // A shape tool previews the shape it will lay down — unless that shape
+        // paints nothing, when its outline is drawn as chrome instead.
+        if matches!(
+            self.tool(),
+            ToolId::Rectangle | ToolId::Oval | ToolId::PolyStar | ToolId::Line | ToolId::Pen
+        ) {
+            let stroke = self.style.stroke_for_new_shape();
+            let strokes = stroke.is_some_and(|(_, width, hairline)| hairline || width > 0.0);
+            let fills = self.style.fill_enabled
+                && !matches!(self.tool(), ToolId::Line | ToolId::Pen);
+            return strokes || fills;
+        }
         // The pencil always previews its own ink.
         if self.tool() != ToolId::Brush {
             return true;

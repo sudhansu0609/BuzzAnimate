@@ -30086,9 +30086,9 @@ mod layer_rig_ui_tests {
     const LIMB: Color = Color::from_rgb8(0xC8, 0x8A, 0x5A);
 
     /// A chest, a left upper arm and a left forearm as bars on one layer, in
-    /// the Biped's slots.
+    /// the Rig panel's own pattern's slots.
     fn three_parts(app: &mut App) -> Vec<Option<buzz_scene::ObjectId>> {
-        let pattern = buzz_rig::RigPattern::biped();
+        let pattern = app.editor.rig_panel.pattern();
         let mut layer = None;
         app.editor.doc.edit("Layer", |scene| {
             layer = Some(scene.add_layer("Character", buzz_scene::LayerKind::Normal));

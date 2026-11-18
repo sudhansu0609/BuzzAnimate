@@ -230,7 +230,7 @@ impl Default for RigPanelState {
     fn default() -> Self {
         Self {
             new_pose_name: String::new(),
-            pattern: 0,
+            pattern: default_pattern(),
             slots: Vec::new(),
             armed: None,
             note: None,
@@ -249,6 +249,13 @@ impl Default for RigPanelState {
             new_part_parent: 0,
         }
     }
+}
+
+/// The pattern a fresh panel shows: **Biped Full**, the user's own characters'
+/// parts (Mishra's front rig) — the biped's eleven plus `leftPalm`/`rightPalm`
+/// and `leftFoot`/`rightFoot` — so hands and feet always have a slot.
+fn default_pattern() -> usize {
+    RigPattern::builtin().iter().position(|p| p.name == "Biped Full").unwrap_or(0)
 }
 
 impl RigPanelState {
@@ -1098,6 +1105,27 @@ fn auto_assign(pattern: &RigPattern, parts: &[LoosePart], state: &mut RigPanelSt
             chosen[slot] = Some(index);
         }
     }
+    // Last, the user's Ctrl+R reading of a name: `cloth` is the hips,
+    // `leftFootA` the left ankle, `frontTtrso1` the chest.
+    for (index, name) in names.iter().enumerate() {
+        if taken[index] {
+            continue;
+        }
+        let Some(stem) = buzz_rig::pattern::body_part(name) else {
+            continue;
+        };
+        let slot = pattern.slot_named(stem).or_else(|| match buzz_rig::pattern::name_side(name)? {
+            buzz_rig::Side::Left => pattern.slot_named(&format!("{stem} L")),
+            buzz_rig::Side::Right => pattern.slot_named(&format!("{stem} R")),
+            buzz_rig::Side::Either => None,
+        });
+        if let Some(slot) = slot
+            && chosen[slot].is_none()
+        {
+            taken[index] = true;
+            chosen[slot] = Some(index);
+        }
+    }
 
     let mut filled = 0;
     state.slots = chosen
@@ -1500,6 +1528,34 @@ mod tests {
         assert!((limits.min.to_degrees() - -90.0).abs() < 1e-9);
         assert!((limits.max.to_degrees() - 90.0).abs() < 1e-9);
         assert!(((-90.0f64).to_radians() - limits.min).abs() < 1e-9);
+    }
+
+    /// A fresh Rig panel's template is every body part of Mishra's front rig
+    /// (`mishraFront` in alaxmi1): Auto puts each of its layers in a slot of
+    /// its own, palms and feet included.
+    #[test]
+    fn a_fresh_rig_panel_has_a_slot_for_every_part_of_mishras_front_rig() {
+        let names = [
+            "head", "leftArm", "rightArm", "leftWrist", "leftpalm", "rightWrist", "rightPalm", "body", "cloth",
+            "rightThigh", "rightShin", "leftThigh", "leftShin", "rightFoot", "leftFoot",
+        ];
+        let parts: Vec<LoosePart> = names.iter().enumerate().map(|(i, n)| part(i as u64 + 1, n)).collect();
+        let profile = buzz_rig::pattern::NamingProfile::animate_convention();
+        let mut state = RigPanelState { profile: Some(profile), ..RigPanelState::default() };
+        let pattern = state.pattern();
+        assert_eq!(pattern.name, "Biped Full");
+        state.slots = vec![None; pattern.slots.len()];
+        auto_assign(&pattern, &parts, &mut state);
+        let at = |slot: &str| {
+            let id = state.slots[pattern.slot_named(slot).unwrap()].map(|o| o.0 as usize - 1);
+            id.map(|i| names[i])
+        };
+        assert_eq!(at("Wrist L"), Some("leftpalm"));
+        assert_eq!(at("Wrist R"), Some("rightPalm"));
+        assert_eq!(at("Ankle L"), Some("leftFoot"));
+        assert_eq!(at("Ankle R"), Some("rightFoot"));
+        assert_eq!(at("Hips"), Some("cloth"));
+        assert_eq!(state.slots.iter().flatten().count(), names.len(), "every part has a slot");
     }
 
     /// LR2: a fresh Rig panel builds a layer rig.

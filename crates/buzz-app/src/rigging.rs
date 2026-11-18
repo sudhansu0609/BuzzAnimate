@@ -569,6 +569,21 @@ pub fn part_at(scene: &Scene, frame: u32, at: Point) -> Option<buzz_ui::LoosePar
     })
 }
 
+/// Every loose part whose drawing's box holds `at`, front to back: what a
+/// slot's click chooses among when parts are stacked on one spot — an eye's
+/// mask, its eyeball and its white all lie over the same pixels.
+pub fn parts_under(scene: &Scene, frame: u32, at: Point) -> Vec<buzz_ui::LoosePart> {
+    loose_parts(scene, frame)
+        .into_iter()
+        .rev()
+        .filter(|part| {
+            scene
+                .find_object(part.object)
+                .is_some_and(|(_, object)| scene.resolved_bounds(object).contains(at))
+        })
+        .collect()
+}
+
 /// Build a skeleton from `pattern` and move the sorted drawings into it.
 ///
 /// `slots` says, for each slot of the pattern, which drawing was put in it.

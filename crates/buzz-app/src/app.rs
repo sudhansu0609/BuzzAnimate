@@ -8984,6 +8984,9 @@ impl App {
                 None => {}
             }
             self.rig_slots_path = Some(path);
+            if open_head {
+                self.lock_head_base();
+            }
         }
         // A slot's drawing on another keyframe of this timeline is still there
         // — and so is one on a timeline this one is open inside (the body's
@@ -9367,6 +9370,13 @@ impl App {
         let count = slots.iter().filter(|s| s.is_some()).count();
         let mut built = None;
 
+        if self.editor.rig_panel.kind == buzz_rig::RigKind::Layers && self.editing_a_head() {
+            self.editor.status = Some(format!(
+                "{count} head part{} tagged. Heads get no layer parenting, so no layer was changed.",
+                if count == 1 { "" } else { "s" }
+            ));
+            return;
+        }
         if self.editor.rig_panel.kind == buzz_rig::RigKind::Layers {
             // The same rigging that filling each slot already did (the parts
             // tagged so far are on their own layers, linked), run over every
@@ -9538,10 +9548,43 @@ impl App {
     /// its pivot goes where it overlaps the part it joins and its layer
     /// follows its parent part's —
     /// see `rigging::link_tagged_parts`.
+    /// Whether the timeline being edited is a head symbol (Rig Head's own
+    /// test, `rigging::head_symbol_for`).
+    fn editing_a_head(&self) -> bool {
+        let scene = self.editor.scene();
+        scene.editing_symbol().is_some_and(|s| crate::rigging::head_symbol_for(scene, s) == Some(s))
+    }
+
+    /// **A head's `base` layer is locked** (user 2026-11-18: "keep the base
+    /// always locked"): the face everything else is drawn over is never
+    /// picked up by a click meant for an eye. Nothing happens when it already is.
+    fn lock_head_base(&mut self) {
+        let base = self
+            .editor
+            .scene()
+            .layers()
+            .iter()
+            .find(|l| l.name.eq_ignore_ascii_case("base") && !l.locked)
+            .map(|l| l.id);
+        if let Some(base) = base {
+            self.editor.doc.edit("Lock base", |scene| {
+                scene.update_layer(base, |l| l.locked = true);
+            });
+        }
+    }
+
     fn name_tagged_layers(&mut self) {
         let slots = self.editor.rig_panel.slots.clone();
         let seen = std::mem::replace(&mut self.rig_slots_seen, slots.clone());
         if seen.len() != slots.len() {
+            return;
+        }
+        // **Inside a head, a tag is only a tag** (user 2026-11-18: "don't
+        // put layer parenting on any layer in the head symbol"): no layer is
+        // renamed, parented or has its pivot moved. Renaming was also what
+        // turned the eye's mask layer into a second `eyeWhite` when a click
+        // picked the wrong part of the eye.
+        if self.editing_a_head() {
             return;
         }
         if self.editor.rig_panel.kind == buzz_rig::RigKind::Layers {
@@ -9624,10 +9667,58 @@ impl App {
         // What a click there would select, exactly (through instances,
         // parenting and depth), when it is a loose part; else the topmost part
         // whose drawing's box holds the point.
+        //
+        // **Of parts stacked on one spot, the one this slot is for** (user
+        // 2026-11-18: "I am not able to tag the eyeMask, eyeWhite and eyeBall
+        // together"). Mask, eyeball and white lie over the same pixels, so the
+        // topmost alone was every click's answer: tagging the white took the
+        // mask out of its own slot. Among everything under the pointer, a
+        // part whose layer is named for the slot wins, a mask layer only for a
+        // mask slot, then one no other slot holds, then the topmost.
         let hit = self.editor.object_at(at, self.editor.pick_tolerance());
-        let picked = hit
-            .and_then(|id| rigging::loose_parts(self.editor.scene(), frame).into_iter().find(|p| p.object == id))
-            .or_else(|| rigging::part_at(self.editor.scene(), frame, at));
+        let picked = {
+            let scene = self.editor.scene();
+            let loose = rigging::loose_parts(scene, frame);
+            let mut under: Vec<buzz_ui::LoosePart> =
+                hit.and_then(|id| loose.iter().find(|p| p.object == id).cloned()).into_iter().collect();
+            for part in rigging::parts_under(scene, frame, at) {
+                if !under.iter().any(|p| p.object == part.object) {
+                    under.push(part);
+                }
+            }
+            let state = &self.editor.rig_panel;
+            let wanted = state
+                .pattern()
+                .slots
+                .get(slot)
+                .map(|s| buzz_ui::rig_panel::slot_label(state, &s.name))
+                .unwrap_or_default();
+            // A mask is only ever the mask: the eye's white, ball and mask
+            // share one spot, and the mask is on top of the other two.
+            let wants_mask = wanted.to_lowercase().contains("mask");
+            let score = |part: &buzz_ui::LoosePart| {
+                let layer = scene.layers().get(part.layer);
+                let named = layer.is_some_and(|l| l.name.eq_ignore_ascii_case(&wanted)) || part.name.eq_ignore_ascii_case(&wanted);
+                let mask = layer.is_some_and(|l| l.kind == buzz_scene::LayerKind::Mask);
+                let free = !state.slots.iter().enumerate().any(|(i, held)| i != slot && *held == Some(part.object));
+                i32::from(named) * 100
+                    + match (wants_mask, mask) {
+                        (true, true) => 50,
+                        (false, true) | (true, false) => -50,
+                        (false, false) => 0,
+                    }
+                    + i32::from(free) * 10
+            };
+            // The best score; of equals, the topmost.
+            let mut best: Option<(i32, usize)> = None;
+            for (index, part) in under.iter().enumerate() {
+                let s = score(part);
+                if best.is_none_or(|(b, _)| s > b) {
+                    best = Some((s, index));
+                }
+            }
+            best.map(|(_, i)| under[i].clone())
+        };
         match picked {
             Some(part) => {
                 let name = part.name.clone();
@@ -30522,6 +30613,60 @@ mod layer_rig_ui_tests {
         app.editor.set_pivot(buzz_geom::Point::new(250.0, 370.0));
         let _ = painted_text(&mut app);
         assert_eq!(app.editor.pivot(), Some(buzz_geom::Point::new(250.0, 370.0)));
+    }
+
+    /// **Inside a head a tag is only a tag** (user 2026-11-18: "I am not able
+    /// to tag the eyeMask, eyeWhite and eyeBall together ... don't put layer
+    /// parenting on any layer in the head symbol, keep the base always
+    /// locked"). Three clicks on the one spot where the eye's mask, ball and
+    /// white overlap fill their three slots; no layer is renamed or parented,
+    /// and the base is locked.
+    #[test]
+    fn the_eyes_stacked_parts_each_go_to_their_own_slot_and_nothing_is_parented() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let eye = buzz_geom::Rect::new(100.0, 100.0, 160.0, 140.0);
+        let mut ids = std::collections::HashMap::new();
+        let mut head = None;
+        app.editor.doc.edit("Head", |scene| {
+            let symbol = scene.add_symbol("mishraHead", buzz_scene::SymbolKind::Graphic, None);
+            scene.enter_symbol(symbol);
+            // Bottom first: base, white, ball (masked), mask, as in faceBAseFront1.
+            for (name, kind, rect) in [
+                ("base", buzz_scene::LayerKind::Normal, buzz_geom::Rect::new(0.0, 0.0, 300.0, 300.0)),
+                ("eyeWhite", buzz_scene::LayerKind::Normal, eye),
+                ("eyeBall", buzz_scene::LayerKind::Masked, eye.inset(-10.0)),
+                ("eyeMask", buzz_scene::LayerKind::Mask, eye),
+            ] {
+                let layer = scene.add_layer(name, kind);
+                ids.insert(name, scene.add_shape(layer, buzz_scene::ShapeData::filled(rect.to_path(1e-9), LIMB)).unwrap());
+            }
+            scene.exit_symbol();
+            head = Some(symbol);
+        });
+        app.editor.doc.edit_view(|scene| {
+            scene.enter_symbol(head.unwrap());
+        });
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        let _ = painted_text(&mut app);
+        let pattern = app.editor.rig_panel.pattern();
+        assert_eq!(pattern.name, "Head");
+        let layers_before: Vec<(String, Option<buzz_scene::LayerId>)> =
+            app.editor.scene().layers().iter().map(|l| (l.name.clone(), l.follows)).collect();
+        let projection = app.editor.edit_to_stage();
+        let screen = app.editor.camera.doc_to_screen(projection.map_point(eye.center()).unwrap());
+        for slot in ["eyeMask", "eyeWhite", "eyeBall"] {
+            let index = pattern.slot_named(slot).unwrap();
+            app.editor.rig_panel.armed = Some(index);
+            app.pick_part_for_slot(index, screen);
+            let _ = painted_text(&mut app);
+        }
+        for slot in ["eyeMask", "eyeWhite", "eyeBall"] {
+            assert_eq!(app.editor.rig_panel.slots[pattern.slot_named(slot).unwrap()], Some(ids[slot]), "{slot}");
+        }
+        let layers_after: Vec<(String, Option<buzz_scene::LayerId>)> =
+            app.editor.scene().layers().iter().map(|l| (l.name.clone(), l.follows)).collect();
+        assert_eq!(layers_after, layers_before, "no layer renamed or parented");
+        assert!(app.editor.scene().layers().iter().find(|l| l.name == "base").unwrap().locked, "the base is locked");
     }
 
     /// **Tagging a mouth leaves its swaps together** (user 2026-11-18,

@@ -621,17 +621,18 @@ impl RigPattern {
     /// **A head**, as the user's own are built (user 2026-11-18: "in the head
     /// symbol of Mishra, the layers which I have shall be the same rigs inside
     /// the head"): `faceBAseFront1`'s layers, each slot called exactly what
-    /// the layer is, so tagging one never renames it. The face is the root;
-    /// the brows, the eye, the lid and the mouth ride on it, and the eyeball
-    /// and the eye's mask on the eye white, so the iris stays inside the eye
-    /// when the white is moved.
+    /// the layer is. The face is the root; the brows, the eye, the lid and the
+    /// mouth hang off it, and the eyeball and the eye's mask off the eye white
+    /// — for a bone rig. Tagged in the Rig panel a head gets no layer
+    /// parenting at all (see `App::name_tagged_layers`).
     pub fn head() -> Self {
         const BASE: usize = 0;
         const EYE_WHITE: usize = 3;
         Self {
             name: "Head".into(),
             slots: vec![
-                slot("base", None, UP, 0.20, Side::Either, true, &["base", "face", "head", "skull"]),
+                // Not required: the user keeps `base` locked, out of reach of a click.
+                slot("base", None, UP, 0.20, Side::Either, false, &["base", "face", "head", "skull"]),
                 slot("leftEyebrow", Some(BASE), 0.0, 0.04, Side::Left, false, &["eyebrow", "brow"]),
                 slot("rightEyebrow", Some(BASE), 0.0, 0.04, Side::Right, false, &["eyebrow", "brow"]),
                 slot("eyeWhite", Some(BASE), 0.0, 0.04, Side::Either, false, &["eye white", "eye whites", "white", "whites", "sclera"]),

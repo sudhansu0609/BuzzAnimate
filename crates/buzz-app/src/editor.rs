@@ -302,6 +302,11 @@ pub struct Editor {
     /// the same for every symbol on the stage, all the way down — what each
     /// showed inside it then ([`StageLayers`] per symbol).
     pub stage_clip: Option<(u32, StageLayers, Vec<(buzz_scene::SymbolId, StageLayers)>)>,
+    /// **The camera Copy Stage took with it** (user 2026-11-18: "in the copy
+    /// and paste stage option also include the camera position and zoom"):
+    /// where it stood, how far it was zoomed and turned on the copied frame
+    /// of the main timeline. `None` inside a symbol, or with no camera.
+    pub stage_clip_camera: Option<buzz_scene::CameraKey>,
     /// **Bring Character Here** is open: the shell draws its list, since
     /// the other open files are the shell's (see `crate::bring`).
     pub bring_open: bool,
@@ -875,6 +880,7 @@ impl Editor {
             frame_clipboard: None,
             motion_clip: None,
             stage_clip: None,
+            stage_clip_camera: None,
             bring_open: false,
             text_next: buzz_scene::TextData::new("Text", 48.0, None),
             text_to_focus: None,
@@ -13401,12 +13407,20 @@ impl Editor {
         let drawn = clip.iter().filter(|(_, objects, _)| !objects.is_empty()).count();
         let mut inside = Vec::new();
         capture_inside(scene, scene.layers(), &clip, frame, &mut inside, &mut std::collections::HashSet::new());
-        self.status = Some(if drawn == 0 {
+        // The camera is keyed on the main timeline's frames, so it comes
+        // along only from there.
+        let camera = if scene.edit_path().is_empty() { scene.camera().state_at(frame) } else { None };
+        self.status = Some(if drawn == 0 && camera.is_none() {
             format!("Copy Stage: nothing on the stage at frame {}", frame + 1)
         } else {
-            format!("Copied the stage at frame {} ({drawn} layers): go to another frame and Paste Stage", frame + 1)
+            format!(
+                "Copied the stage at frame {} ({drawn} layers{}): go to another frame and Paste Stage",
+                frame + 1,
+                if camera.is_some() { ", and the camera" } else { "" }
+            )
         });
-        self.stage_clip = (drawn > 0).then_some((frame, clip, inside));
+        self.stage_clip = (drawn > 0 || camera.is_some()).then_some((frame, clip, inside));
+        self.stage_clip_camera = camera.filter(|_| self.stage_clip.is_some());
     }
 
     /// The layers of the selection when **every** selected object is a part of
@@ -13604,11 +13618,13 @@ impl Editor {
             None => self.copy_stage(),
             Some(from) if from == self.current_frame => {
                 self.stage_clip = None;
+                self.stage_clip_camera = None;
                 self.status = Some(format!("Copy / Paste Stage: let go of the stage copied at frame {}", from + 1));
             }
             Some(from) => {
                 self.paste_stage();
                 self.stage_clip = None;
+                self.stage_clip_camera = None;
                 if let Some(status) = &mut self.status {
                     *status = status.replacen("Pasted the stage", &format!("Pasted the stage from frame {}", from + 1), 1);
                 }
@@ -13632,7 +13648,18 @@ impl Editor {
         let mut layers = 0usize;
         let mut renumbered = 0usize;
         let mut inside_pasted = 0usize;
+        // The camera: keyed at `at` where it stood when copied — on the main
+        // timeline only, and never on a locked camera.
+        let scene = self.doc.scene();
+        let camera = self.stage_clip_camera.filter(|_| scene.edit_path().is_empty());
+        let camera_locked = camera.is_some() && scene.camera().locked;
+        let camera = camera.filter(|_| !camera_locked);
         self.doc.edit("Paste Stage", |scene| {
+            if let Some(key) = camera {
+                let track = scene.camera_mut();
+                track.enabled = true;
+                track.set_key(buzz_scene::CameraKey { frame: at, ..key });
+            }
             let mut inside: Vec<buzz_scene::SymbolId> = Vec::new();
             for (layer, objects, hold) in &clip {
                 if scene.layers().get(*layer).is_none() {
@@ -13692,9 +13719,16 @@ impl Editor {
         self.doc.end_gesture();
         self.selection.prune(self.doc.scene());
         self.status = Some(format!(
-            "Pasted the stage at frame {} on {layers} layers{}{}",
+            "Pasted the stage at frame {} on {layers} layers{}{}{}",
             at + 1,
             if inside_pasted > 0 { format!(", and inside {inside_pasted} symbols") } else { String::new() },
+            if camera.is_some() {
+                ", with the camera's position and zoom"
+            } else if camera_locked {
+                "; the camera is locked, so it was left as it was"
+            } else {
+                ""
+            },
             if renumbered > 0 { format!("; {renumbered} symbols set to frame {}", at + 1) } else { String::new() }
         ));
     }
@@ -31239,6 +31273,39 @@ mod tests {
             layer.frames.keyframe_at(0).is_some_and(|k| k.objects.iter().any(|o| o.id == arm && (o.transform.as_coeffs().iter().zip(Affine::IDENTITY.as_coeffs()).all(|(a, b)| (a - b).abs() < 1e-9)))),
             "the pose before is untouched"
         );
+    }
+
+    /// **The camera comes with the stage** (user 2026-11-18): copied on frame
+    /// 11 where the camera stands left of centre at 2×, pasted on frame 41,
+    /// the camera there is keyed at the same place and zoom, and the keys
+    /// either side are left alone. One undo takes it back.
+    #[test]
+    fn copy_paste_stage_carries_the_camera_position_and_zoom() {
+        let mut e = Editor::default();
+        let layer = e.doc_add_layer("Layer", LayerKind::Normal);
+        e.doc.edit("Draw", |scene| {
+            scene.add_shape(layer, buzz_scene::ShapeData::filled(Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9), Color::BLACK));
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(59);
+            });
+            let track = scene.camera_mut();
+            track.enabled = true;
+            track.set_key(buzz_scene::CameraKey { zoom: 2.0, ..buzz_scene::CameraKey::new(0, Point::new(300.0, 200.0)) });
+            track.set_key(buzz_scene::CameraKey { zoom: 1.0, ..buzz_scene::CameraKey::new(60, Point::new(960.0, 540.0)) });
+        });
+        let copied = e.doc.scene().camera().state_at(10u32).unwrap();
+        e.current_frame = 10;
+        e.run(Command::CopyPasteStage);
+        assert!(e.stage_clip_camera.is_some(), "the camera is copied");
+        e.current_frame = 40;
+        e.run(Command::CopyPasteStage);
+        let track = e.doc.scene().camera();
+        let key = track.keys().iter().find(|k| k.frame == 40).copied().expect("a camera key on frame 41");
+        assert!((key.center - copied.center).hypot() < 1e-9 && (key.zoom - copied.zoom).abs() < 1e-9, "{key:?} vs {copied:?}");
+        assert_eq!(track.keys().iter().map(|k| k.frame).collect::<Vec<_>>(), [0, 40, 60]);
+        assert!(e.status.as_deref().is_some_and(|s| s.contains("camera")), "{:?}", e.status);
+        e.run(Command::Undo);
+        assert_eq!(e.doc.scene().camera().keys().iter().map(|k| k.frame).collect::<Vec<_>>(), [0, 60]);
     }
 
     /// **Copy Stage / Paste Stage**: the stage at one frame, pasted on another

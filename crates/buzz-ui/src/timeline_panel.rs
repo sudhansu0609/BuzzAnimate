@@ -2424,7 +2424,7 @@ fn transport_controls(
         // **Copy / Paste Stage**: one button, two presses — here, then on
         // the frame to paste at.
         let (label, tip) = match state.stage_copied {
-            None => ("Copy Stage".to_string(), "Copy everything on the stage at this frame, every layer. Then go to another frame and press again to paste it there.".to_string()),
+            None => ("Copy Stage".to_string(), "Copy everything on the stage at this frame, every layer, and the camera's position and zoom. Then go to another frame and press again to paste it there.".to_string()),
             Some(from) => (
                 format!("Paste Stage \u{00b7} {}", from + 1),
                 format!("Paste the stage copied at frame {} here, every symbol set to this frame's number. Press on frame {} to let go of it.", from + 1, from + 1),

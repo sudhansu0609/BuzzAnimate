@@ -1370,6 +1370,10 @@ pub struct App {
     move_stage: Option<MoveStageFrames>,
     /// Mark Talk Range…, while it is open.
     talk_range_dialog: Option<TalkRangeDialog>,
+    /// **What a shelf command said with `alert`**, shown as Animate shows it:
+    /// a window with OK. A command run from its key that only wrote to the
+    /// status line looked like it did nothing. `(command, text)`.
+    script_alert: Option<(String, String)>,
     /// Lip Sync All Characters, heard and waiting on the Who's who window.
     who_is_who: Option<WhoIsWho>,
     /// The export presets, built-in and the user's own, for the Export dialog.
@@ -1887,6 +1891,7 @@ impl App {
             symbol_dialog: None,
             move_stage: None,
             talk_range_dialog: None,
+            script_alert: None,
             who_is_who: None,
             presets: crate::presets::PresetLibrary::load(),
             lights: fresh_light_cache(),
@@ -4184,14 +4189,20 @@ impl App {
             }
             return;
         }
+        // A frame clicked in the timeline selects its artwork too; the row is
+        // already where it was clicked.
+        if selection.timeline().is_some() || camera_selected {
+            return;
+        }
+        // **Its layer, brought to the middle of the timeline** — with any
+        // tool that picks on the stage.
+        follow.reveal = follow.last.first().and_then(|id| self.editor.doc.scene().find_object(*id)).map(|(layer, _)| layer);
         // Picked with the Selection tools only: the Bone tool, Free
         // Transform and the rest keep their own options (the Tool tab) in
         // front, which is what they are being used for.
-        if !picking || selection.timeline().is_some() || camera_selected {
+        if !picking {
             return;
         }
-        // Its layer, scrolled into view in the timeline.
-        follow.reveal = follow.last.first().and_then(|id| self.editor.doc.scene().find_object(*id)).map(|(layer, _)| layer);
         // Closed altogether: put it back where the default arrangement has
         // it, so picking a symbol always shows its Looping, First frame and
         // Frame Picker without a trip to the Window menu.
@@ -4845,6 +4856,7 @@ impl App {
         self.move_stage_frames_dialog(&ctx);
         self.bring_character_dialog(&ctx);
         self.talk_range_dialog_ui(&ctx);
+        self.script_alert_ui(&ctx);
         self.cast_windows_ui(&ctx);
         self.who_is_who_dialog(&ctx);
         self.export_dialog(&ctx);
@@ -5415,6 +5427,13 @@ impl App {
     /// does. The wardrobe and the add are the panel's own.
     fn apply_cast_action(&mut self, action: buzz_ui::CastAction) {
         use buzz_ui::CastAction::*;
+        // A character whose main pose only wraps its drawing is unwrapped
+        // first, so Update never writes the one-layer wrapper back to the Cast.
+        if !matches!(action, Open(_)) && crate::cast_combine::has_wrapped_characters(self.editor.doc.scene()) {
+            self.editor.doc.edit("Unwrap Characters", |scene| {
+                crate::cast_combine::unwrap_characters(scene);
+            });
+        }
         match action {
             // The panel already recorded which character is open in its own
             // state; the sheet loads on the next frame.
@@ -7735,6 +7754,12 @@ impl App {
                     range_anchor: self.editor.selection.range_anchor(),
                     timeline_selection: self.editor.selection.timeline().cloned(),
                     camera_selected: self.editor.camera_selected,
+                    master_audio_layer: self
+                        .editor
+                        .doc
+                        .master_audio()
+                        .filter(|(key, _)| self.editor.doc.scene_key(self.editor.doc.active_scene()) == Some(*key))
+                        .map(|(_, layer)| layer),
                     reveal_layer: self.panel_follow.reveal.take(),
                     selected_light: self.editor.light_panel.selected,
                     light_row_selected: self.editor.light_row_selected,
@@ -8392,6 +8417,9 @@ impl App {
         if let Some(alert) = outcome.alerts.first() {
             status.push_str(&format!(" \u{2014} {alert}"));
         }
+        if !outcome.alerts.is_empty() {
+            self.script_alert = Some((name.to_string(), outcome.alerts.join("\n\n")));
+        }
         if let Some(error) = &outcome.error {
             status = format!("{name} stopped: {}", error.lines().next().unwrap_or(error));
         }
@@ -8455,6 +8483,7 @@ impl App {
             return;
         };
         let end = self.editor.doc.scene().frame_count().max(1);
+        let playhead = self.editor.current_frame + 1;
         let mut open = true;
         let (mut mark, mut cancel) = (false, false);
         egui::Window::new("Mark Talk Range")
@@ -8464,12 +8493,21 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 ui.label("The frames a talking command (Shift+A) runs over, and who talks in them.");
-                egui::Grid::new("talk-range-grid").num_columns(2).show(ui, |ui| {
-                    ui.label("From frame");
+                // **Start and end, each its own**: typed, dragged, or taken
+                // from the playhead — move the playhead on the timeline with
+                // this open and press the button beside the end it marks.
+                egui::Grid::new("talk-range-grid").num_columns(3).show(ui, |ui| {
+                    ui.label("Start frame");
                     ui.add(egui::DragValue::new(&mut state.first).range(1..=end));
+                    if ui.small_button("Playhead").on_hover_text("Start the range on the frame the playhead is on").clicked() {
+                        state.first = playhead;
+                    }
                     ui.end_row();
-                    ui.label("To frame");
-                    ui.add(egui::DragValue::new(&mut state.last).range(state.first..=end.max(state.first)));
+                    ui.label("End frame");
+                    ui.add(egui::DragValue::new(&mut state.last).range(1..=end));
+                    if ui.small_button("Playhead").on_hover_text("End the range on the frame the playhead is on").clicked() {
+                        state.last = playhead;
+                    }
                     ui.end_row();
                 });
                 ui.add_space(4.0);
@@ -8496,10 +8534,36 @@ impl App {
             });
         if mark {
             let who: Vec<String> = state.who.into_iter().filter(|(_, on)| *on).map(|(name, _)| name).collect();
-            let first = state.first.max(1) - 1;
-            self.editor.mark_talk_range(first, state.last.max(state.first).max(1) - 1, who);
+            // Either way round: the earlier frame starts it.
+            self.editor.mark_talk_range(state.first.max(1) - 1, state.last.max(1) - 1, who);
         } else if open && !cancel {
             self.talk_range_dialog = Some(state);
+        }
+    }
+
+    /// A shelf command's `alert`, until OK.
+    fn script_alert_ui(&mut self, ctx: &egui::Context) {
+        let Some((name, text)) = self.script_alert.as_ref() else {
+            return;
+        };
+        let mut open = true;
+        let mut ok = false;
+        egui::Window::new(name.as_str())
+            .id(egui::Id::new("script-alert"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(text.as_str());
+                ui.add_space(6.0);
+                if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)) {
+                    ok = true;
+                }
+            });
+        if ok || !open {
+            self.script_alert = None;
         }
     }
 
@@ -10002,6 +10066,49 @@ impl App {
         }
         if let Some((id, above)) = response.place_light {
             self.editor.place_light(id, above);
+        }
+        // A light's row has a layer's switches and menu.
+        if let Some((id, icon)) = response.toggle_light {
+            let label = match icon {
+                buzz_ui::panels::LayerIcon::Lock => "Lock Light",
+                _ => "Show/Hide Light",
+            };
+            self.editor.doc.edit(label, |scene| {
+                if let Some(light) = scene.lights_mut().get_mut(id) {
+                    match icon {
+                        buzz_ui::panels::LayerIcon::Lock => light.locked = !light.locked,
+                        _ => light.enabled = !light.enabled,
+                    }
+                }
+            });
+        }
+        if let Some((id, name)) = response.rename_light {
+            self.editor.doc.edit("Rename Light", |scene| {
+                if let Some(light) = scene.lights_mut().get_mut(id) {
+                    light.name = name;
+                }
+            });
+        }
+        if let Some(id) = response.duplicate_light
+            && let Some(source) = self.editor.doc.scene().lights().get(id).cloned()
+        {
+            let mut copy_id = None;
+            self.editor.doc.edit("Duplicate Light", |scene| {
+                let new = scene.add_light(source.kind.clone());
+                if let Some(light) = scene.lights_mut().get_mut(new) {
+                    *light = buzz_scene::Light { id: new, name: format!("{} copy", source.name), ..source };
+                }
+                copy_id = Some(new);
+            });
+            self.editor.light_panel.selected = copy_id;
+        }
+        if let Some(id) = response.delete_light {
+            self.editor.doc.edit("Delete Light", |scene| {
+                scene.lights_mut().remove(id);
+            });
+            if self.editor.light_panel.selected == Some(id) {
+                self.editor.light_panel.selected = None;
+            }
         }
         if let Some(action) = response.action {
             commands.push(match action {
@@ -12054,6 +12161,18 @@ impl App {
                     let layers_before: std::collections::HashSet<buzz_scene::LayerId> =
                         scene.layers().iter().map(|l| l.id).collect();
                     outcome = Some(library.place_at_frame(&asset, scene, frame));
+                    // A character placed on frame N starts on its own frame N.
+                    if matches!(outcome, Some(Ok(_))) {
+                        let arrived: Vec<buzz_scene::ObjectId> = scene
+                            .layers()
+                            .iter()
+                            .flat_map(|l| l.objects_at(frame).iter().map(|o| o.id))
+                            .filter(|id| !before.contains(id))
+                            .collect();
+                        for id in arrived {
+                            crate::editor::start_at_playhead(scene, frame, id);
+                        }
+                    }
                     // A Cast character remembers its asset (CAST_POSES_PLAN C2 e2), so
                     // "Save changes to <name>" can write the edited copy back.
                     if matches!(outcome, Some(Ok(_))) && is_cast(&asset.folder) {

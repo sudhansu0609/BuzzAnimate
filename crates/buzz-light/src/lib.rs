@@ -443,6 +443,10 @@ pub struct Light {
     /// as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub above: Option<u64>,
+    /// **Locked on its timeline row**, as a layer is: the stage will not
+    /// pick up its handles. Its settings still change from the Lights panel.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
 }
 
 /// The serde default for [`Light::glow`]: a lamp in a file written before the
@@ -540,6 +544,7 @@ impl Light {
             storm: 0.0,
             track: None,
             above: None,
+            locked: false,
         };
 
         // **A gloom reads every one of these backwards**, so it cannot take the

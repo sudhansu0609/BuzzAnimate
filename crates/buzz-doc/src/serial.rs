@@ -443,6 +443,10 @@ pub struct LightDto {
     /// stack, which lights the whole picture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub above: Option<u64>,
+    /// Locked on its timeline row. Absent in older files and on every
+    /// unlocked light.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
     /// Sun: the compass bearing and how high it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azimuth: Option<f64>,
@@ -3089,6 +3093,7 @@ impl DocumentDto {
                             glint: light.glint,
                             storm: light.storm,
                             above: light.above,
+                            locked: light.locked,
                             azimuth: None,
                             elevation: None,
                             horizon: None,
@@ -3389,6 +3394,7 @@ impl DocumentDto {
                     glint: dto.glint,
                     storm: dto.storm,
                     above: dto.above,
+                    locked: dto.locked,
                     track: dto
                         .track
                         .as_ref()

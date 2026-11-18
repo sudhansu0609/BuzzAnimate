@@ -43,11 +43,11 @@ const PICTURE_THUMB: usize = 64;
 /// Edge of the big picture shown while a thumbnail is hovered, in points: big
 /// enough to tell two poses of a character apart, small enough to sit beside
 /// the Library without covering the stage.
-pub const PREVIEW: f32 = 160.0;
+pub const PREVIEW: f32 = 320.0;
 
 /// Longest side of a bitmap's hover preview texture, in pixels (2x
 /// [`PREVIEW`]).
-const PICTURE_PREVIEW: usize = 320;
+const PICTURE_PREVIEW: usize = 640;
 
 /// Which picture of a symbol a [`ThumbnailSource`] is asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

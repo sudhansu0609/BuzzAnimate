@@ -6063,6 +6063,20 @@ impl Editor {
                 }
             }
             Delete => {
+                // **A lamp's row selected: Delete deletes the lamp**, as it
+                // deletes a layer's artwork when a layer's row is picked.
+                if self.light_row_selected
+                    && let Some(id) = self.light_panel.selected
+                    && self.doc.scene().lights().get(id).is_some()
+                {
+                    self.doc.edit("Delete Light", |scene| {
+                        scene.lights_mut().remove(id);
+                    });
+                    self.light_panel.selected = None;
+                    self.light_row_selected = false;
+                    self.light_frames = None;
+                    return;
+                }
                 // With anchors selected under Subselection, Delete takes those
                 // out of the path rather than the whole object.
                 if !self.delete_selected_anchors() {
@@ -10169,6 +10183,9 @@ impl Editor {
         let mut placed = None;
         self.doc.edit("Place Instance", |scene| {
             placed = scene.add_instance_at(layer, frame, symbol, Affine::translate((at.x, at.y)));
+            if let Some(id) = placed {
+                start_at_playhead(scene, frame, id);
+            }
         });
         match placed {
             Some(id) => {
@@ -12688,6 +12705,34 @@ impl Editor {
 
     /// Resolve frame commands through the explicit timeline selection.
     fn timeline_targets(&mut self) -> Vec<(LayerId, u32)> {
+        let targets = self.picked_timeline_cells();
+        // **A puppet is one row standing for its parts**: a frame command on
+        // it — Clear Keyframe, Insert Keyframe, a tween — acts on every part
+        // layer inside, at the same frames. On the folder itself it had
+        // nothing to act on, so it did nothing.
+        let scene = self.doc.scene();
+        let mut out = Vec::with_capacity(targets.len());
+        for (layer, frame) in targets {
+            match scene.layers().get(layer) {
+                Some(l) if l.puppet && l.kind == LayerKind::Folder => {
+                    out.extend(
+                        scene
+                            .layers()
+                            .descendants_of(layer)
+                            .into_iter()
+                            .filter(|id| scene.layers().get(*id).is_some_and(|d| d.kind.holds_artwork()))
+                            .map(|id| (id, frame)),
+                    );
+                }
+                _ => out.push((layer, frame)),
+            }
+        }
+        out
+    }
+
+    /// The timeline cells picked, as rows and frames: the frame selection,
+    /// else the playhead on the selected layers, else on the active layer.
+    fn picked_timeline_cells(&mut self) -> Vec<(LayerId, u32)> {
         if let Some(selection) = self.selection.timeline() {
             return selection
                 .layers
@@ -20221,6 +20266,30 @@ fn resolve_auto_mode(w: u32, h: u32, pixels: &[u8], options: buzz_scene::TraceOp
     }
 }
 
+
+/// **A character placed on frame N starts on its own frame N** — Properties'
+/// First frame set to the playhead, as the F key's script does — so its
+/// lip sync and animation line up with the shot from the moment it lands.
+/// Changed by hand afterwards as ever. Only a Graphic long enough to have
+/// that frame; a short loop (a flame) keeps starting on its first.
+pub(crate) fn start_at_playhead(scene: &mut buzz_scene::Scene, frame: u32, id: ObjectId) {
+    let Some(symbol) = scene
+        .find_object_at(frame, id)
+        .and_then(|(_, o)| o.instance().map(|i| i.symbol))
+        .and_then(|s| scene.library().get(s))
+    else {
+        return;
+    };
+    if symbol.kind != buzz_scene::SymbolKind::Graphic || frame == 0 || frame >= symbol.length() {
+        return;
+    }
+    scene.update_object_at(frame, id, |o| {
+        if let buzz_scene::ObjectKind::Instance(i) = &mut o.kind {
+            i.first_frame = frame;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -21780,6 +21849,95 @@ mod tests {
     /// **Several frames picked on a light's row**, as on a layer: F6 keys
     /// each, Shift+F6 clears every key among them, Shift+F5 takes them out
     /// and the later keys close up, a tween covers every span they touch.
+    /// A long character placed on frame 30 starts on its own frame 30; a
+    /// short loop placed there keeps starting on its first.
+    #[test]
+    fn a_placed_character_starts_on_the_playhead_frame() {
+        let mut e = editor();
+        let (mut long, mut short) = (buzz_scene::SymbolId(0), buzz_scene::SymbolId(0));
+        e.doc.edit("Symbols", |s| {
+            s.set_frame_count(100);
+            long = s.add_symbol("Mishra", buzz_scene::SymbolKind::Graphic, None);
+            short = s.add_symbol("Flame", buzz_scene::SymbolKind::Graphic, None);
+            for (id, len) in [(long, 80), (short, 10)] {
+                if let Some(layers) = s.library_mut().layers_mut(id) {
+                    let first = layers.iter().next().map(|l| l.id).unwrap();
+                    layers.update(first, |l| {
+                        l.frames.insert_frame(len - 1);
+                    });
+                }
+            }
+        });
+        assert_eq!(e.scene().library().get(long).unwrap().length(), 80);
+        e.set_frame(30);
+        let first = |e: &Editor| {
+            let id = e.selection.ids()[0];
+            e.scene().find_object_at(30, id).and_then(|(_, o)| o.instance().map(|i| i.first_frame))
+        };
+        e.place_symbol(long, Point::new(10.0, 10.0));
+        assert_eq!(first(&e), Some(30));
+        e.place_symbol(short, Point::new(10.0, 10.0));
+        assert_eq!(first(&e), Some(0));
+    }
+
+    /// **A puppet's one row takes the frame commands for its parts.**
+    #[test]
+    fn frame_commands_on_a_puppet_row_reach_its_parts() {
+        let mut e = editor();
+        let (mut folder, mut parts) = (LayerId(0), Vec::new());
+        e.doc.edit("Puppet", |s| {
+            folder = s.add_stage_layer("Puppet", LayerKind::Folder);
+            for name in ["Arm", "Head"] {
+                let id = s.add_stage_layer(name, LayerKind::Normal);
+                let at = s.layers().index_of(folder).unwrap() + 1;
+                s.move_layer_to(id, at, Some(folder));
+                s.update_layer(id, |l| {
+                    l.frames.insert_frame(9);
+                    l.frames.insert_keyframe(5);
+                });
+                parts.push(id);
+            }
+            s.update_layer(folder, |l| {
+                l.puppet = true;
+                l.collapsed = true;
+            });
+        });
+        let keyed = |e: &Editor| parts.iter().all(|id| e.scene().layers().get(*id).unwrap().frames.keyframe_start(5) == Some(5));
+        assert!(keyed(&e));
+        e.selection.set_active_layer(Some(folder));
+        e.set_frame(5);
+        e.run(Command::ClearKeyframe);
+        assert!(!keyed(&e), "Clear Keyframe on the puppet cleared its parts' key: {:?}", e.status);
+        e.run(Command::InsertKeyframe);
+        assert!(keyed(&e), "and Insert Keyframe keys them again: {:?}", e.status);
+    }
+
+    /// **A lamp's row is a layer's**: its eye hides it on every frame, even
+    /// keyed, and Delete with its row picked deletes it.
+    #[test]
+    fn a_hidden_keyed_lamp_is_off_and_delete_removes_it() {
+        let mut e = editor();
+        let mut id = None;
+        e.doc.edit("Light", |scene| id = Some(scene.add_light(buzz_scene::LightKind::lamp(Point::new(50.0, 50.0)))));
+        let id = id.unwrap();
+        e.light_panel.selected = Some(id);
+        e.light_row_selected = true;
+        e.light_frames = Some((4, 4));
+        e.set_frame(4);
+        e.run(Command::InsertKeyframe);
+        let lit = |e: &Editor| {
+            let l = e.scene().lights().get(id).unwrap();
+            l.track.as_ref().unwrap().state_at(4, l).enabled
+        };
+        assert!(lit(&e));
+        e.doc.edit("Hide", |s| s.lights_mut().get_mut(id).unwrap().enabled = false);
+        assert!(!lit(&e), "hidden from its row, a keyed lamp is off");
+
+        e.light_frames = None;
+        e.run(Command::Delete);
+        assert!(e.scene().lights().get(id).is_none(), "Delete deleted the lamp");
+    }
+
     #[test]
     fn a_light_rows_frames_are_picked_together() {
         let mut e = editor();

@@ -69,6 +69,15 @@ pub struct TimelineResponse {
     /// A light's row was dragged to a new place in the layer stack: directly
     /// above this layer, or (`None`) at the top. See `Scene::place_light`.
     pub place_light: Option<(LightId, Option<LayerId>)>,
+    /// A light row's eye (switch it on or off) or padlock was clicked, or the
+    /// same picked from its menu — a layer's switches, for a light.
+    pub toggle_light: Option<(LightId, crate::panels::LayerIcon)>,
+    /// A light was renamed on its row.
+    pub rename_light: Option<(LightId, String)>,
+    /// Duplicate Light, from its row's menu.
+    pub duplicate_light: Option<LightId>,
+    /// Delete Light, from its row's menu.
+    pub delete_light: Option<LightId>,
     /// The parenting view was switched on or off.
     pub toggle_parenting: bool,
     /// The depth view was switched on or off.
@@ -794,6 +803,9 @@ pub struct TimelineState {
     /// The camera row is the selected one, so the camera is what the Camera
     /// menu's keyframe commands act on.
     pub camera_selected: bool,
+    /// The layer carrying the film's master audio, on this timeline: its row
+    /// is **pinned right under the Camera's**, wherever the layer sits.
+    pub master_audio_layer: Option<LayerId>,
     /// **Scroll this layer's row into view**, once: set for the frame after
     /// an object is picked on the stage, so its layer can be found. A row in
     /// a collapsed folder (or filtered out) shows its nearest visible folder
@@ -1416,6 +1428,15 @@ pub fn timeline_panel_with_tools_slot(
             if shows_camera_row(scene) {
                 camera_row(ui, scene, columns, state, &mut response);
             }
+            // The master audio's row, fixed under the Camera's on the
+            // document's own timeline, and not drawn again in its place.
+            let master = state
+                .master_audio_layer
+                .filter(|_| scene.edit_path().is_empty())
+                .filter(|id| scene.layers().get(*id).is_some());
+            if let Some(layer) = master.and_then(|id| scene.layers().get(id)) {
+                layer_row(ui, scene, layer, columns, state, &mut response);
+            }
 
             // A channel per light that is already keyed, plus the one currently
             // selected so it can be keyed — on the document timeline only, since
@@ -1472,18 +1493,21 @@ pub fn timeline_panel_with_tools_slot(
                         light_row(ui, scene, light, columns, state, &mut response);
                     }
                 }
+                if master == Some(id) {
+                    continue;
+                }
                 let Some(layer) = scene.layers().get(id) else {
                     continue;
                 };
                 let top = ui.cursor().min.y;
                 layer_row(ui, scene, layer, columns, state, &mut response);
                 if reveal == Some(id) {
-                    // Up or down only: the frame the grid shows stays.
+                    // **Brought to the middle**, on screen already or not, so
+                    // the picked object's row is always in the same place to
+                    // look. Up or down only: the frame the grid shows stays.
                     let clip = ui.clip_rect();
                     let row = egui::Rect::from_x_y_ranges(clip.x_range(), top..=ui.cursor().min.y);
-                    if row.top() < clip.top() || row.bottom() > clip.bottom() {
-                        ui.scroll_to_rect(row, Some(egui::Align::Center));
-                    }
+                    ui.scroll_to_rect(row, Some(egui::Align::Center));
                 }
             }
 
@@ -3432,13 +3456,54 @@ fn light_row(
         let d = egui::vec2(a.cos(), a.sin());
         names.line_segment([sun + d * 4.0, sun + d * 5.5], Stroke::new(1.0, ink));
     }
-    names.text(
-        egui::pos2(name_row.min.x + 18.0, name_row.center().y),
-        Align2::LEFT_CENTER,
-        &light.name,
-        FontId::proportional(11.0),
-        Palette::text(),
-    );
+    // **Named, switched and renamed as a layer is.** The name dims while
+    // the light is off, as a hidden layer's does; double-click renames it.
+    let rename_key = egui::Id::new("timeline-light-rename");
+    let rename_id = LayerId(light.id.0);
+    let name_rect = name_area(name_row).intersect(name_row);
+    let text_x = name_row.min.x + 18.0;
+    let renaming = layer_rename_in(ui.ctx(), rename_key).is_some_and(|(id, ..)| id == rename_id);
+    if renaming {
+        let field = egui::Rect::from_min_max(egui::pos2(text_x, name_rect.min.y + 1.0), egui::pos2(name_rect.max.x, name_rect.max.y - 1.0));
+        if let Some(name) = layer_rename_field(ui, rename_key, rename_id, &light.name, |ui, edit| {
+            ui.put(field, edit.font(FontId::proportional(11.0)).margin(egui::vec2(2.0, 0.0)))
+        }) {
+            out.rename_light = Some((light.id, name));
+        }
+    } else {
+        names.with_clip_rect(name_rect).text(
+            egui::pos2(text_x, name_row.center().y),
+            Align2::LEFT_CENTER,
+            &light.name,
+            FontId::proportional(11.0),
+            if light.enabled { Palette::text() } else { Palette::text_dim() },
+        );
+    }
+    let hover = ui.ctx().input(|i| i.pointer.hover_pos());
+    let switches = switch_columns(name_row);
+    let (eye, lock) = (switches[0], switches[1]);
+    let switch_ink = crate::panels::from_egui(Palette::text());
+    for (column, icon, on) in [
+        (eye, crate::panels::LayerIcon::Eye, light.enabled),
+        (lock, crate::panels::LayerIcon::Lock, light.locked),
+    ] {
+        let hovered = hover.is_some_and(|p| column.contains(p) && response.hovered());
+        crate::panels::paint_layer_icon(&names, column, icon, on, switch_ink, hovered);
+    }
+    let switch_hit = |pos: egui::Pos2| {
+        if eye.contains(pos) {
+            Some(crate::panels::LayerIcon::Eye)
+        } else if lock.contains(pos) {
+            Some(crate::panels::LayerIcon::Lock)
+        } else {
+            None
+        }
+    };
+    if response.double_clicked()
+        && response.interact_pointer_pos().is_some_and(|p| name_rect.contains(p) && switch_hit(p).is_none())
+    {
+        start_layer_rename_in(ui.ctx(), rename_key, rename_id, &light.name);
+    }
 
     // **Dragged by its name, like a layer**, to sit between any two layers.
     if response.drag_started()
@@ -3483,7 +3548,14 @@ fn light_row(
     if response.drag_stopped() {
         ui.ctx().data_mut(|d| d.remove::<u32>(anchor_id));
     }
-    if response.clicked() {
+    let switched = response
+        .clicked()
+        .then(|| ui.ctx().input(|i| i.pointer.interact_pos()).and_then(switch_hit))
+        .flatten();
+    if let Some(icon) = switched {
+        // A switch first: clicking the eye does not also select the light.
+        out.toggle_light = Some((light.id, icon));
+    } else if response.clicked() {
         out.select_light = Some(light.id);
         if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
             && pos.x > grid_left
@@ -3501,7 +3573,10 @@ fn light_row(
     // see `ruler`'s own fix above for why.
     let id = light.id;
     let menu_frame_id = ui.id().with(("timeline-light-menu-frame", id.0));
+    let menu_on_name_id = ui.id().with(("timeline-light-menu-on-name", id.0));
     if response.secondary_clicked() {
+        let on_name = response.interact_pointer_pos().is_some_and(|p| name_row.contains(p));
+        ui.ctx().data_mut(|d| d.insert_temp(menu_on_name_id, on_name));
         let frame = response
             .interact_pointer_pos()
             .filter(|p| p.x > grid_left)
@@ -3513,11 +3588,16 @@ fn light_row(
     // selected and the playhead moved to the frame first, so the command
     // that follows keys this light there.
     response.context_menu(|ui| {
+        out.select_light = Some(id);
+        // On the name, the layer menu; on the frames, the frame commands.
+        if ui.ctx().data(|d| d.get_temp::<bool>(menu_on_name_id)).unwrap_or(false) {
+            light_context_menu(ui, light, out);
+            return;
+        }
         let menu_frame = ui
             .ctx()
             .data(|d| d.get_temp::<u32>(menu_frame_id))
             .unwrap_or(state.current_frame);
-        out.select_light = Some(id);
         // Inside the frames picked, the menu acts on all of them; anywhere
         // else it picks the frame it was opened on.
         match selected_here.filter(|(a, b)| (*a..=*b).contains(&menu_frame)) {
@@ -3537,6 +3617,35 @@ fn light_row(
             }
         }
     });
+}
+
+/// **A light's layer menu**, from its name: what a layer's offers that a
+/// light can do — rename, show or hide, lock, duplicate, delete.
+fn light_context_menu(ui: &mut Ui, light: &Light, out: &mut TimelineResponse) {
+    ui.label(egui::RichText::new(&light.name).small().weak());
+    if ui.button("Rename Light").clicked() {
+        start_layer_rename_in(ui.ctx(), egui::Id::new("timeline-light-rename"), LayerId(light.id.0), &light.name);
+        ui.close();
+    }
+    ui.separator();
+    for (icon, label) in [
+        (crate::panels::LayerIcon::Eye, if light.enabled { "Hide Light" } else { "Show Light" }),
+        (crate::panels::LayerIcon::Lock, if light.locked { "Unlock Light" } else { "Lock Light" }),
+    ] {
+        if ui.button(label).clicked() {
+            out.toggle_light = Some((light.id, icon));
+            ui.close();
+        }
+    }
+    ui.separator();
+    if ui.button("Duplicate Light").clicked() {
+        out.duplicate_light = Some(light.id);
+        ui.close();
+    }
+    if ui.button("Delete Light").clicked() {
+        out.delete_light = Some(light.id);
+        ui.close();
+    }
 }
 
 /// One layer's row: name on the left, frames on the right.
@@ -3726,7 +3835,12 @@ fn layer_row(
     // multi-layer selection — a vertical frame drag selects a dozen — get a
     // light wash instead, so their names stay readable and their own
     // highlights still show: a column of solid blue hid every name in it.
-    let current = state.active_layer == Some(layer.id);
+    // A collapsed folder stands for the active layer filed out of sight in
+    // it, so the picked object's row is highlighted even inside a puppet.
+    let current = state.active_layer.is_some_and(|active| {
+        active == layer.id
+            || (layer.kind == LayerKind::Folder && layer.collapsed && scene.layers().is_inside(active, layer.id))
+    });
     if current {
         // Animate marks the selected layer with a blue name panel and its own
         // outline colour as a line along the bottom of the row — the theme's
@@ -5363,6 +5477,7 @@ mod tests {
             range_anchor: None,
             timeline_selection: None,
             camera_selected: false,
+            master_audio_layer: None,
             selected_light: None,
             light_row_selected: false,
             light_cells: None,
@@ -5626,6 +5741,52 @@ mod tests {
         assert!((after - before).abs() < 0.5, "the frame numbers stayed: {before} -> {after}");
     }
 
+    /// **A picked object's row comes to the middle** even when it was
+    /// already on screen, near the bottom.
+    #[test]
+    fn a_revealed_row_already_in_view_is_brought_to_the_middle() {
+        let mut scene = Scene::empty();
+        for i in 0..40 {
+            scene.add_layer(&format!("Row {i}"), LayerKind::Normal);
+        }
+        let ids: Vec<LayerId> = scene.layers().iter().map(|l| l.id).collect();
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut time = 0.0;
+        let mut drive = |st: &TimelineState| {
+            time += 0.1;
+            let input = egui::RawInput {
+                time: Some(time),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 400.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let _ = timeline_panel(ui, &scene, st);
+            });
+        };
+        let top = |ctx: &egui::Context, id: LayerId| {
+            ctx.data(|d| d.get_temp::<(egui::Rect, f32, f32)>(egui::Id::new((ROW_GEOMETRY, id)))).map(|r| r.0)
+        };
+        let still = state();
+        drive(&still);
+        drive(&still);
+        // The lowest row fully on screen.
+        let (low, before) = ids
+            .iter()
+            .filter_map(|id| top(&ctx, *id).filter(|r| r.max.y < 390.0).map(|r| (*id, r)))
+            .max_by(|a, b| a.1.min.y.total_cmp(&b.1.min.y))
+            .expect("rows on screen");
+        assert!(before.min.y > 250.0, "picked near the bottom: {before:?}");
+        let mut pick = state();
+        pick.reveal_layer = Some(low);
+        drive(&pick);
+        for _ in 0..10 {
+            drive(&still);
+        }
+        let after = top(&ctx, low).expect("still drawn");
+        assert!(after.min.y < before.min.y - 40.0, "brought up towards the middle: {before:?} -> {after:?}");
+    }
+
     /// Right-clicking a frame cell must not freeze the app. Capturing the
     /// menu's frame used to read the pointer inside `ctx.data_mut`, and
     /// egui's context lock is not re-entrant, so the UI thread waited on
@@ -5674,6 +5835,56 @@ mod tests {
                 .is_ok(),
             "right-clicking a frame deadlocked the timeline"
         );
+    }
+
+    /// **A light's row works like a layer's**: its eye switches it, and the
+    /// master audio's layer is pinned right under the Camera, above every
+    /// other row.
+    #[test]
+    fn a_light_row_has_switches_and_the_master_audio_is_pinned_on_top() {
+        let mut scene = Scene::default();
+        // A new layer goes in front, so the audio layer ends at the bottom.
+        let audio = scene.add_stage_layer("Audio", LayerKind::Normal);
+        for name in ["L1", "L2"] {
+            scene.add_stage_layer(name, LayerKind::Normal);
+        }
+        let light = scene.add_light(buzz_scene::LightKind::lamp(buzz_geom::Point::new(10.0, 10.0)));
+
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut st = state();
+        st.master_audio_layer = Some(audio);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 600.0));
+        let frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
+            let mut out = TimelineResponse::default();
+            let _ = ctx.run_ui(input, |ui| out = timeline_panel(ui, &scene, &st));
+            out
+        };
+        frame(vec![]);
+        let row = |id: LayerId| ctx.data(|d| d.get_temp::<(egui::Rect, f32, f32)>(egui::Id::new((ROW_GEOMETRY, id)))).unwrap().0;
+        let audio_row = row(audio);
+        for id in scene.stage_layers().iter().map(|l| l.id).filter(|id| *id != audio) {
+            assert!(audio_row.max.y <= row(id).min.y + 0.5, "the master audio is above every layer");
+        }
+
+        // The lamp's row sits between the pinned audio row and the first layer.
+        let first = scene.stage_layers().iter().map(|l| l.id).find(|id| *id != audio).unwrap();
+        let light_row = egui::Rect::from_min_max(egui::pos2(audio_row.min.x, audio_row.max.y), egui::pos2(audio_row.min.x + LAYER_COLUMN, row(first).min.y));
+        let eye = switch_columns(light_row)[0].center();
+        let press = |pressed| egui::Event::PointerButton { pos: eye, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        frame(vec![egui::Event::PointerMoved(eye)]);
+        frame(vec![press(true)]);
+        let out = frame(vec![press(false)]);
+        assert_eq!(out.toggle_light, Some((light, crate::panels::LayerIcon::Eye)));
+        assert_eq!(out.select_light, None, "a switch does not also select the light");
+
+        let lock = switch_columns(light_row)[1].center();
+        let press = |pressed| egui::Event::PointerButton { pos: lock, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        frame(vec![egui::Event::PointerMoved(lock)]);
+        frame(vec![press(true)]);
+        let out = frame(vec![press(false)]);
+        assert_eq!(out.toggle_light, Some((light, crate::panels::LayerIcon::Lock)));
     }
 
     /// The selected layer's row is marked across the frames too, with its

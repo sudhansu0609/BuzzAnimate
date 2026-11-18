@@ -4657,8 +4657,7 @@ fn draw_layer(
                         let tall = rig_parts
                             .iter()
                             .filter_map(|part| {
-                                part.layer
-                                    .bounds_at(frame)
+                                resolved_layer_bounds(scene, part.layer, frame)
                                     .map(|b| part.follows.transform_rect_bbox(b))
                             })
                             .reduce(|a, b| a.union(b))
@@ -4668,7 +4667,11 @@ fn draw_layer(
                         rect.inflate(reach, reach)
                     }
                     Some(throw) => {
-                        let tall = layer.bounds_at(frame).map(|b| b.height()).unwrap_or(0.0);
+                        // Measured through the library: an instance's own box
+                        // is a placeholder a few units tall, and a reach worked
+                        // out from it clipped a character's shadow off at his
+                        // feet whenever he stood alone on his layer.
+                        let tall = resolved_layer_bounds(scene, layer, frame).map(|b| b.height()).unwrap_or(0.0);
                         let reach = throw.reach(tall);
                         rect.inflate(reach, reach)
                     }
@@ -9136,6 +9139,17 @@ fn shadow_group_bounds(
     ctx.projection.map_rect_bounds(area)
 }
 
+/// The artwork `layer` shows at `frame`, measured through the library — a
+/// symbol instance by what it draws, not by its placeholder box.
+fn resolved_layer_bounds(scene: &Scene, layer: &buzz_scene::Layer, frame: u32) -> Option<buzz_geom::Rect> {
+    layer
+        .objects_at(frame)
+        .iter()
+        .map(|o| scene.resolved_bounds(o))
+        .filter(|b| b.width() > 0.0 || b.height() > 0.0)
+        .reduce(|a, b| a.union(b))
+}
+
 /// One caster's resolved bounds: from the [`BoundsCache`] when the object is a
 /// stored one (a held rig is a lookup), measured through the scene otherwise.
 /// Either way the number `Scene::resolved_bounds` gives.
@@ -9739,6 +9753,33 @@ mod tests {
     use super::*;
     use buzz_geom::{Camera, Point, Rect, Shape, Size};
     use buzz_scene::{LightKind, ShapeData};
+
+    /// **A character alone on its layer is measured by what it draws.** The
+    /// reach a layer's ground shadow is culled to came from the instance's
+    /// placeholder box, a few units tall, and cut the shadow off at the feet.
+    #[test]
+    fn a_lone_instance_is_measured_through_the_library() {
+        let mut scene = Scene::default();
+        let body = scene.add_symbol("Body", buzz_scene::SymbolKind::Graphic, None);
+        if let Some(layers) = scene.library_mut().layers_mut(body) {
+            let first = layers.iter().next().map(|l| l.id).unwrap();
+            layers.update(first, |l| {
+                l.push_object_at(
+                    0,
+                    Arc::new(buzz_scene::Object::shape(
+                        buzz_scene::ObjectId(9001),
+                        ShapeData::filled(Rect::new(0.0, 0.0, 40.0, 300.0).to_path(1e-9), Color::WHITE),
+                    )),
+                );
+            });
+        }
+        let layer = scene.add_stage_layer("Mishra", buzz_scene::LayerKind::Normal);
+        scene.add_instance_at(layer, 0, body, Affine::IDENTITY).expect("placed");
+        let stack = scene.layers().get(layer).unwrap().clone();
+        assert!(stack.bounds_at(0).is_some_and(|b| b.height() < 50.0), "the placeholder is small");
+        let measured = resolved_layer_bounds(&scene, &stack, 0).expect("measured");
+        assert!((measured.height() - 300.0).abs() < 1.0, "{measured:?}");
+    }
 
     /// **The stage clips with an unlocked mask** — an eye's pupil stays in
     /// the eye — except the mask being drawn on, which shows its own shape.

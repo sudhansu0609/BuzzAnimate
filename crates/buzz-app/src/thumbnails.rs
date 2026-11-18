@@ -54,7 +54,7 @@ use buzz_scene::{Scene, SymbolId};
 pub const SIZE: u32 = 96;
 /// The big picture the Library shows while a thumbnail is hovered. Drawn at
 /// [`buzz_ui::library_panel::PREVIEW`] points, sharp on a 2x screen.
-pub const PREVIEW_SIZE: u32 = 320;
+pub const PREVIEW_SIZE: u32 = 640;
 /// An asset's picture, in pixels: the Assets panel draws them up to
 /// [`buzz_ui::assets_panel::MAX_EDGE`] points across, which this keeps sharp
 /// on a Retina screen down to 1.4x.

@@ -195,7 +195,9 @@ impl LightTrack {
         light.shadow_strength = key.shadow_strength;
         light.shadow_adjustment = key.shadow_adjustment;
         light.kind = key.kind;
-        light.enabled = key.enabled;
+        // The light's own switch — its timeline row's eye — is over every
+        // key, as a hidden layer is hidden on every frame.
+        light.enabled = base.enabled && key.enabled;
         light
     }
 

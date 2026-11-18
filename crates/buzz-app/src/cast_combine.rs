@@ -86,7 +86,103 @@ pub(crate) fn pose_scene(scene: &Scene, name: &str) -> Result<(Scene, SymbolId),
         .find(|x| x.name == name)
         .map(|x| x.id)
         .ok_or("the pose symbol vanished")?;
+    let mut held = held;
+    unwrap_pose(&mut held, symbol);
     Ok((held, symbol))
+}
+
+/// **A pose that only wraps another drawing, made into that drawing.**
+///
+/// A character kept from a selection on the stage is saved as one instance of
+/// its body symbol on one layer, so its main pose opened onto a single layer
+/// and a single frame, while every other pose opened onto its parts. When
+/// `pose`'s only artwork is one instance of a symbol on one keyframe, its
+/// layers become that symbol's — every part layer and frame — carried by the
+/// instance's placement so it looks the same. Empty layers (Master Audio) stay
+/// on top. Returns whether it was unwrapped.
+pub fn unwrap_pose(scene: &mut Scene, pose: SymbolId) -> bool {
+    let Some((object, layers)) = wrapped(scene, pose) else {
+        return false;
+    };
+    scene.library_mut().update(pose, |s| s.layers = layers);
+    transform_pose(scene, pose, object.transform);
+    true
+}
+
+/// The instance `pose` only wraps, and the layers it would have unwrapped:
+/// see [`unwrap_pose`]. `None` when it is not a wrapper.
+fn wrapped(scene: &Scene, pose: SymbolId) -> Option<(buzz_scene::Object, buzz_scene::LayerStack)> {
+    let sym = scene.library().get(pose)?;
+    let mut held: Option<buzz_scene::Object> = None;
+    let mut kept: Vec<buzz_scene::Layer> = Vec::new();
+    for layer in sym.layers.iter() {
+        let objects: Vec<&buzz_scene::Object> = layer.all_objects().map(|o| &**o).collect();
+        if objects.is_empty() {
+            kept.push((**layer).clone());
+            continue;
+        }
+        if held.is_some() || objects.len() != 1 || layer.frames.keyframe_count() != 1 {
+            return None;
+        }
+        held = Some(objects[0].clone());
+    }
+    let object = held?;
+    let ObjectKind::Instance(instance) = &object.kind else {
+        return None;
+    };
+    let inner = scene.library().get(instance.symbol)?;
+    if inner.id == pose || inner.layers.is_empty() || !inner.set.is_empty() {
+        return None;
+    }
+    let mut layers = inner.layers.clone();
+    for layer in kept.into_iter().rev() {
+        if !layers.iter().any(|l| l.name == layer.name) {
+            layers.insert(0, layer);
+        }
+    }
+    Some((object, layers))
+}
+
+/// [`unwrap_pose`] on every character's main pose in `scene` (each symbol
+/// that owns a pose set). How many were unwrapped.
+pub fn unwrap_characters(scene: &mut Scene) -> usize {
+    let owners: Vec<SymbolId> = scene.library().iter().filter(|s| !s.set.is_empty()).map(|s| s.id).collect();
+    owners.into_iter().filter(|id| unwrap_pose(scene, *id)).count()
+}
+
+/// Whether any character's main pose in `scene` is a wrapper
+/// [`unwrap_characters`] would unwrap — checked without editing.
+pub fn has_wrapped_characters(scene: &Scene) -> bool {
+    scene.library().iter().any(|s| !s.set.is_empty() && wrapped(scene, s.id).is_some())
+}
+
+/// **Unwrap every Cast character's main pose**, in the Cast files: each file
+/// changed is copied to `_cast_backup/<stamp>_unwrap/` first. The names of
+/// the characters fixed.
+pub fn unwrap_cast(library: &mut AssetLibrary, stamp: &str) -> Vec<String> {
+    let root = library.root().map(Path::to_path_buf).unwrap_or_default();
+    let base = root.join(crate::cast_fresh::BACKUP_FOLDER).join(format!("{stamp}_unwrap"));
+    let mut fixed = Vec::new();
+    for asset in crate::cast_fresh::cast_characters(library) {
+        let Ok(mut scene) = library.load(&asset) else {
+            continue;
+        };
+        if unwrap_characters(&mut scene) == 0 {
+            continue;
+        }
+        let rel = asset.path.strip_prefix(&root).map(Path::to_path_buf).unwrap_or_else(|_| PathBuf::from(asset.path.file_name().unwrap_or_default()));
+        let copy_to = base.join(rel);
+        if copy_to.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+            && std::fs::copy(&asset.path, &copy_to).is_ok()
+            && buzz_doc::format::save(&scene, &asset.path).is_ok()
+        {
+            fixed.push(asset.name.clone());
+        }
+    }
+    if !fixed.is_empty() {
+        library.rescan();
+    }
+    fixed
 }
 
 /// The box a pose symbol's artwork fills at `frame` (followers carrying what
@@ -322,14 +418,58 @@ pub fn pose_choices(scene: &Scene, selected: Option<buzz_scene::ObjectId>, frame
     }
     let here = scene.layers().get(layer)?.frames.objects_at(frame).iter().find(|o| o.id == object.id).cloned();
     let shown = here.as_ref().unwrap_or(object).instance()?.symbol;
-    let poses: Vec<(SymbolId, String)> = scene
-        .library()
-        .symbol_set(shown)
+    let mut shown_name = scene.library().get(shown)?.name.clone();
+    let mut set = scene.library().symbol_set(shown);
+    // **A pose copy outside the set** (`DeepakFront DeepakBack 1`, made by a
+    // Duplicate Symbol or a re-import) is still that character: offer the set
+    // its original belongs to, shown as that original.
+    if set.is_empty()
+        && let Some((owner_set, original)) = stray_pose_set(scene, layer, shown)
+    {
+        set = owner_set;
+        shown_name = original;
+    }
+    let poses: Vec<(SymbolId, String)> = set
         .into_iter()
         .filter_map(|id| scene.library().get(id).map(|s| (id, s.name.clone())))
         .collect();
-    let shown_name = scene.library().get(shown)?.name.clone();
     (poses.len() > 1).then_some((PoseTarget::Instance(object.id), shown_name, poses))
+}
+
+/// A name without the ` 2`, ` 3`… a duplicate symbol is given.
+fn without_copy_number(name: &str) -> &str {
+    let mut name = name.trim_end();
+    while let Some((head, tail)) = name.rsplit_once(' ')
+        && !tail.is_empty()
+        && tail.bytes().all(|b| b.is_ascii_digit())
+    {
+        name = head.trim_end();
+    }
+    name
+}
+
+/// The pose set a symbol in no set belongs to, and the name of the pose it is
+/// a copy of: the set holding a pose of the same name less its copy number,
+/// else — on a layer brought in from the Cast — that character's own set.
+fn stray_pose_set(scene: &Scene, layer: buzz_scene::LayerId, stray: SymbolId) -> Option<(Vec<SymbolId>, String)> {
+    let library = scene.library();
+    let name = library.get(stray)?.name.clone();
+    let base = without_copy_number(&name);
+    let owners = || library.iter().filter(|s| !s.set.is_empty());
+    for owner in owners() {
+        let set = library.symbol_set(owner.id);
+        if let Some(original) = set
+            .iter()
+            .filter_map(|id| library.get(*id))
+            .find(|s| s.id != stray && without_copy_number(&s.name) == base)
+        {
+            return Some((set, original.name.clone()));
+        }
+    }
+    let source = scene.layers().get(layer)?.cast_source.clone()?;
+    let character = source.rsplit('/').next()?.split('|').next()?.to_string();
+    let owner = owners().find(|s| without_copy_number(&s.name) == character)?;
+    Some((library.symbol_set(owner.id), name))
 }
 
 /// The symbol a selected instance shows at `frame`, for linking more poses to
@@ -373,7 +513,33 @@ pub fn addable_poses(scene: &Scene, shown: SymbolId) -> (Vec<(SymbolId, String)>
 /// Turn the target to `pose` from `frame` on (one scene edit).
 pub fn pick_pose(scene: &mut Scene, target: PoseTarget, frame: u32, pose: SymbolId) -> bool {
     match target {
-        PoseTarget::Instance(id) => scene.pick_from_set(frame, id, pose, buzz_scene::SetStart::FromStart),
+        PoseTarget::Instance(id) => {
+            if scene.pick_from_set(frame, id, pose, buzz_scene::SetStart::FromStart) {
+                return true;
+            }
+            // A pose copy outside the set (see `pose_choices`) is switched the
+            // same way — keyed at `frame`, from the new pose's first frame —
+            // into the set it was offered.
+            let Some((layer, object)) = scene.find_object(id) else {
+                return false;
+            };
+            let here = scene.layers().get(layer).and_then(|l| l.frames.objects_at(frame).iter().find(|o| o.id == id).cloned());
+            let Some(shown) = here.as_ref().unwrap_or(object).instance().map(|i| i.symbol) else {
+                return false;
+            };
+            let offered = scene.library().symbol_set(shown).is_empty()
+                && stray_pose_set(scene, layer, shown).is_some_and(|(set, _)| set.contains(&pose));
+            if !offered || shown == pose {
+                return false;
+            }
+            scene.ensure_keyframe_for(frame, id);
+            scene.update_object_at(frame, id, |object| {
+                if let buzz_scene::ObjectKind::Instance(instance) = &mut object.kind {
+                    instance.symbol = pose;
+                    instance.first_frame = 0;
+                }
+            })
+        }
         PoseTarget::Lifted(folder) => buzz_act::pose::switch_lifted_pose(scene, folder, frame, pose).is_ok_and(|r| r.changed),
     }
 }
@@ -381,6 +547,58 @@ pub fn pick_pose(scene: &mut Scene, target: PoseTarget, frame: u32, pose: Symbol
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A main pose that only wraps its body symbol opens onto the body's
+    /// layers and frames once unwrapped, in the same place.
+    #[test]
+    fn a_wrapped_main_pose_is_unwrapped_into_its_parts_in_place() {
+        let mut scene = Scene::default();
+        let body = scene.add_symbol("Body", SymbolKind::Graphic, None);
+        if let Some(layers) = scene.library_mut().layers_mut(body) {
+            let first = layers.iter().next().map(|l| l.id).unwrap();
+            layers.update(first, |l| l.name = "Arm".into());
+            layers.push_front(buzz_scene::Layer::normal(buzz_scene::LayerId(9001), "Head"));
+        }
+        let main = scene.add_symbol("Ana", SymbolKind::Graphic, None);
+        let back = scene.add_symbol("Ana Back", SymbolKind::Graphic, None);
+        assert!(scene.library_mut().include_in_set(main, back));
+        let placed = buzz_scene::Object::instance_of(buzz_scene::ObjectId(9002), body).with_transform(Affine::scale(0.5));
+        if let Some(layers) = scene.library_mut().layers_mut(main) {
+            let first = layers.iter().next().map(|l| l.id).unwrap();
+            layers.update(first, |l| {
+                l.push_object_at(0, Arc::new(placed.clone()));
+            });
+        }
+        assert!(has_wrapped_characters(&scene));
+        assert_eq!(unwrap_characters(&mut scene), 1);
+        let names: Vec<String> = scene.library().get(main).unwrap().layers.iter().map(|l| l.name.clone()).collect();
+        assert!(names.contains(&"Arm".to_string()) && names.contains(&"Head".to_string()), "{names:?}");
+        assert!(!has_wrapped_characters(&scene), "nothing left to unwrap");
+    }
+
+    /// A duplicated pose (`Ana Back 1`) sits in no set; right-click ▸ Pose
+    /// still lists the character's poses and switches to them.
+    #[test]
+    fn a_pose_copy_outside_the_set_still_offers_and_switches_poses() {
+        let mut scene = Scene::default();
+        scene.set_frame_count(20);
+        let front = scene.add_symbol("Ana", buzz_scene::SymbolKind::Graphic, None);
+        let back = scene.add_symbol("Ana Back", buzz_scene::SymbolKind::Graphic, None);
+        let side = scene.add_symbol("Ana Side", buzz_scene::SymbolKind::Graphic, None);
+        assert!(scene.library_mut().include_in_set(front, back));
+        assert!(scene.library_mut().include_in_set(front, side));
+        let copy = scene.add_symbol("Ana Back 1", buzz_scene::SymbolKind::Graphic, None);
+        let layer = scene.add_stage_layer("Ana", buzz_scene::LayerKind::Normal);
+        let id = scene
+            .add_instance_at(layer, 0, copy, buzz_geom::Affine::IDENTITY)
+            .expect("placed");
+        let (_, shown, poses) = pose_choices(&scene, Some(id), 0).expect("offers the set");
+        assert_eq!(shown, "Ana Back");
+        assert_eq!(poses.len(), 3);
+        let (target, ..) = pose_choices(&scene, Some(id), 0).unwrap();
+        assert!(pick_pose(&mut scene, target, 0, side));
+        assert_eq!(pose_choices(&scene, Some(id), 0).unwrap().1, "Ana Side");
+    }
 
     /// The gate: three separate assets of one role become one asset whose set
     /// lists every pose; the separate files are moved to the backup folder;

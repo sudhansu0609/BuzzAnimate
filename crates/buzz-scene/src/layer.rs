@@ -982,7 +982,7 @@ impl LayerStack {
     /// enclosing folders? Bounded by the layer count, so a corrupt parent
     /// cycle cannot hang, the same guard [`Self::is_effectively_visible`] and
     /// [`Self::is_effectively_locked`] use.
-    fn is_inside(&self, id: LayerId, folder: LayerId) -> bool {
+    pub fn is_inside(&self, id: LayerId, folder: LayerId) -> bool {
         let mut current = self.get(id).and_then(|l| l.parent);
         for _ in 0..self.layers.len() {
             match current {

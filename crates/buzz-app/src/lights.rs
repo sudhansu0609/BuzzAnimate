@@ -304,7 +304,14 @@ pub fn target_at(
     tolerance: f64,
     selected: Option<LightId>,
 ) -> Option<LightGesture> {
-    target_among(&gizmos(scene), point, tolerance, selected)
+    target_among(&unlocked(scene, gizmos(scene)), point, tolerance, selected)
+}
+
+/// The gizmos of lights not locked on their timeline row — a locked light's
+/// handles are drawn but cannot be grabbed, as a locked layer's artwork is.
+fn unlocked(scene: &Scene, mut all: Vec<Gizmo>) -> Vec<Gizmo> {
+    all.retain(|g| !scene.lights().get(g.id).is_some_and(|l| l.locked));
+    all
 }
 
 /// [`target_at`], hit-testing each light's keyed state at `frame` instead of
@@ -317,7 +324,7 @@ pub fn target_at_frame(
     tolerance: f64,
     selected: Option<LightId>,
 ) -> Option<LightGesture> {
-    target_among(&gizmos_at(scene, frame), point, tolerance, selected)
+    target_among(&unlocked(scene, gizmos_at(scene, frame)), point, tolerance, selected)
 }
 
 fn target_among(
@@ -572,7 +579,11 @@ pub fn drag_light_at(
         && let Some(light) = scene.lights_mut().get_mut(id)
         && let Some(track) = light.track.clone()
     {
-        *light = track.state_at(frame, light);
+        // Keyed as the key is, not as hidden: a drag must not switch the
+        // light's keys off because its row's eye is.
+        let mut shown = light.clone();
+        shown.enabled = true;
+        *light = track.state_at(frame, &shown);
     }
 
     // 2. The drag itself.
@@ -580,8 +591,13 @@ pub fn drag_light_at(
         return false;
     }
 
-    // 3. Key the result.
+    // 3. Key the result — and a light hidden from its row stays hidden.
     key_after_edit(scene, id, frame, auto_key, &pre_drag);
+    if !pre_drag.enabled
+        && let Some(light) = scene.lights_mut().get_mut(id)
+    {
+        light.enabled = false;
+    }
     true
 }
 
@@ -950,6 +966,18 @@ mod tests {
             LightKind::Lamp { radius, .. } => assert!(radius >= 8.0, "{radius}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A light locked on its timeline row cannot be picked up on the stage.
+    #[test]
+    fn a_locked_light_cannot_be_grabbed() {
+        let mut scene = Scene::default();
+        let id = scene.add_light(LightKind::lamp(Point::new(200.0, 200.0)));
+        let at = Point::new(200.0, 200.0);
+        assert!(target_at(&scene, at, GRAB_PX, None).is_some());
+        scene.lights_mut().get_mut(id).unwrap().locked = true;
+        assert_eq!(target_at(&scene, at, GRAB_PX, None), None);
+        assert_eq!(target_at_frame(&scene, 0, at, GRAB_PX, None), None);
     }
 
     #[test]

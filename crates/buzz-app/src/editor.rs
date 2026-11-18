@@ -302,6 +302,9 @@ pub struct Editor {
     /// the same for every symbol on the stage, all the way down — what each
     /// showed inside it then ([`StageLayers`] per symbol).
     pub stage_clip: Option<(u32, StageLayers, Vec<(buzz_scene::SymbolId, StageLayers)>)>,
+    /// **Bring Character Here** is open: the shell draws its list, since
+    /// the other open files are the shell's (see `crate::bring`).
+    pub bring_open: bool,
     /// **How the Text tool's next text is set**: its size, family (Hindi
     /// faces among them), cut and alignment, chosen in Tool Options before
     /// clicking. Its colour is the fill colour. The words are "Text" until
@@ -872,6 +875,7 @@ impl Editor {
             frame_clipboard: None,
             motion_clip: None,
             stage_clip: None,
+            bring_open: false,
             text_next: buzz_scene::TextData::new("Text", 48.0, None),
             text_to_focus: None,
             puppet_pointer: None,
@@ -6284,6 +6288,7 @@ impl Editor {
             ClearFrames => self.frame_op(FrameOp::ClearFrames),
             ReverseFrames => self.frame_op(FrameOp::ReverseFrames),
             CopyPasteStage => self.copy_paste_stage(),
+            BringCharacterHere => self.bring_open = true,
             ClearTalkRanges => self.clear_talk_ranges(),
             // A dialog, which the app opens.
             MarkTalkRange => {}
@@ -16991,7 +16996,7 @@ fn paste_held(frames: &mut buzz_scene::LayerTimeline, at: u32, objects: Vec<Arc<
     }
 }
 
-fn match_frames_inside(
+pub(crate) fn match_frames_inside(
     scene: &mut Scene,
     symbol: buzz_scene::SymbolId,
     frame: u32,

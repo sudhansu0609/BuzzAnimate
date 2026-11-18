@@ -639,6 +639,7 @@ pub fn build_menus(ui: &mut MenuUi<'_>, state: &MenuState<'_>) -> Vec<Command> {
                 Command::SelectAllFrames,
                 Command::ReverseFrames,
                 Command::CopyPasteStage,
+                Command::BringCharacterHere,
                 Command::MoveStageFrames,
                 Command::MarkTalkRange,
                 Command::ClearTalkRanges,

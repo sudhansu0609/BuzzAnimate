@@ -1249,6 +1249,10 @@ pub struct App {
     egui_repaint: Option<Instant>,
     /// When to try again for a frame the covered window could not draw.
     occluded_retry: Option<Instant>,
+    /// Bring Character Here's list while it is open: group, the scene it is
+    /// in when not this one, and the character.
+    #[allow(clippy::type_complexity)]
+    bring_list: Option<Vec<(String, Option<Arc<buzz_scene::Scene>>, crate::bring::Candidate)>>,
     /// Escape hatch: `BUZZ_POLL=1` forces the old always-redraw loop, for
     /// bisecting any report of stale UI.
     force_poll: bool,
@@ -1845,6 +1849,7 @@ impl App {
             proxy: None,
             egui_repaint: None,
             occluded_retry: None,
+            bring_list: None,
             force_poll: std::env::var("BUZZ_POLL").is_ok(),
             stage_stamp: None,
             perf: Perf::default(),
@@ -4830,6 +4835,7 @@ impl App {
         self.close_prompt_dialog(&ctx);
         self.symbol_dialog_ui(&ctx);
         self.move_stage_frames_dialog(&ctx);
+        self.bring_character_dialog(&ctx);
         self.talk_range_dialog_ui(&ctx);
         self.cast_windows_ui(&ctx);
         self.who_is_who_dialog(&ctx);
@@ -10897,6 +10903,7 @@ impl App {
             item(ui, Command::PasteInPlace, true);
             item(ui, Command::Delete, has_selection);
             item(ui, Command::DeleteAndFill, has_selection);
+            item(ui, Command::BringCharacterHere, true);
             ui.separator();
 
             item(ui, Command::RotateClockwise, has_selection);
@@ -17358,6 +17365,113 @@ impl App {
                 self.editor.doc.end_gesture();
             }
         }
+    }
+
+    /// **Bring Character Here…** ([`crate::bring`]): every character found
+    /// elsewhere, by where it is — this timeline's other frames, the other
+    /// scenes, the other open files — one click to put it at the playhead.
+    /// The list is gathered once when opened (the timelines are walked), and
+    /// again after each placement.
+    fn bring_character_dialog(&mut self, ctx: &egui::Context) {
+        if !self.editor.bring_open {
+            self.bring_list = None;
+            return;
+        }
+        if self.bring_list.is_none() {
+            let mut list: Vec<(String, Option<Arc<buzz_scene::Scene>>, crate::bring::Candidate)> = Vec::new();
+            let at = self.editor.current_frame;
+            let scene = self.editor.doc.scene();
+            for c in crate::bring::candidates(scene, scene.layers(), Some(at)) {
+                list.push(("This timeline".into(), None, c));
+            }
+            let active = self.editor.doc.active_scene();
+            let names = self.editor.doc.scene_names();
+            for (i, other) in self.editor.doc.film().into_iter().enumerate().filter(|(i, _)| *i != active) {
+                let other = Arc::new(other);
+                for c in crate::bring::candidates(&other, other.stage_layers(), None) {
+                    list.push((format!("Scene: {}", names.get(i).cloned().unwrap_or_default()), Some(Arc::clone(&other)), c));
+                }
+            }
+            for d in (0..self.documents.len()).filter(|d| *d != self.active_document) {
+                let doc = self.tab_document(d);
+                let file = self.tab_label(d).trim_end_matches('*').to_string();
+                let names = doc.scene_names();
+                let many = names.len() > 1;
+                for (i, other) in doc.film().into_iter().enumerate() {
+                    let other = Arc::new(other);
+                    let group = if many { format!("{file} \u{b7} {}", names[i]) } else { file.clone() };
+                    for c in crate::bring::candidates(&other, other.stage_layers(), None) {
+                        list.push((group.clone(), Some(Arc::clone(&other)), c));
+                    }
+                }
+            }
+            self.bring_list = Some(list);
+        }
+        let list = self.bring_list.clone().unwrap_or_default();
+        let mut open = true;
+        let mut picked = None;
+        egui::Window::new("Bring Character Here")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(360.0)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Click a character to put it at frame {}, where it stood, its frame number set to {}.",
+                        self.editor.current_frame + 1,
+                        self.editor.current_frame + 1
+                    ))
+                    .small()
+                    .weak(),
+                );
+                if list.is_empty() {
+                    ui.label("No character anywhere else: every one is on stage here.");
+                }
+                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                    let mut group = "";
+                    for (i, (g, _, c)) in list.iter().enumerate() {
+                        if g != group {
+                            group = g;
+                            ui.add_space(4.0);
+                            ui.strong(g);
+                        }
+                        let text = format!("{}  \u{b7} {} \u{b7} frame {}", c.name, c.layer_name, c.frame + 1);
+                        if ui.button(text).clicked() {
+                            picked = Some(i);
+                        }
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.editor.bring_open = false;
+                }
+            });
+        if !open {
+            self.editor.bring_open = false;
+        }
+        let Some((_, from, candidate)) = picked.and_then(|i| list.get(i).cloned()) else { return };
+        let at = self.editor.current_frame;
+        let mut placed = None;
+        self.editor.doc.edit("Bring Character Here", |scene| {
+            placed = crate::bring::bring(scene, from.as_deref(), &candidate, at);
+        });
+        self.editor.doc.end_gesture();
+        match placed {
+            Some(id) => {
+                self.editor.selection.set([id]);
+                self.editor.status = Some(format!(
+                    "{} brought to frame {} on {}, its frame number set to {}",
+                    candidate.name,
+                    at + 1,
+                    candidate.layer_name,
+                    at + 1
+                ));
+            }
+            None => self.editor.status = Some(format!("Could not bring {} here", candidate.name)),
+        }
+        // What is elsewhere has changed.
+        self.bring_list = None;
     }
 
     /// **Move Stage Frames…**: everything on the stage from one frame to

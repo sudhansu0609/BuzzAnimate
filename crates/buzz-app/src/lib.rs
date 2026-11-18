@@ -7,6 +7,7 @@
 pub mod agent;
 #[cfg(target_os = "macos")]
 pub mod native_menu;
+pub mod bring;
 pub mod puppet;
 pub mod agent_bridge;
 pub mod api;

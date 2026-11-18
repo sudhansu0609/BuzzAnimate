@@ -2410,6 +2410,15 @@ fn transport_controls(
         if ui.add(button).on_hover_text(tip).clicked() {
             out.command = Some(crate::Command::CopyPasteStage);
         }
+        // **Bring Character Here**, beside it: a character from other frames,
+        // another scene or another open file, here with its frames aligned.
+        if ui
+            .add(egui::Button::new(egui::RichText::new("Bring Character").small()))
+            .on_hover_text("Put a character from another frame, scene or open file here, its frame number set to this frame's")
+            .clicked()
+        {
+            out.command = Some(crate::Command::BringCharacterHere);
+        }
     }
 }
 

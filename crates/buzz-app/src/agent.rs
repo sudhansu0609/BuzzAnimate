@@ -131,7 +131,7 @@ pub fn route(command: Command) -> Route {
         | StoryboardExport | DeleteAndFill | AiRemoveObject => Route::Args,
 
         // Needs the user, or has no document effect.
-        Quit | Close | MoveStageFrames | MarkTalkRange | ShortcutEditor | Snapshots | About | AiModels | AiGenerateImage | NextDocument | PreviousDocument | PasteboardColour
+        Quit | Close | MoveStageFrames | BringCharacterHere | MarkTalkRange | ShortcutEditor | Snapshots | About | AiModels | AiGenerateImage | NextDocument | PreviousDocument | PasteboardColour
         | TestMovie | RunScript | VoicePushToTalk | VoiceMute => Route::Excluded,
         // Dialogs over BuzzEdit and Buzzcaf Studio; their tools take args.
         SendToBuzzEdit | TranscribeWithBuzzEdit | ImportScriptFromStudio => Route::Excluded,

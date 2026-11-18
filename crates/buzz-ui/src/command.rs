@@ -595,6 +595,10 @@ pub enum Command {
     /// symbol set to show that frame's number. Pressed again on the frame it
     /// copied, it lets go. One command, so one key.
     CopyPasteStage,
+    /// **Bring Character Here…**: a character on this timeline's other
+    /// frames, another scene or another open file, put at the playhead with
+    /// its frame numbers set to the playhead's. See `buzz_app::bring`.
+    BringCharacterHere,
     /// **Mark Talk Range…**: mark frames on the ruler for one or more
     /// characters. A talking command run while ranges are marked (Shift+A)
     /// runs over each of them, for each of its characters, with the lip sync.
@@ -980,6 +984,7 @@ command_table! {
             ReverseFrames => "reverse_frames",
             MoveStageFrames => "move_stage_frames",
             CopyPasteStage => "copy_paste_stage",
+            BringCharacterHere => "bring_character_here",
             MarkTalkRange => "mark_talk_range",
             ClearTalkRanges => "clear_talk_ranges",
             PuppetMode => "puppet_mode",
@@ -1476,6 +1481,7 @@ impl Command {
             ReverseFrames => "Reverse Frames",
             MoveStageFrames => "Move Stage Frames\u{2026}",
             CopyPasteStage => "Copy / Paste Stage",
+            BringCharacterHere => "Bring Character Here\u{2026}",
             MarkTalkRange => "Mark Talk Range\u{2026}",
             ClearTalkRanges => "Clear Talk Ranges",
             PuppetMode => "Puppet Mode",
@@ -1768,6 +1774,7 @@ impl Command {
             ReverseFrames => None,
             MoveStageFrames => None,
             CopyPasteStage => None,
+            BringCharacterHere => None,
             MarkTalkRange => sc(Modifiers::SHIFT, Key::T),
             ClearTalkRanges => None,
             PuppetMode => None,
@@ -1983,6 +1990,7 @@ pub fn palette_commands() -> Vec<Command> {
         ReverseFrames,
         MoveStageFrames,
         CopyPasteStage,
+        BringCharacterHere,
         MarkTalkRange,
         ClearTalkRanges,
         PuppetMode,
@@ -2253,6 +2261,7 @@ mod tests {
             ReverseFrames,
             MoveStageFrames,
             CopyPasteStage,
+            BringCharacterHere,
             MarkTalkRange,
             ClearTalkRanges,
             PuppetMode,
@@ -2453,7 +2462,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            260
+            261
         );
     }
 

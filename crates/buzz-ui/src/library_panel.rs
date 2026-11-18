@@ -26,9 +26,9 @@ use crate::theme::Palette;
 
 /// Edge of a symbol's picture in the list, in points.
 ///
-/// Matches the row height a symbol already had, so adding pictures did not
-/// make the library taller per entry.
-const THUMBNAIL: f32 = 20.0;
+/// Was 20, the row height a symbol had before it had a picture; a little
+/// bigger (user 2026-11-17) so a pose can be told apart without hovering.
+const THUMBNAIL: f32 = 28.0;
 
 /// Room kept on the right of a symbol row for its use count.
 const USE_COUNT: f32 = 26.0;
@@ -76,6 +76,9 @@ pub enum MediaRequest {
     Place(LibraryMedia),
     /// Take it out of the library (the bin button, the menu).
     Delete(LibraryMedia),
+    /// Delete every symbol, picture and sound the film never reaches
+    /// (`Scene::unused_library`), as one undo step.
+    DeleteUnused,
 }
 
 /// A picture or sound being dragged out of the Library, on its way to the
@@ -195,6 +198,13 @@ pub struct LibraryState {
     pub selected_media: Option<LibraryMedia>,
     /// Place or Delete asked of a picture or sound. Taken by the editor.
     pub media_request: Option<MediaRequest>,
+    /// How many times each picture and sound is used, counted off the UI
+    /// thread by the shell as the symbols' counts are.
+    pub image_uses: std::collections::BTreeMap<ImageId, usize>,
+    pub sound_uses: std::collections::BTreeMap<SoundId, usize>,
+    /// Delete Unused asked, waiting on the confirmation: how many of each
+    /// (symbols, pictures, sounds) would go, and the first few names.
+    confirm_unused: Option<((usize, usize, usize), Vec<String>)>,
     /// Folder paths the user has opened.
     expanded: BTreeSet<String>,
     /// Rename buffer, live only while a rename is in progress.
@@ -519,7 +529,7 @@ pub fn library_panel(
             });
     }
 
-    images_section(ui, scene);
+    images_section(ui, scene, &state.image_uses);
 
     ui.separator();
     draw_footer(ui, scene, state, usage, &mut command);
@@ -540,7 +550,7 @@ fn is_generated(name: &str) -> bool {
 /// ones, and an "AI Generated" folder for Generate Image's — each with a
 /// thumbnail, to drag onto the stage as Animate's bitmaps are. A picture sent
 /// to the Library used to be stored in the file but listed nowhere.
-fn images_section(ui: &mut Ui, scene: &Scene) {
+fn images_section(ui: &mut Ui, scene: &Scene, uses: &std::collections::BTreeMap<ImageId, usize>) {
     let images: Vec<std::sync::Arc<buzz_scene::ImageAsset>> = scene.images().iter().cloned().collect();
     if images.is_empty() {
         return;
@@ -560,18 +570,19 @@ fn images_section(ui: &mut Ui, scene: &Scene) {
                         egui::CollapsingHeader::new(format!("AI Generated ({})", generated.len()))
                             .id_salt("library-images-generated")
                             .default_open(true)
-                            .show(ui, |ui| generated.iter().for_each(|i| image_row(ui, i)));
+                            .show(ui, |ui| generated.iter().for_each(|i| image_row(ui, i, uses)));
                     }
                     for image in &imported {
-                        image_row(ui, image);
+                        image_row(ui, image, uses);
                     }
                 });
         });
 }
 
-/// One picture: thumbnail and name, dragged onto the stage to place it.
-fn image_row(ui: &mut Ui, image: &buzz_scene::ImageAsset) {
-    let texture = image_thumbnail(ui.ctx(), image);
+/// One picture: thumbnail, name and use count, dragged onto the stage to
+/// place it; hovering shows it big, as a symbol's thumbnail does.
+fn image_row(ui: &mut Ui, image: &buzz_scene::ImageAsset, uses: &std::collections::BTreeMap<ImageId, usize>) {
+    let texture = image_thumbnail(ui.ctx(), image, 48);
     let id = egui::Id::new(("library-image", image.id.0));
     ui.dnd_drag_source(id, DraggedImage(image.id), |ui| {
         ui.horizontal(|ui| {
@@ -586,15 +597,24 @@ fn image_row(ui: &mut Ui, image: &buzz_scene::ImageAsset) {
                 }
             }
             ui.label(&image.name);
+            let count = uses.get(&image.id).copied().unwrap_or(0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| use_count(ui, count));
         });
     })
     .response
-    .on_hover_text(format!("{} \u{d7} {} \u{2014} drag onto the stage to place it", image.width, image.height));
+    .on_hover_ui(|ui| {
+        let preview = image_thumbnail(ui.ctx(), image, PICTURE_PREVIEW);
+        preview_tooltip(
+            ui,
+            preview.map(|t| (t.id(), t.size_vec2())),
+            &format!("{} \u{d7} {} \u{2014} drag onto the stage to place it", image.width, image.height),
+        );
+    });
 }
 
 /// A small texture of `image`, made once and kept in egui's memory by id.
-fn image_thumbnail(ctx: &egui::Context, image: &buzz_scene::ImageAsset) -> Option<egui::TextureHandle> {
-    let key = egui::Id::new(("library-image-thumb", image.id.0, image.width, image.height));
+fn image_thumbnail(ctx: &egui::Context, image: &buzz_scene::ImageAsset, side: usize) -> Option<egui::TextureHandle> {
+    let key = egui::Id::new(("library-image-thumb", image.id.0, image.width, image.height, side));
     if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(key)) {
         return Some(t);
     }
@@ -602,7 +622,6 @@ fn image_thumbnail(ctx: &egui::Context, image: &buzz_scene::ImageAsset) -> Optio
     if w == 0 || h == 0 || image.pixels.len() < w * h * 4 {
         return None;
     }
-    let side = 48usize;
     let scale = (side as f32 / w.max(h) as f32).min(1.0);
     let (tw, th) = (((w as f32 * scale).round() as usize).max(1), ((h as f32 * scale).round() as usize).max(1));
     let mut rgba = Vec::with_capacity(tw * th * 4);
@@ -615,7 +634,7 @@ fn image_thumbnail(ctx: &egui::Context, image: &buzz_scene::ImageAsset) -> Optio
         }
     }
     let colour = egui::ColorImage::from_rgba_unmultiplied([tw, th], &rgba);
-    let texture = ctx.load_texture(format!("library-image-{}", image.id.0), colour, egui::TextureOptions::LINEAR);
+    let texture = ctx.load_texture(format!("library-image-{}-{side}", image.id.0), colour, egui::TextureOptions::LINEAR);
     ctx.data_mut(|d| d.insert_temp(key, texture.clone()));
     Some(texture)
 }
@@ -965,8 +984,19 @@ fn draw_symbol_row(
     });
 }
 
+/// A row's use count, on its right: weak at zero, the safe-to-delete signal.
+fn use_count(ui: &mut Ui, uses: usize) {
+    let text = RichText::new(format!("{uses}")).small();
+    let text = if uses == 0 { text.weak() } else { text };
+    ui.label(text).on_hover_text(if uses == 0 {
+        "Not used anywhere".to_string()
+    } else {
+        format!("Used {uses} time(s), including inside symbols")
+    });
+}
+
 /// One bitmap row: its small picture (the drag handle, as a symbol's is), a
-/// "P" marker, and its name.
+/// "P" marker, its name and its use count.
 fn draw_picture_row(
     ui: &mut Ui,
     scene: &mut Scene,
@@ -1009,7 +1039,9 @@ fn draw_picture_row(
         });
         ui.label(RichText::new("P").small().weak())
             .on_hover_text(format!("Picture, {} x {}", asset.width, asset.height));
-        draw_media_name(ui, scene, state, LibraryMedia::Picture(id), name, 0.0);
+        draw_media_name(ui, scene, state, LibraryMedia::Picture(id), name, USE_COUNT);
+        let uses = state.image_uses.get(&id).copied().unwrap_or(0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| use_count(ui, uses));
     });
 }
 
@@ -1045,8 +1077,10 @@ fn draw_sound_row(ui: &mut Ui, scene: &mut Scene, state: &mut LibraryState, id: 
             .on_hover_text("Drag onto the stage to put it on a layer");
         ui.label(RichText::new("S").small().weak())
             .on_hover_text("Sound");
-        draw_media_name(ui, scene, state, LibraryMedia::Sound(id), name, DURATION);
+        draw_media_name(ui, scene, state, LibraryMedia::Sound(id), name, DURATION + USE_COUNT);
+        let uses = state.sound_uses.get(&id).copied().unwrap_or(0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            use_count(ui, uses);
             ui.label(RichText::new(format!("{seconds:.1} s")).small().weak());
         });
     });
@@ -1248,7 +1282,55 @@ fn draw_footer(
                 None => *command = Some(Command::DeleteSymbol),
             }
         }
+        // Animate's Select Unused Items, carried through: what the film never
+        // shows, found when asked (it walks the whole document) and deleted
+        // only once confirmed.
+        if ui
+            .button("Unused")
+            .on_hover_text("Delete every symbol, picture and sound that is not used anywhere in the film")
+            .clicked()
+        {
+            let unused = scene.unused_library();
+            let mut names: Vec<String> = unused
+                .symbols
+                .iter()
+                .filter_map(|id| scene.library().get(*id).map(|s| s.name.clone()))
+                .chain(unused.images.iter().filter_map(|id| scene.images().get(*id).map(|i| i.name.clone())))
+                .chain(unused.sounds.iter().filter_map(|id| scene.sounds().get(*id).map(|s| s.name.clone())))
+                .collect();
+            names.truncate(8);
+            state.confirm_unused =
+                Some(((unused.symbols.len(), unused.images.len(), unused.sounds.len()), names));
+        }
     });
+
+    if let Some(((symbols, pictures, sounds), names)) = state.confirm_unused.clone() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            let total = symbols + pictures + sounds;
+            if total == 0 {
+                ui.label("Everything in the Library is used.");
+                if ui.button("OK").clicked() {
+                    state.confirm_unused = None;
+                }
+                return;
+            }
+            ui.label(format!(
+                "Delete {symbols} unused symbol(s), {pictures} picture(s) and {sounds} sound(s)?"
+            ));
+            let more = if total > names.len() { format!(", and {} more", total - names.len()) } else { String::new() };
+            ui.label(RichText::new(format!("{}{more}", names.join(", "))).small().weak());
+            ui.label(RichText::new("Used only inside an unused symbol counts as unused. Undo brings them back.").small().weak());
+            ui.horizontal(|ui| {
+                if ui.button("Delete Unused").clicked() {
+                    state.media_request = Some(MediaRequest::DeleteUnused);
+                    state.confirm_unused = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    state.confirm_unused = None;
+                }
+            });
+        });
+    }
 
     let Some(id) = selected else { return };
     let Some(symbol) = scene.library().get(id) else {

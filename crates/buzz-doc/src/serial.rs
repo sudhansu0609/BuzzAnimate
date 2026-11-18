@@ -229,7 +229,10 @@ use serde::{Deserialize, Serialize};
 /// * **52** — a layer carries `edit_hidden`: hidden while its symbol is
 ///   edited, and drawn wherever the symbol is shown. Absent for every other
 ///   layer, which is every layer of every older document.
-pub const FORMAT_VERSION: u32 = 52;
+/// * **53** — a puppet folder lifted onto the main timeline carries
+///   `puppet_instance`: the character instance it was lifted from. Absent on
+///   every other layer, which is every layer of every older document.
+pub const FORMAT_VERSION: u32 = 53;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -1313,6 +1316,10 @@ pub struct LayerDto {
     /// A puppet folder (see `Layer::puppet`). Absent means not.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub puppet: bool,
+    /// The instance a lifted puppet came from (see `Layer::puppet_instance`).
+    /// Version 53; absent on every other layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub puppet_instance: Option<u64>,
     /// The main sound layer of its timeline (see `Layer::main_sound`). Absent
     /// means not, which is every layer of every older document.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2754,6 +2761,7 @@ impl LayerDto {
             collapsed: layer.collapsed,
             audio_guide: layer.audio_guide,
             puppet: layer.puppet,
+            puppet_instance: layer.puppet_instance.map(|id| id.0),
             main_sound: layer.main_sound,
             cast_source: layer.cast_source.clone(),
             filters: layer.filters.iter().map(FilterDto::from_filter).collect(),
@@ -2827,6 +2835,7 @@ impl LayerDto {
         layer.collapsed = self.collapsed;
         layer.audio_guide = self.audio_guide;
         layer.puppet = self.puppet;
+        layer.puppet_instance = self.puppet_instance.map(buzz_scene::ObjectId);
         layer.main_sound = self.main_sound;
         layer.cast_source = self.cast_source.clone();
         layer.brightness = self.brightness;

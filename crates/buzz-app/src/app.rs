@@ -99,6 +99,45 @@ struct StageStamp {
     mask_drawn_on: Option<u64>,
 }
 
+/// Frames drawn and stage re-encodes since launch, and why each re-encode
+/// happened — what to read when the frame time climbs (`GET /api/state`).
+#[derive(Default)]
+struct Perf {
+    frames: u64,
+    encodes: u64,
+    last_cause: String,
+    causes: std::collections::BTreeMap<String, u64>,
+    /// Redraws asked for by background work landing, by what asked.
+    redraws: std::collections::BTreeMap<&'static str, u64>,
+}
+
+/// Why the stage was encoded again: the first refusal that applied, else
+/// the parts of the stamp that moved.
+fn encode_cause<const N: usize>(old: Option<&StageStamp>, new: &StageStamp, refusals: [(&str, bool); N]) -> String {
+    if let Some((why, _)) = refusals.iter().find(|(_, on)| *on) {
+        return (*why).to_string();
+    }
+    let Some(old) = old else { return "first frame".into() };
+    let moved: Vec<&str> = [
+        ("revision", old.revision != new.revision),
+        ("frame", old.frame != new.frame),
+        ("camera", old.camera != new.camera),
+        ("area", old.area != new.area),
+        ("edit path", old.edit_path != new.edit_path),
+        ("onion", old.onion != new.onion),
+        ("edit multiple", old.edit_multiple != new.edit_multiple),
+        ("lights generation", old.lights_generation != new.lights_generation),
+        ("lights", old.lights != new.lights),
+        ("painted preview", old.painted_preview != new.painted_preview),
+        ("mask", old.mask_drawn_on != new.mask_drawn_on),
+    ]
+    .into_iter()
+    .filter(|(_, m)| *m)
+    .map(|(n, _)| n)
+    .collect();
+    if moved.is_empty() { "unknown".into() } else { moved.join("+") }
+}
+
 /// A batch of shading geometry being built off the UI thread.
 ///
 /// # Why it can be abandoned
@@ -1115,13 +1154,21 @@ struct UsageCache {
     /// The document revision `counts` were computed for.
     revision: Option<u64>,
     counts: std::collections::BTreeMap<buzz_scene::SymbolId, usize>,
+    /// The same for pictures and sounds, which the Library counts too.
+    media: MediaUses,
     /// A recompute in flight: the revision it is for, and where it will land.
     #[allow(clippy::type_complexity)]
     in_flight: Option<(
         u64,
-        crossbeam_channel::Receiver<std::collections::BTreeMap<buzz_scene::SymbolId, usize>>,
+        crossbeam_channel::Receiver<(std::collections::BTreeMap<buzz_scene::SymbolId, usize>, MediaUses)>,
     )>,
 }
+
+/// Uses of each picture and of each sound.
+type MediaUses = (
+    std::collections::BTreeMap<buzz_scene::ImageId, usize>,
+    std::collections::BTreeMap<buzz_scene::SoundId, usize>,
+);
 
 impl UsageCache {
     /// The counts to show right now — the freshest that have finished.
@@ -1139,7 +1186,7 @@ impl UsageCache {
     fn spawned(
         &mut self,
         revision: u64,
-        rx: crossbeam_channel::Receiver<std::collections::BTreeMap<buzz_scene::SymbolId, usize>>,
+        rx: crossbeam_channel::Receiver<(std::collections::BTreeMap<buzz_scene::SymbolId, usize>, MediaUses)>,
     ) {
         self.in_flight = Some((revision, rx));
     }
@@ -1165,10 +1212,12 @@ impl UsageCache {
         let Some((revision, rx)) = &self.in_flight else {
             return;
         };
-        if let Ok(counts) = rx.try_recv() {
+        if let Ok((counts, media)) = rx.try_recv() {
             let revision = *revision;
             self.in_flight = None;
-            self.install(revision, counts);
+            if self.install(revision, counts) {
+                self.media = media;
+            }
         }
     }
 }
@@ -1198,6 +1247,8 @@ pub struct App {
     /// means egui is idle and wants no timed repaint. Folded into
     /// [`App::wants_frame`] so the loop wakes for tooltips and animations.
     egui_repaint: Option<Instant>,
+    /// When to try again for a frame the covered window could not draw.
+    occluded_retry: Option<Instant>,
     /// Escape hatch: `BUZZ_POLL=1` forces the old always-redraw loop, for
     /// bisecting any report of stale UI.
     force_poll: bool,
@@ -1207,6 +1258,10 @@ pub struct App {
     /// tooltip, a background install elsewhere) does not re-encode a huge stage.
     /// See [`StageStamp`].
     stage_stamp: Option<StageStamp>,
+    /// Counts for `/api/state`: see [`Perf`].
+    perf: Perf,
+    /// The stage state drawn with no shading owed; see [`ShadingOwed`].
+    shading_owes_nothing: Option<(u64, u32, u64)>,
     /// The stage's scrollable content extent, cached by `(revision, frame)`.
     /// Computing it walks and resolves every object's bounds through the library
     /// — cheap on a small file, seconds on a rig-heavy import — so it must not
@@ -1789,8 +1844,11 @@ impl App {
             font_previews: buzz_ui::FontPreviews::default(),
             proxy: None,
             egui_repaint: None,
+            occluded_retry: None,
             force_poll: std::env::var("BUZZ_POLL").is_ok(),
             stage_stamp: None,
+            perf: Perf::default(),
+            shading_owes_nothing: None,
             last_rig: 0,
             last_stage_area: None,
             progress_hidden: false,
@@ -1970,6 +2028,20 @@ impl App {
     /// Which of [`Self::wants_frame`]'s reasons hold right now, by name, for
     /// the `BUZZ_FRAME_LOG` line: an idle editor that keeps drawing says why.
     fn redraw_reasons(&self) -> String {
+        let on = self.redraw_flags();
+        let take = |c: &std::sync::atomic::AtomicU64| c.swap(0, std::sync::atomic::Ordering::Relaxed);
+        format!(
+            "{} wakes user {} egui_event {} stale {} rig {}",
+            if on.is_empty() { "-".to_string() } else { on.join(",") },
+            take(&WAKE_USER_EVENT),
+            take(&WAKE_EGUI_EVENT),
+            take(&WAKE_STALE),
+            take(&WAKE_RIG),
+        )
+    }
+
+    /// The names of [`Self::wants_frame`]'s reasons that hold right now.
+    fn redraw_flags(&self) -> Vec<&'static str> {
         let reasons = [
             ("force_poll", self.force_poll),
             ("splash", self.splash.is_open()),
@@ -1992,16 +2064,7 @@ impl App {
             ("tasks", !self.tasks.is_empty()),
             ("egui_repaint", self.egui_repaint.is_some()),
         ];
-        let on: Vec<&str> = reasons.iter().filter(|(_, b)| *b).map(|(n, _)| *n).collect();
-        let take = |c: &std::sync::atomic::AtomicU64| c.swap(0, std::sync::atomic::Ordering::Relaxed);
-        format!(
-            "{} wakes user {} egui_event {} stale {} rig {}",
-            if on.is_empty() { "-".to_string() } else { on.join(",") },
-            take(&WAKE_USER_EVENT),
-            take(&WAKE_EGUI_EVENT),
-            take(&WAKE_STALE),
-            take(&WAKE_RIG),
-        )
+        reasons.iter().filter(|(_, b)| *b).map(|(n, _)| *n).collect()
     }
 
     fn wants_frame(&self) -> Redraw {
@@ -2036,10 +2099,12 @@ impl App {
             return Redraw::Now;
         }
         // Otherwise defer to egui: a timed repaint if it asked for one, else
-        // sleep until woken.
-        match self.egui_repaint {
-            Some(at) => Redraw::At(at),
-            None => Redraw::Idle,
+        // sleep until woken — or the retry of a frame the covered window
+        // could not draw, whichever is first.
+        match (self.egui_repaint, self.occluded_retry) {
+            (Some(a), Some(b)) => Redraw::At(a.min(b)),
+            (Some(at), None) | (None, Some(at)) => Redraw::At(at),
+            (None, None) => Redraw::Idle,
         }
     }
 
@@ -2682,6 +2747,7 @@ fn finish_stage_frame(
     stage_stamp: &mut Option<StageStamp>,
     stage_stale: &mut bool,
     stamp: StageStamp,
+    shading: ShadingOwed<'_>,
 ) {
     *stage_stamp = Some(stamp);
     // Read *after* the draw: it is the draw that discovers what it could not
@@ -2744,6 +2810,28 @@ fn finish_stage_frame(
         });
         window.request_redraw();
     }
+    // Lit, collecting what it could not light, and nothing owed and nothing
+    // building: this frame under this light has no shading to build at all.
+    if shading.queued && shade_build.is_none() && lights.lights.is_empty() {
+        *shading.owes_nothing = Some(shading.key);
+    }
+}
+
+/// What [`finish_stage_frame`] needs to tell a stage with **no shading to
+/// build** from one whose shading is still owed (`cold`).
+///
+/// A lit film whose light builds nothing on a frame (no crescent to cut) kept
+/// an empty light cache for ever, so it was cold for ever, and a cold stage
+/// is never reused: every redraw — a tooltip, the clock, a panel — encoded the
+/// whole stage again, 15 ms a time on alaxmi1, which is the frame time the
+/// readout showed at rest (user 2026-11-18: "the latency increased to 20 ms").
+struct ShadingOwed<'a> {
+    /// The misses were being collected this frame (the light at rest).
+    queued: bool,
+    /// The document revision, frame and lighting fingerprint drawn.
+    key: (u64, u32, u64),
+    /// Where "nothing owed for `key`" is kept; `cold` reads it.
+    owes_nothing: &'a mut Option<(u64, u32, u64)>,
 }
 
 /// One leaf band [`plan_stage_bands`] actually settled on: its own rows in
@@ -7418,7 +7506,7 @@ impl App {
                     let scene = self.editor.doc.scene().clone();
                     let (send, receive) = crossbeam_channel::bounded(1);
                     self.jobs.spawn(Pool::Background, move || {
-                        let _ = send.send(scene.symbol_usage());
+                        let _ = send.send((scene.symbol_usage(), (scene.image_usage(), scene.sound_usage())));
                     });
                     self.usage_cache.spawned(revision, receive);
                 }
@@ -7459,6 +7547,7 @@ impl App {
 
                 let editor = &mut self.editor;
                 let library = &mut editor.library;
+                (library.image_uses, library.sound_uses) = self.usage_cache.media.clone();
                 let thumbnails = &mut self.thumbnails;
                 let usage = self.usage_cache.counts();
                 let mut raised = None;
@@ -10677,6 +10766,32 @@ impl App {
     /// "2000 ms" forever under the old readout — alarming, and wrong about
     /// exactly the number this status bar exists to report. `active.frame_ms`
     /// itself is untouched: playback still reads it for `elapsed`.
+    /// The last frame's work by section, and [`Perf`]'s counts, for the API.
+    pub(crate) fn perf_json(&self) -> serde_json::Value {
+        let last = self.profiler.last();
+        let sections: serde_json::Map<String, serde_json::Value> = crate::profile::Section::ALL
+            .into_iter()
+            .map(|s| (s.label().to_string(), serde_json::json!((last.section(s).as_secs_f64() * 1e4).round() / 10.0)))
+            .collect();
+        serde_json::json!({
+            "frame_ms": (last.total().as_secs_f64() * 1e4).round() / 10.0,
+            "sections": sections,
+            "frames": self.perf.frames,
+            "encodes": self.perf.encodes,
+            "last_encode_cause": self.perf.last_cause,
+            "encode_causes": self.perf.causes,
+            "redraw_flags": self.redraw_flags(),
+            "redraws": self.perf.redraws,
+            "stage_stale": self.stage_stale,
+            "wakes": {
+                "stale": WAKE_STALE.load(std::sync::atomic::Ordering::Relaxed),
+                "rig": WAKE_RIG.load(std::sync::atomic::Ordering::Relaxed),
+                "user": WAKE_USER_EVENT.load(std::sync::atomic::Ordering::Relaxed),
+                "egui": WAKE_EGUI_EVENT.load(std::sync::atomic::Ordering::Relaxed),
+            },
+        })
+    }
+
     fn frame_ms_display(&self) -> f32 {
         self.profiler.last().total().as_secs_f32() * 1000.0
     }
@@ -19621,6 +19736,11 @@ impl App {
             if let Ok(built) = build.results.try_recv() {
                 self.lights.lights.install(built);
                 self.shade_build = None;
+                // Built, and still nothing to show: none is owed any more.
+                if self.lights.lights.is_empty() {
+                    let key = (self.editor.scene().revision(), self.editor.current_frame, rig);
+                    self.shading_owes_nothing = Some(key);
+                }
                 // The stage's shading changed, so a retained encoding is stale.
                 self.lights_generation = self.lights_generation.wrapping_add(1);
                 active.window.request_redraw();
@@ -19679,16 +19799,20 @@ impl App {
         // ever be built for it, and calling it cold forever would refuse the
         // retained encoding on every frame and re-encode the whole stage at the
         // display's rate. See `buzz_render::document::LightDetail`.
+        let shade_key = (self.editor.scene().revision(), self.editor.current_frame, rig);
         let cold = light_cache_empty_of(&self.pipeline, &self.lights)
             && self.editor.scene().lights().is_active()
             && light_detail_of(&self.pipeline, &self.lights)
-                == buzz_render::document::LightDetail::Full;
+                == buzz_render::document::LightDetail::Full
+            // Drawn once already with nothing to build: not owed, so not cold.
+            && self.shading_owes_nothing != Some(shade_key);
         let building = self.shade_build.is_some();
         let bulk = cold || self.editor.is_gesturing();
         // Has the light come to rest? Nothing is recorded or built while it is
         // still moving — see where the batch is started, below.
         let settled = aim == self.shade_aim;
         self.shade_aim = aim;
+        let shade_queued = !building && settled;
         // Not while the cache is lent: the pipeline only runs when these are
         // already `INLINE_BUDGET` and `true` (see `can_encode_ahead`), and they
         // were set so before it was lent.
@@ -19698,7 +19822,7 @@ impl App {
             } else {
                 buzz_render::lighting::INLINE_BUDGET
             });
-            self.lights.lights.set_queue(!building && settled);
+            self.lights.lights.set_queue(shade_queued);
             // T14: while a light is being dragged a heavy frame leaves its
             // crescents out (`DrawCache::set_draft`); they return on release.
             self.lights.set_draft(self.editor.light_gesture.is_some());
@@ -19807,6 +19931,24 @@ impl App {
             && !paints_into_scene
             && self.stage_bands == 0
             && self.stage_stamp.as_ref() == Some(&stamp);
+        // What the live app reports in `/api/state`'s `perf`: frames drawn,
+        // how many re-encoded the stage, and what made the last one.
+        self.perf.frames += 1;
+        if !reuse {
+            self.perf.encodes += 1;
+            self.perf.last_cause = encode_cause(
+                self.stage_stamp.as_ref(),
+                &stamp,
+                [
+                    ("not retained", !self.retain_stage),
+                    ("cold", cold),
+                    ("stale", stale_encoding),
+                    ("painted preview", paints_into_scene),
+                    ("bands", self.stage_bands != 0),
+                ],
+            );
+            *self.perf.causes.entry(self.perf.last_cause.clone()).or_insert(0) += 1;
+        }
         // Already banding, coming into this frame: the band encode below —
         // one `cache.begin`/`end` around all of them — is what actually draws
         // this frame, and `finish_stage_frame` runs once after it instead.
@@ -19943,6 +20085,7 @@ impl App {
                 &mut self.stage_stamp,
                 &mut self.stage_stale,
                 pending_stamp.take().expect("set just above"),
+                ShadingOwed { queued: shade_queued, key: shade_key, owes_nothing: &mut self.shading_owes_nothing },
             );
 
             // **A frame the ordinary ladder cannot fit even at
@@ -20079,13 +20222,18 @@ impl App {
                 return Ok(());
             }
             // Genuinely occluded — another window over this one, or a session
-            // locked. Ask for the frame that will be wanted when it is not.
+            // locked. **Not asked for again at once**: that spun the loop at
+            // well over a thousand frames a second, a core at 100%, for as long
+            // as the window stayed covered. The window's `Occluded(false)`
+            // asks for the frame when it is uncovered; a quiet retry a few
+            // times a second covers a platform that does not say.
             Cst::Timeout | Cst::Occluded => {
-                active.window.request_redraw();
+                self.occluded_retry = Some(Instant::now() + Duration::from_millis(250));
                 return Ok(());
             }
             other => return Err(anyhow::anyhow!("acquiring surface texture: {other:?}")),
         };
+        self.occluded_retry = None;
         let surface_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -20097,6 +20245,7 @@ impl App {
         // own scene has been consumed, because it borrows the same Vello scene
         // to build into. At most a handful per frame; see `thumbnails`.
         if self.thumbnails.pending() {
+            *self.perf.redraws.entry("thumbnails").or_insert(0) += 1;
             let mut scratch = buzz_render::vello::Scene::new();
             self.thumbnails.fulfil(
                 &mut active.gpu,
@@ -20116,6 +20265,7 @@ impl App {
         // and a strip filling in one frame at a time would flicker its way
         // into existence while the user watched.
         if self.preview.pending() {
+            *self.perf.redraws.entry("preview").or_insert(0) += 1;
             let mut scratch = buzz_render::vello::Scene::new();
             self.preview.fulfil(
                 &mut active.gpu,
@@ -20148,6 +20298,7 @@ impl App {
         // reason. Kept separate so a document with a big library and a disk
         // with a big asset folder do not each spend the other's budget.
         if self.asset_thumbnails.pending() {
+            *self.perf.redraws.entry("asset_thumbnails").or_insert(0) += 1;
             let mut scratch = buzz_render::vello::Scene::new();
             self.asset_thumbnails.fulfil(
                 &mut active.gpu,
@@ -20220,6 +20371,7 @@ impl App {
                     &mut self.stage_stamp,
                     &mut self.stage_stale,
                     stamp,
+                    ShadingOwed { queued: shade_queued, key: shade_key, owes_nothing: &mut self.shading_owes_nothing },
                 );
                 // The two redraw requests skipped above for band mode,
                 // read now that `finish_stage_frame` has actually set
@@ -20567,6 +20719,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
+            WindowEvent::Occluded(false) => {
+                self.occluded_retry = None;
+                active.window.request_redraw();
+            }
             WindowEvent::Resized(size) => {
                 active.resize(size.width, size.height);
                 self.window_maximized = active.window.is_maximized();
@@ -20670,6 +20826,13 @@ impl ApplicationHandler<UserEvent> for App {
         if self.poll_auto_save()
             && let Some(active) = &self.active
         {
+            active.window.request_redraw();
+        }
+        // The covered window's quiet retry, once it is due.
+        if self.occluded_retry.is_some_and(|at| Instant::now() >= at)
+            && let Some(active) = &self.active
+        {
+            self.occluded_retry = None;
             active.window.request_redraw();
         }
         let auto_save = self.auto_save_wake();

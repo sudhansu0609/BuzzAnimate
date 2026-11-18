@@ -1713,6 +1713,94 @@ impl Scene {
         counts
     }
 
+    /// **What the Library holds that the film never shows**: every symbol,
+    /// picture and sound the main timeline does not reach — through instances,
+    /// groups, rigs and warps, into the symbols it places and theirs, and into
+    /// the other members of a reached symbol's set (which it switches to).
+    /// A symbol used only inside an unused one is unused too.
+    pub fn unused_library(&self) -> UnusedLibrary {
+        use std::collections::BTreeSet;
+
+        fn walk(object: &Object, symbols: &mut Vec<SymbolId>, images: &mut BTreeSet<ImageId>) {
+            let mut shape = |data: &ShapeData| {
+                let fill = data.fill.as_ref().map(|f| &f.paint);
+                let stroke = data.stroke.as_ref().map(|s| &s.paint);
+                for paint in fill.into_iter().chain(stroke) {
+                    if let Some(image) = paint.image() {
+                        images.insert(image.asset.id);
+                    }
+                }
+            };
+            match &object.kind {
+                ObjectKind::Instance(i) => symbols.push(i.symbol),
+                ObjectKind::Shape(data) => shape(data),
+                ObjectKind::Warp(warp) => shape(&warp.shape),
+                ObjectKind::Group(children) => {
+                    for c in children {
+                        walk(c, symbols, images);
+                    }
+                }
+                ObjectKind::Armature(rig) => {
+                    for part in &rig.parts {
+                        walk(&part.artwork, symbols, images);
+                    }
+                }
+            }
+        }
+
+        let mut reached: BTreeSet<SymbolId> = BTreeSet::new();
+        let mut images: BTreeSet<ImageId> = BTreeSet::new();
+        let mut sounds: BTreeSet<SoundId> = BTreeSet::new();
+        let mut stacks: Vec<&LayerStack> = vec![self.stage_layers()];
+        let mut found: Vec<SymbolId> = Vec::new();
+        while let Some(stack) = stacks.pop() {
+            for layer in stack.iter() {
+                for keyframe in layer.frames.keyframes() {
+                    if let Some(sound) = keyframe.sound {
+                        sounds.insert(sound.sound);
+                    }
+                }
+                for object in layer.all_objects() {
+                    walk(object, &mut found, &mut images);
+                }
+            }
+            while let Some(id) = found.pop() {
+                if reached.insert(id)
+                    && let Some(symbol) = self.library.get(id)
+                {
+                    stacks.push(&symbol.layers);
+                    found.extend(symbol.set.iter().copied());
+                }
+            }
+        }
+        UnusedLibrary {
+            symbols: self.library.iter().map(|s| s.id).filter(|id| !reached.contains(id)).collect(),
+            images: self.images().iter().map(|i| i.id).filter(|id| !images.contains(id)).collect(),
+            sounds: self.sounds().iter().map(|s| s.id).filter(|id| !sounds.contains(id)).collect(),
+        }
+    }
+
+    /// Delete everything [`Self::unused_library`] finds, leaving symbol
+    /// editing first. What was deleted.
+    pub fn remove_unused_library(&mut self) -> UnusedLibrary {
+        let unused = self.unused_library();
+        if unused.is_empty() {
+            return unused;
+        }
+        self.edit_document();
+        for id in &unused.symbols {
+            self.library.remove(*id);
+        }
+        for id in &unused.images {
+            self.images_mut().remove(*id);
+        }
+        for id in &unused.sounds {
+            self.sounds_mut().remove(*id);
+        }
+        self.bump();
+        unused
+    }
+
     /// Add a symbol, giving it a unique name and a fresh id.
     pub fn add_symbol(
         &mut self,
@@ -5565,5 +5653,60 @@ mod tests {
         assert_eq!(keys(1, 10), Some((1, 3)), "the body is one key, same length");
         assert_eq!(keys(2, 20), Some((6, 6)), "the mouth chart is untouched");
         assert!(report.skipped >= 1);
+    }
+}
+
+/// What [`Scene::unused_library`] found: the Library's symbols, pictures and
+/// sounds nothing in the film reaches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnusedLibrary {
+    pub symbols: Vec<SymbolId>,
+    pub images: Vec<ImageId>,
+    pub sounds: Vec<SoundId>,
+}
+
+impl UnusedLibrary {
+    pub fn len(&self) -> usize {
+        self.symbols.len() + self.images.len() + self.sounds.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod unused_library_tests {
+    use super::*;
+
+    /// On the stage, or in a set of something on the stage, is used; only
+    /// inside a symbol nothing places is not — and deleting takes all of it.
+    #[test]
+    fn unused_is_what_the_main_timeline_never_reaches() {
+        let mut scene = Scene::default();
+        let layer = scene.add_layer("Stage", LayerKind::Normal);
+        let used = scene.add_symbol("used", SymbolKind::Graphic, None);
+        let pose = scene.add_symbol("used pose", SymbolKind::Graphic, None);
+        let inner = scene.add_symbol("inner", SymbolKind::Graphic, None);
+        let outer = scene.add_symbol("outer", SymbolKind::Graphic, None);
+        let lone = scene.add_symbol("lone", SymbolKind::Graphic, None);
+        scene.add_instance_at(layer, 0, used, Affine::IDENTITY).unwrap();
+        assert!(scene.library_mut().include_in_set(used, pose));
+        scene.enter_symbol(outer);
+        let outer_layer = scene.layers().iter().next().unwrap().id;
+        scene.add_instance_at(outer_layer, 0, inner, Affine::IDENTITY).unwrap();
+        scene.edit_document();
+
+        let mut unused = scene.unused_library().symbols;
+        unused.sort();
+        let mut want = vec![inner, outer, lone];
+        want.sort();
+        assert_eq!(unused, want);
+
+        let removed = scene.remove_unused_library();
+        assert_eq!(removed.symbols.len(), 3);
+        assert!(scene.library().get(used).is_some() && scene.library().get(pose).is_some());
+        assert!(scene.library().get(inner).is_none() && scene.library().get(lone).is_none());
+        assert!(scene.unused_library().is_empty());
     }
 }

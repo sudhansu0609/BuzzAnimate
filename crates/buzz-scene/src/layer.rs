@@ -271,6 +271,13 @@ pub struct Layer {
     /// older document.
     pub puppet: bool,
 
+    /// **A puppet lifted onto this timeline** from a character's symbol
+    /// (`buzz_app::puppet::lift`): the instance it was lifted from, hidden
+    /// while the parts are posed here, and shown again — with the poses
+    /// written back into its symbol — when Puppet Mode is turned off. Set
+    /// only on such a puppet's folder; `None` everywhere else.
+    pub puppet_instance: Option<crate::ObjectId>,
+
     /// **The main sound layer** of its timeline: the one lip sync reads, set on
     /// the layer a sound was last placed or attached on (Import Sound, a sound
     /// dragged from the Library, Attach Sound) and cleared on the others of the
@@ -371,6 +378,7 @@ impl Layer {
             collapsed: false,
             audio_guide: false,
             puppet: false,
+            puppet_instance: None,
             main_sound: false,
             cast_source: None,
             filters: Vec::new(),

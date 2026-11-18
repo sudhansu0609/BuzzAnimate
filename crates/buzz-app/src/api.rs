@@ -694,6 +694,7 @@ impl App {
             "path": editor.doc.path().map(|p| p.display().to_string()),
             "title": editor.doc.title(),
             "dirty": editor.doc.is_dirty(),
+            "perf": self.perf_json(),
             "current_frame": editor.current_frame,
             "frame_count": scene.frame_count(),
             "film_frames": editor.doc.film_frames(),

@@ -7605,7 +7605,34 @@ impl Editor {
             MediaRequest::Place(LibraryMedia::Picture(id)) => self.place_library_image(id, None),
             MediaRequest::Place(LibraryMedia::Sound(id)) => self.place_library_sound(id),
             MediaRequest::Delete(media) => self.delete_library_media(media),
+            MediaRequest::DeleteUnused => self.delete_unused_library(),
         }
+    }
+
+    /// The Library's **Delete Unused**: every symbol, picture and sound the
+    /// film never reaches, in one undo step.
+    pub fn delete_unused_library(&mut self) {
+        let mut removed = buzz_scene::UnusedLibrary::default();
+        self.doc.edit("Delete Unused Items", |scene| {
+            removed = scene.remove_unused_library();
+        });
+        self.doc.end_gesture();
+        if removed.is_empty() {
+            self.status = Some("Nothing unused in the Library".into());
+            return;
+        }
+        self.library.selected = None;
+        self.library.selected_media = None;
+        self.selection.prune(self.doc.scene());
+        let scene = self.doc.scene().clone();
+        self.sound.refresh(&scene);
+        self.after_context_change();
+        self.status = Some(format!(
+            "Deleted {} unused symbol(s), {} picture(s) and {} sound(s) \u{2014} Undo brings them back",
+            removed.symbols.len(),
+            removed.images.len(),
+            removed.sounds.len()
+        ));
     }
 
     /// A picture or sound dragged out of the Library and dropped on the stage
@@ -13353,9 +13380,12 @@ impl Editor {
     ///
     /// - on a puppet (a part of one selected, or its row active): the parts
     ///   back as layers;
-    /// - on a character on the stage: its parts, inside its symbol (or inside
-    ///   the character a wrapper symbol holds), filed under one puppet, and the
-    ///   character opened in place to be posed;
+    /// - on a character placed on this timeline: its parts lifted out of its
+    ///   symbol onto this timeline under one puppet row, posed here, and put
+    ///   back into the symbol when Puppet Mode is turned off
+    ///   ([`crate::puppet::lift`] / [`crate::puppet::lower`]);
+    /// - on a wrapper symbol holding a character: the character's parts filed
+    ///   under one puppet inside it, and the character opened in place;
     /// - on a Cast character's layers: its folder made the puppet;
     /// - inside a character's own timeline: its parts made a puppet.
     pub fn toggle_puppet(&mut self) {
@@ -13363,11 +13393,20 @@ impl Editor {
         let picked = self.selection.ids().first().and_then(|id| scene.find_object(*id)).map(|(l, _)| l);
         let here = picked.or(self.selection.active_layer());
         if let Some(folder) = here.and_then(|l| crate::puppet::puppet_of(scene, l)) {
+            let lifted = scene.layers().get(folder).is_some_and(|l| l.puppet_instance.is_some());
             self.doc.edit("Puppet Mode Off", |s| {
-                s.edit_open_layers(|stack| crate::puppet::unpuppet(stack, folder));
+                if lifted {
+                    crate::puppet::lower(s, folder);
+                } else {
+                    s.edit_open_layers(|stack| crate::puppet::unpuppet(stack, folder));
+                }
             });
             self.selection.prune(self.doc.scene());
-            self.status = Some("Puppet Mode off: the parts are layers again, as they were".into());
+            self.status = Some(if lifted {
+                "Puppet Mode off: the poses are in the character's symbol, every layer there to open and change".into()
+            } else {
+                "Puppet Mode off: the parts are layers again, as they were".into()
+            });
             return;
         }
 
@@ -13395,6 +13434,28 @@ impl Editor {
                 return;
             };
             let name = library.get(target).map(|d| d.name.clone()).unwrap_or_default();
+            // **The character itself placed here: posed on this timeline.**
+            // Its parts come out of the symbol under one puppet row, and go
+            // back into it when Puppet Mode is turned off.
+            if target == symbol {
+                let frame = self.current_frame;
+                let mut lifted = None;
+                self.doc.edit("Puppet Mode", |s| {
+                    let folder = LayerId(s.next_object_id().0);
+                    lifted = crate::puppet::lift(s, id, frame, folder);
+                });
+                match lifted {
+                    Some(folder) => {
+                        self.selection.clear();
+                        self.selection.set_active_layer(Some(folder));
+                        self.status = Some(format!(
+                            "{name} is a puppet on this timeline: drag a part to turn it about its joint, and each pose is keyed with an ease. Puppet Mode again puts the poses back in its symbol"
+                        ));
+                    }
+                    None => self.status = Some(format!("Puppet Mode: {name} has no parts to make a puppet of")),
+                }
+                return;
+            }
             let already = library.get(target).is_some_and(|d| d.layers.iter().any(|l| l.puppet));
             if !already {
                 let mut made = false;
@@ -30919,17 +30980,24 @@ mod tests {
                 l.frames.insert_frame(29);
             });
             let id = scene.next_object_id();
-            scene.add_object_at(stage, 0, Object::instance_of(id, guy));
+            // Placed away from the origin: the lift carries the move.
+            scene.add_object_at(stage, 0, Object::instance_of(id, guy).with_transform(Affine::translate((100.0, 50.0))));
             ids = (guy, id, arm_id);
         });
         let (guy, placed, arm) = ids;
         e.selection.set([placed]);
         e.run(Command::PuppetMode);
-        let def = e.scene().library().get(guy).unwrap();
-        let folder = def.layers.iter().find(|l| l.puppet).expect("a puppet folder in the character");
-        assert!(folder.collapsed, "shown as one row");
-        assert_eq!(def.layers.iter().filter(|l| l.parent == Some(folder.id)).count(), 2, "body and arm under it");
-        assert_eq!(e.scene().editing_symbol(), Some(guy), "opened to be posed");
+        // On the main timeline: one puppet row naming the instance, the parts
+        // under it, the instance hidden, nothing opened.
+        assert_eq!(e.scene().editing_symbol(), None, "posed on the main timeline");
+        let folder = e.scene().layers().iter().find(|l| l.puppet).expect("a puppet folder on the stage").clone();
+        assert_eq!(folder.puppet_instance, Some(placed));
+        assert_eq!(e.scene().layers().iter().filter(|l| l.parent == Some(folder.id)).count(), 2, "body and arm under it");
+        assert!(!e.scene().find_object(placed).unwrap().1.visible, "the instance is hidden while posed");
+        let arm_layer = e.scene().layers().iter().find(|l| l.name == "rightArm").unwrap();
+        assert!(arm_layer.follows.is_some(), "the parenting comes with it");
+        let lifted = arm_layer.frames.objects_at(0).iter().find(|o| o.id == arm).unwrap().transform;
+        assert_eq!(lifted, Affine::translate((100.0, 50.0)), "where the instance showed it");
 
         e.set_frame(12);
         e.selection.set([arm]);
@@ -30939,21 +31007,26 @@ mod tests {
         e.puppet_pointer = Some(to);
         e.apply(ToolAction::MoveSelection { delta: to - from });
 
-        let scene = e.scene();
-        let layer = scene.layers().iter().find(|l| l.name == "rightArm").unwrap();
+        // Off: the poses go back into the symbol, in its own coordinates.
+        e.run(Command::PuppetMode);
+        assert!(e.scene().layers().iter().all(|l| !l.puppet), "the puppet row is gone");
+        assert!(e.scene().find_object(placed).unwrap().1.visible, "the instance shows again");
+        let def = e.scene().library().get(guy).unwrap();
+        assert_eq!(def.layers.len(), 2, "every layer is in the symbol, none added");
+        let layer = def.layers.iter().find(|l| l.name == "rightArm").unwrap();
+        assert!(layer.follows.is_some(), "still following the body");
         let key = layer.frames.keyframe_at(12).expect("keyed");
-        assert_eq!(key.start, 12, "the pose is keyed on the playhead");
+        assert_eq!(key.start, 12, "the pose is keyed on the frame it was posed on");
         assert_eq!(layer.frames.tween_at(0), crate::puppet::pose_ease(), "eased in from the pose before");
         let turned = key.objects.iter().find(|o| o.id == arm).unwrap().transform;
         let c = turned.as_coeffs();
         assert!((c[1].atan2(c[0]).abs() - std::f64::consts::FRAC_PI_2).abs() < 1e-6, "a quarter turn: {c:?}");
         let joint_now = turned * Point::new(40.0, 0.0);
         assert!((joint_now - Point::new(40.0, 0.0)).hypot() < 1e-6, "the joint stays put: {joint_now:?}");
-        assert!(layer.frames.keyframe_at(0).is_some_and(|k| k.objects.iter().any(|o| o.id == arm && o.transform == Affine::IDENTITY)), "the pose before is untouched");
-
-        e.run(Command::PuppetMode);
-        let def = e.scene().library().get(guy).unwrap();
-        assert!(def.layers.iter().all(|l| !l.puppet && l.parent.is_none()), "the layers are back");
+        assert!(
+            layer.frames.keyframe_at(0).is_some_and(|k| k.objects.iter().any(|o| o.id == arm && (o.transform.as_coeffs().iter().zip(Affine::IDENTITY.as_coeffs()).all(|(a, b)| (a - b).abs() < 1e-9)))),
+            "the pose before is untouched"
+        );
     }
 
     /// **Copy Stage / Paste Stage**: the stage at one frame, pasted on another

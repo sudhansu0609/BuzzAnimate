@@ -9,7 +9,13 @@
 //! before. Nothing is moved, copied or re-timed: the parts, their parenting,
 //! their keys and every script that reads them are exactly as they were.
 
-use buzz_scene::{Easing, LayerId, LayerKind, LayerStack, Scene, Tween};
+use std::sync::Arc;
+
+use buzz_geom::Affine;
+use buzz_scene::{
+    Easing, FrameSegment, Layer, LayerId, LayerKind, LayerStack, LayerTimeline, LoopMode, ObjectId, ObjectKind, Scene,
+    Tween,
+};
 
 /// The puppet folder `layer` sits in (or is), on the open timeline.
 pub fn puppet_of(scene: &Scene, layer: LayerId) -> Option<LayerId> {
@@ -89,6 +95,250 @@ pub fn unpuppet(stack: &mut LayerStack, folder: LayerId) -> bool {
         stack.update(c, |l| l.parent = None);
     }
     stack.remove(folder).is_some()
+}
+
+/// The span of `layer` a keyframe holding `object` covers, at or before
+/// `frame` when several do: `(first, last)` frames.
+fn instance_span(layer: &Layer, object: ObjectId, frame: u32) -> Option<(u32, u32)> {
+    let keys = layer.frames.keyframes();
+    let holding = |k: &&buzz_scene::Keyframe| k.objects.iter().any(|o| o.id == object);
+    let key = keys
+        .iter()
+        .filter(holding)
+        .filter(|k| k.start <= frame)
+        .last()
+        .or_else(|| keys.iter().find(holding))?;
+    let next = keys.iter().map(|k| k.start).find(|s| *s > key.start);
+    let last = next.map_or(layer.frames.length().saturating_sub(1), |n| n - 1);
+    Some((key.start, last.max(key.start)))
+}
+
+/// `segment` with every object, and the rest pose, carried by `by`.
+fn carried(mut segment: FrameSegment, by: Affine) -> FrameSegment {
+    for key in &mut segment.keyframes {
+        key.objects = Arc::new(
+            key.objects
+                .iter()
+                .map(|o| {
+                    let mut o = (**o).clone();
+                    o.transform = by * o.transform;
+                    Arc::new(o)
+                })
+                .collect(),
+        );
+    }
+    segment
+}
+
+/// Show or hide `object` on the keyframe of `layer` starting at `start`.
+fn set_shown(stack: &mut LayerStack, layer: LayerId, start: u32, object: ObjectId, shown: bool) {
+    stack.update(layer, |l| {
+        for key in l.frames.keyframes_mut().iter_mut().filter(|k| k.start == start) {
+            for each in Arc::make_mut(&mut key.objects).iter_mut() {
+                if each.id == object {
+                    Arc::make_mut(each).visible = shown;
+                }
+            }
+        }
+    });
+}
+
+/// **Puppet Mode on a character placed on the open timeline** (user
+/// 2026-11-17: "it shall open in main timeline, the puppet shall work in main
+/// timeline, but when I remove puppet mode I shall be able to go inside the
+/// symbol and there I will have all layers").
+///
+/// The character's part layers are lifted out of its symbol onto this
+/// timeline, filed under a puppet folder where the instance's layer is: each
+/// one as the instance shows it — its frames from the instance's first frame,
+/// laid over the span of the keyframe holding the instance, and carried by the
+/// instance's transform (the parenting's rest poses with them, so the links
+/// still hold). The instance stays, hidden, and the folder names it
+/// (`Layer::puppet_instance`); [`lower`] writes the poses back into the
+/// symbol. Sound layers stay in the symbol. `None` (nothing changed) when
+/// `instance` is not a symbol instance on the open timeline or its symbol has
+/// no parts. `folder` is the new folder's id.
+pub fn lift(scene: &mut Scene, instance: ObjectId, frame: u32, folder: LayerId) -> Option<LayerId> {
+    let (home, object) = scene.find_object(instance)?;
+    let placed = object.instance()?.clone();
+    let transform = object.transform;
+    let (start, last) = instance_span(scene.layers().get(home)?, instance, frame)?;
+    let span = last - start + 1;
+    let symbol = scene.library().get(placed.symbol)?.clone();
+    let parts: Vec<Arc<Layer>> = symbol.layers.iter().filter(|l| !stays_out(l)).cloned().collect();
+    if parts.is_empty() {
+        return None;
+    }
+    // Fresh ids, the symbol's layers in the same order.
+    let ids: Vec<LayerId> = parts.iter().map(|_| LayerId(scene.next_object_id().0)).collect();
+    let map = |id: LayerId| parts.iter().position(|p| p.id == id).map(|i| ids[i]);
+    let first = placed.first_frame;
+    let lifted: Vec<Layer> = parts
+        .iter()
+        .zip(&ids)
+        .map(|(part, id)| {
+            let mut layer = (**part).clone();
+            layer.id = *id;
+            layer.parent = Some(part.parent.and_then(map).unwrap_or(folder));
+            // The lifted folder is the puppet; one made inside the symbol
+            // before is only a folder here.
+            layer.puppet = false;
+            layer.follows = part.follows.and_then(map);
+            layer.rest_pose = part.rest_pose.map(|r| transform * r);
+            // Held on its first frame, a frozen instance lifts as that one pose.
+            let to = if placed.loop_mode == LoopMode::SingleFrame { first } else { first + span - 1 };
+            let mut frames = LayerTimeline::from_parts(Vec::new(), start + span);
+            if let Some(segment) = part.frames.segment(first.min(part.frames.length().saturating_sub(1)), to) {
+                frames.overwrite(start, &carried(segment, transform));
+            }
+            layer.frames = frames;
+            layer
+        })
+        .collect();
+
+    let stack = scene.edit_layers();
+    let at = stack.index_of(home)?;
+    let mut puppet = Layer::new(folder, format!("{} (puppet)", symbol.name), LayerKind::Folder);
+    puppet.puppet = true;
+    puppet.puppet_instance = Some(instance);
+    puppet.parent = stack.get(home).and_then(|l| l.parent);
+    for (offset, layer) in std::iter::once(puppet).chain(lifted).enumerate() {
+        stack.insert(at + offset, layer);
+    }
+    set_shown(stack, home, start, instance, false);
+    Some(folder)
+}
+
+/// **Puppet Mode off for a lifted puppet** ([`lift`]): every part's frames
+/// over the instance's span go back into the symbol from the instance's first
+/// frame, its transform taken back off; a part matched to the symbol's layer
+/// of the same name replaces those frames there, a new one becomes a new
+/// layer. Its parenting goes with it. The folder and its parts leave this
+/// timeline and the instance shows again — a frozen instance with poses keyed
+/// across the span now plays them once. With the instance gone the parts stay
+/// here as layers. Whether anything changed.
+pub fn lower(scene: &mut Scene, folder: LayerId) -> bool {
+    let Some(instance) = scene.layers().get(folder).and_then(|l| l.puppet_instance) else {
+        return false;
+    };
+    let stack = scene.layers();
+    let members: Vec<Arc<Layer>> = stack.iter().filter(|l| inside(stack, l.id, folder)).cloned().collect();
+    // The keyframe it was lifted from: the lifted layers end where its span
+    // does, and only there is the instance hidden.
+    let end = members.iter().map(|m| m.frames.length()).max().unwrap_or(1);
+    let found = scene.find_object(instance).and_then(|(home, object)| {
+        let placed = object.instance()?.clone();
+        let layer = scene.layers().get(home)?;
+        let held: Vec<u32> = layer
+            .frames
+            .keyframes()
+            .iter()
+            .filter(|k| k.objects.iter().any(|o| o.id == instance))
+            .map(|k| k.start)
+            .collect();
+        let hidden = held.iter().copied().find(|s| {
+            layer.frames.keyframe_at(*s).is_some_and(|k| k.objects.iter().any(|o| o.id == instance && !o.visible))
+        });
+        let start = hidden
+            .or_else(|| held.iter().copied().find(|s| instance_span(layer, instance, *s).is_some_and(|(_, l)| l + 1 == end)))
+            .or_else(|| held.first().copied())?;
+        let span = instance_span(layer, instance, start)?;
+        let transform = layer.frames.keyframe_at(start)?.objects.iter().find(|o| o.id == instance)?.transform;
+        Some((home, placed, transform, span))
+    });
+    let mut written = false;
+    if let Some((home, placed, transform, (start, last))) = found
+        && transform.determinant().abs() > 1e-12
+    {
+        let back = transform.inverse();
+        let first = placed.first_frame;
+        let mut keyed_across = false;
+        let mut new_ids: Vec<LayerId> = Vec::new();
+        for _ in &members {
+            new_ids.push(LayerId(scene.next_object_id().0));
+        }
+        if let Some(symbol) = scene.library_mut().layers_mut(placed.symbol) {
+            // Each member's layer in the symbol: the one of its name, else new.
+            let targets: Vec<LayerId> = members
+                .iter()
+                .zip(&new_ids)
+                .map(|(m, fresh)| {
+                    symbol
+                        .iter()
+                        .find(|l| l.name == m.name && l.kind == m.kind && !stays_out(l))
+                        .map_or(*fresh, |l| l.id)
+                })
+                .collect();
+            let target_of = |id: LayerId| members.iter().position(|m| m.id == id).map(|i| targets[i]);
+            let to = if placed.loop_mode == LoopMode::SingleFrame { first } else { first + (last - start) };
+            for (member, target) in members.iter().zip(&targets) {
+                let parent = member.parent.filter(|p| *p != folder).and_then(target_of);
+                let follows = member.follows.and_then(target_of);
+                // **Only what was changed goes back.** A part left as it was
+                // lifted is not rewritten: rewriting it would re-time the
+                // symbol (its length, its keys) for every other instance.
+                let posed = member.frames.segment(start, last);
+                if let Some(existing) = symbol.get(*target) {
+                    let as_lifted: Option<FrameSegment> = existing
+                        .frames
+                        .segment(first.min(existing.frames.length().saturating_sub(1)), to)
+                        .map(|s| carried(s, transform));
+                    let same = as_lifted.as_ref().map(|s| &s.keyframes) == posed.as_ref().map(|s| &s.keyframes);
+                    if same && existing.parent == parent && existing.follows == follows {
+                        continue;
+                    }
+                }
+                let segment = posed.map(|s| carried(s, back));
+                keyed_across |= segment.as_ref().is_some_and(|s| s.keyframes.len() > 1);
+                let rest = member.rest_pose.map(|r| back * r);
+                if symbol.get(*target).is_none() {
+                    let mut layer = (**member).clone();
+                    layer.id = *target;
+                    layer.frames = LayerTimeline::from_parts(Vec::new(), 1);
+                    symbol.insert(0, layer);
+                }
+                symbol.update(*target, |l| {
+                    if let Some(segment) = &segment {
+                        l.frames.overwrite(first, segment);
+                    }
+                    l.parent = parent;
+                    l.follows = follows;
+                    l.follows_bone = member.follows_bone;
+                    l.rest_pose = rest;
+                    l.visible = member.visible;
+                    l.locked = member.locked;
+                });
+            }
+        }
+        let stack = scene.edit_layers();
+        set_shown(stack, home, start, instance, true);
+        if placed.loop_mode == LoopMode::SingleFrame && keyed_across {
+            stack.update(home, |l| {
+                for key in l.frames.keyframes_mut() {
+                    for each in Arc::make_mut(&mut key.objects).iter_mut() {
+                        if each.id == instance
+                            && let ObjectKind::Instance(i) = &mut Arc::make_mut(each).kind
+                        {
+                            i.loop_mode = LoopMode::PlayOnce;
+                        }
+                    }
+                }
+            });
+        }
+        written = true;
+    }
+    let stack = scene.edit_layers();
+    if !written {
+        // The instance is gone (or cannot be undone): the poses stay here as
+        // layers rather than being lost with the folder.
+        stack.update(folder, |l| l.puppet_instance = None);
+        return unpuppet(stack, folder);
+    }
+    for member in &members {
+        stack.remove(member.id);
+    }
+    stack.remove(folder);
+    true
 }
 
 /// Does `stack` look like a character's own timeline: part layers named for

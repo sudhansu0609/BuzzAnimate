@@ -6298,16 +6298,16 @@ impl Editor {
             ExtendPart => self.extend_part(),
 
             NewLayer => {
-                let id = self.doc_add_layer("Layer", LayerKind::Normal);
+                let id = self.add_layer_above_active("Layer", LayerKind::Normal);
                 self.selection.set_active_layer(Some(id));
             }
             NewLayerFolder => {
-                self.doc_add_layer("Folder", LayerKind::Folder);
+                self.add_layer_above_active("Folder", LayerKind::Folder);
             }
             NewReferenceLayer => {
                 // A guide layer: drawn faded, never exported. Made active so the
                 // next Import Image drops the reference art straight onto it.
-                let id = self.doc_add_layer("Reference", LayerKind::Guide);
+                let id = self.add_layer_above_active("Reference", LayerKind::Guide);
                 self.selection.set_active_layer(Some(id));
                 self.status =
                     Some("Reference layer added — File > Import to Stage puts a picture on it to trace over".into());
@@ -13879,9 +13879,10 @@ impl Editor {
     /// back on the layers they were cut from whatever was selected, so a cut
     /// frame could not be moved to another layer.
     ///
-    /// The copied frames are *inserted* — what was at that frame moves along
-    /// to make room, and carries on after the pasted frames as it was. The
-    /// objects are given fresh ids, so pasting twice gives two drawings
+    /// The copied frames *replace* the frames there, each copied drawing a
+    /// keyframe, and nothing else is keyed: it used to insert them and key
+    /// the frame after so what was there resumed, which left a keyframe the
+    /// user had not asked for after every paste. The objects are given fresh ids, so pasting twice gives two drawings
     /// rather than one shared between two frames.
     fn paste_frames(&mut self) {
         let Some(clip) = self.frame_clipboard.clone() else {
@@ -13923,15 +13924,19 @@ impl Editor {
                     continue;
                 }
                 let at = frame + clipped.offset;
+                let end = at + clipped.length;
                 scene.update_layer(layer, |l| {
                     let f = &mut l.frames;
-                    let inside = at < f.length();
-                    for _ in 0..clipped.length {
-                        f.insert_frame(at);
+                    // Past the layer's end, the layer grows to take them.
+                    if end > f.length() {
+                        f.insert_frame(end - 1);
                     }
-                    // What stood at the playhead resumes after the paste.
-                    if inside {
-                        f.insert_keyframe(at + clipped.length);
+                    // The copied frames replace the ones there. Nothing after
+                    // them is moved or keyed: the last pasted drawing holds up
+                    // to the next keyframe, as it was copied.
+                    let inside: Vec<u32> = (at + 1..end).filter(|&k| f.is_keyframe(k)).collect();
+                    for k in inside {
+                        f.clear_keyframe(k);
                     }
                     for (offset, _) in &clipped.drawings {
                         f.insert_blank_keyframe(frame + offset);
@@ -15257,6 +15262,26 @@ impl Editor {
         created
     }
 
+    /// **New Layer, Folder or Reference Layer, as Animate adds them**: just
+    /// above the layer being worked on, in the folder it is filed in — at the
+    /// top only when no layer is. They all went on top of the timeline, far
+    /// from the layer they were made for. One undo step.
+    fn add_layer_above_active(&mut self, prefix: &str, kind: LayerKind) -> LayerId {
+        let n = self.doc.scene().layers().len() + 1;
+        let here = self.selection.active_layer().filter(|id| self.doc.scene().layers().get(*id).is_some());
+        let mut created = LayerId(0);
+        self.doc.edit("New Layer", |scene| {
+            created = scene.add_layer(format!("{prefix}_{n}"), kind);
+            if let Some(here) = here
+                && let Some(index) = scene.layer_index(here)
+            {
+                let folder = scene.layers().get(here).and_then(|l| l.parent);
+                scene.move_layer_to(created, index, folder);
+            }
+        });
+        created
+    }
+
     fn delete_active_layer(&mut self) {
         let Some(layer) = self.selection.active_layer() else {
             return;
@@ -15549,6 +15574,7 @@ impl Editor {
         }
 
         let mut report = None;
+        let mut renumbered = 0usize;
         self.doc.edit(label, |scene| {
             report = Some(scene.merge(
                 &lifted,
@@ -15558,6 +15584,7 @@ impl Editor {
                     offset,
                 },
             ));
+            renumbered = show_this_frame(scene, layer, frame, &before);
         });
 
         // What arrived is what the user now wants to move — the same rule
@@ -15578,15 +15605,16 @@ impl Editor {
         let count = arrived.len();
         self.selection.set(arrived);
 
+        let set = if renumbered > 0 { format!("; {renumbered} symbols set to frame {}", frame + 1) } else { String::new() };
         self.status = Some(match report {
             Some(report) if report.symbols > 0 => format!(
-                "Pasted {count} {} and {} symbol{}",
+                "Pasted {count} {} and {} symbol{}{set}",
                 if count == 1 { "object" } else { "objects" },
                 report.symbols,
                 if report.symbols == 1 { "" } else { "s" }
             ),
             _ => format!(
-                "Pasted {count} {}",
+                "Pasted {count} {}{set}",
                 if count == 1 { "object" } else { "objects" }
             ),
         });
@@ -17081,6 +17109,53 @@ fn capture_inside(
             out.push((instance.symbol, layers));
         }
     }
+}
+
+/// **What was pasted shows the frame it was pasted on** (user 2026-11-19:
+/// "when I copy an object, the frame of the object shall be automatically set
+/// to that frame on which it is copied; same with the internal objects' frame
+/// numbers"): each symbol pasted onto `layer` at `frame` — every object there
+/// not in `before` — is set to show `frame`, and the symbols inside it in
+/// turn, as F and Paste Stage set them. A symbol too short to reach `frame`
+/// (a mouth or an eye chart, a walk cycle) keeps the frame it had, as F
+/// leaves it. How many symbols were set.
+fn show_this_frame(scene: &mut Scene, layer: LayerId, frame: u32, before: &[ObjectId]) -> usize {
+    let Some(target) = scene.layers().get(layer) else {
+        return 0;
+    };
+    let elapsed = elapsed_on(target, frame);
+    let mut sets: Vec<(ObjectId, u32)> = Vec::new();
+    let mut inside: Vec<buzz_scene::SymbolId> = Vec::new();
+    for object in target.objects_at(frame).iter().filter(|o| !before.contains(&o.id)) {
+        let Some(instance) = object.instance() else { continue };
+        let Some(def) = scene.library().get(instance.symbol) else { continue };
+        if !def.kind.follows_parent_timeline() || instance.sync_to_root || frame >= def.length() {
+            continue;
+        }
+        if instance.resolve_frame(def.kind, elapsed, def.length()) != frame {
+            sets.push((object.id, instance.first_frame_showing(frame, elapsed, def.length())));
+        }
+        inside.push(instance.symbol);
+    }
+    let mut changed = sets.len();
+    if !sets.is_empty() {
+        scene.update_layer(layer, |l| {
+            let Some(keyframe) = l.frames.keyframe_at_mut(frame) else { return };
+            let objects = Arc::make_mut(&mut keyframe.objects);
+            for (id, first) in sets {
+                if let Some(object) = objects.iter_mut().find(|o| o.id == id)
+                    && let ObjectKind::Instance(instance) = &mut Arc::make_mut(object).kind
+                {
+                    instance.first_frame = first;
+                }
+            }
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    for symbol in inside {
+        changed += match_frames_inside(scene, symbol, frame, &mut seen);
+    }
+    changed
 }
 
 /// One layer of a Paste Stage: `objects` keyed on `at`, replacing what was
@@ -21669,12 +21744,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **Delete takes the object from the frame you are on, not before it.**
-    /// F6 copies share ids, and Delete used to take the object out of the
-    /// first keyframe holding that id — on frame 30 it emptied frames 0–9.
+    /// **A pasted symbol shows the frame it was pasted on, inside and out**
+    /// (user 2026-11-19): a body copied on frame 10 — showing its own 10, the
+    /// head inside it its 10 — and pasted on frame 40 shows its 40, and the
+    /// head inside its 40, as F would set them. A chart too short to reach 40
+    /// keeps its frame.
     #[test]
-    fn deleting_on_a_later_frame_leaves_the_earlier_frames_alone() {
+    fn a_pasted_symbol_shows_the_frame_it_is_pasted_on() {
         let mut e = editor();
+        let layer = e.selection.active_layer().expect("a layer");
+        let mut made = None;
+        e.doc.edit("Body", |scene| {
+            let long = |scene: &mut Scene, name: &str, frames: u32| {
+                let id = scene.add_symbol(name, buzz_scene::SymbolKind::Graphic, None);
+                scene.library_mut().update(id, |s| {
+                    let first = s.layers.iter().next().unwrap().id;
+                    s.layers.update(first, |l| { l.frames.insert_frame(frames - 1); });
+                });
+                id
+            };
+            let head = long(scene, "head", 100);
+            let chart = long(scene, "mouthChart", 12);
+            let body = long(scene, "body", 100);
+            scene.library_mut().update(body, |s| {
+                let first = s.layers.iter().next().unwrap().id;
+                s.layers.update(first, |l| {
+                    let mut inner = buzz_scene::Object::instance_of(buzz_scene::ObjectId(9001), head);
+                    if let ObjectKind::Instance(i) = &mut inner.kind {
+                        i.first_frame = 10;
+                        i.loop_mode = buzz_scene::LoopMode::SingleFrame;
+                    }
+                    l.frames.set_objects(0, vec![Arc::new(inner)]);
+                });
+            });
+            scene.update_layer(layer, |l| { l.frames.insert_frame(99); l.frames.insert_blank_keyframe(10); l.frames.insert_blank_keyframe(40); });
+            let mut placed = buzz_scene::Object::instance_of(scene.next_object_id(), body);
+            if let ObjectKind::Instance(i) = &mut placed.kind {
+                i.first_frame = 10;
+            }
+            let id = placed.id;
+            let mut mouth = buzz_scene::Object::instance_of(scene.next_object_id(), chart);
+            if let ObjectKind::Instance(i) = &mut mouth.kind {
+                i.first_frame = 3;
+                i.loop_mode = buzz_scene::LoopMode::SingleFrame;
+            }
+            let mouth_id = mouth.id;
+            scene.update_layer(layer, |l| { l.frames.set_objects(10, vec![Arc::new(placed), Arc::new(mouth)]); });
+            made = Some((id, mouth_id, body, head));
+        });
+        let (id, mouth_id, body, head) = made.unwrap();
+        e.set_frame(10);
+        e.selection.set([id, mouth_id]);
+        e.run(Command::Copy);
+        e.set_frame(40);
+        e.run(Command::PasteInPlace);
+
+        let scene = e.scene();
+        let pasted: Vec<&Arc<Object>> = scene.layers().get(layer).unwrap().objects_at(40).iter().collect();
+        let shows = |symbol: buzz_scene::SymbolId| {
+            pasted.iter().find_map(|o| o.instance().filter(|i| i.symbol == symbol).map(|i| i.first_frame))
+        };
+        assert_eq!(shows(body), Some(40), "the body shows frame 40");
+        let chart = scene.library().iter().find(|s| s.name == "mouthChart").unwrap().id;
+        assert_eq!(shows(chart), Some(3), "a chart too short to reach 40 keeps its frame");
+        let inner = scene.library().get(body).unwrap().layers.iter().next().unwrap().objects_at(40).first().and_then(|o| o.instance().map(|i| (i.symbol, i.first_frame)));
+        assert_eq!(inner, Some((head, 40)), "the head inside shows frame 40 too");
+        assert_eq!(scene.layers().get(layer).unwrap().objects_at(10).len(), 2, "the copied ones are as they were");
+    }
+
+    /// **Delete takes the object from the keyframe the frame belongs to** —
+    /// the nearest on the left — and from no keyframe before it. F6 copies
+    /// share ids, and Delete used to take the object out of the first
+    /// keyframe holding that id (on frame 30 it emptied frames 0–9); then it
+    /// made the playhead a keyframe and emptied that, leaving a new blank
+    /// keyframe behind every Delete. Only Auto Keyframe makes one now.
+    #[test]
+    fn deleting_on_a_later_frame_takes_it_from_that_keyframe() {
+        let mut e = editor();
+        e.auto_keyframe = false;
         e.style.drawing_mode = DrawingMode::ObjectDrawing;
         let layer = e.selection.active_layer().expect("a layer");
         e.apply(ToolAction::AddShape {
@@ -21689,14 +21836,16 @@ mod tests {
             });
         });
         let on = |e: &Editor, f: u32| e.scene().layers().get(layer).unwrap().objects_at(f).len();
+        let keys = |e: &Editor| e.scene().layers().get(layer).unwrap().frames.keyframes().iter().map(|k| k.start).collect::<Vec<_>>();
         let id = e.scene().layers().get(layer).unwrap().objects_at(30)[0].id;
 
         // Picked on the stage at frame 30, partway into the 10–39 span.
         e.set_frame(30);
         e.selection.select_one(id);
         e.run(Command::Delete);
-        assert_eq!((on(&e, 0), on(&e, 10), on(&e, 29)), (1, 1, 1), "the frames before keep it");
-        assert_eq!((on(&e, 30), on(&e, 39)), (0, 0), "gone from the playhead on");
+        assert_eq!(keys(&e), vec![0, 10, 40], "no keyframe made");
+        assert_eq!((on(&e, 10), on(&e, 30), on(&e, 39)), (0, 0, 0), "gone from the keyframe at 10");
+        assert_eq!((on(&e, 0), on(&e, 9)), (1, 1), "the keyframe before keeps it");
         assert_eq!(on(&e, 40), 1, "the next keyframe's drawing is its own");
 
         // A frame clicked in the timeline, then Delete: the same.
@@ -21704,7 +21853,41 @@ mod tests {
         e.selection.set_timeline(buzz_ui::TimelineSelection::new([layer], 30, 30, layer, 30));
         e.selection.select_timeline_contents(e.doc.scene(), 30);
         e.run(Command::Delete);
+        assert_eq!((keys(&e), on(&e, 9), on(&e, 10)), (vec![0, 10, 40], 1, 0));
+
+        // With Auto Keyframe on, the playhead is keyed first.
+        e.run(Command::Undo);
+        e.auto_keyframe = true;
+        e.selection.select_one(id);
+        e.run(Command::Delete);
+        assert_eq!(keys(&e), vec![0, 10, 30, 40]);
         assert_eq!((on(&e, 29), on(&e, 30)), (1, 0));
+    }
+
+    /// **New Layer goes just above the layer being worked on**, in its
+    /// folder, as in Animate — not on top of the whole timeline.
+    #[test]
+    fn a_new_layer_goes_above_the_active_one() {
+        let mut e = editor();
+        let bottom = e.selection.active_layer().expect("a layer");
+        let folder = e.doc_add_layer("Folder", buzz_scene::LayerKind::Folder);
+        let inside = e.doc_add_layer("Arm", buzz_scene::LayerKind::Normal);
+        e.doc.edit("File", |s| { s.move_layer_to(inside, s.layer_index(folder).unwrap() + 1, Some(folder)); });
+        let _top = e.doc_add_layer("Top", buzz_scene::LayerKind::Normal);
+        let order = |e: &Editor| e.scene().layers().iter().map(|l| l.id).collect::<Vec<_>>();
+
+        e.selection.set_active_layer(Some(bottom));
+        e.run(Command::NewLayer);
+        let made = e.selection.active_layer().unwrap();
+        let rows = order(&e);
+        assert_eq!(rows.iter().position(|&l| l == made).unwrap() + 1, rows.iter().position(|&l| l == bottom).unwrap(), "just above: {rows:?}");
+
+        e.selection.set_active_layer(Some(inside));
+        e.run(Command::NewLayer);
+        let made = e.selection.active_layer().unwrap();
+        let rows = order(&e);
+        assert_eq!(rows.iter().position(|&l| l == made).unwrap() + 1, rows.iter().position(|&l| l == inside).unwrap());
+        assert_eq!(e.scene().layers().get(made).unwrap().parent, Some(folder), "in the same folder");
     }
 
     /// **Copy Frames, pasted somewhere else** (⌘⌥C, ⌘⌥V): frames of two layers
@@ -22105,11 +22288,15 @@ mod tests {
         e.run(buzz_ui::Command::CutFrames);
         assert_eq!((on(&e, first, 7), on(&e, first, 8), on(&e, first, 10), on(&e, first, 11)), (1, 0, 0, 1));
 
-        // Paste inserts the three frames at 15; what was there moves along.
+        // Paste puts the three frames over 15–17: nothing moves along, and
+        // the copied drawing is the only keyframe it adds — none after it.
         let length = e.scene().layers().get(first).unwrap().frames.length();
         e.set_frame(15);
         e.run(buzz_ui::Command::PasteFrames);
-        assert_eq!(e.scene().layers().get(first).unwrap().frames.length(), length + 3);
+        let frames = &e.scene().layers().get(first).unwrap().frames;
+        assert_eq!(frames.length(), length);
+        assert!(frames.is_keyframe(15));
+        assert!((16..length).all(|f| !frames.is_keyframe(f)), "no keyframe after the pasted one");
         assert_eq!((on(&e, first, 15), on(&e, first, 17), on(&e, first, 18)), (1, 1, 1));
         assert_eq!(on(&e, second, 15), 1, "the other layer is not pasted onto");
     }

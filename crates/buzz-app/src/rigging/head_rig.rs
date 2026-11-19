@@ -112,6 +112,11 @@ pub(crate) fn classify(name: &str) -> Option<Part> {
 /// `base`, `moustacheFront`); `None` when neither says anything.
 pub fn head_layer_name(layer: &Layer) -> Option<String> {
     let n = layer.name.to_lowercase();
+    // The eye's mask: a mask layer, or one named for it. Its own name before
+    // anything else in it ("eyeWhite" left on a mask layer by an old tag).
+    if layer.kind == buzz_scene::LayerKind::Mask || n.contains("mask") {
+        return Some("eyeMask".into());
+    }
     let skipped = layer.parent.is_some() || n.starts_with("layer") || n.contains("sound") || n.trim().is_empty();
     if !skipped {
         let left = n.contains("left") || n.contains("l_") || n.contains("_l");

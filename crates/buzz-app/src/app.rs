@@ -430,6 +430,68 @@ fn fresh_light_cache() -> buzz_render::document::DrawCache {
     cache
 }
 
+/// The side of a Set Visemes picture, in pixels: twice the size it is shown,
+/// so it stays sharp on a Retina screen.
+const VISEME_THUMB_PIXELS: u32 = 88;
+
+/// **Each frame of mouth chart `mouth`, drawn on its own**, `side` pixels
+/// square: an instance frozen on that frame, every frame framed alike — on
+/// the bounds of them all — so the shapes compare at one size. At most 120
+/// frames; none when no exporter can be had (no GPU).
+fn mouth_chart_pictures(scene: &buzz_scene::Scene, mouth: buzz_scene::SymbolId, side: u32) -> Vec<buzz_export::Frame> {
+    let Some(length) = scene.library().get(mouth).map(|s| s.length().clamp(1, 120)) else {
+        return Vec::new();
+    };
+    let Ok(mut exporter) = buzz_export::Exporter::new(&buzz_render::GpuPreference::default()) else {
+        return Vec::new();
+    };
+    let mut mini = scene.clone();
+    mini.edit_document();
+    mini.stage_mut().size = buzz_geom::Size::new(f64::from(side), f64::from(side));
+    mini.camera_mut().enabled = false;
+    for id in mini.layers().iter().map(|l| l.id).collect::<Vec<_>>() {
+        mini.remove_layer(id);
+    }
+    let frozen = |frame: u32| {
+        let mut object = buzz_scene::Object::instance_of(buzz_scene::ObjectId(u64::MAX - 1), mouth);
+        if let buzz_scene::ObjectKind::Instance(instance) = &mut object.kind {
+            instance.first_frame = frame;
+            instance.loop_mode = buzz_scene::LoopMode::SingleFrame;
+        }
+        object
+    };
+    let mut bounds: Option<buzz_geom::Rect> = None;
+    for frame in 0..length {
+        let b = mini.resolved_bounds(&frozen(frame));
+        if b.width() > 0.0 && b.height() > 0.0 {
+            bounds = Some(bounds.map_or(b, |a| a.union(b)));
+        }
+    }
+    let Some(bounds) = bounds else {
+        return Vec::new();
+    };
+    let half = f64::from(side) / 2.0;
+    let scale = (f64::from(side) / bounds.width()).min(f64::from(side) / bounds.height()) / 1.15;
+    let place = buzz_geom::Affine::translate(buzz_geom::Vec2::new(half, half))
+        * buzz_geom::Affine::scale(scale)
+        * buzz_geom::Affine::translate(-bounds.center().to_vec2());
+    let layer = mini.add_layer("Viseme", buzz_scene::LayerKind::Normal);
+    let settings = buzz_export::ExportSettings::for_stage(&mini);
+    let mut out = Vec::new();
+    for frame in 0..length {
+        let mut object = frozen(frame);
+        object.transform = place;
+        mini.update_layer(layer, |l| {
+            l.frames.set_objects(0, vec![std::sync::Arc::new(object)]);
+        });
+        match exporter.render(&mini, 0, &settings) {
+            Ok(picture) => out.push(picture),
+            Err(_) => return Vec::new(),
+        }
+    }
+    out
+}
+
 /// Where a scrollbar's thumb goes, and how much of the extent is on screen.
 ///
 /// Kept as a function of the four numbers rather than a method so it can be
@@ -1383,6 +1445,14 @@ pub struct App {
     move_stage: Option<MoveStageFrames>,
     /// Mark Talk Range…, while it is open.
     talk_range_dialog: Option<TalkRangeDialog>,
+    /// **Set Visemes' pictures**: each frame of a mouth chart drawn small —
+    /// the chart (by id and the copy of it drawn), and a texture per frame.
+    /// Redrawn only when another mouth is chosen or the chart is changed.
+    viseme_thumbs: Option<(u64, usize, Vec<egui::TextureHandle>)>,
+    /// **A talk range begun, its end not yet marked**: the frame Talk Range
+    /// was pressed on, and the objects picked on the stage then (whose
+    /// character is ticked when the dialog opens).
+    talk_range_start: Option<(u32, Vec<buzz_scene::ObjectId>)>,
     /// **What a shelf command said with `alert`**, shown as Animate shows it:
     /// a window with OK. A command run from its key that only wrote to the
     /// status line looked like it did nothing. `(command, text)`.
@@ -1904,6 +1974,8 @@ impl App {
             symbol_dialog: None,
             move_stage: None,
             talk_range_dialog: None,
+            viseme_thumbs: None,
+            talk_range_start: None,
             script_alert: None,
             who_is_who: None,
             presets: crate::presets::PresetLibrary::load(),
@@ -7811,6 +7883,7 @@ impl App {
                     shot_end: self.editor.shot_end_marker(),
                     stage_copied: self.editor.stage_clip.as_ref().map(|c| c.0),
                     talk_ranges: self.talk_range_bands(),
+                    talk_range_marking: self.talk_range_marking(),
                 };
                 let response = buzz_ui::timeline_panel_with_tools_slot(
                     ui,
@@ -8464,24 +8537,92 @@ impl App {
             .collect()
     }
 
-    /// **Mark Talk Range…**: the frames selected in the timeline if there are
-    /// some, else from the playhead to the end of the line spoken there; the
-    /// character picked on the stage ticked (or the only one there is).
-    fn open_talk_range_dialog(&mut self) {
-        let picked = self.editor.selection.ids();
-        let selected = self.editor.selection.timeline().filter(|t| t.last_frame > t.first_frame).map(|t| (t.first_frame, t.last_frame));
+    /// **The Talk Range button (Shift+T)**, marked by hand: the first press
+    /// marks the start on the playhead, and nothing else; the next, after
+    /// moving the playhead forward, marks the end there and opens the dialog
+    /// to pick who talks. Pressed again without moving, the end is taken for
+    /// it — where the line spoken there ends. While the dialog is open a
+    /// press moves its end to the playhead.
+    ///
+    /// The first press used to open the dialog at once with an end already
+    /// worked out, and took a frame selection left on the timeline as the
+    /// whole range, so neither end could be marked by hand.
+    fn talk_range_button(&mut self) {
+        if let Some(state) = self.talk_range_dialog.as_mut() {
+            state.last = self.editor.current_frame + 1;
+            let (first, last) = (state.first.min(state.last), state.first.max(state.last));
+            self.editor.status = Some(format!("Talk range: frames {first}\u{2013}{last} \u{2014} tick who talks and press Mark"));
+            return;
+        }
+        // The frames count on the main timeline.
         if !self.editor.doc.scene().edit_path().is_empty() {
             self.editor.doc.edit_view(|scene| scene.edit_document());
             self.editor.after_context_change();
         }
+        let frame = self.editor.current_frame;
+        let Some((start, picked)) = self.talk_range_start.take() else {
+            if crate::scene_life::talkers(self.editor.doc.scene()).is_empty() {
+                self.editor.status = Some("Mark Talk Range: there is no character on the stage".into());
+                return;
+            }
+            self.talk_range_start = Some((frame, self.editor.selection.ids()));
+            self.editor.status = Some(format!(
+                "Talk range starts on frame {} \u{2014} move the playhead to its last frame and press End Range",
+                frame + 1
+            ));
+            return;
+        };
+        let end = if frame == start {
+            self.editor.spoken_line_end(start).filter(|e| *e > start).unwrap_or(start + 48)
+        } else {
+            frame
+        };
+        self.open_talk_range_dialog(start, end, &picked);
+    }
+
+    /// **The talk range being marked, put right**: `again` starts it over on
+    /// the playhead, its end still to mark; otherwise it is let go of,
+    /// nothing marked. Once begun there was no way to move its start or drop
+    /// it.
+    fn restart_talk_range(&mut self, again: bool) {
+        let picked = match (self.talk_range_start.take(), self.talk_range_dialog.take()) {
+            (Some((_, picked)), _) => picked,
+            (None, Some(_)) => self.editor.selection.ids(),
+            (None, None) => return,
+        };
+        if again {
+            let frame = self.editor.current_frame;
+            self.talk_range_start = Some((frame, picked));
+            self.editor.status = Some(format!(
+                "Talk range starts on frame {} \u{2014} move the playhead to its last frame and press End Range",
+                frame + 1
+            ));
+        } else {
+            self.editor.status = Some("Talk range let go of".into());
+        }
+    }
+
+    /// The talk range being marked, as the ruler and the button show it:
+    /// from its start to its end, or — its end not marked yet — to the
+    /// playhead.
+    fn talk_range_marking(&self) -> Option<(u32, u32)> {
+        if let Some(d) = &self.talk_range_dialog {
+            return Some((d.first.max(1) - 1, d.last.max(1) - 1));
+        }
+        self.talk_range_start.as_ref().map(|(start, _)| (*start, self.editor.current_frame))
+    }
+
+    /// **Mark Talk Range…** over frames `first..=last` of the main timeline:
+    /// who talks in them to pick — the character of an object in `picked`
+    /// ticked, or the only one there is.
+    fn open_talk_range_dialog(&mut self, first: u32, last: u32, picked: &[buzz_scene::ObjectId]) {
         let scene = self.editor.doc.scene();
         let talkers = crate::scene_life::talkers(scene);
         if talkers.is_empty() {
             self.editor.status = Some("Mark Talk Range: there is no character on the stage".into());
             return;
         }
-        let frame = self.editor.current_frame;
-        let (first, last) = selected.unwrap_or_else(|| (frame, self.editor.spoken_line_end(frame).filter(|e| *e > frame).unwrap_or(frame + 48)));
+        let (first, last) = (first.min(last), first.max(last));
         let who = talkers
             .iter()
             .map(|t| {
@@ -8490,6 +8631,7 @@ impl App {
             })
             .collect();
         self.talk_range_dialog = Some(TalkRangeDialog { first: first + 1, last: last + 1, who });
+        self.editor.status = Some(format!("Talk range: frames {}\u{2013}{} \u{2014} tick who talks and press Mark", first + 1, last + 1));
     }
 
     /// Draw Mark Talk Range…, and mark the range once it is accepted.
@@ -8533,6 +8675,11 @@ impl App {
                     }
                 });
                 let any = state.who.iter().any(|(_, on)| *on);
+                // Mark waits for someone to be ticked; say so, rather than
+                // leave a greyed button to puzzle over.
+                if !any {
+                    ui.colored_label(ui.visuals().warn_fg_color, "Tick who talks in these frames to mark them.");
+                }
                 ui.label(
                     egui::RichText::new("Not saved with the document. Right-click the ruler to remove one, or Clear Talk Ranges.")
                         .small()
@@ -8692,7 +8839,7 @@ impl App {
                 match self.editor.lip_sync_inputs() {
                     Some((_, _, mouth, layer, placement)) => {
                         let slice = crate::scene_life::rhubarb_slice(keys, *heard_from, from, to);
-                        self.editor.apply_lip_sync_keys(&slice, to.saturating_sub(from), from, mouth, layer, placement);
+                        self.lip_sync_keys(&slice, to.saturating_sub(from), from, mouth, layer, placement);
                         mouthed += 1;
                     }
                     None => warnings.push(format!("{at}: no mouth found, so it is not lip-synced")),
@@ -9057,10 +9204,16 @@ impl App {
                 Some(buzz_ui::rig_panel::HeadSection {
                     symbol: id,
                     name: symbol.name.clone(),
+                    // A layer locked or hidden is out of reach of tagging,
+                    // here as on the stage.
                     layers: symbol
                         .layers
                         .iter()
-                        .filter(|l| l.kind != buzz_scene::LayerKind::Folder)
+                        .filter(|l| {
+                            l.kind != buzz_scene::LayerKind::Folder
+                                && !symbol.layers.is_effectively_locked(l.id)
+                                && symbol.layers.is_effectively_visible(l.id)
+                        })
                         .map(|l| (l.id, l.name.clone(), crate::rigging::head_layer_name(l)))
                         .collect(),
                 })
@@ -9372,7 +9525,7 @@ impl App {
 
         if self.editor.rig_panel.kind == buzz_rig::RigKind::Layers && self.editing_a_head() {
             self.editor.status = Some(format!(
-                "{count} head part{} tagged. Heads get no layer parenting, so no layer was changed.",
+                "{count} head part{} tagged and their layers named. Heads get no layer parenting.",
                 if count == 1 { "" } else { "s" }
             ));
             return;
@@ -9579,15 +9732,12 @@ impl App {
         if seen.len() != slots.len() {
             return;
         }
-        // **Inside a head, a tag is only a tag** (user 2026-11-18: "don't
-        // put layer parenting on any layer in the head symbol"): no layer is
-        // renamed, parented or has its pivot moved. Renaming was also what
-        // turned the eye's mask layer into a second `eyeWhite` when a click
-        // picked the wrong part of the eye.
-        if self.editing_a_head() {
-            return;
-        }
-        if self.editor.rig_panel.kind == buzz_rig::RigKind::Layers {
+        // **Inside a head a tag names the layer, and only that** (user
+        // 2026-11-18: "don't put layer parenting on any layer in the head
+        // symbol"; 2026-11-19: "inside the head symbol when I am tagging the
+        // parts the layers are not getting renamed"): no layer is parented or
+        // has its pivot moved, whatever the Rig kind.
+        if self.editor.rig_panel.kind == buzz_rig::RigKind::Layers && !self.editing_a_head() {
             let fresh: Vec<usize> = slots
                 .iter()
                 .enumerate()
@@ -9618,7 +9768,9 @@ impl App {
                 let (layer, _) = scene.find_object((*held)?)?;
                 let l = scene.layers().get(layer)?;
                 let name = buzz_ui::rig_panel::slot_label(&self.editor.rig_panel, &pattern.slots.get(i)?.name);
-                (l.objects_at(frame).len() == 1 && l.name != name).then_some((layer, name))
+                // A name that differs only in case is kept: the user's
+                // commands find `leftEyeBrow` as `leftEyebrow`.
+                (l.objects_at(frame).len() == 1 && !l.name.eq_ignore_ascii_case(&name)).then_some((layer, name))
             })
             .collect();
         if renames.is_empty() {
@@ -9662,6 +9814,12 @@ impl App {
 
     fn pick_part_for_slot(&mut self, slot: usize, screen: buzz_geom::Point) {
         let at = self.editor.screen_to_edit(screen);
+        self.pick_part_for_slot_at(slot, at);
+    }
+
+    /// [`Self::pick_part_for_slot`] at `at`, in the space of the timeline
+    /// being edited.
+    fn pick_part_for_slot_at(&mut self, slot: usize, at: buzz_geom::Point) {
         let frame = self.editor.frame();
 
         // What a click there would select, exactly (through instances,
@@ -9687,33 +9845,56 @@ impl App {
                 }
             }
             let state = &self.editor.rig_panel;
-            let wanted = state
-                .pattern()
-                .slots
-                .get(slot)
-                .map(|s| buzz_ui::rig_panel::slot_label(state, &s.name))
-                .unwrap_or_default();
+            let pattern = state.pattern();
+            let labels: Vec<String> = pattern.slots.iter().map(|s| buzz_ui::rig_panel::slot_label(state, &s.name)).collect();
+            let wanted = labels.get(slot).cloned().unwrap_or_default();
             // A mask is only ever the mask: the eye's white, ball and mask
             // share one spot, and the mask is on top of the other two.
             let wants_mask = wanted.to_lowercase().contains("mask");
+            // **Named for a slot**, as the user names layers: case aside, and
+            // a plural or a side after it (`eyeBalls`, `eyeMaskSide`) — the
+            // eyeball slot took the nose over a layer called `eyeBalls`.
+            let named_for = |part: &buzz_ui::LoosePart, label: &str| {
+                let layer = scene.layers().get(part.layer).map(|l| l.name.as_str()).unwrap_or_default();
+                rigging::name_is_for(layer, label) || rigging::name_is_for(&part.name, label)
+            };
             let score = |part: &buzz_ui::LoosePart| {
                 let layer = scene.layers().get(part.layer);
-                let named = layer.is_some_and(|l| l.name.eq_ignore_ascii_case(&wanted)) || part.name.eq_ignore_ascii_case(&wanted);
                 let mask = layer.is_some_and(|l| l.kind == buzz_scene::LayerKind::Mask);
+                let named = named_for(part, &wanted);
+                // The obvious part of another slot is never taken for this
+                // one — the eyeMask slot took the eyeLid when the mask's own
+                // layer was locked — unless it is the mask this slot wants.
+                let theirs = !named
+                    && !(wants_mask && mask)
+                    && labels.iter().enumerate().any(|(i, label)| i != slot && named_for(part, label));
                 let free = !state.slots.iter().enumerate().any(|(i, held)| i != slot && *held == Some(part.object));
-                i32::from(named) * 100
+                i32::from(named) * 100 - i32::from(theirs) * 1000
                     + match (wants_mask, mask) {
-                        (true, true) => 50,
+                        (true, true) => 150,
                         (false, true) | (true, false) => -50,
                         (false, false) => 0,
                     }
                     + i32::from(free) * 10
             };
-            // The best score; of equals, the topmost.
+            // **The slot's own layer locked or hidden** (user 2026-11-19: "if
+            // I lock or hide a layer that layer shall not be available for
+            // tagging"): nothing else is taken in its place — the eyeMask slot
+            // took the nose, and named the nose's layer eyeMask.
+            let layers = scene.layers();
+            let shut = !under.iter().any(|p| named_for(p, &wanted))
+                && layers.iter().any(|l| {
+                    rigging::name_is_for(&l.name, &wanted) && (layers.is_effectively_locked(l.id) || !layers.is_effectively_visible(l.id))
+                });
+            if shut {
+                under.clear();
+            }
+            // The best score; of equals, the topmost. Never a part that is
+            // another slot's.
             let mut best: Option<(i32, usize)> = None;
             for (index, part) in under.iter().enumerate() {
                 let s = score(part);
-                if best.is_none_or(|(b, _)| s > b) {
+                if s > -500 && best.is_none_or(|(b, _)| s > b) {
                     best = Some((s, index));
                 }
             }
@@ -9730,7 +9911,19 @@ impl App {
                 // Clicking past the artwork cancels, which is the way out of
                 // every other armed gesture in the program.
                 self.editor.rig_panel.armed = None;
-                self.editor.status = Some("Nothing there. The slot is still empty.".into());
+                // The slot's own layer out of reach: say so, rather than
+                // leave the user clicking at it.
+                let state = &self.editor.rig_panel;
+                let wanted = state.pattern().slots.get(slot).map(|s| buzz_ui::rig_panel::slot_label(state, &s.name)).unwrap_or_default();
+                let layers = self.editor.scene().layers();
+                let shut = layers
+                    .iter()
+                    .find(|l| rigging::name_is_for(&l.name, &wanted) && (layers.is_effectively_locked(l.id) || !layers.is_effectively_visible(l.id)))
+                    .map(|l| l.name.clone());
+                self.editor.status = Some(match shut {
+                    Some(name) => format!("{name} is locked or hidden, so it cannot be tagged. The slot is still empty."),
+                    None => "Nothing there. The slot is still empty.".into(),
+                });
             }
         }
     }
@@ -9949,6 +10142,9 @@ impl App {
 
     /// Turn timeline interactions into editor actions.
     fn apply_timeline(&mut self, response: buzz_ui::TimelineResponse, commands: &mut Vec<Command>) {
+        if let Some(again) = response.restart_talk_range {
+            self.restart_talk_range(again);
+        }
         if let Some(i) = response.remove_talk_range {
             self.editor.remove_talk_range(i);
         }
@@ -12078,7 +12274,7 @@ impl App {
                 self.move_stage = Some(MoveStageFrames { first: first + 1, last: last + 1, to: last + 2, copy: false });
             }
             Command::LipSyncAllCharacters => self.lip_sync_all_start(),
-            Command::MarkTalkRange => self.open_talk_range_dialog(),
+            Command::MarkTalkRange => self.talk_range_button(),
             Command::ToggleMasterAudioMode => self.toggle_master_audio_mode(),
             Command::ImportCaptions => self.ask_for_path(
                 crate::dialogs::Request::open_file().filter("Subtitles", &["srt", "vtt"]),
@@ -14074,7 +14270,7 @@ impl App {
                 ));
             }
             AiResult::LipSyncHeard { keys, length, start, mouth, layer, placement, secs } => {
-                self.editor.apply_lip_sync_keys(&keys, length, start, mouth, layer, placement);
+                self.lip_sync_keys(&keys, length, start, mouth, layer, placement);
                 if let Some(status) = self.editor.status.as_mut() {
                     status.push_str(&format!(" \u{2014} heard by Rhubarb in {secs:.1} s"));
                 }
@@ -17650,6 +17846,78 @@ impl App {
         buzz_act::face::animate_from_map(&buzz_act::face::analyse_mouth_chart(scene, mouth))
     }
 
+    /// The visemes a lip sync of `mouth` keys with, when the Lip Sync window
+    /// has not set them for it: the ones the window would show — saved on the
+    /// mouth, else the animator's Animate mapping, else read from the drawings.
+    /// A talking command over talk ranges (Shift+A) used to key with a mapping
+    /// guessed from the drawings even where the window showed the Animate
+    /// one, so frames the window never offered (a 10 for S) were keyed.
+    fn fill_visemes(&mut self, mouth: u64) {
+        if self.editor.lip_sync.visemes_for == Some(mouth) && self.editor.lip_sync.visemes.is_some() {
+            return;
+        }
+        let id = buzz_scene::SymbolId(mouth);
+        let frames = self.editor.doc.scene().library().get(id).map_or(1, |s| s.length());
+        let visemes = self.visemes_for(id).map(|f| f.min(frames.saturating_sub(1)));
+        self.editor.lip_sync.visemes = Some(visemes);
+        self.editor.lip_sync.visemes_for = Some(mouth);
+        self.editor.lip_sync.chart_frames = frames;
+    }
+
+    /// [`Editor::apply_lip_sync_keys`] with the visemes the window shows for
+    /// `mouth` ([`Self::fill_visemes`]).
+    fn lip_sync_keys(&mut self, keys: &[(u32, usize)], length: u32, start: u32, mouth: u64, layer: u64, placement: buzz_geom::Affine) {
+        self.fill_visemes(mouth);
+        self.editor.apply_lip_sync_keys(keys, length, start, mouth, layer, placement);
+    }
+
+    /// **Save on mouth**: the visemes the Lip Sync window shows, kept on the
+    /// chosen mouth now, not only when a sync runs — a talking command over
+    /// talk ranges (Shift+A) opens no window, and uses what the mouth
+    /// carries. One undo step.
+    fn save_visemes(&mut self) {
+        let (Some(id), Some(mapping)) = (self.editor.lip_sync.mouth.map(buzz_scene::SymbolId), self.editor.lip_sync.visemes) else {
+            return;
+        };
+        let name = self.editor.doc.scene().library().get(id).map(|s| s.name.clone()).unwrap_or_default();
+        if buzz_act::face::animate_chart_of(self.editor.doc.scene(), id) != Some(mapping) {
+            self.editor.doc.edit("Set Visemes", |scene| buzz_act::face::set_animate_chart(scene, id, mapping));
+            self.editor.doc.end_gesture();
+        }
+        self.editor.lip_sync.result = Some(format!("Visemes saved on {name}: every lip sync of it uses them"));
+    }
+
+    /// **The chosen mouth chart's frames, drawn small**, for Set Visemes to
+    /// pick from: drawn once for each mouth (and again when its drawings
+    /// change), then kept. Empty with no mouth chosen, or when nothing could
+    /// draw them — the frames are then picked by number.
+    fn viseme_thumbnails(&mut self, ctx: &egui::Context) -> Vec<egui::TextureHandle> {
+        let Some(id) = self.editor.lip_sync.mouth.map(buzz_scene::SymbolId) else {
+            return Vec::new();
+        };
+        let scene = self.editor.doc.scene();
+        let Some(symbol) = scene.library().get(id) else {
+            return Vec::new();
+        };
+        let drawn = std::sync::Arc::as_ptr(symbol) as usize;
+        if let Some((mouth, at, thumbs)) = &self.viseme_thumbs
+            && (*mouth, *at) == (id.0, drawn)
+        {
+            return thumbs.clone();
+        }
+        let frames = mouth_chart_pictures(scene, id, VISEME_THUMB_PIXELS);
+        let thumbs: Vec<egui::TextureHandle> = frames
+            .into_iter()
+            .enumerate()
+            .map(|(i, frame)| {
+                let image = egui::ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.pixels);
+                ctx.load_texture(format!("viseme-{}-{i}", id.0), image, egui::TextureOptions::LINEAR)
+            })
+            .collect();
+        self.viseme_thumbs = Some((id.0, drawn, thumbs.clone()));
+        thumbs
+    }
+
     /// Draw the Lip Sync dialog and act on it.
     fn lip_sync_dialog(&mut self, ctx: &egui::Context) {
         if !self.editor.lip_sync.open {
@@ -17670,6 +17938,7 @@ impl App {
             }
         }
 
+        let thumbs = self.viseme_thumbnails(ctx);
         let (track, mouths, layers) = self.editor.lip_sync_choices();
         let response = buzz_ui::lip_sync_dialog(
             ctx,
@@ -17677,6 +17946,7 @@ impl App {
             track.as_deref(),
             &mouths,
             &layers,
+            &thumbs,
         );
 
         if response.make_mouth {
@@ -17696,10 +17966,16 @@ impl App {
             let map = buzz_act::face::analyse_mouth_chart(self.editor.doc.scene(), id);
             self.editor.lip_sync.visemes = Some(buzz_act::face::animate_from_map(&map));
         }
+        if response.visemes_save {
+            self.save_visemes();
+        }
         if response.confirmed {
             if crate::rhubarb::binary().is_some() {
                 self.lip_sync_with_rhubarb();
             } else {
+                if let Some(mouth) = self.editor.lip_sync.mouth {
+                    self.fill_visemes(mouth);
+                }
                 self.editor.run_lip_sync();
             }
         }
@@ -18234,7 +18510,7 @@ impl App {
                 self.editor.lip_sync.open = open;
                 if let Some((_, _, mouth, layer, placement)) = self.editor.lip_sync_inputs() {
                     let slice = crate::scene_life::rhubarb_slice(keys, pending.start, from, to);
-                    self.editor.apply_lip_sync_keys(&slice, to.saturating_sub(from), from, mouth, layer, placement);
+                    self.lip_sync_keys(&slice, to.saturating_sub(from), from, mouth, layer, placement);
                     mouthed_lines += 1;
                 } else if !warnings.iter().any(|w| w.starts_with(&format!("{}: no mouth", talker.name))) {
                     warnings.push(format!("{}: no mouth found, so its lines are not lip-synced", talker.name));
@@ -24001,6 +24277,66 @@ mod idle_tests {
         assert_eq!(app.selected_mouth(), Some((mouth, layer)));
         app.open_lip_sync();
         assert_eq!((app.editor.lip_sync.mouth, app.editor.lip_sync.layer), (Some(mouth.0), Some(layer.0)));
+    }
+
+    /// **Set Visemes can be saved on the mouth without a sync**, so a
+    /// talking command over talk ranges (Shift+A), which opens no window,
+    /// lip-syncs with them too. They were kept only when Sync was pressed.
+    #[test]
+    fn visemes_are_saved_on_the_mouth() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let mut mouth = None;
+        app.editor.doc.edit("Mouth", |scene| {
+            let id = scene.add_symbol("manMouthFront", buzz_scene::SymbolKind::Graphic, None);
+            scene.library_mut().update(id, |s| {
+                let first = s.layers.iter().next().unwrap().id;
+                s.layers.update(first, |l| { l.frames.insert_frame(11); });
+            });
+            mouth = Some(id);
+        });
+        let mouth = mouth.unwrap();
+        app.editor.lip_sync = buzz_ui::LipSyncState::opened();
+        app.editor.lip_sync.mouth = Some(mouth.0);
+        let mine = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        app.editor.lip_sync.visemes = Some(mine);
+        app.save_visemes();
+        assert_eq!(buzz_act::face::animate_chart_of(app.editor.doc.scene(), mouth), Some(mine), "kept on the mouth");
+        app.editor.lip_sync = buzz_ui::LipSyncState::opened();
+        app.editor.lip_sync.mouth = Some(mouth.0);
+        assert_eq!(app.visemes_for(mouth), mine, "and shown again next time");
+    }
+
+    /// **Every lip sync keys the frames the Lip Sync window shows.** A
+    /// talking command over talk ranges opens no window, and keyed with a
+    /// mapping guessed from the drawings even where the window showed
+    /// another, so frames the window never offered (a 10 for S) turned up.
+    #[test]
+    fn a_lip_sync_without_the_window_keys_the_visemes_it_shows() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let mut made = None;
+        app.editor.doc.edit("Head", |scene| {
+            let chart = scene.add_symbol("man3MouthFront", buzz_scene::SymbolKind::Graphic, None);
+            scene.library_mut().update(chart, |s| {
+                let first = s.layers.iter().next().unwrap().id;
+                s.layers.update(first, |l| { l.frames.insert_frame(9); });
+            });
+            let layer = scene.add_layer("mouth", buzz_scene::LayerKind::Normal);
+            let id = scene.add_instance_at(layer, 0, chart, buzz_geom::Affine::IDENTITY).unwrap();
+            made = Some((chart, layer, id));
+        });
+        let (chart, layer, id) = made.unwrap();
+        app.editor.selection.select_one(id);
+        let shown = app.visemes_for(chart);
+        // As a talking command over talk ranges does: the window reset, shut.
+        app.open_lip_sync();
+        app.editor.lip_sync.open = false;
+        let keys: Vec<(u32, usize)> = (0..12).map(|slot| (slot as u32 * 2, slot)).collect();
+        app.lip_sync_keys(&keys, 24, 0, chart.0, layer.0, buzz_geom::Affine::IDENTITY);
+        let keyed: Vec<u32> = app.editor.scene().layers().get(layer).unwrap().all_objects().filter_map(|o| o.instance().map(|i| i.first_frame)).collect();
+        assert!(!keyed.is_empty());
+        assert!(keyed.iter().all(|f| shown.contains(f)), "keyed {keyed:?}, the window shows {shown:?}");
     }
 
     /// **Lip Sync offers mouths only.** The whole library was offered, a fog
@@ -30669,6 +31005,72 @@ mod layer_rig_ui_tests {
         assert!(app.editor.scene().layers().iter().find(|l| l.name == "base").unwrap().locked, "the base is locked");
     }
 
+    /// **Inside a head a tag names the layer, and no more** (user 2026-11-19:
+    /// "inside the head symbol when I am tagging the parts the layers are not
+    /// getting renamed ... I am not able to tag eyelid and eyemask. If I lock
+    /// or hide a layer that layer shall not be available for tagging"). A
+    /// slot takes the part on the layer named for it however the user spelt
+    /// it (`eyeBalls`, `eyeLids`) — not the nose, which it used to — and that
+    /// layer takes the slot's name; nothing is parented. A locked eyeMask is
+    /// not tagged and nothing else is taken for it; locked and hidden layers
+    /// are not offered by Rig Head either.
+    #[test]
+    fn head_tags_name_their_layers_and_skip_locked_ones() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let eye = buzz_geom::Rect::new(100.0, 100.0, 160.0, 140.0);
+        let mut ids = std::collections::HashMap::new();
+        let mut head = None;
+        app.editor.doc.edit("Head", |scene| {
+            let symbol = scene.add_symbol("bhushanHead", buzz_scene::SymbolKind::Graphic, None);
+            scene.enter_symbol(symbol);
+            // Bottom first, as in manFaceFront1: the nose and the lid lie
+            // over the eye too.
+            for (name, kind, rect) in [
+                ("base", buzz_scene::LayerKind::Normal, buzz_geom::Rect::new(0.0, 0.0, 300.0, 300.0)),
+                ("nose", buzz_scene::LayerKind::Normal, buzz_geom::Rect::new(90.0, 90.0, 170.0, 200.0)),
+                ("eyeWhite", buzz_scene::LayerKind::Normal, eye),
+                ("eyeBalls", buzz_scene::LayerKind::Masked, eye.inset(-10.0)),
+                ("eyeMask", buzz_scene::LayerKind::Mask, eye),
+                ("eyeLids", buzz_scene::LayerKind::Normal, eye.inset(-5.0)),
+                ("hair", buzz_scene::LayerKind::Normal, buzz_geom::Rect::new(0.0, 0.0, 300.0, 60.0)),
+            ] {
+                let layer = scene.add_layer(name, kind);
+                ids.insert(name, (layer, scene.add_shape(layer, buzz_scene::ShapeData::filled(rect.to_path(1e-9), LIMB)).unwrap()));
+            }
+            scene.update_layer(ids["eyeMask"].0, |l| l.locked = true);
+            scene.update_layer(ids["hair"].0, |l| l.visible = false);
+            scene.exit_symbol();
+            head = Some(symbol);
+        });
+        app.editor.doc.edit_view(|scene| {
+            scene.enter_symbol(head.unwrap());
+        });
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        let _ = painted_text(&mut app);
+        let pattern = app.editor.rig_panel.pattern();
+        assert_eq!(pattern.name, "Head");
+        let name_of = |app: &App, key: &str| app.editor.scene().layers().get(ids[key].0).unwrap().name.clone();
+
+        for slot in ["eyeBall", "eyeLid", "eyeMask"] {
+            let index = pattern.slot_named(slot).unwrap();
+            app.editor.rig_panel.armed = Some(index);
+            app.pick_part_for_slot_at(index, eye.center());
+            let _ = painted_text(&mut app);
+        }
+        let held = |slot: &str| app.editor.rig_panel.slots[pattern.slot_named(slot).unwrap()];
+        assert_eq!(held("eyeBall"), Some(ids["eyeBalls"].1), "the eyeballs, not the nose");
+        assert_eq!(held("eyeLid"), Some(ids["eyeLids"].1));
+        assert_eq!(held("eyeMask"), None, "the mask's layer is locked: nothing taken for it");
+        assert!(app.editor.status.as_deref().unwrap_or("").contains("locked or hidden"), "{:?}", app.editor.status);
+        assert_eq!((name_of(&app, "eyeBalls"), name_of(&app, "eyeLids")), ("eyeBall".to_string(), "eyeLid".to_string()), "named for their tags");
+        assert_eq!((name_of(&app, "nose"), name_of(&app, "eyeMask")), ("nose".to_string(), "eyeMask".to_string()), "nothing else renamed");
+        assert!(app.editor.scene().layers().iter().all(|l| l.follows.is_none()), "nothing parented");
+
+        let offered: Vec<String> = app.editor.rig_panel.head.as_ref().expect("the head").layers.iter().map(|(_, n, _)| n.clone()).collect();
+        assert!(!offered.iter().any(|n| n == "eyeMask" || n == "hair"), "locked and hidden layers are not offered: {offered:?}");
+        assert!(buzz_ui::rig_panel::HEAD_NAMES.contains(&"eyeMask"), "eyeMask can be picked as a name");
+    }
+
     /// **Tagging a mouth leaves its swaps together** (user 2026-11-18,
     /// Mishra's head): a layer holding a different mouth on each keyframe is
     /// already the mouth's own, so it is linked as it is, not split into a
@@ -33034,6 +33436,59 @@ mod talk_range_tests {
         let status = app.editor.status.clone().unwrap_or_default();
         assert!(status.contains("Nobody, frames 11\u{2013}31: not on the stage"), "{status}");
         assert!(status.contains("Sita, frames 11\u{2013}31: not on the stage"), "{status}");
+    }
+
+    /// **The Talk Range button marks the start, End Range the end**, by
+    /// hand: the first press marks only the start — no dialog, no end worked
+    /// out, a frame selection left on the timeline ignored — and the next,
+    /// the playhead moved forward, marks the end there and opens the dialog
+    /// to pick who. Pressed again on the start frame, the end is taken for it.
+    #[test]
+    fn the_talk_range_button_marks_the_start_then_the_end() {
+        let (mut app, _, _) = two_characters();
+        app.editor.selection.set_timeline(buzz_ui::TimelineSelection::new([], 3, 8, buzz_scene::LayerId(0), 3));
+        app.editor.set_frame(10);
+        app.dispatch(Command::MarkTalkRange);
+        assert!(app.talk_range_dialog.is_none(), "only the start is marked");
+        assert_eq!(app.talk_range_marking(), Some((10, 10)));
+        app.editor.set_frame(25);
+        assert_eq!(app.talk_range_marking(), Some((10, 25)), "shown up to the playhead");
+        app.dispatch(Command::MarkTalkRange);
+        let dialog = app.talk_range_dialog.as_ref().expect("the end marked, who to pick");
+        assert_eq!((dialog.first, dialog.last), (11, 26), "frames 11–26, as marked");
+        app.editor.set_frame(30);
+        app.dispatch(Command::MarkTalkRange);
+        assert_eq!(app.talk_range_dialog.as_ref().map(|d| d.last), Some(31), "a press with it open moves the end");
+
+        app.restart_talk_range(false);
+        app.editor.set_frame(40);
+        app.dispatch(Command::MarkTalkRange);
+        app.dispatch(Command::MarkTalkRange);
+        let dialog = app.talk_range_dialog.as_ref().expect("ended on its own frame");
+        assert_eq!(dialog.first, 41);
+        assert!(dialog.last > dialog.first, "with the end taken for it");
+    }
+
+    /// **A range begun can be started over or dropped**: Start Here moves its
+    /// start to the playhead, ✕ lets it go with nothing marked.
+    #[test]
+    fn a_talk_range_begun_can_be_started_over_or_dropped() {
+        let (mut app, _, _) = two_characters();
+        app.editor.set_frame(10);
+        app.dispatch(Command::MarkTalkRange);
+        app.editor.set_frame(30);
+        app.restart_talk_range(true);
+        assert_eq!(app.talk_range_marking().map(|m| m.0), Some(30), "started over on the playhead");
+        app.editor.set_frame(40);
+        app.dispatch(Command::MarkTalkRange);
+        assert_eq!(app.talk_range_dialog.as_ref().map(|d| (d.first, d.last)), Some((31, 41)));
+
+        app.restart_talk_range(false);
+        assert!(app.talk_range_dialog.is_none() && app.talk_range_marking().is_none(), "let go of");
+        assert!(app.editor.talk_ranges_here().is_empty(), "nothing marked");
+        app.editor.set_frame(50);
+        app.dispatch(Command::MarkTalkRange);
+        assert_eq!(app.talk_range_marking().map(|m| m.0), Some(50), "the next press begins a new one");
     }
 
     /// Ranges belong to their scene, and come off one by one or all at once.

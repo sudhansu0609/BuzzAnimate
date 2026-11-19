@@ -2186,6 +2186,36 @@ mod tests {
         assert!(!doc.scene().library().get(base).unwrap().layers.iter().any(|l| l.audio_guide), "a base drawing carries no master");
     }
 
+    /// **A head's master plays frame for frame with the stage**, however late
+    /// it is first placed: its frame N hears the scene's frame N, the whole
+    /// dialogue its timeline is long enough for. Placed at frame 100 it used
+    /// to hear only from 100 on, from its own frame 0, and ran out early.
+    #[test]
+    fn a_heads_master_plays_frame_for_frame_with_the_stage() {
+        let mut doc = Document::default();
+        stub_master_audio(&mut doc, 240);
+        let mut ana = None;
+        doc.edit("Cast", |scene| {
+            let id = scene.add_symbol("Ana", buzz_scene::SymbolKind::Graphic, Some("Cast"));
+            scene.library_mut().update(id, |s| {
+                let first = s.layers.iter().next().unwrap().id;
+                s.layers.update(first, |l| { l.frames.insert_frame(199); });
+            });
+            let layer = scene.add_stage_layer("Ana", LayerKind::Normal);
+            scene.update_stage_layer(layer, |l| { l.frames.insert_frame(239); });
+            scene.update_stage_layer(layer, |l| { l.frames.insert_blank_keyframe(100); });
+            let object = scene.next_object_id();
+            scene.add_object_at(layer, 100, buzz_scene::Object::instance_of(object, id));
+            ana = Some(id);
+        });
+        doc.add_master_audio_guides().expect("a master is set");
+        let symbol = doc.scene().library().get(ana.unwrap()).unwrap();
+        let guide = symbol.layers.iter().find(|l| l.audio_guide).expect("a guide");
+        let sound = guide.frames.keyframes()[0].sound.expect("the master on it");
+        assert_eq!(sound.trim_start, 0.0, "from the scene's start, not where it was placed");
+        assert!((sound.trim_end.unwrap() - 200.0 / 24.0).abs() < 1e-4, "as long as the head: {:?}", sound.trim_end);
+    }
+
     /// With Master Audio mode off, a master set still guides every pose of a
     /// character — and leaves every other sound alone.
     #[test]

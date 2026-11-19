@@ -552,6 +552,19 @@ pub fn loose_parts(scene: &Scene, frame: u32) -> Vec<buzz_ui::LoosePart> {
     out
 }
 
+/// Whether a layer (or part) called `name` is the one for the slot labelled
+/// `label`, as the user names layers: case aside, and with a plural or a side
+/// after it — `eyeBalls` and `eyeMaskSide` are the eyeBall and eyeMask.
+pub fn name_is_for(name: &str, label: &str) -> bool {
+    let squash = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+    let (name, label) = (squash(name), squash(label));
+    if label.is_empty() || name.is_empty() {
+        return false;
+    }
+    let single = |s: &str| s.strip_suffix('s').unwrap_or(s).to_string();
+    name == label || single(&name) == single(&label) || name.strip_prefix(&label).is_some_and(|rest| matches!(rest, "s" | "side" | "sside" | "front" | "back"))
+}
+
 /// The topmost unrigged drawing under `at`, for filling an armed slot.
 ///
 /// Front to back, so what is clicked is what is on top — the same rule a

@@ -384,6 +384,7 @@ fn draw_icon_contact_sheet(ui: &mut egui::Ui) {
                     shot_end: None,
         stage_copied: None,
                     talk_ranges: Vec::new(),
+                    talk_range_marking: None,
                 };
                 let _ = buzz_ui::timeline_panel::timeline_panel(ui, scene, &state);
             });

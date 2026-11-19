@@ -6,12 +6,12 @@
 //! master so its waveform shows while animating inside it. See
 //! `docs/MASTER_AUDIO_AND_PROTECT_PLAN.md` Part M (step M2).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use buzz_scene::{
-    Layer, LayerId, LayerKind, LayerStack, LayerTimeline, Object, ObjectKind, Scene, SoundAsset,
-    SoundId, SoundRef, SoundSync, Symbol, SymbolId, SymbolInstance,
+    Layer, LayerId, LayerKind, LayerStack, LayerTimeline, Scene, SoundAsset, SoundId, SoundRef,
+    SoundSync, Symbol, SymbolId,
 };
 
 use crate::{Document, SceneRole};
@@ -219,93 +219,6 @@ fn format_time(seconds: f64) -> String {
     let s = seconds.max(0.0);
     let minutes = (s / 60.0).floor() as u64;
     format!("{minutes}:{:04.1}", s - minutes as f64 * 60.0)
-}
-
-/// Every symbol instance in a layer stack, with the keyframe start it sits
-/// on. Hidden layers and hidden objects are left out: only *visible* uses
-/// decide where a symbol is first seen.
-fn instances_in(stack: &LayerStack) -> Vec<(u32, SymbolInstance)> {
-    fn walk(object: &Object, start: u32, out: &mut Vec<(u32, SymbolInstance)>) {
-        if !object.visible {
-            return;
-        }
-        match &object.kind {
-            ObjectKind::Instance(inst) => out.push((start, inst.clone())),
-            ObjectKind::Group(children) => {
-                for child in children {
-                    walk(child, start, out);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    for layer in stack.iter() {
-        if !layer.visible || layer.audio_guide {
-            continue;
-        }
-        for keyframe in layer.frames.keyframes() {
-            for object in keyframe.objects.iter() {
-                walk(object, keyframe.start, &mut out);
-            }
-        }
-    }
-    out
-}
-
-/// For every symbol shown in the scene: the stage frame of its first visible
-/// use, and its **anchor** — the stage frame its own frame 0 corresponds to
-/// (`s0 - f0`, nested uses composing). Unused symbols are absent.
-fn symbol_anchors(scene: &Scene) -> HashMap<SymbolId, (i64, i64)> {
-    let library = scene.library();
-    let f0 = |inst: &SymbolInstance| -> i64 {
-        match library.get(inst.symbol) {
-            Some(s) if s.kind.follows_parent_timeline() => inst.first_frame as i64,
-            _ => 0,
-        }
-    };
-    let mut anchors: HashMap<SymbolId, (i64, i64)> = HashMap::new();
-    let offer = |anchors
-: &mut HashMap<SymbolId, (i64, i64)>, id: SymbolId, visible: i64, anchor: i64| -> bool {
-        match anchors.get(&id) {
-            Some(&(v, _)) if v <= visible => false,
-            _ => {
-                anchors.insert(id, (visible, anchor));
-                true
-            }
-        }
-    };
-    for (start, inst) in instances_in(scene.stage_layers()) {
-        let start = start as i64;
-        let anchor = if inst.sync_to_root { 0 } else { start - f0(&inst) };
-        offer(&mut anchors, inst.symbol, start, anchor);
-    }
-    let nested: HashMap<SymbolId, Vec<(u32, SymbolInstance)>> = library
-        .iter()
-        .map(|s| (s.id, instances_in(&s.layers)))
-        .collect();
-    for _ in 0..=library.len() {
-        let mut changed = false;
-        let known: Vec<(SymbolId, (i64, i64))> = anchors.iter().map(|(k, v)| (*k, *v)).collect();
-        for (parent, (parent_visible, parent_anchor)) in known {
-            let Some(children) = nested.get(&parent) else {
-                continue;
-            };
-            for (start, inst) in children {
-                let visible = (parent_anchor + *start as i64).max(parent_visible);
-                let anchor = if inst.sync_to_root {
-                    0
-                } else {
-                    parent_anchor + *start as i64 - f0(inst)
-                };
-                changed |= offer(&mut anchors, inst.symbol, visible, anchor);
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    anchors
 }
 
 /// Set a layer's span to exactly `frames` (at least 1).
@@ -782,7 +695,6 @@ fn plan_scene(
     // Measured from the trim actually written, so a re-run lands on the same
     // `f32` values.
     let slice_start = reference.trim_start as f64;
-    let anchors = symbol_anchors(&work);
     let master_seconds = master.duration_seconds();
     let mut symbols_given_guide = 0;
     // **Every pose of a character**: a symbol in a character's pose set gets
@@ -808,9 +720,14 @@ fn plan_scene(
             }
             continue;
         }
-        let anchor = anchors.get(id).map_or(0, |&(_, a)| a);
-        let trim_start = (slice_start + anchor as f64 / fps)
-.clamp(0.0, master_seconds.max(0.0));
+        // **Frame for frame with the stage**: the symbol's frame N hears what
+        // the scene's frame N does. Symbols here are set to the frame they
+        // are on (F, Paste Stage), so that is the dialogue their frames are
+        // animated against. It used to be anchored where the symbol was first
+        // seen with its frame 0 — a head placed at 160 s heard only the last
+        // 18 s, from its frame 0, and a head placed at 108 s ran out of
+        // dialogue 70 s in, the rest of it silent and with no waveform.
+        let trim_start = slice_start.clamp(0.0, master_seconds.max(0.0));
         let length = symbol
             .layers
             .iter()

@@ -1261,7 +1261,7 @@ impl Command {
             ImportImage => "Import Image…",
             AttachSound => "Attach Sound to Frame",
             RemoveSound => "Remove Sound from Frame",
-            LipSync => "Lip Sync…",
+            LipSync => "Lip Sync and Visemes…",
             NewMouthSymbol => "New Mouth Symbol",
             DetectBeats => "Detect Beats",
             FitToNarration => "Fit to Narration",

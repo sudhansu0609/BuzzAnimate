@@ -3492,14 +3492,15 @@ impl Scene {
     }
 
     /// **Delete an object where the playhead is** — from the keyframe the
-    /// playhead is on, and under Edit Multiple Frames from every keyframe
-    /// beginning in the range.
+    /// playhead's frame belongs to, and under Edit Multiple Frames from every
+    /// keyframe beginning in the range.
     ///
-    /// Partway into a keyframe's span, the frame is made a keyframe first, so
-    /// the frames before the playhead keep the object: deleting on frame 1915
-    /// must not reach back and empty frame 1533. [`Self::remove_object`]
-    /// takes the *first* keyframe holding the id, and F6 copies share ids,
-    /// so it used to delete from a keyframe long before the playhead.
+    /// Partway into a keyframe's span it is deleted from that keyframe, the
+    /// nearest on the left — the whole span loses it, as in Animate — and only
+    /// with Auto Keyframe on is the frame made a keyframe first. Never from an
+    /// earlier keyframe than that: [`Self::remove_object`] takes the *first*
+    /// keyframe holding the id, and F6 copies share ids, so deleting on frame
+    /// 1915 once emptied frame 537.
     pub fn remove_object_where(&mut self, at: EditAt, id: ObjectId) -> bool {
         let Some((layer_id, _)) = self.find_object(id) else {
             return false;
@@ -3528,7 +3529,12 @@ impl Scene {
             if !here {
                 return;
             }
-            if !frames.is_keyframe(at.frame) {
+            // From the keyframe the frame belongs to — the nearest one on its
+            // left — as Animate deletes. Only Auto Keyframe makes the frame a
+            // keyframe first, so the frames before it keep the object; it
+            // used to do so always, leaving a new, emptied keyframe behind
+            // every Delete partway into a span.
+            if at.auto_key && !frames.is_keyframe(at.frame) {
                 frames.insert_keyframe(at.frame);
             }
             if let Some(keyframe) = frames.keyframe_at_mut(at.frame) {

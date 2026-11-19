@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use buzz_scene::{LayerId, ObjectId, Scene};
+use buzz_scene::{CameraKey, LayerId, LayerKind, ObjectId, Scene};
 
 /// The JavaScript the prelude runs to build `fl` and `document`.
 const PRELUDE: &str = include_str!("prelude.js");
@@ -516,6 +516,10 @@ pub(crate) struct State {
     /// (`ScriptContext::master_audio`), so a script that switches scenes is
     /// not stopped on another scene's layer of the same id.
     pub master_audio: Option<(usize, LayerId)>,
+    /// Every `insertKeyframe` the script asked for — scene, layer, frame —
+    /// refused or not, so a key on every layer can reach the camera too
+    /// (see [`key_the_camera_with_the_layers`]).
+    pub keyed: Vec<(usize, LayerId, u32)>,
 }
 
 impl State {
@@ -641,15 +645,17 @@ pub fn run_film(
         layer_fx_base: std::collections::HashMap::new(),
         waited: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         master_audio,
+        keyed: Vec::new(),
     }));
 
     let (error, stopped) = evaluate(&state, source, limits, stop);
 
     // Take the work back out, whether or not the script finished. A partial
     // result is still the user's work.
-    let finished = Rc::try_unwrap(state)
+    let mut finished = Rc::try_unwrap(state)
         .unwrap_or_else(|rc| RefCell::new(rc.borrow().clone_state()))
         .into_inner();
+    key_the_camera_with_the_layers(&mut finished);
 
     let after: Vec<u64> = finished.scenes.iter().map(|s| s.revision()).collect();
     let changed = after != before;
@@ -667,6 +673,50 @@ pub fn run_film(
         stopped,
         save_requested: finished.save_requested,
         elapsed: started.elapsed(),
+    }
+}
+
+/// **A keyframe on every layer keys the camera too.** In Animate the camera
+/// is a layer, so a command that F6s every layer at a frame (Shift+S's
+/// `addKeyframeOnAllLayersCurrentFrame`) keys it with the rest. Here it is a
+/// track of its own that `timeline.layers` never lists, so the run makes up
+/// for it: where the script keyed, on the main timeline, every layer that
+/// holds frames — folders and sound layers aside, as such a command skips
+/// them — the camera gets a key there too, holding the shot it has there.
+/// Only a camera that is on and unlocked, and not where it has a key already.
+fn key_the_camera_with_the_layers(state: &mut State) {
+    let mut frames: Vec<(usize, u32)> = state.keyed.iter().map(|&(scene, _, frame)| (scene, frame)).collect();
+    frames.sort_unstable();
+    frames.dedup();
+    for (index, frame) in frames {
+        let Some(scene) = state.scenes.get_mut(index) else {
+            continue;
+        };
+        let camera = scene.camera();
+        if scene.editing_symbol().is_some() || !camera.enabled || camera.locked || camera.has_key_at(frame) {
+            continue;
+        }
+        let master = state.master_audio.and_then(|(s, layer)| (s == index).then_some(layer));
+        let needed: Vec<LayerId> = scene
+            .layers()
+            .iter()
+            .filter(|l| {
+                l.kind != LayerKind::Folder
+                    && Some(l.id) != master
+                    && !l.audio_guide
+                    && !l.name.to_lowercase().contains("sound")
+                    && !l.frames.keyframes().iter().any(|k| k.sound.is_some())
+            })
+            .map(|l| l.id)
+            .collect();
+        if needed.is_empty() || !needed.iter().all(|&id| state.keyed.contains(&(index, id, frame))) {
+            continue;
+        }
+        let Some(shot) = camera.state_at(frame) else {
+            continue;
+        };
+        scene.camera_mut().set_key(CameraKey { frame, ..shot });
+        state.trace.push(format!("Camera keyed at frame {} with the layers", frame + 1));
     }
 }
 
@@ -693,6 +743,7 @@ impl State {
             layer_fx_base: self.layer_fx_base.clone(),
             waited: Arc::clone(&self.waited),
             master_audio: self.master_audio,
+            keyed: self.keyed.clone(),
         }
     }
 }
@@ -925,6 +976,46 @@ mod tests {
         let layer = scene.layers().get(guide).expect("the guide");
         assert_eq!(layer.name, "Dialogue");
         assert_eq!(layer.frames.keyframes().len(), 1);
+    }
+
+    /// **Shift+S's "keyframe on all layers" keys the camera too**, as Animate's
+    /// camera layer is one of the layers — holding the shot it has there. A
+    /// key on only some of the layers, or a locked camera, leaves it alone.
+    #[test]
+    fn a_keyframe_on_every_layer_keys_the_camera() {
+        let all = r#"
+            var t = fl.getDocumentDOM().getTimeline();
+            for (var i = 0; i < t.layers.length; i++) {
+                if (t.layers[i].name.toLowerCase().indexOf("sound") !== -1) continue;
+                t.setSelectedLayers(i);
+                t.insertKeyframe(12);
+            }
+        "#;
+        let filmed = || {
+            let mut scene = document();
+            scene.add_layer("sound fx", LayerKind::Normal);
+            let camera = scene.camera_mut();
+            camera.enabled = true;
+            let mut key = CameraKey::new(0, buzz_geom::Point::new(40.0, 30.0));
+            key.zoom = 2.0;
+            camera.set_key(key);
+            scene
+        };
+
+        let mut scene = filmed();
+        let out = run_source(&mut scene, all);
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let key = scene.camera().keys().iter().find(|k| k.frame == 12).expect("the camera is keyed at 12");
+        assert_eq!((key.center, key.zoom), (buzz_geom::Point::new(40.0, 30.0), 2.0), "holding its shot");
+
+        let mut scene = filmed();
+        run_source(&mut scene, "var t = fl.getDocumentDOM().getTimeline(); t.setSelectedLayers(0); t.insertKeyframe(12);");
+        assert!(!scene.camera().has_key_at(12), "one layer keyed is not every layer");
+
+        let mut scene = filmed();
+        scene.camera_mut().locked = true;
+        run_source(&mut scene, all);
+        assert!(!scene.camera().has_key_at(12), "a locked camera is not keyed");
     }
 
     /// Speech from frame 10 to 40 with a 4-frame breath at 25, then quiet

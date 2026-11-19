@@ -131,6 +131,10 @@ pub struct TimelineResponse {
     /// The talk range at this index of [`TimelineState::talk_ranges`] was
     /// removed from the ruler's right-click menu.
     pub remove_talk_range: Option<usize>,
+    /// The talk range being marked was started over at the playhead
+    /// (`Some(true)`, Start Here) or let go of (`Some(false)`, ✕ or a
+    /// right-click on End Range).
+    pub restart_talk_range: Option<bool>,
     /// The frame cells were made wider or narrower.
     ///
     /// Not undoable, and deliberately: how big the timeline is drawn is not a
@@ -892,6 +896,10 @@ pub struct TimelineState {
     /// **Talk ranges** marked on this scene (Mark Talk Range…), drawn as
     /// bands along the ruler with the characters' names on them.
     pub talk_ranges: Vec<TalkRangeBand>,
+    /// **A talk range being marked** — Mark Talk Range is open — from its
+    /// start to the end it has now. The button reads End Range meanwhile: move
+    /// the playhead forward and press it to end the range there.
+    pub talk_range_marking: Option<(u32, u32)>,
 }
 
 /// One talk range as the ruler draws it: frames `start..=end`, and who it is
@@ -2397,27 +2405,59 @@ fn transport_controls(
             }
         }
 
-        // **Talk Range**: one button — a click marks a range (the frames
-        // selected, else from the playhead to the end of the line), a
+        // **Talk Range**: one button, two presses, marked by hand — a click
+        // marks the start on the playhead; then it reads End Range, and a
+        // click after moving the playhead forward marks the end there (on the
+        // same frame, the end is taken from the line spoken there). A
         // right-click clears them. Counted once there are some.
         ui.separator();
         let marked = state.talk_ranges.len();
-        let label = if marked == 0 { "Talk Range".to_string() } else { format!("Talk Ranges \u{00b7} {marked}") };
         let key = state
             .key_names
             .get(&crate::Command::MarkTalkRange)
             .filter(|k| !k.is_empty())
             .map(|k| format!(" ({k})"))
             .unwrap_or_default();
-        let button = egui::Button::new(egui::RichText::new(label).small()).selected(marked > 0);
-        let response = ui.add(button).on_hover_text(format!(
-            "Mark the frames a talking command (Shift+A) runs over, and who talks in them{key}. \
-             Right-click to clear every range."
-        ));
+        let (label, tip) = match state.talk_range_marking {
+            Some((start, end)) => (
+                format!("End Range \u{00b7} {}", start + 1),
+                format!(
+                    "The range starts on frame {}. Move the playhead to the last frame they talk on and press to end it there (frame {} now){key}. \
+                     Pressed on its first frame, the end is where the line spoken there ends.",
+                    start + 1,
+                    end + 1
+                ),
+            ),
+            None => (
+                if marked == 0 { "Talk Range".to_string() } else { format!("Talk Ranges \u{00b7} {marked}") },
+                format!(
+                    "Mark the start of a range a talking command (Shift+A) runs over, on the playhead{key}; then move to its last frame and press End Range, and pick who talks in it. \
+                     Right-click to clear every range."
+                ),
+            ),
+        };
+        let button = egui::Button::new(egui::RichText::new(label).small()).selected(marked > 0 || state.talk_range_marking.is_some());
+        let response = ui.add(button).on_hover_text(tip);
         if response.clicked() {
             out.command = Some(crate::Command::MarkTalkRange);
         }
-        if response.secondary_clicked() && marked > 0 {
+        // While one is being marked, its start can be put right: started
+        // over on the playhead, or the range let go of altogether.
+        if state.talk_range_marking.is_some() {
+            if response.secondary_clicked() {
+                out.restart_talk_range = Some(false);
+            }
+            if ui
+                .small_button("Start Here")
+                .on_hover_text("Start the range on the frame the playhead is on instead")
+                .clicked()
+            {
+                out.restart_talk_range = Some(true);
+            }
+            if ui.small_button("\u{2715}").on_hover_text("Let go of this range without marking it").clicked() {
+                out.restart_talk_range = Some(false);
+            }
+        } else if response.secondary_clicked() && marked > 0 {
             out.command = Some(crate::Command::ClearTalkRanges);
         }
 
@@ -2619,6 +2659,10 @@ fn ruler(
 
     draw_loop_band(&painter, rect, grid_left, columns, region, cell_width);
     draw_talk_ranges(&painter, rect, grid_left, columns, &state.talk_ranges, cell_width);
+    if let Some((start, end)) = state.talk_range_marking {
+        let band = TalkRangeBand { start: start.min(end), end: start.max(end), label: "new range".into() };
+        draw_talk_ranges(&painter, rect, grid_left, columns, std::slice::from_ref(&band), cell_width);
+    }
     draw_playhead(&painter, rect, grid_left, state.current_frame, cell_width);
 
     // **P1: the grid pages to keep the playhead in view.** Animate does the
@@ -5503,6 +5547,7 @@ mod tests {
             nearest_depth: -900.0,
             shot_end: None,
             stage_copied: None,
+            talk_range_marking: None,
             talk_ranges: Vec::new(),
         }
     }

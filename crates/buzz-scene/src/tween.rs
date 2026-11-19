@@ -534,17 +534,12 @@ pub fn interpolate_objects(
 
         TweenKind::Classic | TweenKind::Motion => from
             .iter()
-            .map(|start| {
-                // Matched by id, which survives reordering and works because
-                // F6 clones keyframes with their ids intact.
-                match to.iter().find(|e| e.id == start.id) {
-                    Some(end) => {
-                        interpolate_object(start, end, tween, eased, frame_of_reference)
-                    }
-                    // Present only at the start: hold it rather than tween
-                    // from nothing.
-                    None => (**start).clone(),
-                }
+            .zip(classic_partners(from, to))
+            .map(|(start, partner)| match partner {
+                Some(j) => interpolate_object(start, &to[j], tween, eased, frame_of_reference),
+                // Present only at the start: hold it rather than tween
+                // from nothing.
+                None => (**start).clone(),
             })
             .collect(),
 
@@ -582,6 +577,45 @@ pub fn interpolate_objects(
             out
         }
     }
+}
+
+/// **Which object on the first keyframe a classic or motion tween carries to
+/// which on the second.** By id first, which survives reordering and works
+/// because F6 clones keyframes with their ids intact.
+///
+/// An instance the next keyframe has no id for still tweens, as in Animate,
+/// to the instance left over there: one of the same symbol, in order, else
+/// any left over of the same kind — the symbol the tween starts with is the
+/// one shown until the next key. A walk built from poses has a fresh instance
+/// on every keyframe, and matching by id alone held every part still, then
+/// jumped it on the next key. Shapes are not paired this way: a classic tween
+/// does not move raw artwork.
+fn classic_partners(from: &[std::sync::Arc<Object>], to: &[std::sync::Arc<Object>]) -> Vec<Option<usize>> {
+    let mut partner: Vec<Option<usize>> = from.iter().map(|start| to.iter().position(|e| e.id == start.id)).collect();
+    let mut taken = vec![false; to.len()];
+    for j in partner.iter().flatten() {
+        taken[*j] = true;
+    }
+    let symbol = |o: &Object| match &o.kind {
+        ObjectKind::Instance(i) => Some(i.symbol),
+        _ => None,
+    };
+    let same_symbol = |a: &Object, b: &Object| symbol(a).is_some() && symbol(a) == symbol(b);
+    let same_kind = |a: &Object, b: &Object| {
+        !matches!(a.kind, ObjectKind::Shape(_)) && std::mem::discriminant(&a.kind) == std::mem::discriminant(&b.kind)
+    };
+    for fits in [&same_symbol as &dyn Fn(&Object, &Object) -> bool, &same_kind] {
+        for (i, start) in from.iter().enumerate() {
+            if partner[i].is_some() {
+                continue;
+            }
+            if let Some(j) = (0..to.len()).find(|&j| !taken[j] && fits(start, &to[j])) {
+                partner[i] = Some(j);
+                taken[j] = true;
+            }
+        }
+    }
+    partner
 }
 
 /// **Which drawing on the first keyframe becomes which on the second.**
@@ -2394,6 +2428,25 @@ mod tests {
         };
         assert!((x(1) - 50.0).abs() < 1e-9, "object 1 went to {}", x(1));
         assert!((x(2) - 100.0).abs() < 1e-9, "object 2 went to {}", x(2));
+    }
+
+    /// **A walk made of poses tweens.** Each pose keyframe holds a fresh
+    /// instance of the part, so no id carries over: the part still tweens to
+    /// the instance of its symbol on the next key, as Animate's classic tween
+    /// does — and a shape with no id match still holds.
+    #[test]
+    fn a_new_instance_on_the_next_key_is_tweened_to() {
+        let at = |id: u64, symbol: u64, x: f64| {
+            Arc::new(Object::instance_of(ObjectId(id), crate::symbol::SymbolId(symbol)).with_transform(Affine::translate((x, 0.0))))
+        };
+        let from = vec![at(1, 7, 0.0), at(2, 8, 0.0), object(3, Affine::IDENTITY)];
+        let to = vec![at(12, 8, 200.0), at(11, 7, 100.0), object(13, Affine::translate((50.0, 0.0)))];
+        let out = interpolate_objects(&from, &to, &Tween::classic(), None, 0.5, None);
+        let x = |i: usize| (out[i].transform * Point::ORIGIN).x;
+        assert!((x(0) - 50.0).abs() < 1e-9, "the symbol-7 part went to {}", x(0));
+        assert!((x(1) - 100.0).abs() < 1e-9, "the symbol-8 part went to {}", x(1));
+        assert_eq!(x(2), 0.0, "a shape is not moved by a classic tween");
+        assert_eq!(out[0].id, ObjectId(1), "the in-between is the starting instance");
     }
 
     #[test]

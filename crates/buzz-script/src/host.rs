@@ -1240,6 +1240,11 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             };
             (id, f)
         };
+        {
+            let mut s = state.borrow_mut();
+            let scene = s.current;
+            s.keyed.push((scene, id, f));
+        }
         if hands_off(state, id, "keyed") {
             return Ok(());
         }

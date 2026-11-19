@@ -226,7 +226,7 @@ pub struct HeadSection {
 /// The names a head layer can be given: the user's Shift+R command's
 /// (`renameHeadLayers.jsfl`), then Rig Head's other parts.
 pub const HEAD_NAMES: &[&str] = &[
-    "eyeWhite", "leftEyeWhite", "rightEyeWhite", "eyeBall", "eyebrow", "leftEyebrow", "rightEyebrow",
+    "eyeWhite", "leftEyeWhite", "rightEyeWhite", "eyeBall", "eyeMask", "eyebrow", "leftEyebrow", "rightEyebrow",
     "eyeLid", "mouth", "nose", "hair", "base", "moustacheFront",
 ];
 

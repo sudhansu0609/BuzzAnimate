@@ -51,6 +51,7 @@ fn main() -> Result<()> {
     buzz_ai::ai_config::ensure_claude_key();
 
     init_tracing();
+    keep_crashes();
 
     // `--gpu <substring>` forces a specific adapter; `--script <file>` runs a
     // script over the document once it is open; `--brief <file>` and
@@ -267,6 +268,29 @@ fn init_tracing() {
 /// subscriber if the file cannot be created — a log that goes nowhere useful
 /// is still better than a process that fails to start over one that is only
 /// diagnostic.
+/// **A crash leaves its reason behind** (user 2026-11-20: "the app crashed",
+/// with nothing to say why). A panic in an app opened from Finder printed to
+/// a terminal nobody had, and `last.log` starts afresh at the next launch.
+/// Now what panicked, where, and the backtrace go to the log and to a file of
+/// their own, `crash-<time>.log` beside it, which no launch overwrites; the
+/// panic then goes on as before.
+fn keep_crashes() {
+    let dir = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join("Library").join("Logs").join("BuzzAnimate"));
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let report = format!("BuzzAnimate panicked on thread '{thread}': {info}\n\n{backtrace}\n");
+        tracing::error!("{report}");
+        if let Some(dir) = &dir {
+            let _ = std::fs::create_dir_all(dir);
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let _ = std::fs::write(dir.join(format!("crash-{stamp}.log")), &report);
+        }
+        previous(info);
+    }));
+}
+
 #[cfg(not(debug_assertions))]
 fn init_tracing() {
     // Without LOCALAPPDATA (macOS, Linux): `~/Library/Logs/BuzzAnimate` on a

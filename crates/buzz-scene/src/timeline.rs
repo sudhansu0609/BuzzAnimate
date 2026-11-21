@@ -429,10 +429,22 @@ impl LayerTimeline {
         if self.is_keyframe(frame) {
             return false;
         }
-        let objects = self
-            .keyframe_at(frame)
-            .map(|k| Arc::clone(&k.objects))
-            .unwrap_or_default();
+        // **Inside a tween, the tween is split, not lost** (user 2026-11-21:
+        // "if I have a classic tween between two positions and in that I put
+        // keyframes, the classic tween is getting removed; it shall use those
+        // as keyframes and do the tween between them"). As Animate's F6
+        // does: the new keyframe holds the tweened state at `frame` and
+        // carries the tween on to the next keyframe, so both halves still
+        // tween and nothing moves until it is changed.
+        let split = self.index_at(frame).and_then(|i| {
+            let k = &self.keyframes[i];
+            (k.tween.is_active() && self.keyframes.get(i + 1).is_some()).then(|| (k.tween, k.ease_curve.clone()))
+        });
+        let objects = match (&split, self.resolved_at(frame)) {
+            (Some(_), ResolvedFrame::Tweened(tweened)) => Arc::new(tweened.into_iter().map(Arc::new).collect()),
+            _ => self.keyframe_at(frame).map(|k| Arc::clone(&k.objects)).unwrap_or_default(),
+        };
+        let (tween, ease_curve) = split.unwrap_or_default();
         // F6 keeps the look of the frame it was pressed on, colour effect
         // included.
         let color = self.color_at(frame);
@@ -442,14 +454,59 @@ impl LayerTimeline {
             start: frame,
             objects,
             label: None,
-            tween: crate::tween::Tween::default(),
-            ease_curve: None,
+            tween,
+            ease_curve,
             // A duplicated keyframe does *not* duplicate its sound: F6 on a
             // dialogue layer would otherwise start the whole take again from
             // the new frame, on top of the one already playing.
             sound: None,
             color,
         });
+        true
+    }
+
+    /// **F6 with the graphics carrying on**: [`Self::insert_keyframe`], and
+    /// then each graphic instance on the new keyframe starts on the frame it
+    /// was showing there, so it goes on playing rather than jumping back to
+    /// where the keyframe it was copied from started (user 2026-11-20: "on
+    /// each frame unless I change it, the frame number of the object shall be
+    /// matched to the current frame number"). An instance matched to the
+    /// frame number keeps matching; one set to another frame on purpose keeps
+    /// its offset. As Animate's F6 does.
+    ///
+    /// `graphics` is each graphic symbol's length — a movie clip, which shows
+    /// its first frame whatever the timeline does, is left alone, as is a
+    /// Single Frame instance (it already shows the same frame) and one locked
+    /// to the root timeline.
+    pub fn insert_keyframe_carrying_on(&mut self, frame: u32, graphics: &std::collections::HashMap<crate::SymbolId, u32>) -> bool {
+        let start = self.keyframe_start(frame).filter(|s| *s < frame);
+        if !self.insert_keyframe(frame) {
+            return false;
+        }
+        let Some(start) = start else {
+            return true;
+        };
+        let elapsed = frame - start;
+        let carried = |object: &Object| -> Option<u32> {
+            let instance = object.instance()?;
+            let length = *graphics.get(&instance.symbol)?;
+            if instance.sync_to_root {
+                return None;
+            }
+            let shown = instance.resolve_frame(crate::SymbolKind::Graphic, elapsed, length);
+            (shown != instance.first_frame).then_some(shown)
+        };
+        if let Some(key) = self.keyframes.iter_mut().find(|k| k.start == frame)
+            && key.objects.iter().any(|o| carried(o).is_some())
+        {
+            for object in Arc::make_mut(&mut key.objects).iter_mut() {
+                if let Some(shown) = carried(object)
+                    && let crate::ObjectKind::Instance(instance) = &mut Arc::make_mut(object).kind
+                {
+                    instance.first_frame = shown;
+                }
+            }
+        }
         true
     }
 
@@ -1327,6 +1384,39 @@ mod tests {
         );
     }
 
+    /// **A keyframe put inside a classic tween splits it** (user 2026-11-21):
+    /// the new keyframe stands where the tween had it on that frame, and the
+    /// tween goes on from it to the next keyframe, so both halves still tween
+    /// and nothing jumps. Outside a tween F6 still copies the keyframe.
+    #[test]
+    fn a_keyframe_inside_a_classic_tween_splits_it() {
+        let mut t = LayerTimeline::new();
+        t.push_object(0, object(1));
+        t.insert_frame(19);
+        t.insert_keyframe(10);
+        let moved = t.objects_at_mut(10).expect("the end keyframe");
+        Arc::make_mut(&mut moved[0]).transform = buzz_geom::Affine::translate((100.0, 0.0));
+        assert!(t.set_tween(0, crate::tween::Tween::classic()));
+        let x_at = |t: &LayerTimeline, frame: u32| t.resolved_at(frame).iter().next().map(|o| o.transform.translation().x).unwrap();
+        let before: Vec<f64> = (0..=10).map(|f| x_at(&t, f)).collect();
+
+        assert!(t.insert_keyframe(5));
+        assert!(t.tween_span_at(5).is_some_and(|s| s.start == 5 && s.end == Some(10)), "the new keyframe tweens on");
+        assert!(t.tween_span_at(2).is_some_and(|s| s.end == Some(5)), "and the first half still tweens");
+        assert!((t.objects_at(5)[0].transform.translation().x - 50.0).abs() < 1e-6, "it holds the tweened place");
+        let after: Vec<f64> = (0..=10).map(|f| x_at(&t, f)).collect();
+        for (f, (a, b)) in before.iter().zip(&after).enumerate() {
+            assert!((a - b).abs() < 1e-6, "frame {f} moved: {a} then {b}");
+        }
+
+        // Untweened: a plain copy, no tween.
+        let mut plain = LayerTimeline::new();
+        plain.push_object(0, object(1));
+        plain.insert_frame(9);
+        assert!(plain.insert_keyframe(4));
+        assert!(plain.tween_span_at(4).is_none());
+    }
+
     /// A tween with no following keyframe interpolates towards nothing. The
     /// model has to say so, because that is the difference between a dashed
     /// line and a working animation.
@@ -1456,6 +1546,44 @@ mod move_frames_tests {
     use buzz_geom::Shape as _;
     use kurbo::Rect;
     use peniko::Color;
+
+    /// **F6 carries a graphic on** from the frame it was showing: one matched
+    /// to the frame number keeps matching, one offset on purpose keeps its
+    /// offset; a Single Frame instance, a movie clip (not in the map) and one
+    /// locked to the root are left as they were.
+    #[test]
+    fn a_new_keyframe_carries_its_graphics_on() {
+        use crate::symbol::{LoopMode, SymbolId};
+        let instance = |id: u64, symbol: u64, first: u32, mode: LoopMode, root: bool| {
+            let mut o = Object::instance_of(ObjectId(id), SymbolId(symbol));
+            if let crate::ObjectKind::Instance(i) = &mut o.kind {
+                i.first_frame = first;
+                i.loop_mode = mode;
+                i.sync_to_root = root;
+            }
+            Arc::new(o)
+        };
+        let mut t = LayerTimeline::new();
+        t.insert_frame(99);
+        t.insert_blank_keyframe(10);
+        t.set_objects(
+            10,
+            vec![
+                instance(1, 7, 10, LoopMode::Loop, false),       // matched to the frame number
+                instance(2, 7, 50, LoopMode::Loop, false),       // offset on purpose
+                instance(3, 7, 3, LoopMode::SingleFrame, false), // a held pose
+                instance(4, 8, 10, LoopMode::Loop, false),       // a movie clip
+                instance(5, 7, 10, LoopMode::Loop, true),        // locked to the root
+            ],
+        );
+        let graphics: std::collections::HashMap<SymbolId, u32> = [(SymbolId(7), 400)].into_iter().collect();
+        assert!(t.insert_keyframe_carrying_on(25, &graphics));
+        let firsts: Vec<u32> = t.objects_at(25).iter().map(|o| o.instance().unwrap().first_frame).collect();
+        assert_eq!(firsts, vec![25, 65, 3, 10, 10]);
+        let before: Vec<u32> = t.objects_at(10).iter().map(|o| o.instance().unwrap().first_frame).collect();
+        assert_eq!(before, vec![10, 50, 3, 10, 10], "the keyframe it came from is as it was");
+        assert!(!t.insert_keyframe_carrying_on(25, &graphics), "already a keyframe");
+    }
 
     fn object(id: u64) -> Arc<Object> {
         Arc::new(Object::shape(

@@ -978,6 +978,27 @@ mod tests {
         assert_eq!(layer.frames.keyframes().len(), 1);
     }
 
+    /// **A script's insertKeyframe carries a character on** (user 2026-11-20):
+    /// Shift+S partway into a span keeps the character on the frame number,
+    /// as F6 does, instead of starting it again where its keyframe started.
+    #[test]
+    fn a_script_keyframe_keeps_a_character_on_the_frame_number() {
+        let mut scene = Scene::default();
+        let body = scene.add_symbol("body", buzz_scene::SymbolKind::Graphic, None);
+        scene.library_mut().update(body, |s| {
+            let first = s.layers.iter().next().unwrap().id;
+            s.layers.update(first, |l| { l.frames.insert_frame(199); });
+        });
+        let layer = scene.layers().iter().next().unwrap().id;
+        let id = scene.next_object_id();
+        scene.update_layer(layer, |l| { l.frames.insert_frame(99); });
+        scene.add_object_at(layer, 0, buzz_scene::Object::instance_of(id, body));
+        let out = run_source(&mut scene, "var t = fl.getDocumentDOM().getTimeline(); t.setSelectedLayers(0); t.insertKeyframe(12);");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let first = scene.layers().get(layer).unwrap().objects_at(12)[0].instance().unwrap().first_frame;
+        assert_eq!(first, 12, "frame 12 shows the body's 12");
+    }
+
     /// **Shift+S's "keyframe on all layers" keys the camera too**, as Animate's
     /// camera layer is one of the layers — holding the shot it has there. A
     /// key on only some of the layers, or a locked camera, leaves it alone.

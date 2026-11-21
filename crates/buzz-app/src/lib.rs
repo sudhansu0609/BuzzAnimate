@@ -59,6 +59,7 @@ pub mod stage_pins;
 pub mod profile;
 pub mod rig_limits;
 pub mod rig_parts;
+pub mod rig_slots;
 pub mod rhubarb;
 pub mod rigging;
 pub mod scene_life;

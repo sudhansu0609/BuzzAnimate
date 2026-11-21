@@ -683,6 +683,9 @@ pub enum Pick {
     VoiceTake,
     /// An Animate keyboard-shortcut file to bring over.
     AnimateKeymap,
+    /// Bring Character Here's **From a file…**: a document not open, whose
+    /// characters join the list.
+    BringFromFile,
 }
 
 /// **The AI work is done: give its memory back.** The ONNX models (SAM 2, LaMa,
@@ -1328,6 +1331,11 @@ pub struct App {
     /// in when not this one, and the character.
     #[allow(clippy::type_complexity)]
     bring_list: Option<Vec<(String, Option<Arc<buzz_scene::Scene>>, crate::bring::Candidate)>>,
+    /// **Files read for Bring Character Here** that are not open: each one's
+    /// name and its scenes (name, scene), so their characters are listed.
+    bring_files: Vec<(String, Vec<(String, Arc<buzz_scene::Scene>)>)>,
+    /// A file being read for Bring Character Here, off the UI thread.
+    bring_loading: Option<(String, crossbeam_channel::Receiver<Result<Vec<(String, Arc<buzz_scene::Scene>)>, String>>)>,
     /// Escape hatch: `BUZZ_POLL=1` forces the old always-redraw loop, for
     /// bisecting any report of stale UI.
     force_poll: bool,
@@ -1601,6 +1609,9 @@ pub struct App {
     cast_edited_seen: Option<((u64, usize, u64), std::collections::BTreeSet<std::path::PathBuf>)>,
     /// A Cast key's asset and main symbol name, read once from its file.
     cast_main_names: std::collections::HashMap<String, Option<(buzz_doc::Asset, String)>>,
+    /// `(document, symbol name)` already looked up in the Cast by
+    /// [`Self::link_selection_to_cast`], so each is read at most once.
+    cast_pose_links_checked: std::collections::HashSet<(u64, String)>,
     /// What the Eyedropper's cursor last read under its tip: (pointer,
     /// drawing revision, frame) and the colour. See [`Self::eyedropper_peek`].
     #[allow(clippy::type_complexity)]
@@ -1613,6 +1624,11 @@ pub struct App {
     /// (`rig_slots_path` is the one showing).
     rig_slots_kept: std::collections::HashMap<Vec<u64>, (usize, Vec<Option<buzz_scene::ObjectId>>)>,
     rig_slots_path: Option<Vec<u64>>,
+    /// The document the kept slots are of; another one starts them over
+    /// from what `rig_slots.json` kept for it.
+    rig_slots_doc: Option<u64>,
+    /// What `rig_slots.json` was last given: (film, timeline, slots).
+    rig_slots_written: Option<(std::path::PathBuf, String, crate::rig_slots::Kept)>,
     /// The Rig panel's slots as they were last looked at, so a slot filled
     /// since renames its layer once (`App::name_tagged_layers`).
     rig_slots_seen: Vec<Option<buzz_scene::ObjectId>>,
@@ -1943,6 +1959,8 @@ impl App {
             egui_repaint: None,
             occluded_retry: None,
             bring_list: None,
+            bring_files: Vec::new(),
+            bring_loading: None,
             force_poll: std::env::var("BUZZ_POLL").is_ok(),
             stage_stamp: None,
             perf: Perf::default(),
@@ -2032,10 +2050,13 @@ impl App {
             cast_copy_prints: std::collections::HashMap::new(),
             cast_edited_seen: None,
             cast_main_names: std::collections::HashMap::new(),
+            cast_pose_links_checked: std::collections::HashSet::new(),
             eyedropper_peek: std::cell::RefCell::new(None),
             dropper_pick: None,
             rig_slots_kept: std::collections::HashMap::new(),
             rig_slots_path: None,
+            rig_slots_doc: None,
+            rig_slots_written: None,
             rig_slots_seen: Vec::new(),
             master_guided: std::collections::HashSet::new(),
             preview: crate::preview::Preview::default(),
@@ -4811,11 +4832,7 @@ impl App {
                             .frame(egui::Frame::new().fill(Palette::bg()).inner_margin(3))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    tab_action = self.document_tabs(ui);
-                                    ui.separator();
-                                    if let Some(command) = self.breadcrumb(ui) {
-                                        commands.push(command);
-                                    }
+                                    tab_action = self.breadcrumb_then_tabs(ui, &mut commands, false);
                                 });
                             });
                     }
@@ -4904,6 +4921,7 @@ impl App {
         self.poll_even_lines();
         self.poll_optimize();
         self.poll_tasks();
+        self.link_selection_to_cast();
         self.voice_tick(&ctx);
         // The Assistant's tool calls run here, on the UI thread, one frame at a time.
         if self.agent_pump() {
@@ -5754,10 +5772,130 @@ impl App {
         self.sync_shot_with_cast_renaming(asset, &renames)
     }
 
+    /// The open timelines `path` (symbol ids) as `rig_slots.json` names them:
+    /// the symbols' names joined by `/`, `""` for the stage.
+    fn rig_timeline_key(&self, path: &[u64]) -> String {
+        let library = self.editor.doc.scene().library();
+        path.iter()
+            .map(|id| library.get(buzz_scene::SymbolId(*id)).map(|s| s.name.clone()).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// The slots `rig_slots.json` kept for timeline `path` of this film,
+    /// each drawing still in it (one gone since is an empty slot).
+    fn saved_rig_slots(&self, path: &[u64]) -> Option<(usize, Vec<Option<buzz_scene::ObjectId>>)> {
+        let film = self.editor.doc.path()?.to_path_buf();
+        let kept = crate::rig_slots::get(&film, &self.rig_timeline_key(path))?;
+        if kept.pattern >= buzz_rig::RigPattern::builtin().len() {
+            return None;
+        }
+        let scene = self.editor.doc.scene();
+        let exists = |id: buzz_scene::ObjectId| {
+            scene.stage_layers().iter().any(|l| l.find_object(id).is_some())
+                || scene.library().iter().any(|s| s.layers.iter().any(|l| l.find_object(id).is_some()))
+        };
+        let slots: Vec<Option<buzz_scene::ObjectId>> =
+            kept.slots.iter().map(|s| s.map(buzz_scene::ObjectId).filter(|id| exists(*id))).collect();
+        slots.iter().any(Option::is_some).then_some((kept.pattern, slots))
+    }
+
+    /// Write the slots showing to `rig_slots.json` when they changed, for the
+    /// timeline they were filled on, so they are there after a restart.
+    fn keep_rig_slots(&mut self) {
+        let (Some(film), Some(path)) = (self.editor.doc.path().map(|p| p.to_path_buf()), self.rig_slots_path.clone()) else {
+            return;
+        };
+        let timeline = self.rig_timeline_key(&path);
+        let state = &self.editor.rig_panel;
+        let kept = crate::rig_slots::Kept { pattern: state.pattern, slots: state.slots.iter().map(|s| s.map(|id| id.0)).collect() };
+        let now = (film, timeline, kept);
+        if self.rig_slots_written.as_ref() == Some(&now) {
+            return;
+        }
+        // Nothing filled on a timeline never kept: no file to write.
+        let first = self.rig_slots_written.is_none();
+        let (film, timeline, kept) = &now;
+        if !(first && kept.slots.iter().all(Option::is_none) && crate::rig_slots::get(film, timeline).is_none()) {
+            if let Err(e) = crate::rig_slots::put(film, timeline, Some(kept)) {
+                tracing::warn!("could not keep the Rig slots: {e}");
+            }
+        }
+        self.rig_slots_written = Some(now);
+    }
+
+    /// **A selected character takes its poses from the Cast.** One symbol
+    /// instance selected whose symbol has no poses linked, named like a Cast
+    /// character that has some (the film's own `bhushan`, imported with the
+    /// FLA, and `Cast/bhushan` posed in the Cast panel): the Cast's poses are
+    /// copied in and linked, as one undo step, so right-click ▸ Pose,
+    /// Properties ▸ Pose and Next/Previous Pose offer them. Each symbol name is
+    /// looked up once per document.
+    fn link_selection_to_cast(&mut self) {
+        if self.agent_active() || self.editor.selection.len() != 1 {
+            return;
+        }
+        let frame = self.editor.edit_at().frame;
+        let selected = self.editor.selection.iter().next();
+        let scene = self.editor.doc.scene();
+        let Some(shown) = crate::cast_combine::pose_symbol(scene, selected, frame) else {
+            return;
+        };
+        let Some(name) = scene.library().get(shown).map(|s| s.name.clone()) else {
+            return;
+        };
+        let key = (self.editor.doc.uid(), name.clone());
+        if self.cast_pose_links_checked.contains(&key) {
+            return;
+        }
+        self.cast_pose_links_checked.insert(key);
+        // Placed from the Cast: lined up when it was placed, and kept by the Cast.
+        let from_cast = scene
+            .find_object(selected.expect("one selected"))
+            .and_then(|(layer, _)| scene.layers().get(layer))
+            .is_some_and(|l| l.cast_source.is_some());
+        if from_cast {
+            return;
+        }
+        let linked = crate::cast_combine::pose_choices(scene, selected, frame).is_some();
+        let Some(asset) = crate::cast_fresh::cast_characters(&self.editor.assets).into_iter().find(|a| a.name == name) else {
+            return;
+        };
+        let Ok(cast) = self.editor.assets.load(&asset) else {
+            return;
+        };
+        let mut probe = self.editor.doc.scene().clone();
+        if linked {
+            // Linked before its poses were lined up: stood on the main pose now.
+            if !crate::cast_pose_edit::line_up_linked_poses(&mut probe, &cast, &name) {
+                return;
+            }
+            self.editor.doc.edit("Line Up Poses", |scene| {
+                crate::cast_pose_edit::line_up_linked_poses(scene, &cast, &name);
+            });
+            self.editor.status = Some(format!("{name}: every pose now stands where the main pose does, at its size"));
+            return;
+        }
+        if !crate::cast_pose_edit::link_cast_poses(&mut probe, &cast, &name) {
+            return;
+        }
+        self.editor.doc.edit("Poses from the Cast", |scene| {
+            crate::cast_pose_edit::link_cast_poses(scene, &cast, &name);
+        });
+        let count = self.editor.doc.scene().library().find_by_name(&name).map_or(0, |s| s.set.len());
+        self.editor.status = Some(format!(
+            "{name}: {count} poses linked from the Cast \u{b7} right-click \u{25b8} Pose or Properties \u{25b8} Pose"
+        ));
+    }
+
     /// [`Self::sync_shot_with_cast`] after poses renamed in the Cast, `(old,
     /// new)` by full name, made here in that order.
     fn sync_shot_with_cast_renaming(&mut self, asset: &buzz_doc::Asset, renames: &[(String, String)]) -> bool {
-        if !crate::cast_pose_edit::is_placed(self.editor.doc.scene(), &asset.folder, &asset.name) {
+        // Placed from the Cast, or the film's own copy whose poses were
+        // linked from it (`link_selection_to_cast`).
+        let scene = self.editor.doc.scene();
+        let linked = scene.library().find_by_name(&asset.name).is_some_and(|s| !s.set.is_empty());
+        if !linked && !crate::cast_pose_edit::is_placed(scene, &asset.folder, &asset.name) {
             return false;
         }
         let Some(fresh) = self.editor.assets.assets().iter().find(|a| a.folder == asset.folder && a.name == asset.name).cloned() else {
@@ -6487,11 +6625,7 @@ impl App {
             // its place** on the top line, beside Zoom and Presets, as
             // Animate's do — the strip they had above the stage is not
             // drawn, and the stage has its height back.
-            let tabs = self.document_tabs(ui);
-            ui.separator();
-            if let Some(command) = self.breadcrumb(ui) {
-                commands.push(command);
-            }
+            let tabs = self.breadcrumb_then_tabs(ui, commands, true);
             self.tabs_in_title = Some(tabs);
             return;
         }
@@ -6602,7 +6736,10 @@ impl App {
     fn title_drag_zone(&mut self, ui: &mut egui::Ui) {
         let rest = ui.available_size();
         if rest.x <= 0.0 {
-            self.title_rects.drag = None;
+            // The tabs on this line keep the gap before them as the zone.
+            if self.tabs_in_title.is_none() {
+                self.title_rects.drag = None;
+            }
             return;
         }
         let (rect, response) = ui.allocate_exact_size(rest, egui::Sense::click_and_drag());
@@ -6618,6 +6755,37 @@ impl App {
         }
         self.title_rects.drag = Some(rect);
         self.queue_title_drag(&response);
+    }
+
+    /// **The scene and symbol path, then the file name at the far right**
+    /// (user 2026-11-21: "the file name shall be on the most right, the scene
+    /// and symbol names before it"). The document tabs are measured first in
+    /// an invisible sizing pass, so they land at the end of the row on the
+    /// very frame they are drawn; on the title bar (`title`) the gap before
+    /// them drags the window.
+    fn breadcrumb_then_tabs(&mut self, ui: &mut egui::Ui, commands: &mut Vec<Command>, title: bool) -> Option<TabAction> {
+        if let Some(command) = self.breadcrumb(ui) {
+            commands.push(command);
+        }
+        let width = {
+            let mut measure = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt(("document-tabs-measure", title))
+                    .max_rect(ui.available_rect_before_wrap())
+                    .layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .sizing_pass()
+                    .invisible(),
+            );
+            let _ = self.document_tabs(&mut measure);
+            measure.min_rect().width()
+        };
+        let gap = (ui.available_width() - width - 2.0).max(ui.spacing().item_spacing.x);
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(gap, ui.available_height().max(1.0)), egui::Sense::click_and_drag());
+        if title {
+            self.title_rects.drag = Some(rect);
+            self.queue_title_drag(&response);
+        }
+        self.document_tabs(ui)
     }
 
     /// Dragging a piece of the title bar moves the window; double-clicking
@@ -9096,6 +9264,18 @@ impl App {
         // head"): a head open gets a list of its own on the **Head** template,
         // its own layers' slots, and the body's waits for the way back out.
         let path: Vec<u64> = self.editor.scene().edit_path().iter().map(|s| s.0).collect();
+        // Another document (or this one opened again): its own slots.
+        let uid = self.editor.doc.uid();
+        if self.rig_slots_doc != Some(uid) {
+            if self.rig_slots_doc.is_some() {
+                self.rig_slots_kept.clear();
+                self.rig_slots_path = None;
+                self.editor.rig_panel.slots.clear();
+                self.editor.rig_panel.armed = None;
+            }
+            self.rig_slots_doc = Some(uid);
+            self.rig_slots_written = None;
+        }
         let open_head = {
             let scene = self.editor.scene();
             scene.editing_symbol().is_some_and(|s| crate::rigging::head_symbol_for(scene, s) == Some(s))
@@ -9118,7 +9298,13 @@ impl App {
                 Some(old) => {
                     let state = &self.editor.rig_panel;
                     self.rig_slots_kept.insert(old, (state.pattern, state.slots.clone()));
-                    let (pattern, slots) = self.rig_slots_kept.remove(&path).unwrap_or((fresh, Vec::new()));
+                    let (pattern, slots) =
+                        self.rig_slots_kept.remove(&path).or_else(|| self.saved_rig_slots(&path)).unwrap_or((fresh, Vec::new()));
+                    self.editor.rig_panel.pattern = pattern;
+                    self.editor.rig_panel.slots = slots;
+                    self.editor.rig_panel.armed = None;
+                }
+                None if let Some((pattern, slots)) = self.saved_rig_slots(&path) => {
                     self.editor.rig_panel.pattern = pattern;
                     self.editor.rig_panel.slots = slots;
                     self.editor.rig_panel.armed = None;
@@ -9135,6 +9321,7 @@ impl App {
                 self.lock_head_base();
             }
         }
+        self.keep_rig_slots();
         // A slot's drawing on another keyframe of this timeline is still there
         // — and so is one on a timeline this one is open inside (the body's
         // arm, with the head open), named for the layer it is on.
@@ -9833,16 +10020,22 @@ impl App {
         // mask out of its own slot. Among everything under the pointer, a
         // part whose layer is named for the slot wins, a mask layer only for a
         // mask slot, then one no other slot holds, then the topmost.
-        let hit = self.editor.object_at(at, self.editor.pick_tolerance());
+        //
+        // **The part clicked, by its drawing** (user 2026-11-20: "I am tagging
+        // but it's not picking"). The parts are those drawn under the pointer,
+        // topmost first — their pixels, not their boxes. Chosen by boxes, a
+        // big part already named for the slot (Bhushan's base, renamed
+        // midCloth) held it against every click on the part meant for it.
+        // Only where nothing is drawn under the pointer do boxes count.
+        let drawn = self.editor.objects_under(at, self.editor.pick_tolerance());
         let picked = {
             let scene = self.editor.scene();
             let loose = rigging::loose_parts(scene, frame);
             let mut under: Vec<buzz_ui::LoosePart> =
-                hit.and_then(|id| loose.iter().find(|p| p.object == id).cloned()).into_iter().collect();
-            for part in rigging::parts_under(scene, frame, at) {
-                if !under.iter().any(|p| p.object == part.object) {
-                    under.push(part);
-                }
+                drawn.iter().filter_map(|id| loose.iter().find(|p| p.object == *id).cloned()).collect();
+            let exact = !under.is_empty();
+            if !exact {
+                under = rigging::parts_under(scene, frame, at);
             }
             let state = &self.editor.rig_panel;
             let pattern = state.pattern();
@@ -9889,16 +10082,54 @@ impl App {
             if shut {
                 under.clear();
             }
-            // The best score; of equals, the topmost. Never a part that is
-            // another slot's.
-            let mut best: Option<(i32, usize)> = None;
-            for (index, part) in under.iter().enumerate() {
-                let s = score(part);
-                if s > -500 && best.is_none_or(|(b, _)| s > b) {
-                    best = Some((s, index));
+            let mask = |part: &buzz_ui::LoosePart| scene.layers().get(part.layer).is_some_and(|l| l.kind == buzz_scene::LayerKind::Mask);
+            let theirs = |part: &buzz_ui::LoosePart| {
+                !named_for(part, &wanted) && labels.iter().enumerate().any(|(i, label)| i != slot && named_for(part, label))
+            };
+            if exact {
+                // Drawn under the pointer: **the topmost part, the one
+                // clicked**, unless it is plainly another slot's — then, of
+                // those stacked under it (the eye's white, ball and mask), the
+                // one named for this slot, else the first that is no other
+                // slot's. A mask slot takes the mask; any other slot looks
+                // past a mask, which lies over what it shows.
+                if wants_mask {
+                    under
+                        .iter()
+                        .find(|p| mask(p))
+                        .or_else(|| under.iter().find(|p| named_for(p, &wanted)))
+                        .or_else(|| under.iter().find(|p| !theirs(p)))
+                        .or_else(|| under.first())
+                        .cloned()
+                } else {
+                    let shown: Vec<&buzz_ui::LoosePart> = match under.iter().filter(|p| !mask(p)).collect::<Vec<_>>() {
+                        none if none.is_empty() => under.iter().collect(),
+                        some => some,
+                    };
+                    let top = shown[0];
+                    if named_for(top, &wanted) || !theirs(top) {
+                        Some(top.clone())
+                    } else {
+                        shown
+                            .iter()
+                            .find(|p| named_for(p, &wanted))
+                            .or_else(|| shown.iter().find(|p| !theirs(p)))
+                            .map(|p| (*p).clone())
+                            .or_else(|| Some(top.clone()))
+                    }
                 }
+            } else {
+                // The best score; of equals, the topmost. Never a part that
+                // is another slot's.
+                let mut best: Option<(i32, usize)> = None;
+                for (index, part) in under.iter().enumerate() {
+                    let s = score(part);
+                    if s > -500 && best.is_none_or(|(b, _)| s > b) {
+                        best = Some((s, index));
+                    }
+                }
+                best.map(|(_, i)| under[i].clone())
             }
-            best.map(|(_, i)| under[i].clone())
         };
         match picked {
             Some(part) => {
@@ -13092,6 +13323,7 @@ impl App {
             Pick::ExportFla => self.export_fla_to(path),
             Pick::AiSceneImage => self.ai_scene_from_image_from(path),
             Pick::GenerateWorkflow => self.generate_image.set_workflow(path),
+            Pick::BringFromFile => self.bring_load_file(path),
         }
     }
 
@@ -18105,6 +18337,25 @@ impl App {
             self.bring_list = None;
             return;
         }
+        // A file read for it has arrived: its characters join the list.
+        if let Some((name, receive)) = &self.bring_loading {
+            match receive.try_recv() {
+                Ok(Ok(scenes)) => {
+                    let name = name.clone();
+                    self.bring_files.retain(|(n, _)| *n != name);
+                    self.bring_files.push((name.clone(), scenes));
+                    self.bring_loading = None;
+                    self.bring_list = None;
+                    self.editor.status = Some(format!("Bring Character Here: {name}'s characters are in the list"));
+                }
+                Ok(Err(e)) => {
+                    self.editor.status = Some(format!("Could not read {name}: {e}"));
+                    self.bring_loading = None;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => self.bring_loading = None,
+            }
+        }
         if self.bring_list.is_none() {
             let mut list: Vec<(String, Option<Arc<buzz_scene::Scene>>, crate::bring::Candidate)> = Vec::new();
             let at = self.editor.current_frame;
@@ -18133,11 +18384,22 @@ impl App {
                     }
                 }
             }
+            // Files read for this, not open.
+            for (file, scenes) in &self.bring_files {
+                let many = scenes.len() > 1;
+                for (scene_name, other) in scenes {
+                    let group = if many { format!("{file} \u{b7} {scene_name}") } else { file.clone() };
+                    for c in crate::bring::candidates(other, other.stage_layers(), None) {
+                        list.push((group.clone(), Some(Arc::clone(other)), c));
+                    }
+                }
+            }
             self.bring_list = Some(list);
         }
         let list = self.bring_list.clone().unwrap_or_default();
         let mut open = true;
         let mut picked = None;
+        let mut pick_file = false;
         egui::Window::new("Bring Character Here")
             .collapsible(false)
             .resizable(true)
@@ -18154,6 +18416,21 @@ impl App {
                     .small()
                     .weak(),
                 );
+                // **From a file…**: a film not open in a tab.
+                ui.horizontal(|ui| {
+                    let loading = self.bring_loading.as_ref().map(|(n, _)| n.clone());
+                    if ui
+                        .add_enabled(loading.is_none(), egui::Button::new("From a file\u{2026}"))
+                        .on_hover_text("List the characters of another .buzz file, without opening it in a tab")
+                        .clicked()
+                    {
+                        pick_file = true;
+                    }
+                    if let Some(name) = loading {
+                        ui.spinner();
+                        ui.label(egui::RichText::new(format!("Reading {name}\u{2026}")).small().weak());
+                    }
+                });
                 if list.is_empty() {
                     ui.label("No character anywhere else: every one is on stage here.");
                 }
@@ -18178,6 +18455,14 @@ impl App {
         if !open {
             self.editor.bring_open = false;
         }
+        if pick_file {
+            self.ask_for_path(
+                crate::dialogs::Request::open_file()
+                    .title("Bring a character from")
+                    .filter("BuzzAnimate document", &[buzz_doc::EXTENSION]),
+                Pick::BringFromFile,
+            );
+        }
         let Some((_, from, candidate)) = picked.and_then(|i| list.get(i).cloned()) else { return };
         let at = self.editor.current_frame;
         let mut placed = None;
@@ -18200,6 +18485,28 @@ impl App {
         }
         // What is elsewhere has changed.
         self.bring_list = None;
+    }
+
+    /// **Read `path` for Bring Character Here**, off the UI thread: its
+    /// scenes, by name, join the list when it is read
+    /// ([`Self::bring_character_dialog`]). Opening it in a tab is not needed.
+    fn bring_load_file(&mut self, path: std::path::PathBuf) {
+        let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+        let (send, receive) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let read = Document::open(&path).map_err(|e| e.to_string()).map(|doc| {
+                let names = doc.scene_names();
+                doc.film()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, scene)| (names.get(i).cloned().unwrap_or_default(), Arc::new(scene)))
+                    .collect::<Vec<_>>()
+            });
+            let _ = send.send(read);
+        });
+        self.editor.status = Some(format!("Reading {name} for Bring Character Here\u{2026}"));
+        self.bring_loading = Some((name, receive));
+        self.editor.bring_open = true;
     }
 
     /// **Move Stage Frames…**: everything on the stage from one frame to
@@ -24805,7 +25112,7 @@ mod idle_tests {
         d.app.editor.set_frame(10);
         d.frame(vec![]);
         d.press("Paste Stage \u{00b7} 4");
-        assert!(d.app.editor.stage_clip.is_none(), "pasted and let go");
+        assert_eq!(d.app.editor.stage_clip.as_ref().map(|c| c.0), Some(3), "pasted, and the copy kept for more");
         assert!(d.app.editor.doc.scene().editing_symbol().is_some(), "still inside the symbol");
         let keys: Vec<u32> = d.app.editor.doc.scene().layers().iter().next().unwrap().frames.keyframes().iter().map(|k| k.start).collect();
         assert_eq!(keys, vec![0, 10], "keyed on the symbol's frame 11");
@@ -24836,9 +25143,13 @@ mod idle_tests {
         d.app.editor.set_frame(20);
         d.frame(vec![]);
         d.press("Paste Stage \u{00b7} 1");
-        assert!(d.app.editor.stage_clip.is_none(), "pasted and let go");
+        assert_eq!(d.app.editor.stage_clip.as_ref().map(|c| c.0), Some(0), "pasted, and the copy kept for more");
         let pasted = d.app.editor.doc.scene().layers().get(layer).unwrap().frames.keyframe_at(20).map(|k| (k.start, k.objects.len()));
         assert_eq!(pasted, Some((20, 1)), "the drawing is keyed on frame 21");
+        d.frame(vec![]);
+        assert!(d.find("Paste Stage \u{00b7} 1").is_some(), "still Paste Stage");
+        d.press("\u{2715}");
+        assert!(d.app.editor.stage_clip.is_none(), "the \u{2715} lets go of it");
         d.frame(vec![]);
         assert!(d.find("Copy Stage").is_some(), "and the button says Copy Stage again");
     }
@@ -25215,6 +25526,22 @@ mod idle_tests {
         app.editor.doc.edit("Draw", |s| {
             s.add_shape(layer, shape);
         });
+    }
+
+    /// **The file name sits right of the scene and symbol path** (user
+    /// 2026-11-21: "the file name shall be on the most right, the scene and
+    /// symbol names shall be before it"), on the first frame drawn.
+    #[test]
+    fn the_file_name_is_right_of_the_scene_name() {
+        let mut d = MenuDrive::new();
+        d.frame(vec![]);
+        let scene_name = d.app.editor.doc.scene_names()[d.app.editor.doc.active_scene()].clone();
+        let file = d.app.tab_label(d.app.active_document);
+        let at = |d: &MenuDrive, label: &str| d.texts.iter().rev().find(|(t, _)| t == label).map(|(_, r)| *r);
+        let scene_at = at(&d, &scene_name).unwrap_or_else(|| panic!("no {scene_name:?}: {:?}", d.texts.iter().map(|t| &t.0).take(40).collect::<Vec<_>>()));
+        let file_at = at(&d, &file).unwrap_or_else(|| panic!("no {file:?}"));
+        assert!((scene_at.center().y - file_at.center().y).abs() < 20.0, "on one row: {scene_at:?} {file_at:?}");
+        assert!(file_at.min.x > scene_at.max.x + 100.0, "the file name far right of the scene's: {scene_at:?} {file_at:?}");
     }
 
     /// **D2: several documents, as tabs.** File ▸ New opens a second tab
@@ -31005,6 +31332,101 @@ mod layer_rig_ui_tests {
         assert!(app.editor.scene().layers().iter().find(|l| l.name == "base").unwrap().locked, "the base is locked");
     }
 
+    /// **Bring Character Here from a file not open** (user 2026-11-20: "bring
+    /// characters shall work across different files as well"): From a file…
+    /// reads it off the UI thread, and its characters are listed under its
+    /// name, ready to bring — with no tab opened for it.
+    #[test]
+    fn bring_character_lists_a_file_that_is_not_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("village.buzz");
+        let mut other = buzz_scene::Scene::default();
+        let guy = other.add_symbol("guy", buzz_scene::SymbolKind::Graphic, None);
+        other.library_mut().update(guy, |s| {
+            let first = s.layers.iter().next().unwrap().id;
+            s.layers.update(first, |l| {
+                l.name = "body".into();
+                l.frames.insert_frame(399);
+            });
+        });
+        let raju = other.add_layer("Raju", buzz_scene::LayerKind::Normal);
+        let id = other.next_object_id();
+        other.update_layer(raju, |l| {
+            l.frames.push_object(0, Arc::new(buzz_scene::Object::instance_of(id, guy)));
+            l.frames.insert_frame(99);
+        });
+        Document::new(other).save_as(&path).unwrap();
+
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        let tabs = app.documents.len();
+        app.bring_load_file(path);
+        assert!(app.editor.bring_open, "the list is open");
+        let ctx = egui::Context::default();
+        let began = std::time::Instant::now();
+        while app.bring_files.is_empty() && began.elapsed() < std::time::Duration::from_secs(20) {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.build_ui(ui);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.build_ui(ui);
+        });
+        let list = app.bring_list.clone().expect("listed");
+        let (group, from, candidate) = list.iter().find(|(g, ..)| g == "village").expect("the file's characters are listed").clone();
+        assert_eq!((group.as_str(), candidate.name.as_str(), candidate.layer_name.as_str()), ("village", "guy", "Raju"));
+        assert_eq!(app.documents.len(), tabs, "no tab opened for it");
+
+        let mut placed = None;
+        app.editor.doc.edit("Bring", |scene| placed = crate::bring::bring(scene, from.as_deref(), &candidate, 12));
+        assert!(placed.is_some(), "brought");
+        let scene = app.editor.doc.scene();
+        let layer = scene.layers().iter().find(|l| l.name == "Raju").expect("a Raju layer");
+        assert!(layer.objects_at(12).iter().any(|o| o.instance().is_some_and(|i| scene.library().get(i.symbol).is_some_and(|s| s.name == "guy") && i.first_frame == 12)));
+    }
+
+    /// **A slot takes the part clicked** (user 2026-11-20, Bhushan: "I am
+    /// tagging but it's not picking"). A big part already named for the
+    /// slot — the base, renamed midCloth by an earlier tag — lies under the
+    /// lower torso; clicking the lower torso puts the lower torso in the
+    /// slot. Chosen by boxes, the named base won every click. Where the part
+    /// clicked is plainly another slot's (the shin over the foot), the one
+    /// under it named for this slot is taken.
+    #[test]
+    fn a_slot_takes_the_part_clicked_over_one_named_for_it() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let mut ids = std::collections::HashMap::new();
+        app.editor.doc.edit("Body", |scene| {
+            for (name, rect) in [
+                ("midCloth", buzz_geom::Rect::new(0.0, 0.0, 200.0, 200.0)),
+                ("rightFoot", buzz_geom::Rect::new(150.0, 150.0, 190.0, 190.0)),
+                ("rightShin", buzz_geom::Rect::new(160.0, 100.0, 180.0, 170.0)),
+                ("lowTorso", buzz_geom::Rect::new(40.0, 40.0, 120.0, 120.0)),
+            ] {
+                let layer = scene.add_layer(name, buzz_scene::LayerKind::Normal);
+                ids.insert(name, scene.add_shape(layer, buzz_scene::ShapeData::filled(rect.to_path(1e-9), LIMB)).unwrap());
+            }
+        });
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        let _ = painted_text(&mut app);
+        let pattern = app.editor.rig_panel.pattern();
+        let slot_of = |app: &App, label: &str| {
+            let state = &app.editor.rig_panel;
+            pattern.slots.iter().position(|s| buzz_ui::rig_panel::slot_label(state, &s.name) == label).unwrap()
+        };
+        let mid = slot_of(&app, "midCloth");
+        app.editor.rig_panel.armed = Some(mid);
+        app.pick_part_for_slot_at(mid, buzz_geom::Point::new(80.0, 80.0));
+        assert_eq!(app.editor.rig_panel.slots[mid], Some(ids["lowTorso"]), "the lower torso, clicked: {:?}", app.editor.status);
+
+        let foot = slot_of(&app, "rightFoot");
+        app.editor.rig_panel.armed = Some(foot);
+        app.pick_part_for_slot_at(foot, buzz_geom::Point::new(170.0, 160.0));
+        assert_eq!(app.editor.rig_panel.slots[foot], Some(ids["rightFoot"]), "the foot under the shin");
+    }
+
     /// **Inside a head a tag names the layer, and no more** (user 2026-11-19:
     /// "inside the head symbol when I am tagging the parts the layers are not
     /// getting renamed ... I am not able to tag eyelid and eyemask. If I lock
@@ -31117,6 +31539,58 @@ mod layer_rig_ui_tests {
     /// head"), and coming back out finds the body's as it was; a symbol
     /// elsewhere has its own list too. Clicking something that is not a head
     /// keeps the Rig Head section on the head it was on.
+    /// **The rig stays, body and head** (user 2026-11-21: "when I rig a
+    /// character, the rig stays there be it body or head, it shall not
+    /// reset"): the slots filled on the stage and in a head are there again
+    /// after the app restarts and the film is opened again.
+    #[test]
+    fn rig_slots_of_body_and_head_survive_a_restart() {
+        // Filled slots only: a part another test added to the template
+        // (the shared scratch `rig_parts.json`) adds an empty one at the end.
+        let filled = |slots: &[Option<buzz_scene::ObjectId>]| -> Vec<(usize, buzz_scene::ObjectId)> {
+            slots.iter().enumerate().filter_map(|(i, s)| s.map(|id| (i, id))).collect()
+        };
+        let dir = tempfile::tempdir().expect("dir");
+        let film = dir.path().join("film.buzz");
+        let mut app = App::new(GpuPreference::Automatic);
+        let body = three_parts(&mut app);
+        let mut head = None;
+        app.editor.doc.edit("Head", |scene| {
+            head = Some(scene.add_symbol("Head", buzz_scene::SymbolKind::Graphic, None));
+        });
+        let head = head.unwrap();
+        app.editor.doc.save_as(&film).expect("saved");
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        app.editor.rig_panel.slots = body.clone();
+        let _ = painted_text(&mut app);
+        app.editor.doc.edit_view(|scene| {
+            scene.enter_symbol(head);
+        });
+        let _ = painted_text(&mut app);
+        let mut in_head = vec![None; app.editor.rig_panel.slots.len().max(1)];
+        in_head[0] = body.iter().flatten().next().copied();
+        app.editor.rig_panel.slots = in_head.clone();
+        let _ = painted_text(&mut app);
+
+        // The app again, the film opened again.
+        let mut again = App::new(GpuPreference::Automatic).with_document(buzz_doc::Document::open(&film).expect("opened"));
+        again.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        let _ = painted_text(&mut again);
+        assert_eq!(filled(&again.editor.rig_panel.slots), filled(&body), "the body's slots are back");
+        assert_eq!(again.editor.rig_panel.pattern().name, "Biped Full");
+        again.editor.doc.edit_view(|scene| {
+            scene.enter_symbol(head);
+        });
+        let _ = painted_text(&mut again);
+        assert_eq!(again.editor.rig_panel.pattern().name, "Head");
+        assert_eq!(filled(&again.editor.rig_panel.slots), filled(&in_head), "and the head's");
+        again.editor.doc.edit_view(|scene| {
+            scene.exit_symbol();
+        });
+        let _ = painted_text(&mut again);
+        assert_eq!(filled(&again.editor.rig_panel.slots), filled(&body), "back out, the body's still");
+    }
+
     #[test]
     fn rig_slots_and_head_survive_going_elsewhere() {
         let mut app = App::new(GpuPreference::Automatic);
@@ -33601,3 +34075,4 @@ mod cast_window_tests {
         assert!(app.editor.cast_panel.add_pose.is_none(), "Cancel closes it");
     }
 }
+

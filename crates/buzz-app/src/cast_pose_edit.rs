@@ -191,7 +191,49 @@ pub fn is_placed(scene: &Scene, folder: &str, name: &str) -> bool {
 /// full name, is renamed here too, with the layers that show it. Whether
 /// anything changed.
 pub fn sync_placed_character(scene: &mut Scene, cast: &Scene, folder: &str, name: &str, renamed: Option<(&str, &str)>) -> bool {
-    let placed = is_placed(scene, folder, name);
+    sync_character(scene, cast, folder, name, renamed, false)
+}
+
+/// **A film's own copy of a Cast character takes the Cast's poses** (user
+/// 2026-11-21: "I have the poses set in the bhushan cast, still when I click
+/// Pose I do not see the options"). A character brought into the film some
+/// other way than placing it from the Cast — imported with the FLA, pasted
+/// from another film — is a symbol of the same name with no poses linked.
+/// Its poses are copied in from `cast` (with what they draw, renamed where a
+/// name is taken) and linked as its set, the way
+/// [`sync_placed_character`] does for one placed from the Cast. Whether
+/// anything changed; nothing does when the Cast has no other poses.
+pub fn link_cast_poses(scene: &mut Scene, cast: &Scene, name: &str) -> bool {
+    if pose_names(cast).len() < 2 {
+        return false;
+    }
+    let changed = sync_character(scene, cast, "", name, None, true);
+    // Every pose stands where the main pose stands, as tall as it is: the
+    // Cast's own poses are drawn at their own spot and size, and this film's
+    // main is its own drawing, so they are lined up on it here, as placing a
+    // character from the Cast does (`App::line_up_placed_poses`).
+    let lined = line_up_linked_poses(scene, cast, name);
+    changed || lined
+}
+
+/// **Line up the poses of the film's own copy of a Cast character** on its
+/// main pose — the same feet, the same height (`cast_combine::normalise_poses`)
+/// — when they are the Cast's poses linked by [`link_cast_poses`]. Whether
+/// anything moved.
+pub fn line_up_linked_poses(scene: &mut Scene, cast: &Scene, name: &str) -> bool {
+    let Some(main) = scene.library().find_by_name(name).map(|s| s.id) else {
+        return false;
+    };
+    let set = scene.library().symbol_set(main);
+    let cast_poses = pose_names(cast);
+    if set.len() < 2 || !set.iter().all(|id| cast_poses.contains(&name_of(scene, *id))) {
+        return false;
+    }
+    !crate::cast_combine::normalise_poses(scene, main).is_empty()
+}
+
+fn sync_character(scene: &mut Scene, cast: &Scene, folder: &str, name: &str, renamed: Option<(&str, &str)>, linking: bool) -> bool {
+    let placed = linking || is_placed(scene, folder, name);
     let Some(main) = scene.library().find_by_name(name).map(|s| s.id) else {
         return false;
     };
@@ -1072,6 +1114,45 @@ mod tests {
         let mut other = Scene::default();
         other.add_symbol("Raju", SymbolKind::Graphic, None);
         assert!(!sync_placed_character(&mut other, &cast, &asset.folder, "Raju", None));
+    }
+
+    /// **A film's own copy takes the Cast's poses** (user 2026-11-21, the
+    /// film's `bhushan` imported with the FLA, posed in the Cast): the poses
+    /// come in and are linked as its set, so the Pose menu offers them; a
+    /// pose the film already has by name is linked, not copied twice; a
+    /// Cast character with one pose links nothing.
+    #[test]
+    fn a_film_copy_of_a_cast_character_takes_its_poses() {
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = AssetLibrary::at(dir.path());
+        let asset = saved(&mut library, "Raju");
+        let mut doc = Scene::default();
+        for name in ["Back", "Side"] {
+            doc.add_symbol(name, SymbolKind::Graphic, None);
+        }
+        add_pose(&mut library, &asset, "Back", PoseInput::LibrarySymbol(&doc, "Back"), "2026-11-21_010101").expect("added");
+        let asset = library.assets().iter().find(|a| a.name == "Raju").cloned().unwrap();
+        add_pose(&mut library, &asset, "Side", PoseInput::LibrarySymbol(&doc, "Side"), "2026-11-21_010102").expect("added");
+        let cast = library.load(&asset).expect("the cast file");
+
+        let mut film = Scene::default();
+        let raju = film.add_symbol("Raju", SymbolKind::Graphic, None);
+        let mine = film.add_symbol("Raju Side", SymbolKind::Graphic, None);
+        assert!(film.library().symbol_set(raju).is_empty());
+        assert!(!sync_placed_character(&mut film, &cast, &asset.folder, "Raju", None), "not placed from the Cast: sync leaves it");
+        assert!(link_cast_poses(&mut film, &cast, "Raju"));
+        let names: Vec<String> = film.library().symbol_set(raju).into_iter().map(|id| name_of(&film, id)).collect();
+        assert_eq!(names.len(), 3, "main and the Cast's two poses: {names:?}");
+        assert_eq!(names[..2], ["Raju".to_string(), "Raju Back".to_string()]);
+        assert!(film.library().symbol_set(raju).contains(&mine), "a pose the film already has by that name is used, not copied again");
+        assert_eq!(film.library().iter().filter(|s| s.name.starts_with("Raju Side")).count(), 1);
+        assert!(!link_cast_poses(&mut film, &cast, "Raju"), "already linked");
+
+        let lone = saved(&mut library, "Solo");
+        let lone = library.load(&lone).expect("one pose");
+        let mut film = Scene::default();
+        film.add_symbol("Solo", SymbolKind::Graphic, None);
+        assert!(!link_cast_poses(&mut film, &lone, "Solo"));
     }
 
     /// **Extra pose tags** (user 2026-11-17): a character with poses takes

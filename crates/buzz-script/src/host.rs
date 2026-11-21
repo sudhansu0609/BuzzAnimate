@@ -387,8 +387,10 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         if hands_off(state, id, "keyed") {
             return Ok(());
         }
-        state.borrow_mut().scene_mut().update_layer(id, |l| {
-            l.frames.insert_keyframe(frame);
+        let mut s = state.borrow_mut();
+        let graphics = s.scene().graphic_lengths();
+        s.scene_mut().update_layer(id, |l| {
+            l.frames.insert_keyframe_carrying_on(frame, &graphics);
         });
         Ok(())
     });
@@ -1248,13 +1250,15 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
         if hands_off(state, id, "keyed") {
             return Ok(());
         }
-        state.borrow_mut().scene_mut().update_layer(id, |l| {
+        let mut s = state.borrow_mut();
+        let graphics = s.scene().graphic_lengths();
+        s.scene_mut().update_layer(id, |l| {
             // Past the layer's last frame, the layer is extended first, so the
             // new keyframe carries the last drawing on (F6 there does).
             if f >= l.frames.length() {
                 l.frames.insert_frame(f);
             }
-            l.frames.insert_keyframe(f);
+            l.frames.insert_keyframe_carrying_on(f, &graphics);
         });
         Ok(())
     });

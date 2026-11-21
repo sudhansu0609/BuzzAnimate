@@ -85,6 +85,9 @@ pub struct FrameClip {
     /// (`Scene::extract_frames`): pasted anywhere else they arrive from this,
     /// as new layers.
     pub scene: buzz_scene::Scene,
+    /// The first frame copied: pasted `n` frames later, a graphic on it shows
+    /// `n` frames further on ([`shifted_first`]).
+    pub from: u32,
 }
 
 /// What a camera edit says when the camera is locked: the lock is a small
@@ -307,6 +310,17 @@ pub struct Editor {
     /// where it stood, how far it was zoomed and turned on the copied frame
     /// of the main timeline. `None` inside a symbol, or with no camera.
     pub stage_clip_camera: Option<buzz_scene::CameraKey>,
+    /// **Where Copy Stage copied from**, and the copy as a document of its
+    /// own (`Scene::extract_frames`, each layer holding what it showed, with
+    /// every symbol those use): pasted in another file, scene or symbol it
+    /// arrives from this, its symbols brought along — the layer ids and
+    /// symbol ids in `stage_clip` mean nothing there.
+    pub stage_clip_from: Option<((u64, Option<buzz_doc::SceneKey>, Vec<buzz_scene::SymbolId>), Scene)>,
+    /// **The lights Copy Stage took with it**: every light as it stood on the
+    /// copied frame of the main timeline (its keys resolved, its track
+    /// dropped), with the rig's own settings. Pasted in another file they are
+    /// keyed there, or added; `None` inside a symbol.
+    pub stage_clip_lights: Option<buzz_scene::LightRig>,
     /// **Bring Character Here** is open: the shell draws its list, since
     /// the other open files are the shell's (see `crate::bring`).
     pub bring_open: bool,
@@ -881,6 +895,8 @@ impl Editor {
             motion_clip: None,
             stage_clip: None,
             stage_clip_camera: None,
+            stage_clip_from: None,
+            stage_clip_lights: None,
             bring_open: false,
             text_next: buzz_scene::TextData::new("Text", 48.0, None),
             text_to_focus: None,
@@ -4519,6 +4535,14 @@ impl Editor {
             .find_map(|frame| self.object_at_frame(frame, point, tolerance, &table))
     }
 
+    /// **Every object whose artwork is under `point`** on the playhead's
+    /// frame, topmost first — what [`Self::object_at`] chooses among, by its
+    /// drawn pixels rather than its box. The Rig panel's slots pick from these.
+    pub fn objects_under(&self, point: Point, tolerance: f64) -> Vec<ObjectId> {
+        let table = self.symbol_bounds();
+        self.hits_at_frame(self.current_frame, point, tolerance, &table).into_iter().rev().map(|(id, _)| id).collect()
+    }
+
     /// Topmost object under `point` on one particular frame.
     fn object_at_frame(
         &self,
@@ -4527,6 +4551,31 @@ impl Editor {
         tolerance: f64,
         table: &std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>,
     ) -> Option<ObjectId> {
+        let hits = self.hits_at_frame(frame, point, tolerance, table);
+        // **A faint veil is clicked through.** The topmost hit wins — unless
+        // it is barely there (a fog or haze drawn at a fifth of its strength
+        // over half the stage) and there is solid artwork under it, which is
+        // what the click was for. Clicking where there is nothing but the
+        // veil still takes the veil. It used to take the veil everywhere it
+        // reached, so nothing under it could be selected or moved.
+        let solid = |o: &f32| *o >= FAINT_OPACITY;
+        match hits.last() {
+            Some((_, top)) if !solid(top) => {
+                hits.iter().rev().find(|(_, o)| solid(o)).or(hits.last()).map(|(id, _)| *id)
+            }
+            top => top.map(|(id, _)| *id),
+        }
+    }
+
+    /// Everything under `point` on `frame`, back to front, with how strongly
+    /// each is drawn.
+    fn hits_at_frame(
+        &self,
+        frame: u32,
+        point: Point,
+        tolerance: f64,
+        table: &std::collections::HashMap<buzz_scene::SymbolId, buzz_geom::Rect>,
+    ) -> Vec<(ObjectId, f32)> {
         let scene = self.doc.scene();
         // Everything under the point, back to front, with how strongly each
         // is drawn.
@@ -4583,19 +4632,7 @@ impl Editor {
                 }
             }
         }
-        // **A faint veil is clicked through.** The topmost hit wins — unless
-        // it is barely there (a fog or haze drawn at a fifth of its strength
-        // over half the stage) and there is solid artwork under it, which is
-        // what the click was for. Clicking where there is nothing but the
-        // veil still takes the veil. It used to take the veil everywhere it
-        // reached, so nothing under it could be selected or moved.
-        let solid = |o: &f32| *o >= FAINT_OPACITY;
-        match hits.last() {
-            Some((_, top)) if !solid(top) => {
-                hits.iter().rev().find(|(_, o)| solid(o)).or(hits.last()).map(|(id, _)| *id)
-            }
-            top => top.map(|(id, _)| *id),
-        }
+        hits
     }
 
     /// The colour under `point` for the eyedropper — the topmost shape's fill or
@@ -6329,6 +6366,7 @@ impl Editor {
             ClearFrames => self.frame_op(FrameOp::ClearFrames),
             ReverseFrames => self.frame_op(FrameOp::ReverseFrames),
             CopyPasteStage => self.copy_paste_stage(),
+            ClearStageCopy => self.clear_stage_copy(),
             BringCharacterHere => self.bring_open = true,
             ClearTalkRanges => self.clear_talk_ranges(),
             // A dialog, which the app opens.
@@ -13014,6 +13052,8 @@ impl Editor {
         let allow_locked = self.workspace.frames_on_locked_layers;
 
         self.doc.edit(label, |scene| {
+            // F6 carries the graphics on from the frame they were showing.
+            let graphics = if matches!(op, FrameOp::InsertKeyframe) { scene.graphic_lengths() } else { Default::default() };
             for (layer, frame) in targets.iter().copied() {
                 let eligible = scene
                     .layers()
@@ -13028,7 +13068,7 @@ impl Editor {
                     let did_change = match op {
                         FrameOp::InsertFrame => l.frames.insert_frame(frame),
                         FrameOp::RemoveFrame => l.frames.remove_frame(frame),
-                        FrameOp::InsertKeyframe => l.frames.insert_keyframe(frame),
+                        FrameOp::InsertKeyframe => l.frames.insert_keyframe_carrying_on(frame, &graphics),
                         FrameOp::InsertBlankKeyframe => l.frames.insert_blank_keyframe(frame),
                         FrameOp::ClearKeyframe => l.frames.clear_keyframe(frame),
                         FrameOp::ClearFrames => l.frames.clear_frames(frame),
@@ -13419,8 +13459,36 @@ impl Editor {
                 if camera.is_some() { ", and the camera" } else { "" }
             )
         });
-        self.stage_clip = (drawn > 0 || camera.is_some()).then_some((frame, clip, inside));
+        // The copy as a document of its own, for a paste in another file.
+        let spans: Vec<(LayerId, u32, u32)> = clip.iter().map(|(layer, ..)| (*layer, frame, frame)).collect();
+        let mut lifted = scene.extract_frames(&spans);
+        let lifted_layers: Vec<LayerId> = lifted.layers().iter().map(|l| l.id).collect();
+        for (layer, (_, objects, hold)) in lifted_layers.iter().zip(&clip) {
+            lifted.update_layer(*layer, |l| {
+                l.frames.set_objects(0, objects.clone());
+                l.frames.insert_frame(hold.saturating_sub(1));
+            });
+        }
+        let source = (self.doc.uid(), self.doc.scene_key(self.doc.active_scene()), scene.edit_path().to_vec());
+        self.stage_clip = (drawn > 0 || camera.is_some()).then_some((frame, clip.clone(), inside));
         self.stage_clip_camera = camera.filter(|_| self.stage_clip.is_some());
+        self.stage_clip_from = self.stage_clip.is_some().then_some((source, lifted));
+        // The lights as they stand here, on the main timeline only.
+        self.stage_clip_lights = (self.stage_clip.is_some() && scene.edit_path().is_empty() && !scene.lights().lights.is_empty()).then(|| {
+            let mut rig = scene.lights().keyed_at(frame).into_owned();
+            // A light drawn above a layer with nothing on it here is drawn
+            // above the nearest one below it that has — the layers it lights
+            // are the same, and only those come across.
+            let rows: Vec<LayerId> = scene.layers().iter().map(|l| l.id).collect();
+            let drawn = |id: &LayerId| clip.iter().any(|(layer, objects, _)| layer == id && !objects.is_empty());
+            for light in &mut rig.lights {
+                light.track = None;
+                if let Some(at) = light.above.and_then(|a| rows.iter().position(|id| id.0 == a)) {
+                    light.above = rows[at..].iter().find(|id| drawn(id)).map(|id| id.0).or(light.above);
+                }
+            }
+            rig
+        });
     }
 
     /// The layers of the selection when **every** selected object is a part of
@@ -13611,25 +13679,41 @@ impl Editor {
 
     /// **Copy / Paste Stage**, one button: with nothing held, copies the
     /// stage at the playhead ([`Self::copy_stage`]); holding a copy, pastes it
-    /// at the playhead ([`Self::paste_stage`]) and lets go, ready for the next
-    /// copy. Pressed on the frame it copied, it lets go without pasting.
+    /// at the playhead ([`Self::paste_stage`]) — **and keeps holding it**
+    /// (user 2026-11-21: "how do I paste a stage multiple times if I need
+    /// it? I shall be able to clear it and copy again if I do not"), so each
+    /// press on another frame pastes it again. Pressed on the frame it
+    /// copied, it lets go without pasting; so does Clear Stage Copy
+    /// ([`Self::clear_stage_copy`], the ✕ beside the button).
     pub fn copy_paste_stage(&mut self) {
         match self.stage_clip.as_ref().map(|c| c.0) {
             None => self.copy_stage(),
-            Some(from) if from == self.current_frame => {
-                self.stage_clip = None;
-                self.stage_clip_camera = None;
-                self.status = Some(format!("Copy / Paste Stage: let go of the stage copied at frame {}", from + 1));
-            }
+            Some(from) if from == self.current_frame => self.clear_stage_copy(),
             Some(from) => {
                 self.paste_stage();
-                self.stage_clip = None;
-                self.stage_clip_camera = None;
-                if let Some(status) = &mut self.status {
-                    *status = status.replacen("Pasted the stage", &format!("Pasted the stage from frame {}", from + 1), 1);
+                if let Some(status) = &mut self.status
+                    && status.starts_with("Pasted the stage")
+                {
+                    *status = format!(
+                        "{} \u{2014} press again on another frame to paste it again, or Clear Stage Copy (\u{2715}) to copy something else",
+                        status.replacen("Pasted the stage", &format!("Pasted the stage from frame {}", from + 1), 1)
+                    );
                 }
             }
         }
+    }
+
+    /// **Clear Stage Copy**: let go of the stage copy, so the next Copy /
+    /// Paste Stage copies afresh.
+    pub fn clear_stage_copy(&mut self) {
+        let Some(from) = self.stage_clip.take().map(|c| c.0) else {
+            self.status = Some("Clear Stage Copy: no stage is copied".into());
+            return;
+        };
+        self.stage_clip_camera = None;
+        self.stage_clip_from = None;
+        self.stage_clip_lights = None;
+        self.status = Some(format!("Let go of the stage copied at frame {} \u{2014} the next press copies again", from + 1));
     }
 
     /// **Paste Stage**: what [`Self::copy_stage`] took, laid down as a
@@ -13644,6 +13728,16 @@ impl Editor {
             self.status = Some("Paste Stage: Copy Stage first, on the frame to copy".into());
             return;
         };
+        // **Copied somewhere else** — another file, scene or symbol: its own
+        // layer and symbol ids would land on whatever here has the same
+        // numbers, so it arrives from its own document instead.
+        let here = (self.doc.uid(), self.doc.scene_key(self.doc.active_scene()), self.doc.scene().edit_path().to_vec());
+        if let Some((source, lifted)) = self.stage_clip_from.clone()
+            && source != here
+        {
+            self.paste_stage_elsewhere(lifted, &clip, symbols);
+            return;
+        }
         let at = self.current_frame;
         let mut layers = 0usize;
         let mut renumbered = 0usize;
@@ -13733,6 +13827,181 @@ impl Editor {
         ));
     }
 
+    /// **Paste Stage in another file, scene or symbol** than the one copied
+    /// (user 2026-11-20: "copy and paste stage ... shall work across different
+    /// files as well"). The copy arrives from its own document (`lifted`): the
+    /// symbols it uses come along, one already here unchanged reused rather
+    /// than copied again. Each copied layer is keyed at the playhead on this
+    /// timeline's layer of the same name — each used once, in order — or on a
+    /// new layer of that name when there is none; every symbol is set to show
+    /// this frame and what it showed inside (`inside`) is pasted there, as
+    /// [`Self::paste_stage`] does; the camera too. One undo step.
+    fn paste_stage_elsewhere(&mut self, lifted: Scene, clip: &StageLayers, inside: Vec<(buzz_scene::SymbolId, StageLayers)>) {
+        let at = self.current_frame;
+        let lights = self.stage_clip_lights.clone().filter(|_| self.doc.scene().edit_path().is_empty());
+        let scene = self.doc.scene();
+        let camera = self.stage_clip_camera.filter(|_| scene.edit_path().is_empty());
+        let camera_locked = camera.is_some() && scene.camera().locked;
+        let camera = camera.filter(|_| !camera_locked);
+        let master = self.script_master_audio();
+        let reaches = |library: &buzz_scene::Library, symbol: buzz_scene::SymbolId| {
+            library.get(symbol).is_some_and(|def| def.kind.follows_parent_timeline() && at < def.length())
+        };
+        // Symbols this document already holds, unchanged: they are not brought
+        // again, and what they showed is pasted into this document's own.
+        let shared: std::collections::HashSet<buzz_scene::SymbolId> = lifted
+            .library()
+            .iter()
+            .filter(|s| scene.library().get(s.id).is_some_and(|mine| **mine == ***s))
+            .map(|s| s.id)
+            .collect();
+        let mut lifted = lifted;
+        let mut inside_pasted = 0usize;
+        for (symbol, inner) in &inside {
+            if shared.contains(symbol) || !reaches(lifted.library(), *symbol) {
+                continue;
+            }
+            lifted.library_mut().update(*symbol, |def| {
+                for (layer, objects, hold) in inner {
+                    def.layers.update(*layer, |l| paste_held(&mut l.frames, at, objects.clone(), *hold));
+                }
+            });
+            inside_pasted += 1;
+        }
+        for id in &shared {
+            lifted.library_mut().remove(*id);
+        }
+        // The copied layers' names, in the order they arrive.
+        let names: Vec<String> = lifted.layers().iter().map(|l| l.name.clone()).collect();
+        let (mut onto, mut added, mut renumbered) = (0usize, 0usize, 0usize);
+        let (mut brought, mut lit) = (0usize, 0usize);
+        self.doc.edit("Paste Stage", |scene| {
+            if let Some(key) = camera {
+                let track = scene.camera_mut();
+                track.enabled = true;
+                track.set_key(buzz_scene::CameraKey { frame: at, ..key });
+            }
+            // The layers a copied one can go onto: by name, each once — never
+            // one with nothing on it anywhere, as a new file's own `Layer_1`
+            // is: the chair's `Layer_1` went onto that, at the bottom of the
+            // stack, behind the whole background.
+            let mut free: Vec<(LayerId, String)> = scene
+                .layers()
+                .iter()
+                .filter(|l| l.kind != LayerKind::Folder && !l.audio_guide && Some(l.id) != master)
+                .filter(|l| l.frames.keyframes().iter().any(|k| !k.objects.is_empty()))
+                .map(|l| (l.id, l.name.clone()))
+                .collect();
+            let before: Vec<LayerId> = scene.layers().iter().map(|l| l.id).collect();
+            brought = scene.merge(&lifted, buzz_scene::ImportTarget::Stage).symbols;
+            let arrived: Vec<LayerId> = scene.layers().iter().map(|l| l.id).filter(|id| !before.contains(id)).collect();
+            let mut showing: Vec<buzz_scene::SymbolId> = Vec::new();
+            // Where the copied layer above this one went, so a new layer goes
+            // just below it and the stack keeps the copy's order.
+            let mut above: Option<LayerId> = None;
+            // Each copied layer and the layer here it went to, for the lights
+            // drawn above one of them.
+            let mut went: Vec<(LayerId, LayerId)> = Vec::new();
+            for (index, id) in arrived.into_iter().enumerate() {
+                let Some(layer) = scene.layers().get(id).cloned() else { continue };
+                let source = clip.get(index).map(|(l, ..)| *l).filter(|_| names.get(index) == Some(&layer.name));
+                // Each symbol set to show `at` from its first frame here.
+                let objects: Vec<Arc<Object>> = layer
+                    .objects_at(0)
+                    .iter()
+                    .map(|object| {
+                        let mut object = object.clone();
+                        if let ObjectKind::Instance(instance) = &object.kind
+                            && let Some(def) = scene.library().get(instance.symbol)
+                            && def.kind.follows_parent_timeline()
+                            && !instance.sync_to_root
+                            && at < def.length()
+                        {
+                            let first = instance.first_frame_showing(at, 0, def.length());
+                            showing.push(instance.symbol);
+                            if first != instance.first_frame
+                                && let ObjectKind::Instance(i) = &mut Arc::make_mut(&mut object).kind
+                            {
+                                i.first_frame = first;
+                                renumbered += 1;
+                            }
+                        }
+                        object
+                    })
+                    .collect();
+                let hold = layer.frames.length().max(1);
+                match free.iter().position(|(_, name)| *name == layer.name) {
+                    Some(index) => {
+                        let (target, _) = free.remove(index);
+                        scene.update_layer(target, |l| paste_held(&mut l.frames, at, objects, hold));
+                        scene.remove_layer(id);
+                        above = Some(target);
+                        went.extend(source.map(|s| (s, target)));
+                        onto += 1;
+                    }
+                    // Nothing on it, and no layer here to clear: no empty
+                    // layer is made for it.
+                    None if objects.is_empty() => {
+                        scene.remove_layer(id);
+                    }
+                    None => {
+                        scene.update_layer(id, |l| {
+                            l.frames.set_objects(0, objects);
+                            l.frames.delay(at);
+                        });
+                        if let Some(over) = above
+                            && let Some(index) = scene.layer_index(over)
+                        {
+                            let folder = scene.layers().get(over).and_then(|l| l.parent);
+                            scene.move_layer_to(id, index + 1, folder);
+                        }
+                        above = Some(id);
+                        went.extend(source.map(|s| (s, id)));
+                        added += 1;
+                    }
+                }
+            }
+            // What the symbols already here showed, pasted inside them.
+            for (symbol, inner) in &inside {
+                if !shared.contains(symbol) || !reaches(scene.library(), *symbol) {
+                    continue;
+                }
+                scene.library_mut().update(*symbol, |def| {
+                    for (layer, objects, hold) in inner {
+                        def.layers.update(*layer, |l| paste_held(&mut l.frames, at, objects.clone(), *hold));
+                    }
+                });
+                inside_pasted += 1;
+            }
+            let mut seen = std::collections::HashSet::new();
+            for symbol in showing {
+                renumbered += match_frames_inside(scene, symbol, at, &mut seen);
+            }
+            if let Some(rig) = &lights {
+                lit = paste_lights_at(scene, rig, at, &went);
+            }
+        });
+        self.doc.end_gesture();
+        self.selection.prune(self.doc.scene());
+        self.status = Some(format!(
+            "Pasted the stage at frame {} on {} layers{}{}{}{}{}{}",
+            at + 1,
+            onto + added,
+            if added > 0 { format!(" ({added} new)") } else { String::new() },
+            if brought > 0 { format!(", bringing {brought} symbols") } else { String::new() },
+            if inside_pasted > 0 { format!(", and inside {inside_pasted} symbols") } else { String::new() },
+            if lit > 0 { format!(", {lit} light{}", if lit == 1 { "" } else { "s" }) } else { String::new() },
+            if camera.is_some() {
+                ", with the camera's position and zoom"
+            } else if camera_locked {
+                "; the camera is locked, so it was left as it was"
+            } else {
+                ""
+            },
+            if renumbered > 0 { format!("; {renumbered} symbols set to frame {}", at + 1) } else { String::new() }
+        ));
+    }
+
     /// **Copy Frames**, and **Cut Frames** when `and_clear`.
     ///
     /// The frames selected in the timeline — those layers, those frames —
@@ -13801,6 +14070,7 @@ impl Editor {
             layers: clipped,
             source: (self.doc.uid(), self.doc.scene_key(self.doc.active_scene()), scene.edit_path().to_vec()),
             scene: scene.extract_frames(&stacked),
+            from: first,
         };
         let count: usize = clip.layers.iter().flat_map(|c| &c.drawings).map(|(_, objects)| objects.len()).sum();
         let layers = clip.layers.len();
@@ -13906,7 +14176,11 @@ impl Editor {
         let mut locked = 0usize;
         let mut added = 0usize;
         let allow_locked = self.workspace.frames_on_locked_layers;
+        // **Pasted later, graphics show later frames**: a drawing copied from
+        // frame 100 showing its own 100 and pasted on 500 shows its 500.
+        let shift = i64::from(frame) - i64::from(clip.from);
         self.doc.edit("Paste Frames", |scene| {
+            let graphics = scene.graphic_lengths();
             let mut rows = frame_rows(scene);
             let first = rows.iter().position(|&r| r == target).unwrap_or(0);
             for clipped in &clipboard {
@@ -13946,6 +14220,7 @@ impl Editor {
                     for object in objects {
                         let mut copy = (**object).clone();
                         copy.id = scene.next_object_id();
+                        shifted_first(&mut copy, shift, &graphics);
                         if scene.add_object_at(layer, frame + offset, copy).is_some() {
                             pasted += 1;
                         }
@@ -14001,13 +14276,24 @@ impl Editor {
         }
         let before: Vec<LayerId> = self.doc.scene().layers().iter().map(|l| l.id).collect();
         let mut arrived: Vec<LayerId> = Vec::new();
+        let shift = i64::from(frame) - i64::from(clip.from);
         self.doc.edit("Paste Frames", |scene| {
             scene.merge(&lifted, buzz_scene::ImportTarget::Stage);
             arrived = scene.layers().iter().map(|l| l.id).filter(|id| !before.contains(id)).collect();
-            if frame > 0 {
-                for id in &arrived {
-                    scene.update_layer(*id, |l| l.frames.delay(frame));
-                }
+            let graphics = scene.graphic_lengths();
+            for id in &arrived {
+                scene.update_layer(*id, |l| {
+                    if frame > 0 {
+                        l.frames.delay(frame);
+                    }
+                    for keyframe in l.frames.keyframes_mut() {
+                        for object in Arc::make_mut(&mut keyframe.objects).iter_mut() {
+                            if object.instance().is_some() {
+                                shifted_first(Arc::make_mut(object), shift, &graphics);
+                            }
+                        }
+                    }
+                });
             }
         });
         self.doc.end_gesture();
@@ -17156,6 +17442,83 @@ fn show_this_frame(scene: &mut Scene, layer: LayerId, frame: u32, before: &[Obje
         changed += match_frames_inside(scene, symbol, frame, &mut seen);
     }
     changed
+}
+
+/// **The lights of a stage pasted from another file** (user 2026-11-20:
+/// "light was also not copied"): each light of `rig` — as it stood on the
+/// copied frame — keyed at `at` on the light here of the same name, the frames
+/// before keeping how it looked; a light with no namesake here is added as it
+/// was. A file with no lights takes the rig's own settings too. A light drawn
+/// above a copied layer is drawn above the layer that layer went to (`went`:
+/// copied layer, layer here). How many lights.
+fn paste_lights_at(scene: &mut Scene, rig: &buzz_scene::LightRig, at: u32, went: &[(LayerId, LayerId)]) -> usize {
+    let first = scene.lights().lights.is_empty();
+    let mut count = 0;
+    for copied in &rig.lights {
+        let above = copied.above.and_then(|a| went.iter().find(|(from, _)| from.0 == a).map(|(_, to)| to.0));
+        let here = scene.lights().lights.iter().find(|l| l.name == copied.name).map(|l| l.id);
+        match here {
+            Some(id) => {
+                let Some(light) = scene.lights_mut().get_mut(id) else { continue };
+                let animates = light.track.as_ref().is_some_and(|t| t.animates());
+                // The frames before keep how the light looked: a still light
+                // starts its track from what it was.
+                let before = (!animates && at > 0).then(|| buzz_scene::LightKey::from_light(0, light));
+                let mut state = copied.clone();
+                state.id = id;
+                let key = buzz_scene::LightKey::from_light(at, &state);
+                let track = light.track.get_or_insert_with(buzz_scene::LightTrack::new);
+                if let Some(k0) = before {
+                    track.set_key(k0);
+                }
+                track.set_key(key);
+                track.enabled = true;
+                light.enabled = track.keys().iter().any(|k| k.enabled);
+                if above.is_some() {
+                    light.above = above;
+                }
+            }
+            None => {
+                let mut light = copied.clone();
+                light.id = buzz_scene::LightId(scene.next_object_id().0);
+                light.track = None;
+                light.above = above;
+                scene.lights_mut().lights.push(light);
+            }
+        }
+        count += 1;
+    }
+    if count > 0 {
+        let lights = scene.lights_mut();
+        if first {
+            let kept = std::mem::take(&mut lights.lights);
+            *lights = buzz_scene::LightRig { lights: kept, ..rig.clone() };
+        }
+        lights.enabled = true;
+    }
+    count
+}
+
+/// **A graphic moved `shift` frames along the timeline shows frames that much
+/// further on** (user 2026-11-20: "on each frame unless I change it, the frame
+/// number of the object shall be matched to the current frame number"): its
+/// first frame moves with it, by its looping mode — a Single Frame instance,
+/// a movie clip (not in `graphics`) and one locked to the root keep theirs.
+fn shifted_first(object: &mut Object, shift: i64, graphics: &std::collections::HashMap<buzz_scene::SymbolId, u32>) {
+    let ObjectKind::Instance(instance) = &mut object.kind else { return };
+    let Some(length) = graphics.get(&instance.symbol).map(|l| i64::from((*l).max(1))) else { return };
+    if shift == 0 || instance.sync_to_root {
+        return;
+    }
+    let first = i64::from(instance.first_frame);
+    let moved = match instance.loop_mode {
+        buzz_scene::LoopMode::SingleFrame => first,
+        buzz_scene::LoopMode::Loop => (first + shift).rem_euclid(length),
+        buzz_scene::LoopMode::PlayOnce => (first + shift).clamp(0, length - 1),
+        buzz_scene::LoopMode::PlayOnceReverse => (first - shift).clamp(0, length - 1),
+        buzz_scene::LoopMode::LoopReverse => (first - shift).rem_euclid(length),
+    };
+    instance.first_frame = moved as u32;
 }
 
 /// One layer of a Paste Stage: `objects` keyed on `at`, replacing what was
@@ -21742,6 +22105,180 @@ mod tests {
         e.import_image_full_size(&path).unwrap();
         assert_eq!(width(&e), 800.0, "all 800 pixels wide");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Copy / Paste Stage across files** (user 2026-11-20): a stage copied
+    /// in one file and pasted in another arrives there — its character's
+    /// symbol brought along, keyed at the playhead on the layer of the same
+    /// name, a layer it has no match for made, the character showing this
+    /// frame and the eye inside it as it was on the frame copied. Pasted in a
+    /// file that already has that symbol unchanged, it is not copied again.
+    /// It used to paste by the other file's layer numbers, onto nothing or
+    /// onto whatever layer here had the same number.
+    #[test]
+    fn paste_stage_works_in_another_file() {
+        let mut e = editor();
+        let mut made = None;
+        e.doc.edit("Fixture", |scene| {
+            let eye = scene.add_symbol("eye", buzz_scene::SymbolKind::Graphic, None);
+            let ana = scene.add_symbol("Ana", buzz_scene::SymbolKind::Graphic, None);
+            scene.enter_symbol(ana);
+            let face = scene.layers().iter().next().unwrap().id;
+            scene.update_layer(face, |l| { l.name = "face".into(); l.frames.insert_frame(99); });
+            let inner = scene.next_object_id();
+            scene.add_object_at(face, 0, Object::instance_of(inner, eye));
+            scene.update_layer(face, |l| { l.frames.insert_keyframe(10); });
+            scene.update_object_at(10, inner, |o| o.transform = Affine::translate((7.0, 0.0)));
+            scene.exit_symbol();
+            scene.enter_symbol(eye);
+            let e0 = scene.layers().iter().next().unwrap().id;
+            scene.update_layer(e0, |l| { l.frames.insert_frame(99); });
+            scene.add_shape(e0, ShapeData::filled(square(0.0, 0.0, 4.0), Color::WHITE));
+            scene.exit_symbol();
+            let stage = scene.layers().iter().next().unwrap().id;
+            scene.update_layer(stage, |l| { l.name = "Ana".into(); l.frames.insert_frame(99); });
+            let prop = scene.add_layer("tree", LayerKind::Normal);
+            scene.update_layer(prop, |l| { l.frames.insert_frame(99); });
+            scene.add_shape(prop, ShapeData::filled(square(50.0, 50.0, 10.0), Color::WHITE));
+            // A chair on a `Layer_1`, on top; a lamp drawn above the tree.
+            let chair = scene.add_layer("Layer_1", LayerKind::Normal);
+            scene.update_layer(chair, |l| { l.frames.insert_frame(99); });
+            scene.add_shape(chair, ShapeData::filled(square(80.0, 80.0, 6.0), Color::WHITE));
+            let lamp = scene.add_light(buzz_scene::LightKind::gloom(buzz_geom::Point::new(10.0, 10.0)));
+            if let Some(light) = scene.lights_mut().get_mut(lamp) {
+                light.name = "Lamp".into();
+                light.above = Some(prop.0);
+            }
+            let placed = scene.next_object_id();
+            let mut ana_at = Object::instance_of(placed, ana);
+            if let ObjectKind::Instance(i) = &mut ana_at.kind { i.first_frame = 0; }
+            scene.add_object_at(stage, 0, ana_at);
+            made = Some(ana);
+        });
+        let ana = made.unwrap();
+        let film = e.doc.scene().clone();
+        e.set_frame(10);
+        e.run(Command::CopyPasteStage);
+        assert!(e.stage_clip.is_some());
+
+        // Another file: its own empty `Layer_1`, and an "Ana" layer with a
+        // stone on it; no symbols, no lights.
+        let mut other = buzz_scene::Scene::default();
+        let only = other.layers().iter().next().unwrap().id;
+        other.update_layer(only, |l| { l.name = "Layer_1".into(); l.frames.insert_frame(99); });
+        let theirs = other.add_layer("Ana", LayerKind::Normal);
+        other.update_layer(theirs, |l| { l.frames.insert_frame(99); });
+        other.add_shape(theirs, ShapeData::filled(square(0.0, 0.0, 3.0), Color::WHITE));
+        let doc = Document::new(other);
+        let view = DocView::fresh(&doc);
+        let _ = e.swap_document(doc, view);
+        e.set_frame(40);
+        e.run(Command::CopyPasteStage);
+        let scene = e.scene();
+        let symbol = scene.library().iter().find(|s| s.name == "Ana").expect("Ana is brought along").id;
+        let on_ana = scene.layers().iter().find(|l| l.name == "Ana").unwrap();
+        let placed = on_ana.objects_at(40).iter().find_map(|o| o.instance().filter(|i| i.symbol == symbol).cloned()).expect("Ana on her layer at 40");
+        assert_eq!(placed.first_frame, 40, "showing frame 40");
+        assert_eq!(on_ana.id, theirs, "onto the Ana layer that was here");
+        assert!(on_ana.objects_at(39).iter().all(|o| o.instance().is_none()), "keyed at the playhead, not before");
+        let rows: Vec<(String, usize)> = scene.layers().iter().map(|l| (l.name.clone(), l.objects_at(40).len())).collect();
+        let row = |name: &str, count: usize| rows.iter().position(|(n, c)| n == name && *c == count);
+        let (chair, tree, ana_row) = (row("Layer_1", 1).expect("the chair's layer"), row("tree", 1).expect("a layer for the tree"), row("Ana", 1).unwrap());
+        assert!(chair < tree && tree < ana_row, "in the copy's order: {rows:?}");
+        assert!(scene.layers().get(only).unwrap().frames.keyframes().iter().all(|k| k.objects.is_empty()), "not onto the empty Layer_1 at the bottom: {rows:?}");
+        let lamp = scene.lights().lights.iter().find(|l| l.name == "Lamp").expect("the lamp comes too");
+        let tree_layer = scene.layers().iter().find(|l| l.name == "tree").unwrap().id;
+        assert_eq!(lamp.above, Some(tree_layer.0), "above the tree here");
+        assert!(scene.lights().enabled, "lighting on");
+        let def = scene.library().get(symbol).unwrap();
+        let inner = def.layers.iter().next().unwrap().objects_at(40)[0].clone();
+        assert_eq!(inner.transform, Affine::translate((7.0, 0.0)), "the eye as it was on the frame copied");
+        assert!(scene.library().iter().any(|s| s.name == "eye"), "the symbol inside comes too");
+
+        // A copy of the same film: Ana is not brought a second time.
+        e.run(Command::ClearStageCopy);
+        e.set_frame(10);
+        let doc = Document::new(film);
+        let view = DocView::fresh(&doc);
+        let _ = e.swap_document(doc, view);
+        e.set_frame(10);
+        e.run(Command::CopyPasteStage);
+        let doc = Document::new({
+            let mut twin = e.doc.scene().clone();
+            let ids: Vec<LayerId> = twin.layers().iter().map(|l| l.id).collect();
+            for id in ids { twin.update_layer(id, |l| { l.frames.insert_blank_keyframe(0); }); }
+            twin
+        });
+        let view = DocView::fresh(&doc);
+        let _ = e.swap_document(doc, view);
+        e.set_frame(30);
+        e.run(Command::CopyPasteStage);
+        let scene = e.scene();
+        assert_eq!(scene.library().iter().filter(|s| s.name.starts_with("Ana")).count(), 1, "Ana is reused, not copied again");
+        let on_ana = scene.layers().iter().find(|l| l.name == "Ana").unwrap();
+        assert!(on_ana.objects_at(30).iter().any(|o| o.instance().is_some_and(|i| i.symbol == ana && i.first_frame == 30)));
+    }
+
+    /// **On every frame a character shows that frame's number unless it was
+    /// set otherwise** (user 2026-11-20): F6 partway into a span keeps a
+    /// graphic matched to the frame number — it used to start the new
+    /// keyframe from where the old one started, so the character jumped back
+    /// — and frames copied from 10 and pasted on 60 show 60. A chart held on
+    /// one drawing stays on it.
+    #[test]
+    fn f6_and_paste_frames_keep_characters_on_the_frame_number() {
+        let mut e = editor();
+        let layer = e.selection.active_layer().expect("a layer");
+        let mut made = None;
+        e.doc.edit("Fixture", |scene| {
+            let body = scene.add_symbol("body", buzz_scene::SymbolKind::Graphic, None);
+            let chart = scene.add_symbol("mouthChart", buzz_scene::SymbolKind::Graphic, None);
+            for (id, frames) in [(body, 200), (chart, 12)] {
+                scene.library_mut().update(id, |s| {
+                    let first = s.layers.iter().next().unwrap().id;
+                    s.layers.update(first, |l| { l.frames.insert_frame(frames - 1); });
+                });
+            }
+            scene.update_layer(layer, |l| { l.frames.insert_frame(99); l.frames.insert_blank_keyframe(10); });
+            let mut walker = Object::instance_of(scene.next_object_id(), body);
+            if let ObjectKind::Instance(i) = &mut walker.kind { i.first_frame = 10; }
+            let mut mouth = Object::instance_of(scene.next_object_id(), chart);
+            if let ObjectKind::Instance(i) = &mut mouth.kind { i.first_frame = 4; i.loop_mode = buzz_scene::LoopMode::SingleFrame; }
+            scene.update_layer(layer, |l| { l.frames.set_objects(10, vec![Arc::new(walker), Arc::new(mouth)]); });
+            made = Some(body);
+        });
+        let body = made.unwrap();
+        let shows = |e: &Editor, f: u32| {
+            let scene = e.scene();
+            let l = scene.layers().get(layer).unwrap();
+            let elapsed = elapsed_on(l, f);
+            l.objects_at(f)
+                .iter()
+                .map(|o| {
+                    let i = o.instance().unwrap();
+                    let def = scene.library().get(i.symbol).unwrap();
+                    i.resolve_frame(def.kind, elapsed, def.length())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shows(&e, 30), vec![30, 4]);
+
+        e.set_frame(30);
+        e.selection.set_timeline(buzz_ui::TimelineSelection::new([layer], 30, 30, layer, 30));
+        e.run(Command::InsertKeyframe);
+        assert!(e.scene().layers().get(layer).unwrap().frames.is_keyframe(30));
+        assert_eq!(shows(&e, 30), vec![30, 4], "F6: still frame 30, the mouth still on its drawing");
+        assert_eq!(shows(&e, 40), vec![40, 4]);
+
+        // Copy frame 10, paste it on 60: the body shows 60 there.
+        e.set_frame(10);
+        e.selection.set_timeline(buzz_ui::TimelineSelection::new([layer], 10, 10, layer, 10));
+        e.run(Command::CopyFrames);
+        e.set_frame(60);
+        e.selection.set_timeline(buzz_ui::TimelineSelection::new([layer], 60, 60, layer, 60));
+        e.run(Command::PasteFrames);
+        assert_eq!(shows(&e, 60), vec![60, 4], "pasted on 60: frame 60");
+        let _ = body;
     }
 
     /// **A pasted symbol shows the frame it was pasted on, inside and out**
@@ -31495,6 +32032,42 @@ mod tests {
         assert_eq!(e.doc.scene().camera().keys().iter().map(|k| k.frame).collect::<Vec<_>>(), [0, 60]);
     }
 
+    /// **A stage copy pastes as often as it is needed** (user 2026-11-21):
+    /// after a paste it is still held, so every press on another frame pastes
+    /// it again; Clear Stage Copy (or a press on the frame copied) lets go, and
+    /// the next press copies afresh.
+    #[test]
+    fn a_stage_copy_pastes_again_until_it_is_cleared() {
+        let mut e = Editor::default();
+        let layer = e.doc_add_layer("Layer", LayerKind::Normal);
+        e.doc.edit("Draw", |scene| {
+            scene.add_shape(layer, buzz_scene::ShapeData::filled(Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9), Color::BLACK));
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(59);
+            });
+        });
+        let drawn = |e: &Editor, f: u32| e.doc.scene().layers().get(layer).unwrap().frames.keyframe_at(f).is_some_and(|k| k.start == f && k.objects.len() == 1);
+        e.set_frame(0);
+        e.run(Command::CopyPasteStage);
+        for at in [10, 20, 30] {
+            e.set_frame(at);
+            e.run(Command::CopyPasteStage);
+            assert!(drawn(&e, at), "pasted on frame {}", at + 1);
+            assert_eq!(e.stage_clip.as_ref().map(|c| c.0), Some(0), "still holding the copy");
+        }
+        assert!(e.status.as_deref().is_some_and(|s| s.contains("paste it again")), "{:?}", e.status);
+
+        e.run(Command::ClearStageCopy);
+        assert!(e.stage_clip.is_none() && e.stage_clip_camera.is_none() && e.stage_clip_from.is_none());
+        e.set_frame(40);
+        e.run(Command::CopyPasteStage);
+        assert_eq!(e.stage_clip.as_ref().map(|c| c.0), Some(40), "the next press copies afresh");
+        assert!(e.doc.scene().layers().get(layer).unwrap().frames.keyframes().iter().all(|k| k.start != 40), "and pastes nothing");
+        e.set_frame(40);
+        e.run(Command::CopyPasteStage);
+        assert!(e.stage_clip.is_none(), "pressed on the frame it copied, it lets go");
+    }
+
     /// **Copy Stage / Paste Stage**: the stage at one frame, pasted on another
     /// with one key each. Every symbol, and the symbols inside it, shows the
     /// new frame's number; the master audio is left alone; one undo takes it
@@ -31545,7 +32118,7 @@ mod tests {
         assert_eq!(e.stage_clip.as_ref().map(|c| c.0), Some(10), "the first press copies");
         e.set_frame(200);
         e.run(Command::CopyPasteStage);
-        assert!(e.stage_clip.is_none(), "the second press pastes and lets go");
+        assert_eq!(e.stage_clip.as_ref().map(|c| c.0), Some(10), "the second press pastes and keeps the copy");
 
         let scene = e.scene();
         let pasted = scene.layers().get(a).unwrap().frames.keyframe_at(200).expect("a keyframe at 200");

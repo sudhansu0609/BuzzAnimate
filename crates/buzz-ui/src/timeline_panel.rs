@@ -2467,12 +2467,23 @@ fn transport_controls(
             None => ("Copy Stage".to_string(), "Copy everything on the stage at this frame, every layer, and the camera's position and zoom. Then go to another frame and press again to paste it there.".to_string()),
             Some(from) => (
                 format!("Paste Stage \u{00b7} {}", from + 1),
-                format!("Paste the stage copied at frame {} here, every symbol set to this frame's number. Press on frame {} to let go of it.", from + 1, from + 1),
+                format!("Paste the stage copied at frame {} here, every symbol set to this frame's number. The copy stays: press on more frames to paste it again. \u{2715} or right-click lets go of it.", from + 1),
             ),
         };
         let button = egui::Button::new(egui::RichText::new(label).small()).selected(state.stage_copied.is_some());
-        if ui.add(button).on_hover_text(tip).clicked() {
+        let pressed = ui.add(button).on_hover_text(tip);
+        if pressed.clicked() {
             out.command = Some(crate::Command::CopyPasteStage);
+        }
+        // Holding a copy: let go of it, to copy something else.
+        if state.stage_copied.is_some()
+            && (pressed.secondary_clicked()
+                || ui
+                    .small_button("\u{2715}")
+                    .on_hover_text("Clear Stage Copy \u{2014} let go of the copied stage, so the next press copies again")
+                    .clicked())
+        {
+            out.command = Some(crate::Command::ClearStageCopy);
         }
         // **Bring Character Here**, beside it: a character from other frames,
         // another scene or another open file, here with its frames aligned.
@@ -2568,6 +2579,12 @@ fn ruler(
     let response = ui.interact(rect, ui.id().with("timeline-ruler"), Sense::click_and_drag());
     let grid_left = rect.min.x + LAYER_COLUMN;
     let pinned_left = ui.clip_rect().min.x;
+    // Where the frames start on screen: right of the pinned layer-names
+    // column. Once the grid scrolls sideways `grid_left` runs under that
+    // column, so a click on its hide/lock/outline-all headings must not also
+    // scrub to the hidden frame beneath it (each click on Lock All used to
+    // step the playhead back, the view followed, and the next went further).
+    let frames_left = grid_left.max(pinned_left + LAYER_COLUMN);
     let font = FontId::proportional(9.0);
 
     // The numbers, loop band and playhead scroll with the grid, clipped to the
@@ -2799,7 +2816,7 @@ fn ruler(
     // Initiating drag downward from the ruler begins vertical column frame selection.
     if response.drag_started()
         && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
-        && pos.x >= grid_left
+        && pos.x >= frames_left
     {
         let at = ((pos.x - grid_left) / cell_width).max(0.0);
         let frame = at.floor() as u32;
@@ -2824,7 +2841,7 @@ fn ruler(
     // Clicking, dragging or double-clicking along the ruler scrubs.
     if (response.clicked() || response.dragged() || is_double_click)
         && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
-        && pos.x >= grid_left
+        && pos.x >= frames_left
     {
         let frame = ((pos.x - grid_left) / cell_width).floor().max(0.0) as u32;
         let clamped = frame.min(columns.saturating_sub(1));
@@ -2849,7 +2866,7 @@ fn ruler(
     let ruler_menu_id = egui::Id::new("timeline_ruler_menu_frame");
     if response.secondary_clicked()
         && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
-        && pos.x >= grid_left
+        && pos.x >= frames_left
     {
         let frame = ((pos.x - grid_left) / cell_width).floor().max(0.0) as u32;
         let clamped = frame.min(columns.saturating_sub(1));
@@ -6703,6 +6720,48 @@ mod tests {
             "the menu must not have re-picked the frame under the pointer's \
              later position: {texts:?}"
         );
+    }
+
+    /// **Lock All does not move the playhead** (user 2026-11-21: "when I lock
+    /// all the layers from the top, the current frame moves to previous
+    /// frames each time I click the lock"). With the grid scrolled sideways
+    /// the frames run under the pinned headings; a click on a heading flips
+    /// its switch on every layer and scrubs nowhere.
+    #[test]
+    fn clicking_lock_all_on_a_scrolled_timeline_does_not_scrub() {
+        let ctx = egui::Context::default();
+        let mut scene = Scene::default();
+        scene.add_layer("A", buzz_scene::LayerKind::Normal);
+        let st = state();
+        let columns = 400u32;
+        // Scrolled 600 points to the right: the ruler starts off screen.
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(-600.0, 0.0),
+            egui::vec2(LAYER_COLUMN + columns as f32 * st.frame_width, RULER_HEIGHT),
+        );
+        let name_row = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(LAYER_COLUMN, RULER_HEIGHT));
+        let lock = switch_columns(name_row)[1].center();
+        let mut got = TimelineResponse::default();
+        let mut drive = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 600.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let mut response = TimelineResponse::default();
+                ruler(ui, rect, &scene, columns, LoopRegion::default(), &st, &mut response);
+                if response.toggle_all.is_some() || response.scrub_to.is_some() {
+                    got = response;
+                }
+            });
+        };
+        let mods = egui::Modifiers::default();
+        drive(vec![egui::Event::PointerMoved(lock)]);
+        drive(vec![egui::Event::PointerButton { pos: lock, button: egui::PointerButton::Primary, pressed: true, modifiers: mods }]);
+        drive(vec![egui::Event::PointerButton { pos: lock, button: egui::PointerButton::Primary, pressed: false, modifiers: mods }]);
+        assert_eq!(got.toggle_all, Some(crate::panels::LayerIcon::Lock), "the heading still locks every layer");
+        assert_eq!(got.scrub_to, None, "and the playhead stays where it was");
     }
 
     /// The layer column has three things it can be, and each has to draw for

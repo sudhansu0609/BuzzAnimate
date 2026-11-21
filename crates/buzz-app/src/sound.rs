@@ -320,7 +320,7 @@ impl SoundBank {
     /// symbol has a sound of its own on its timeline, which is then the one
     /// (a scene kept in a symbol, with its own dialogue).
     pub fn stage_track(&self, scene: &Scene) -> Option<(SoundId, u32, Arc<Clip>)> {
-        track_cue(scene)
+        self.playable_cue(scene)
             .and_then(|cue| {
                 let clip = self.clips.get(&cue.sound)?;
                 Some((cue.sound, cue.start_frame, Arc::clone(clip)))
@@ -338,7 +338,7 @@ impl SoundBank {
     /// only that slice, or analysis searches audio that never plays here at
     /// all.
     pub fn stage_track_trimmed(&self, scene: &Scene) -> Option<(SoundId, u32, Arc<Clip>)> {
-        let cue = track_cue(scene)?;
+        let cue = self.playable_cue(scene)?;
         let clip = self.clips.get(&cue.sound)?;
         let clip = if cue.trim_start > 0.0 || cue.trim_end.is_some() {
             Arc::new(clip.trimmed(cue.trim_start, cue.trim_end))
@@ -353,13 +353,29 @@ impl SoundBank {
 /// its **main sound layer**'s (the layer a sound was last placed or attached
 /// on), else its first streamed sound, else its first — and otherwise the main
 /// timeline's, chosen the same way.
-fn track_cue(scene: &Scene) -> Option<buzz_scene::SoundCue> {
+fn track_cues(scene: &Scene) -> Vec<buzz_scene::SoundCue> {
     let pick = |cues: Vec<buzz_scene::SoundCue>| cues.iter().find(|cue| cue.sync.follows_timeline()).or(cues.first()).cloned();
     let open = !scene.edit_path().is_empty();
-    open.then(|| scene.main_sound_cue().or_else(|| pick(scene.open_symbol_cues())))
-        .flatten()
-        .or_else(|| scene.stage_main_sound_cue())
-        .or_else(|| pick(scene.stage_cues()))
+    let mut out = Vec::new();
+    if open {
+        out.extend(scene.main_sound_cue());
+        out.extend(pick(scene.open_symbol_cues()));
+    }
+    out.extend(scene.stage_main_sound_cue());
+    out.extend(pick(scene.stage_cues()));
+    out
+}
+
+impl SoundBank {
+    /// **The first of [`track_cues`] there is audio for.** A character
+    /// brought in from the Cast can carry a Master Audio guide whose sound
+    /// is not in this film (user 2026-11-21: Shift+A on the shirt character
+    /// lip-synced nothing, "There is no sound on the main timeline"): that
+    /// cue is passed over for the film's own dialogue instead of ending the
+    /// search.
+    fn playable_cue(&self, scene: &Scene) -> Option<buzz_scene::SoundCue> {
+        track_cues(scene).into_iter().find(|cue| self.clips.contains_key(&cue.sound))
+    }
 }
 
 impl std::fmt::Debug for SoundBank {
@@ -550,6 +566,31 @@ mod tests {
         // Back on the root, nothing has changed.
         scene.edit_document();
         assert_eq!(scene.stage_cues(), cues_on_root);
+    }
+
+    /// **A guide whose sound is not in the film does not hide the dialogue**
+    /// (user 2026-11-21: the shirt character's head carried a Master Audio
+    /// guide from the Cast pointing at a sound this film does not have, and
+    /// Shift+A's lip sync said "There is no sound on the main timeline").
+    #[test]
+    fn a_missing_sound_inside_the_head_falls_back_to_the_dialogue() {
+        let (mut scene, sound, character, head) = document_with_dialogue();
+        let gone = SoundId(9_999);
+        let layer = scene.library().get(head).expect("the head").layers.iter().next().expect("a layer").id;
+        scene.library_mut().update(head, |symbol| {
+            symbol.layers.update(layer, |l| {
+                if let Some(keyframe) = l.frames.keyframe_at_mut(0) {
+                    keyframe.sound = Some(SoundRef::stream(gone));
+                }
+            });
+        });
+        let mut bank = SoundBank::new(24.0);
+        bank.sync_with(&scene);
+        assert!(scene.enter_symbol(character) && scene.enter_symbol(head));
+        assert!(scene.open_symbol_cues().iter().any(|c| c.sound == gone), "the head cues its missing sound");
+        let (track, start, _) = bank.stage_track_trimmed(&scene).expect("the dialogue");
+        assert_eq!((track, start), (sound, 0));
+        assert_eq!(bank.stage_track(&scene).map(|t| t.0), Some(sound));
     }
 
     /// A sound on a layer inside a *symbol* is not the document's soundtrack:

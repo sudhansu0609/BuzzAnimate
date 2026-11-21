@@ -64,6 +64,8 @@ pub struct MergeReport {
     pub objects: usize,
     /// Symbols renamed because the name was already taken: (wanted, given).
     pub renamed: Vec<(String, String)>,
+    /// Pictures added to the image library for the artwork that came in.
+    pub images: usize,
 }
 
 impl MergeReport {
@@ -431,8 +433,171 @@ impl Scene {
             }
         }
 
+        // 7. The pictures it is painted with, kept in this document's own
+        //    library, or a save writes them nowhere.
+        report.images = self.adopt_images();
+
         self.bump();
         report
+    }
+
+    /// **Every picture the artwork is painted with is kept in this document's
+    /// image library** (user 2026-11-20: "all the colour vanished from the
+    /// image"). A bitmap fill carries its picture with it, so artwork brought
+    /// from another file looks right at once — but a save writes only the
+    /// library's pictures into `media/`, and on opening a fill whose picture is
+    /// not there is painted flat grey: a shop pasted from one film into
+    /// another lost its walls, its shelves and its books that way.
+    ///
+    /// Each picture painted somewhere — the stage and every symbol, nested
+    /// groups, rigged parts and turnaround views included — that the library
+    /// does not hold is added: under its own id where that is free, else under
+    /// a new one, the fills that use it pointed at the copy. One the library
+    /// already holds (the same pixels) is used as it is. Artwork is touched
+    /// only where a picture's id changes. How many pictures were added.
+    pub fn adopt_images(&mut self) -> usize {
+        use crate::image::ImageAsset;
+        use crate::object::Paint;
+        use std::sync::Arc;
+
+        fn paints(object: &Object, out: &mut Vec<Arc<ImageAsset>>) {
+            let mut take = |paint: &Paint| {
+                if let Paint::Image(fill) = paint
+                    && !out.iter().any(|a| Arc::ptr_eq(a, &fill.asset))
+                {
+                    out.push(Arc::clone(&fill.asset));
+                }
+            };
+            match &object.kind {
+                ObjectKind::Shape(shape) => {
+                    if let Some(fill) = &shape.fill {
+                        take(&fill.paint);
+                    }
+                    if let Some(stroke) = &shape.stroke {
+                        take(&stroke.paint);
+                    }
+                }
+                ObjectKind::Group(children) => children.iter().for_each(|c| paints(c, out)),
+                ObjectKind::Armature(rig) => rig.parts.iter().for_each(|p| paints(&p.artwork, out)),
+                ObjectKind::Instance(_) | ObjectKind::Warp(_) => {}
+            }
+            for view in object.turnaround.views() {
+                paints(&view.drawing, out);
+            }
+        }
+        let same = |a: &ImageAsset, b: &ImageAsset| {
+            a.blob_id() == b.blob_id() || Arc::ptr_eq(&a.pixels, &b.pixels) || (!a.source.is_empty() && Arc::ptr_eq(&a.source, &b.source))
+        };
+
+        let mut used: Vec<Arc<ImageAsset>> = Vec::new();
+        let stacks: Vec<LayerStack> = std::iter::once(self.layers.clone())
+            .chain(self.library.iter().map(|s| s.layers.clone()))
+            .collect();
+        for stack in &stacks {
+            for layer in stack.iter() {
+                for keyframe in layer.frames.keyframes() {
+                    for object in keyframe.objects.iter() {
+                        paints(object, &mut used);
+                    }
+                }
+            }
+        }
+
+        let mut added = 0;
+        let mut moved: Vec<(Arc<ImageAsset>, Arc<ImageAsset>)> = Vec::new();
+        for asset in used {
+            if self.images.get(asset.id).is_some_and(|mine| same(mine, &asset)) {
+                continue;
+            }
+            if let Some(mine) = self.images.iter().find(|mine| same(mine, &asset)).cloned() {
+                moved.push((asset, mine));
+                continue;
+            }
+            let mut copy = (*asset).clone();
+            if self.images.get(asset.id).is_some() {
+                copy.id = crate::ImageId(self.ids.take());
+                copy.name = self.images.unique_name(&copy.name);
+            } else {
+                self.ids.reserve_above(asset.id.0);
+            }
+            let kept = self.images.insert(copy);
+            added += 1;
+            if kept.id != asset.id {
+                moved.push((asset, kept));
+            }
+        }
+
+        if !moved.is_empty() {
+            fn repoint(object: &mut Object, moved: &[(Arc<ImageAsset>, Arc<ImageAsset>)]) {
+                let swap = |paint: &mut Paint| {
+                    if let Paint::Image(fill) = paint
+                        && let Some((_, to)) = moved.iter().find(|(from, _)| Arc::ptr_eq(from, &fill.asset))
+                    {
+                        fill.asset = Arc::clone(to);
+                    }
+                };
+                match &mut object.kind {
+                    ObjectKind::Shape(shape) => {
+                        if let Some(fill) = &mut shape.fill {
+                            swap(&mut fill.paint);
+                        }
+                        if let Some(stroke) = &mut shape.stroke {
+                            swap(&mut stroke.paint);
+                        }
+                    }
+                    ObjectKind::Group(children) => children.iter_mut().for_each(|c| repoint(Arc::make_mut(c), moved)),
+                    ObjectKind::Armature(rig) => rig.parts.iter_mut().for_each(|p| repoint(Arc::make_mut(&mut p.artwork), moved)),
+                    ObjectKind::Instance(_) | ObjectKind::Warp(_) => {}
+                }
+                if !object.turnaround.views().is_empty() {
+                    let mut views = object.turnaround.clone();
+                    for (angle, drawing) in object.turnaround.views().iter().map(|v| (v.angle, Arc::clone(&v.drawing))).collect::<Vec<_>>() {
+                        let mut drawing = (*drawing).clone();
+                        repoint(&mut drawing, moved);
+                        views.set(angle, Arc::new(drawing));
+                    }
+                    object.turnaround = views;
+                }
+            }
+            // Only the objects painted with a moved picture are touched.
+            let wants = |object: &Object| {
+                let mut found = Vec::new();
+                paints(object, &mut found);
+                found.iter().any(|a| moved.iter().any(|(from, _)| Arc::ptr_eq(from, a)))
+            };
+            let fix = |stack: &mut LayerStack| {
+                let ids: Vec<LayerId> = stack.iter().map(|l| l.id).collect();
+                for id in ids {
+                    let touches = stack.get(id).is_some_and(|l| l.frames.keyframes().iter().any(|k| k.objects.iter().any(|o| wants(o))));
+                    if !touches {
+                        continue;
+                    }
+                    stack.update(id, |layer| {
+                        for keyframe in layer.frames.keyframes_mut() {
+                            if !keyframe.objects.iter().any(|o| wants(o)) {
+                                continue;
+                            }
+                            for object in Arc::make_mut(&mut keyframe.objects).iter_mut() {
+                                if wants(object) {
+                                    repoint(Arc::make_mut(object), &moved);
+                                }
+                            }
+                        }
+                    });
+                }
+            };
+            fix(&mut self.layers);
+            let symbols: Vec<SymbolId> = self.library.iter().map(|s| s.id).collect();
+            for id in symbols {
+                let touches = self.library.get(id).is_some_and(|s| {
+                    s.layers.iter().any(|l| l.frames.keyframes().iter().any(|k| k.objects.iter().any(|o| wants(o))))
+                });
+                if touches {
+                    self.library.update(id, |s| fix(&mut s.layers));
+                }
+            }
+        }
+        added
     }
 
     /// **Unpack a symbol's own layers onto the stage** (CAST_POSES_PLAN C2): copies
@@ -471,6 +636,58 @@ mod tests {
     use crate::object::ShapeData;
     use crate::symbol::SymbolKind;
     use buzz_geom::{Affine, Shape as _};
+
+    /// **A picture painted on artwork from another file comes into this
+    /// file's image library** — under its own id where that is free, under a
+    /// new one where another picture has it, the fill pointed at the copy — so
+    /// a save keeps it. It used to come only as far as the fill: saved and
+    /// opened again, the shop's walls were flat grey.
+    #[test]
+    fn a_pasted_picture_is_kept_in_the_image_library() {
+        use crate::image::{ImageAsset, ImageFill, ImageId};
+        use crate::object::Paint;
+        let painted = |asset: std::sync::Arc<ImageAsset>| {
+            let mut shape = ShapeData::filled(buzz_geom::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9), peniko::Color::WHITE);
+            if let Some(fill) = &mut shape.fill {
+                fill.paint = Paint::Image(Box::new(ImageFill::new(asset, buzz_geom::Rect::new(0.0, 0.0, 10.0, 10.0))));
+            }
+            shape
+        };
+        // The source: a wall painted with picture 7, which only the fill holds.
+        let wall = std::sync::Arc::new(ImageAsset::blank(ImageId(7), "wall", 4, 4));
+        let mut source = Scene::empty();
+        let layer = source.add_layer("walls", crate::layer::LayerKind::Normal);
+        source.add_shape(layer, painted(std::sync::Arc::clone(&wall)));
+
+        let mut here = Scene::default();
+        let report = here.merge(&source, ImportTarget::Stage);
+        assert_eq!(report.images, 1);
+        assert!(here.images().get(ImageId(7)).is_some(), "kept under its own id");
+
+        // A file whose picture 7 is something else: the wall gets a new id.
+        let mut there = Scene::default();
+        there.images_mut().insert(ImageAsset::blank(ImageId(7), "sky", 2, 2));
+        there.merge(&source, ImportTarget::Stage);
+        assert_eq!(there.images().len(), 2, "the sky stays, the wall comes");
+        let fill_id = there
+            .layers()
+            .iter()
+            .flat_map(|l| l.objects_at(0).to_vec())
+            .find_map(|o| match &o.kind {
+                ObjectKind::Shape(s) => match &s.fill.as_ref()?.paint {
+                    Paint::Image(f) => Some(f.asset.id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the wall is painted");
+        assert_ne!(fill_id, ImageId(7), "not the sky's id");
+        assert_eq!(there.images().get(fill_id).map(|a| a.name.as_str()), Some("wall"), "the fill names the wall's copy");
+        assert_eq!(there.images().get(ImageId(7)).map(|a| a.name.as_str()), Some("sky"));
+
+        // Merged again: nothing new.
+        assert_eq!(there.merge(&source, ImportTarget::Stage).images, 0, "the same picture is not added twice");
+    }
     use kurbo::Rect;
     use peniko::Color;
 

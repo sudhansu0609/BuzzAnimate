@@ -593,8 +593,13 @@ pub enum Command {
     /// everything on the stage at the playhead, every layer; the next, on
     /// another frame, pastes it there as a keyframe on each layer with every
     /// symbol set to show that frame's number. Pressed again on the frame it
-    /// copied, it lets go. One command, so one key.
+    /// copied, it lets go. One command, so one key. **The copy stays after
+    /// a paste**, so each further press on another frame pastes it again,
+    /// until [`Command::ClearStageCopy`] lets go of it.
     CopyPasteStage,
+    /// **Clear Stage Copy**: let go of the stage Copy / Paste Stage is
+    /// holding, so its next press copies afresh.
+    ClearStageCopy,
     /// **Bring Character Here…**: a character on this timeline's other
     /// frames, another scene or another open file, put at the playhead with
     /// its frame numbers set to the playhead's. See `buzz_app::bring`.
@@ -984,6 +989,7 @@ command_table! {
             ReverseFrames => "reverse_frames",
             MoveStageFrames => "move_stage_frames",
             CopyPasteStage => "copy_paste_stage",
+            ClearStageCopy => "clear_stage_copy",
             BringCharacterHere => "bring_character_here",
             MarkTalkRange => "mark_talk_range",
             ClearTalkRanges => "clear_talk_ranges",
@@ -1481,6 +1487,7 @@ impl Command {
             ReverseFrames => "Reverse Frames",
             MoveStageFrames => "Move Stage Frames\u{2026}",
             CopyPasteStage => "Copy / Paste Stage",
+            ClearStageCopy => "Clear Stage Copy",
             BringCharacterHere => "Bring Character Here\u{2026}",
             MarkTalkRange => "Mark Talk Range\u{2026}",
             ClearTalkRanges => "Clear Talk Ranges",
@@ -1774,6 +1781,7 @@ impl Command {
             ReverseFrames => None,
             MoveStageFrames => None,
             CopyPasteStage => None,
+            ClearStageCopy => None,
             BringCharacterHere => None,
             MarkTalkRange => sc(Modifiers::SHIFT, Key::T),
             ClearTalkRanges => None,
@@ -1990,6 +1998,7 @@ pub fn palette_commands() -> Vec<Command> {
         ReverseFrames,
         MoveStageFrames,
         CopyPasteStage,
+        ClearStageCopy,
         BringCharacterHere,
         MarkTalkRange,
         ClearTalkRanges,
@@ -2261,6 +2270,7 @@ mod tests {
             ReverseFrames,
             MoveStageFrames,
             CopyPasteStage,
+            ClearStageCopy,
             BringCharacterHere,
             MarkTalkRange,
             ClearTalkRanges,
@@ -2462,7 +2472,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            261
+            262
         );
     }
 

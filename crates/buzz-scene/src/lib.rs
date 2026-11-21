@@ -3506,6 +3506,7 @@ impl Scene {
             return false;
         };
         let mut changed = false;
+        let graphics = if at.auto_key { self.graphic_lengths() } else { Default::default() };
         let remove = |keyframe: &mut Keyframe| {
             match keyframe.objects.iter().position(|o| o.id == id) {
                 Some(index) => {
@@ -3535,7 +3536,7 @@ impl Scene {
             // used to do so always, leaving a new, emptied keyframe behind
             // every Delete partway into a span.
             if at.auto_key && !frames.is_keyframe(at.frame) {
-                frames.insert_keyframe(at.frame);
+                frames.insert_keyframe_carrying_on(at.frame, &graphics);
             }
             if let Some(keyframe) = frames.keyframe_at_mut(at.frame) {
                 changed |= remove(keyframe);
@@ -3680,11 +3681,23 @@ impl Scene {
         if target.frames.is_keyframe(frame) || frame >= target.frames.length() {
             return false;
         }
+        let graphics = self.graphic_lengths();
         let mut made = false;
         self.update_layer(layer, |layer| {
-            made = layer.frames.insert_keyframe(frame);
+            made = layer.frames.insert_keyframe_carrying_on(frame, &graphics);
         });
         made
+    }
+
+    /// Every graphic symbol's length, for
+    /// [`LayerTimeline::insert_keyframe_carrying_on`]: the symbols whose
+    /// instances play along with the timeline they are on.
+    pub fn graphic_lengths(&self) -> std::collections::HashMap<SymbolId, u32> {
+        self.library
+            .iter()
+            .filter(|s| s.kind.follows_parent_timeline())
+            .map(|s| (s.id, s.length()))
+            .collect()
     }
 
     /// Auto Keyframe for the layer an object lives on.

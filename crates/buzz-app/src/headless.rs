@@ -301,6 +301,7 @@ fn build(job: &RenderJob, report: &mut Vec<String>) -> Result<Document> {
             hooks: Default::default(),
             overrides: Vec::new(),
             dialogue: None,
+            listener: None,
             lip_sync: None,
             // The run starts on the first scene; the master audio is kept
             // when that is where it lives.

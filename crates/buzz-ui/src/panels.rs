@@ -5209,6 +5209,7 @@ pub fn color_row(ui: &mut Ui, id: &str, color: &mut Color) -> bool {
             .clicked()
         {
             egui::Popup::open_id(ui.ctx(), popup);
+            crate::screen_color::offer(ui.ctx(), target);
         }
 
         // The field is authoritative only while it is being typed in: while
@@ -5259,6 +5260,11 @@ fn color_swatch_picker(ui: &mut Ui, target: egui::Id, color: &mut Color32) -> (b
 
     let mut changed = false;
     let popup = egui::Popup::default_response_id(&response);
+    // Opening the picker offers the stage eyedropper too (see
+    // `screen_color::offer`).
+    if response.clicked() && !egui::Popup::is_id_open(ui.ctx(), popup) {
+        crate::screen_color::offer(ui.ctx(), target);
+    }
     egui::Popup::from_toggle_button_response(&response)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {

@@ -20,6 +20,7 @@ pub mod scene_builder;
 pub mod director;
 pub mod breakdown;
 pub mod siglip;
+pub mod phonemes;
 pub mod transcribe;
 pub mod voice;
 pub mod story;

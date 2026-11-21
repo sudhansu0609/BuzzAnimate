@@ -193,6 +193,19 @@ const HUE_WIDTH: f32 = 12.0;
 pub fn color_button(ui: &mut Ui, color: &mut egui::Color32) -> Response {
     let size = ui.spacing().interact_size;
     let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+    // A colour the stage eyedropper took for this button.
+    let mut taken = false;
+    if let Some(picked) = crate::screen_color::take(response.id) {
+        let rgba = picked.to_rgba8();
+        *color = egui::Color32::from_rgba_unmultiplied(rgba.r, rgba.g, rgba.b, rgba.a);
+        taken = true;
+    }
+    // Opening the picker offers the stage eyedropper too (see
+    // `screen_color::offer`).
+    let was_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+    if response.clicked() && !was_open {
+        crate::screen_color::offer(ui.ctx(), response.id);
+    }
     if ui.is_rect_visible(rect) {
         egui::color_picker::show_color_at(ui.painter(), *color, rect);
         let stroke = if response.hovered() {
@@ -209,8 +222,11 @@ pub fn color_button(ui: &mut Ui, color: &mut egui::Color32) -> Response {
         .show(|ui| {
             changed = compact_color_picker(ui, id, color, true);
         });
-    if changed {
+    if changed || taken {
         response.mark_changed();
+    }
+    if taken {
+        egui::Popup::close_id(ui.ctx(), egui::Popup::default_response_id(&response));
     }
     response
 }

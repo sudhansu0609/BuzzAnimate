@@ -144,6 +144,13 @@ pub struct ScriptContext {
     /// host did not measure it.
     pub dialogue: Option<Dialogue>,
 
+    /// **Which way the selected character's eyes turn to meet the one it is
+    /// talking to** — the nearest other character on the stage — as a unit
+    /// vector in its head's own space, x right and y down
+    /// (`fl.buzzAnimate.listener()`). `None`: nobody else is there, or the
+    /// host did not look.
+    pub listener: Option<(f64, f64)>,
+
     /// **A lip sync the script asked for** (`fl.buzzAnimate.lipSync(start,
     /// end)`), in frames of the timeline it left open: the host runs it on
     /// the selected mouth once the run is committed. Animate has no way for a
@@ -1086,6 +1093,19 @@ mod tests {
         assert!(out.error.is_none(), "{:?}", out.error);
         assert_eq!(out.trace, vec!["ends 140".to_string()]);
         assert_eq!(out.context.lip_sync, Some((112, 140)));
+    }
+
+    /// **`fl.buzzAnimate.listener()`** hands a talking command the way to
+    /// the character being talked to, or null when there is nobody.
+    #[test]
+    fn a_command_reads_which_way_its_listener_is() {
+        let mut scene = Scene::default();
+        let context = ScriptContext { listener: Some((-1.0, 0.25)), ..Default::default() };
+        let out = run(&mut scene, context, "var l = fl.buzzAnimate.listener(); fl.trace(l.dx + ' ' + l.dy);", &Limits::default());
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(out.trace, vec!["-1 0.25".to_string()]);
+        let out = run(&mut scene, ScriptContext::default(), "fl.trace(String(fl.buzzAnimate.listener()));", &Limits::default());
+        assert_eq!(out.trace, vec!["null".to_string()]);
     }
 
     // -- animation ----------------------------------------------------------

@@ -381,3 +381,93 @@ pub(crate) fn trace(width: u32, height: u32, pixels: &[u8], options: &TraceOptio
     report.message = format!("{} (+ {n} even lines, {width_px:.1} px)", report.message);
     report
 }
+
+/// **The thin ink of a picture as strokes of one width** (user 2026-11-21:
+/// "when I am tracing an image to make my character, let's have smoother
+/// lines, more uniform lines"), for `TraceMode::InkAndColour` with
+/// [`TraceOptions::even_lines`]: `mask` (native pixels, `true` = ink, the
+/// masses already left out) goes through the line tracer's centreline
+/// pipeline, as [`trace`]'s even lines do, and every stroke is drawn at one
+/// width — `want` pixels, or (`0`) the ink's area over the strokes' length,
+/// the median line weight — in the ink's own colour (a stroke clearly another
+/// colour, a brown line on black ink, keeps its own). Smooth, round-capped,
+/// even, instead of filled outlines that follow every bump of the scan.
+pub(crate) fn even_strokes(w: usize, h: usize, pixels: &[u8], mask: &[bool], want: f64, line_smooth: f64, min_line_length: f64) -> Vec<ShapeData> {
+    if !mask.iter().any(|&v| v) {
+        return Vec::new();
+    }
+    let (mut rs, mut gs, mut bs) = (Vec::new(), Vec::new(), Vec::new());
+    for i in (0..w * h).filter(|&i| mask[i]) {
+        rs.push(pixels[i * 4]);
+        gs.push(pixels[i * 4 + 1]);
+        bs.push(pixels[i * 4 + 2]);
+    }
+    let global = [median(&mut rs), median(&mut gs), median(&mut bs)];
+    let global_lab = srgb_to_lab(global);
+    let mut png = vec![255u8; w * h * 4];
+    for i in (0..w * h).filter(|&i| mask[i]) {
+        png[i * 4..i * 4 + 3].fill(0);
+    }
+    let mut lo = TraceOptions::line_art();
+    lo.mode = TraceMode::LineArt;
+    lo.line_style = LineStyle::Stroke;
+    lo.uniform_width = None;
+    lo.ink_detect = crate::trace::InkDetect::Global(Some(140));
+    lo.speckle = 6;
+    lo.fill_enclosed = false;
+    lo.ink_masses = true;
+    lo.min_line_length = min_line_length;
+    lo.line_smooth = line_smooth;
+    let lines = trace_core_with(w, h, &png, &lo, Straighten::default());
+    let mut strokes: Vec<ShapeData> = Vec::new();
+    let mut masses: Vec<ShapeData> = Vec::new();
+    for shape in lines.shapes {
+        if shape.stroke.is_some() {
+            strokes.push(shape);
+        } else {
+            masses.push(shape);
+        }
+    }
+    let width_px = if want > 0.0 {
+        want
+    } else {
+        let length: f64 = strokes.iter().map(|s| crate::trace_bold::path_length(&s.path)).sum();
+        let area = mask.iter().filter(|&&v| v).count() as f64;
+        (area / length.max(1.0)).clamp(1.2, 6.0)
+    };
+    let ink = Color::from_rgb8(global[0], global[1], global[2]);
+    for shape in &mut strokes {
+        let mut pts: Vec<Point> = Vec::new();
+        kurbo::flatten(shape.path.iter(), 0.5, |el| match el {
+            kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => pts.push(p),
+            _ => {}
+        });
+        let (mut r, mut g, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        for p in &pts {
+            let (x, y) = (p.x.floor() as i64, p.y.floor() as i64);
+            if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
+                continue;
+            }
+            let i = y as usize * w + x as usize;
+            if mask[i] {
+                r.push(pixels[i * 4]);
+                g.push(pixels[i * 4 + 1]);
+                b.push(pixels[i * 4 + 2]);
+            }
+        }
+        let own = [median(&mut r), median(&mut g), median(&mut b)];
+        let colour = if r.is_empty() || delta_e(srgb_to_lab(own), global_lab) <= OWN_COLOUR_DE { ink } else { Color::from_rgb8(own[0], own[1], own[2]) };
+        if let Some(stroke) = shape.stroke.as_mut() {
+            stroke.width = width_px;
+            stroke.paint = Paint::Solid(colour);
+        }
+    }
+    // A blob too fat to be a line stays a filled shape, in the ink's colour.
+    for shape in &mut masses {
+        if let Some(fill) = shape.fill.as_mut() {
+            fill.paint = Paint::Solid(ink);
+        }
+    }
+    masses.extend(strokes);
+    masses
+}

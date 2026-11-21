@@ -4884,6 +4884,13 @@ impl App {
                     self.stage_scrollbars(ui, area);
                     self.stage_camera_controls(ui, area);
                     if self.doc_available() {
+                        // The Eyedropper's chip reads what a click would take.
+                        if (self.editor.tool() == buzz_ui::ToolId::Eyedropper || self.dropper_pick.is_some())
+                            && let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos())
+                            && area.contains(pos)
+                        {
+                            self.refresh_eyedropper_peek(area, pos);
+                        }
                         self.draw_tool_cursor(ui, area);
                     }
                     area
@@ -6764,28 +6771,77 @@ impl App {
     /// very frame they are drawn; on the title bar (`title`) the gap before
     /// them drags the window.
     fn breadcrumb_then_tabs(&mut self, ui: &mut egui::Ui, commands: &mut Vec<Command>, title: bool) -> Option<TabAction> {
-        if let Some(command) = self.breadcrumb(ui) {
-            commands.push(command);
-        }
-        let width = {
-            let mut measure = ui.new_child(
+        // **Both kept to the room there is** (user 2026-11-21: "when I am
+        // inside a symbol and zoom in with multiple files the zoom level ...
+        // gets hidden, overlapped"). A deep symbol path and several file tabs
+        // ran on past the end of the row, over the zoom controls beside it.
+        // Measured first, unseen; when they do not fit, the tabs take up to
+        // about half and scroll, and the path takes the rest and scrolls,
+        // kept at its end — the symbol open now.
+        let measure = |app: &mut Self, ui: &mut egui::Ui, salt: &str, crumb: bool| -> f32 {
+            let mut child = ui.new_child(
                 egui::UiBuilder::new()
-                    .id_salt(("document-tabs-measure", title))
-                    .max_rect(ui.available_rect_before_wrap())
+                    .id_salt((salt, title))
+                    .max_rect(egui::Rect::from_min_size(ui.cursor().min, egui::vec2(100_000.0, ui.available_height().max(1.0))))
                     .layout(egui::Layout::left_to_right(egui::Align::Center))
                     .sizing_pass()
                     .invisible(),
             );
-            let _ = self.document_tabs(&mut measure);
-            measure.min_rect().width()
+            if crumb {
+                let _ = app.breadcrumb(&mut child);
+            } else {
+                let _ = app.document_tabs(&mut child);
+            }
+            child.min_rect().width()
         };
-        let gap = (ui.available_width() - width - 2.0).max(ui.spacing().item_spacing.x);
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(gap, ui.available_height().max(1.0)), egui::Sense::click_and_drag());
+        let crumb_w = measure(self, ui, "breadcrumb-measure", true);
+        let tabs_w = measure(self, ui, "document-tabs-measure", false);
+        let room = ui.available_width();
+        let spacing = ui.spacing().item_spacing.x;
+        let height = ui.available_height().max(1.0);
+        // Path, spacing, the gap (at least a spacing wide), spacing, tabs.
+        let between = 3.0 * spacing + 2.0;
+        let fits = crumb_w + tabs_w + between <= room;
+        let tabs_max = if fits { tabs_w } else { tabs_w.min((room * 0.45).max(120.0)) };
+        let crumb_max = if fits { crumb_w } else { (room - tabs_max - between).max(40.0) };
+
+        // The path, scrolled to its end when it is cut short.
+        ui.allocate_ui_with_layout(egui::vec2(crumb_max, height), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_max_width(crumb_max);
+            egui::ScrollArea::horizontal()
+                .id_salt(("breadcrumb-scroll", title))
+                .max_width(crumb_max)
+                .stick_to_right(true)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(command) = self.breadcrumb(ui) {
+                            commands.push(command);
+                        }
+                    });
+                });
+        });
+        // Less the spacing egui puts between the gap and the tabs after it.
+        let gap = (ui.available_width() - tabs_max - spacing - 2.0).max(spacing);
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(gap, height), egui::Sense::click_and_drag());
         if title {
             self.title_rects.drag = Some(rect);
             self.queue_title_drag(&response);
         }
-        self.document_tabs(ui)
+        // The file tabs, at the far right, scrolling when there are more
+        // than fit.
+        let mut tabs = None;
+        ui.allocate_ui_with_layout(egui::vec2(tabs_max, height), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_max_width(tabs_max);
+            egui::ScrollArea::horizontal()
+                .id_salt(("document-tabs-scroll", title))
+                .max_width(tabs_max)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    tabs = self.document_tabs(ui);
+                });
+        });
+        tabs
     }
 
     /// Dragging a piece of the title bar moves the window; double-clicking
@@ -8701,7 +8757,14 @@ impl App {
         self.editor
             .talk_ranges_here()
             .into_iter()
-            .map(|(_, r)| buzz_ui::TalkRangeBand { start: r.start, end: r.end, label: r.who.join(", ") })
+            .map(|(_, r)| buzz_ui::TalkRangeBand {
+                start: r.start,
+                end: r.end,
+                label: match &r.talks_to {
+                    Some(to) => format!("{} \u{2192} {to}", r.who.join(", ")),
+                    None => r.who.join(", "),
+                },
+            })
             .collect()
     }
 
@@ -8798,7 +8861,7 @@ impl App {
                 (t.name.clone(), on)
             })
             .collect();
-        self.talk_range_dialog = Some(TalkRangeDialog { first: first + 1, last: last + 1, who });
+        self.talk_range_dialog = Some(TalkRangeDialog { first: first + 1, last: last + 1, who, talks_to: None });
         self.editor.status = Some(format!("Talk range: frames {}\u{2013}{} \u{2014} tick who talks and press Mark", first + 1, last + 1));
     }
 
@@ -8842,6 +8905,22 @@ impl App {
                         ui.checkbox(on, name.as_str());
                     }
                 });
+                // **Talks to**: who the talkers' eyes rest on. The nearest
+                // character unless one is picked.
+                ui.horizontal(|ui| {
+                    ui.label("Talks to:");
+                    let shown = state.talks_to.clone().unwrap_or_else(|| "Nearest character".into());
+                    egui::ComboBox::from_id_salt("talk-range-talks-to")
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut state.talks_to, None, "Nearest character");
+                            for (name, _) in &state.who {
+                                ui.selectable_value(&mut state.talks_to, Some(name.clone()), name.as_str());
+                            }
+                        })
+                        .response
+                        .on_hover_text("Who the talkers look at while they talk (Shift+A). Nearest character: the one standing closest to each of them.");
+                });
                 let any = state.who.iter().any(|(_, on)| *on);
                 // Mark waits for someone to be ticked; say so, rather than
                 // leave a greyed button to puzzle over.
@@ -8865,7 +8944,7 @@ impl App {
         if mark {
             let who: Vec<String> = state.who.into_iter().filter(|(_, on)| *on).map(|(name, _)| name).collect();
             // Either way round: the earlier frame starts it.
-            self.editor.mark_talk_range(state.first.max(1) - 1, state.last.max(1) - 1, who);
+            self.editor.mark_talk_range_to(state.first.max(1) - 1, state.last.max(1) - 1, who, state.talks_to);
         } else if open && !cancel {
             self.talk_range_dialog = Some(state);
         }
@@ -8914,8 +8993,8 @@ impl App {
             self.talk_ranges_run(pending, None, None);
             return;
         };
-        if crate::rhubarb::binary().is_none() {
-            pending.note = Some("no lip sync: Rhubarb is not installed".into());
+        if !crate::mouths::available() {
+            pending.note = Some("no lip sync: neither the speech-sound model nor Rhubarb is installed".into());
             self.talk_ranges_run(pending, None, None);
             return;
         }
@@ -8931,12 +9010,11 @@ impl App {
         let seconds = |frame: u32| ((frame - sound_start) as f64 / fps) as f32;
         let clip = std::sync::Arc::new(clip.trimmed(seconds(from), Some(seconds(to))));
         let (send, receive) = crossbeam_channel::bounded(1);
-        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "Talk Ranges (Rhubarb)", move |ctx| {
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "Talk Ranges (lip sync)", move |ctx| {
             let cancel = ctx.cancel.clone();
             let began = std::time::Instant::now();
-            match crate::rhubarb::cues(&clip, &|| cancel.is_cancelled()) {
-                Ok(cues) => {
-                    let keys = crate::rhubarb::keys_closing_silence(&cues, fps, &clip.frame_levels(fps));
+            match crate::mouths::heard_keys(&clip, fps, &|| cancel.is_cancelled()) {
+                Ok(keys) => {
                     let secs = began.elapsed().as_secs_f64();
                     let _ = send.send(AiResult::TalkRangesHeard { pending, keys, start: from, secs });
                     crate::tasks::TaskOutcome::Finished(String::new())
@@ -8945,7 +9023,7 @@ impl App {
             }
         });
         self.track_ai(id, receive);
-        self.editor.status = Some(format!("{name}: listening to the dialogue under the talk ranges with Rhubarb\u{2026}"));
+        self.editor.status = Some(format!("{name}: listening to the dialogue under the talk ranges with {}\u{2026}", crate::mouths::ear()));
     }
 
     /// **The command, run over every talk range** for each character marked
@@ -8981,7 +9059,16 @@ impl App {
                     continue;
                 };
                 self.editor.selection.set([id]);
+                // Who this one looks at: the range's Talks to (not itself),
+                // else the nearest character.
+                self.editor.script_listener = range
+                    .talks_to
+                    .as_ref()
+                    .filter(|to| *to != who)
+                    .and_then(|to| talkers.iter().find(|t| &t.name == to))
+                    .and_then(|t| crate::scene_life::character_instance_at(self.editor.doc.scene(), t, range.start));
                 let outcome = self.editor.run_script_source(&name, &source, vec![range.end.to_string()], false);
+                self.editor.script_listener = None;
                 if let Some(e) = &outcome.error {
                     warnings.push(format!("{at}: {name} stopped: {}", e.lines().next().unwrap_or(e)));
                     continue;
@@ -9024,7 +9111,7 @@ impl App {
             say.push_str(&format!(", {mouthed} lip-synced"));
         }
         if let Some(secs) = secs {
-            say.push_str(&format!(" (heard by Rhubarb in {secs:.1} s)"));
+            say.push_str(&format!(" (heard by {} in {secs:.1} s)", crate::mouths::ear()));
         }
         if !warnings.is_empty() {
             say.push_str(&format!(" \u{2014} {}", warnings.join("; ")));
@@ -9040,8 +9127,8 @@ impl App {
         let open = self.editor.lip_sync.open;
         self.open_lip_sync();
         self.editor.lip_sync.open = open;
-        if crate::rhubarb::binary().is_none() {
-            self.editor.status = Some("Lip sync skipped: Rhubarb is not installed".into());
+        if !crate::mouths::available() {
+            self.editor.status = Some("Lip sync skipped: neither the speech-sound model nor Rhubarb is installed".into());
             return;
         }
         self.lip_sync_with_rhubarb_over(Some((start, end)));
@@ -9280,7 +9367,22 @@ impl App {
             let scene = self.editor.scene();
             scene.editing_symbol().is_some_and(|s| crate::rigging::head_symbol_for(scene, s) == Some(s))
         };
-        let deeper = !open_head && self.rig_slots_path.as_ref().is_some_and(|filled| path.starts_with(filled));
+        // **A timeline with a rig of its own always shows it** (user
+        // 2026-11-21, the shirt character: "all my rig vanished and was
+        // reset"). The stage is "outside" every symbol, so opening any
+        // character from the stage counted as going deeper and kept the
+        // stage's empty list on show — the character's own slots never came
+        // back, and what was filled then was kept as the stage's. A list is
+        // carried deeper only when it has something in it and the timeline
+        // opened has nothing of its own.
+        let has_own = self.rig_slots_path.as_ref() != Some(&path)
+            && (self.rig_slots_kept.get(&path).is_some_and(|(_, slots)| slots.iter().any(Option::is_some))
+                || self.saved_rig_slots(&path).is_some());
+        let showing = self.editor.rig_panel.slots.iter().any(Option::is_some);
+        let deeper = !open_head
+            && !has_own
+            && showing
+            && self.rig_slots_path.as_ref().is_some_and(|filled| path.starts_with(filled));
         if self.rig_slots_path.as_ref() != Some(&path) && !deeper {
             let head = buzz_ui::rig_panel::head_pattern();
             let current = self.editor.rig_panel.pattern;
@@ -10997,10 +11099,24 @@ impl App {
         {
             return *peek;
         }
+        // Read by `refresh_eyedropper_peek` before the cursor is drawn; this
+        // is only the stored paint, for a frame it has not caught up with.
         let local = buzz_geom::Point::new((pos.x - area.min.x) as f64, (pos.y - area.min.y) as f64);
-        let peek = self.editor.sampled_paint_at(self.editor.screen_to_edit(local));
+        self.editor.sampled_paint_at_with(self.editor.screen_to_edit(local), true)
+    }
+
+    /// **The colour the Eyedropper shows beside its tip**, read the way a
+    /// click takes it (`Editor::picked_at`: the pixel the stage draws there),
+    /// so what the chip says is what a click picks. Once per pointer move,
+    /// frame or edit.
+    fn refresh_eyedropper_peek(&mut self, area: egui::Rect, pos: egui::Pos2) {
+        let key = (pos, self.editor.doc.scene().revision(), self.editor.current_frame);
+        if self.eyedropper_peek.borrow().as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        let local = buzz_geom::Point::new((pos.x - area.min.x) as f64, (pos.y - area.min.y) as f64);
+        let peek = self.editor.picked_at(local, true);
         *self.eyedropper_peek.borrow_mut() = Some((key, peek));
-        peek
     }
 
     fn draw_tool_cursor(&self, ui: &egui::Ui, area: egui::Rect) {
@@ -11978,6 +12094,22 @@ impl App {
             self.dropper_pick = Some((target, self.editor.tool()));
             self.editor.status = Some("Eyedropper: click the artwork to take its colour \u{2014} Esc to stop".into());
         }
+        // **A colour picker opened with a painting tool in hand arms the
+        // eyedropper** (user 2026-11-21): a click on the stage takes the
+        // colour seen there for that swatch, and the Brush or Bucket paints
+        // with it; a click in the picker instead puts the eyedropper away
+        // (`pressed_elsewhere`, below) and the stage paints again.
+        if let Some(target) = buzz_ui::screen_color::dropper_offer(ui.ctx()) {
+            use buzz_ui::ToolId::*;
+            let tool = self.editor.tool();
+            if matches!(tool, Brush | PaintBucket) && self.dropper_pick.is_none() {
+                self.dropper_pick = Some((target, tool));
+                let name = if tool == Brush { "Brush" } else { "Paint Bucket" };
+                self.editor.status = Some(format!(
+                    "Eyedropper: click anything on the stage to take its colour for the {name} \u{2014} or choose in the picker; Esc to stop"
+                ));
+            }
+        }
         let id = ui.id().with("stage");
         let response = ui.interact(area, id, egui::Sense::click_and_drag());
         // Remembered so the menu can turn a pointer position into a document
@@ -12200,7 +12332,7 @@ impl App {
                     && let Some(pos) = ctx.input(|i| i.pointer.interact_pos())
                 {
                     self.dropper_pick = None;
-                    self.editor.status = Some(match self.editor.sampled_paint_at_with(self.editor.screen_to_edit(local(pos)), true) {
+                    self.editor.status = Some(match self.editor.picked_at(local(pos), true) {
                         Some((colour, _)) => {
                             buzz_ui::screen_color::deliver(target, colour);
                             let [r, g, b, _] = colour.to_rgba8().to_u8_array();
@@ -13411,6 +13543,7 @@ impl App {
             hooks: Default::default(),
             overrides,
             dialogue: None,
+            listener: None,
             lip_sync: None,
             master_audio: self.editor.script_master_audio(),
         };
@@ -14504,7 +14637,7 @@ impl App {
             AiResult::LipSyncHeard { keys, length, start, mouth, layer, placement, secs } => {
                 self.lip_sync_keys(&keys, length, start, mouth, layer, placement);
                 if let Some(status) = self.editor.status.as_mut() {
-                    status.push_str(&format!(" \u{2014} heard by Rhubarb in {secs:.1} s"));
+                    status.push_str(&format!(" \u{2014} heard by {} in {secs:.1} s", crate::mouths::ear()));
                 }
             }
             AiResult::TalkRangesHeard { pending, keys, start, secs } => {
@@ -18202,7 +18335,7 @@ impl App {
             self.save_visemes();
         }
         if response.confirmed {
-            if crate::rhubarb::binary().is_some() {
+            if crate::mouths::available() {
                 self.lip_sync_with_rhubarb();
             } else {
                 if let Some(mouth) = self.editor.lip_sync.mouth {
@@ -18238,12 +18371,11 @@ impl App {
         };
         let length = clip.duration_frames(fps);
         let (send, receive) = crossbeam_channel::bounded(1);
-        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "Lip Sync (Rhubarb)", move |ctx| {
+        let id = self.tasks.spawn_thread(crate::tasks::TaskKind::Ai, "Lip Sync", move |ctx| {
             let cancel = ctx.cancel.clone();
             let began = std::time::Instant::now();
-            match crate::rhubarb::cues(&clip, &|| cancel.is_cancelled()) {
-                Ok(cues) => {
-                    let keys = crate::rhubarb::keys_closing_silence(&cues, fps, &clip.frame_levels(fps));
+            match crate::mouths::heard_keys(&clip, fps, &|| cancel.is_cancelled()) {
+                Ok(keys) => {
                     let secs = began.elapsed().as_secs_f64();
                     let _ = send.send(AiResult::LipSyncHeard { keys, length, start, mouth, layer, placement, secs });
                     crate::tasks::TaskOutcome::Finished(String::new())
@@ -18252,8 +18384,8 @@ impl App {
             }
         });
         self.track_ai(id, receive);
-        self.editor.lip_sync.result = Some("Listening to the dialogue with Rhubarb\u{2026}".into());
-        self.editor.status = Some("Lip Sync: listening to the dialogue with Rhubarb\u{2026}".into());
+        self.editor.lip_sync.result = Some(format!("Listening to the dialogue with {}\u{2026}", crate::mouths::ear()));
+        self.editor.status = Some(format!("Lip Sync: listening to the dialogue with {}\u{2026}", crate::mouths::ear()));
     }
 
     /// Somebody asked to close the window.
@@ -21214,6 +21346,8 @@ impl App {
                 scale,
                 &mut self.lights,
             );
+            // The colour picker reads the stage at this same level of detail.
+            self.editor.stage_detail = Some(self.lights.detail());
             if let Some(inputs) = &seek_inputs {
                 let missed = self.lights.symbol_scenes.builds
                     + self.lights.symbol_scenes.first_sightings
@@ -25542,6 +25676,48 @@ mod idle_tests {
         let file_at = at(&d, &file).unwrap_or_else(|| panic!("no {file:?}"));
         assert!((scene_at.center().y - file_at.center().y).abs() < 20.0, "on one row: {scene_at:?} {file_at:?}");
         assert!(file_at.min.x > scene_at.max.x + 100.0, "the file name far right of the scene's: {scene_at:?} {file_at:?}");
+    }
+
+    /// **The path and the tabs stay in their room** (user 2026-11-21: inside
+    /// a symbol, with several files open, they ran over the zoom controls):
+    /// given 420 points, a three-deep symbol path and six file tabs take no
+    /// more, the tabs scrolling and the path kept at its end.
+    #[test]
+    fn a_deep_path_and_many_tabs_stay_inside_the_row() {
+        let mut d = MenuDrive::new();
+        for _ in 0..5 {
+            d.app.open_document_in_new_tab(crate::editor::Editor::build_new_document(&buzz_ui::DocumentSetup::default()));
+        }
+        let mut path = Vec::new();
+        d.app.editor.doc.edit("Symbols", |scene| {
+            for name in ["shirtFront 3 with a long name", "rajuFaceFront 4 the head", "man3MouthFront 4 the mouth"] {
+                path.push(scene.add_symbol(name, buzz_scene::SymbolKind::Graphic, None));
+            }
+        });
+        d.app.editor.doc.edit_view(|scene| {
+            for id in &path {
+                scene.enter_symbol(*id);
+            }
+        });
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut used = 0.0;
+        for frame in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 200.0))),
+                time: Some(f64::from(frame) / 60.0),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let row = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(420.0, 32.0));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                    let mut commands = Vec::new();
+                    let _ = d.app.breadcrumb_then_tabs(ui, &mut commands, true);
+                    used = ui.min_rect().right() - row.left();
+                });
+            });
+        }
+        assert!(used <= 421.0, "the path and tabs took {used} of 420 points");
     }
 
     /// **D2: several documents, as tabs.** File ▸ New opens a second tab
@@ -31539,6 +31715,58 @@ mod layer_rig_ui_tests {
     /// head"), and coming back out finds the body's as it was; a symbol
     /// elsewhere has its own list too. Clicking something that is not a head
     /// keeps the Rig Head section on the head it was on.
+    /// **A character opened from the stage shows its own rig** (user
+    /// 2026-11-21, the shirt character: "all my rig vanished and was
+    /// reset"): the stage seen first, then the character opened — its slots
+    /// are there, every time it is opened again, and after a restart. The
+    /// stage is outside every symbol, and its empty list used to be carried
+    /// into the character as if into a part of it.
+    #[test]
+    fn a_character_opened_from_the_stage_shows_its_own_rig() {
+        let filled = |slots: &[Option<buzz_scene::ObjectId>]| -> Vec<(usize, buzz_scene::ObjectId)> {
+            slots.iter().enumerate().filter_map(|(i, s)| s.map(|id| (i, id))).collect()
+        };
+        let dir = tempfile::tempdir().expect("dir");
+        let film = dir.path().join("film.buzz");
+        let mut app = App::new(GpuPreference::Automatic);
+        let parts = three_parts(&mut app);
+        let mut character = None;
+        app.editor.doc.edit("Character", |scene| {
+            character = Some(scene.add_symbol("Shirt", buzz_scene::SymbolKind::Graphic, None));
+        });
+        let character = character.unwrap();
+        app.editor.doc.save_as(&film).expect("saved");
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        let _ = painted_text(&mut app);
+        app.editor.doc.edit_view(|scene| {
+            scene.enter_symbol(character);
+        });
+        let _ = painted_text(&mut app);
+        app.editor.rig_panel.slots = parts.clone();
+        let _ = painted_text(&mut app);
+        for round in 0..2 {
+            app.editor.doc.edit_view(|scene| {
+                scene.edit_document();
+            });
+            let _ = painted_text(&mut app);
+            assert!(app.editor.rig_panel.slots.iter().all(Option::is_none), "the stage has its own list (round {round})");
+            app.editor.doc.edit_view(|scene| {
+                scene.enter_symbol(character);
+            });
+            let _ = painted_text(&mut app);
+            assert_eq!(filled(&app.editor.rig_panel.slots), filled(&parts), "opened again, its rig is there (round {round})");
+        }
+
+        let mut again = App::new(GpuPreference::Automatic).with_document(buzz_doc::Document::open(&film).expect("opened"));
+        again.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        let _ = painted_text(&mut again);
+        again.editor.doc.edit_view(|scene| {
+            scene.enter_symbol(character);
+        });
+        let _ = painted_text(&mut again);
+        assert_eq!(filled(&again.editor.rig_panel.slots), filled(&parts), "after a restart, from the stage, too");
+    }
+
     /// **The rig stays, body and head** (user 2026-11-21: "when I rig a
     /// character, the rig stays there be it body or head, it shall not
     /// reset"): the slots filled on the stage and in a head are there again
@@ -32900,6 +33128,8 @@ struct TalkRangeDialog {
     first: u32,
     last: u32,
     who: Vec<(String, bool)>,
+    /// Who they talk to: `None`, the nearest character (the default).
+    talks_to: Option<String>,
 }
 
 /// A talking command waiting to run over the talk ranges while Rhubarb
@@ -33143,6 +33373,77 @@ mod tool_follow_tests {
         frame(&mut app, vec![press(at, false)]);
         assert_eq!(buzz_ui::screen_color::take(swatch).map(|c| c.to_rgba8()), Some(green.to_rgba8()), "picked off the locked layer");
         assert!(app.dropper_pick.is_none());
+    }
+
+    /// **Opening a colour picker with the Brush or the Paint Bucket arms the
+    /// eyedropper** (user 2026-11-21): a click on the artwork sends the colour
+    /// seen there to that swatch, the tool stays in hand and paints nothing
+    /// on that click. With another tool in hand opening a picker arms nothing;
+    /// and a click elsewhere (in the picker) puts the armed dropper away.
+    #[test]
+    fn opening_a_picker_with_the_brush_arms_the_eyedropper() {
+        use buzz_ui::ToolId;
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                time: Some(t),
+                ..Default::default()
+            };
+            let mut area = egui::Rect::NOTHING;
+            let _ = ctx.run_ui(input, |ui| {
+                area = app.build_ui(ui);
+            });
+            area
+        };
+        let area = frame(&mut app, vec![]);
+        let at = area.center();
+        let under = app.editor.screen_to_edit(buzz_geom::Point::new((at.x - area.min.x) as f64, (at.y - area.min.y) as f64));
+        let red = peniko::Color::from_rgba8(0xC0, 0x20, 0x30, 255);
+        app.editor.apply(ToolAction::AddShape {
+            shape: buzz_scene::ShapeData::filled(buzz_geom::Shape::to_path(&buzz_geom::Rect::from_center_size(under, (80.0, 80.0)), 0.1), red),
+            label: "Draw",
+        });
+        let shapes = app.editor.scene().shape_count();
+        let swatch = egui::Id::new("the-brush-fill-swatch");
+        let press = |at: egui::Pos2, pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+
+        // Another tool: opening a picker arms nothing.
+        app.editor.run(Command::SelectTool(ToolId::Selection));
+        buzz_ui::screen_color::offer(&ctx, swatch);
+        frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+        assert!(app.dropper_pick.is_none(), "the Selection tool keeps the stage");
+
+        // The Brush: armed; a click takes the red for the swatch.
+        app.editor.run(Command::SelectTool(ToolId::Brush));
+        buzz_ui::screen_color::offer(&ctx, swatch);
+        frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+        assert!(app.dropper_pick.is_some(), "the eyedropper is armed with the Brush");
+        frame(&mut app, vec![press(at, true)]);
+        frame(&mut app, vec![press(at, false)]);
+        let got = buzz_ui::screen_color::take(swatch).map(|c| c.to_rgba8());
+        assert_eq!(got.map(|c| (c.r, c.g, c.b)), Some((0xC0, 0x20, 0x30)), "the swatch gets the red");
+        assert!(app.dropper_pick.is_none(), "put away after the pick");
+        assert_eq!(app.editor.tool(), ToolId::Brush, "the Brush stays in hand");
+        assert_eq!(app.editor.scene().shape_count(), shapes, "and painted nothing on the pick");
+
+        // The Paint Bucket: armed; a click off the stage (the picker) lets go.
+        app.editor.run(Command::SelectTool(ToolId::PaintBucket));
+        buzz_ui::screen_color::offer(&ctx, swatch);
+        frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+        assert!(app.dropper_pick.is_some(), "armed with the Paint Bucket");
+        let off = egui::pos2(area.min.x - 5.0, area.min.y + 5.0);
+        frame(&mut app, vec![egui::Event::PointerMoved(off), press(off, true)]);
+        frame(&mut app, vec![press(off, false)]);
+        assert!(app.dropper_pick.is_none(), "a click elsewhere puts it away");
+        assert!(buzz_ui::screen_color::take(swatch).is_none(), "and picks nothing");
     }
 
     /// **A swatch's Pick is the eyedropper on the stage** (user 2026-11-17:
@@ -33839,6 +34140,60 @@ mod talk_range_tests {
         (app, ramesh, sita)
     }
 
+    /// **Talks to** (user 2026-11-21): a range marked "Ramesh talks to Sita"
+    /// turns Ramesh's eyes to Sita though Gopal stands nearer; a range left
+    /// on the default turns them to the nearest, Gopal. The ruler says who.
+    #[test]
+    fn a_talk_range_turns_the_eyes_to_who_it_names_else_the_nearest() {
+        let mut scene = buzz_scene::Scene::default();
+        let mut next = 90_000u64;
+        let mut place = |scene: &mut buzz_scene::Scene, name: &str, x: f64| {
+            let symbol = scene.add_symbol(name, buzz_scene::SymbolKind::Graphic, None);
+            next += 1;
+            let face = buzz_scene::Object::shape(
+                buzz_scene::ObjectId(next),
+                buzz_scene::ShapeData::filled(buzz_geom::Shape::to_path(&buzz_geom::Rect::new(-30.0, -200.0, 30.0, 0.0), 1e-9), peniko::Color::BLACK),
+            );
+            scene.library_mut().update(symbol, |s| {
+                let first = s.layers.iter().next().unwrap().id;
+                s.layers.update(first, |l| {
+                    l.name = "head".into();
+                    l.frames.set_objects(0, vec![std::sync::Arc::new(face)]);
+                });
+            });
+            let layer = scene.add_layer(name, buzz_scene::LayerKind::Normal);
+            let id = scene.next_object_id();
+            scene.add_object_at(layer, 0, buzz_scene::Object::instance_of(id, symbol).with_transform(buzz_geom::Affine::translate((x, 600.0))));
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(99);
+            });
+        };
+        place(&mut scene, "Ramesh", 500.0);
+        place(&mut scene, "Gopal", 300.0);
+        place(&mut scene, "Sita", 1400.0);
+        let mut app = App::new(GpuPreference::Automatic).with_document(Document::new(scene));
+        app.editor.mark_talk_range_to(10, 30, vec!["Ramesh".into()], Some("Sita".into()));
+        app.editor.mark_talk_range(40, 60, vec!["Ramesh".into()]);
+        assert_eq!(app.talk_range_bands()[0].label, "Ramesh \u{2192} Sita", "the ruler says who");
+        const LOOKS: &str = r#"
+            var end = parseInt(prompt("Confirm the END frame number for the talking range:", "0"), 10);
+            var t = fl.getDocumentDOM().getTimeline();
+            var l = fl.buzzAnimate.listener();
+            t.addNewLayer("look " + t.currentFrame + " " + (l ? (l.dx > 0 ? "right" : "left") : "none"));
+        "#;
+        let pending = PendingTalkRanges {
+            name: "talk".into(),
+            source: LOOKS.into(),
+            ranges: app.editor.talk_ranges_here().into_iter().map(|(_, r)| r.clone()).collect(),
+            note: None,
+        };
+        app.talk_ranges_run(pending, None, None);
+        let mut looks: Vec<String> = app.editor.doc.scene().layers().iter().map(|l| l.name.clone()).filter(|n| n.starts_with("look ")).collect();
+        looks.sort();
+        assert_eq!(looks, vec!["look 10 right", "look 40 left"], "Sita on the right when named, else Gopal, the nearest");
+        assert_eq!(app.editor.script_listener, None, "let go after the run");
+    }
+
     /// A stand-in for autoTalkingAnimation: asks for its end frame, and
     /// leaves a layer saying who it ran on and over which frames.
     const TALKING: &str = r#"
@@ -34075,4 +34430,7 @@ mod cast_window_tests {
         assert!(app.editor.cast_panel.add_pose.is_none(), "Cancel closes it");
     }
 }
+
+
+
 

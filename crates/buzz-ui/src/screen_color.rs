@@ -39,6 +39,24 @@ pub fn dropper_request(ctx: &egui::Context) -> Option<Id> {
     ctx.data_mut(|d| d.remove_temp::<Option<Id>>(dropper_key())).flatten()
 }
 
+/// **A swatch's picker was just opened** (user 2026-11-21: "when I select
+/// the brush or paint bucket and click the choose-a-colour panel, the
+/// eyedropper shall automatically get active"): the shell arms the stage
+/// eyedropper for `target` when the tool in hand paints with a colour.
+pub fn offer(ctx: &egui::Context, target: Id) {
+    ctx.data_mut(|d| d.insert_temp(offer_key(), Some(target)));
+    ctx.request_repaint();
+}
+
+/// The swatch whose picker was opened this frame, once — for the shell.
+pub fn dropper_offer(ctx: &egui::Context) -> Option<Id> {
+    ctx.data_mut(|d| d.remove_temp::<Option<Id>>(offer_key())).flatten()
+}
+
+fn offer_key() -> Id {
+    Id::new("screen-color-dropper-offer")
+}
+
 fn dropper_key() -> Id {
     Id::new("screen-color-dropper-request")
 }

@@ -1253,6 +1253,13 @@
     lineEnd: function (frame) { return host.dialogueLineEnd(Number(frame)); },
     // Lip sync the selected mouth from `start` to `end` once the command ends.
     lipSync: function (start, end) { host.requestLipSync(Number(start), Number(end)); },
+    // Which way the selected character's eyes turn to look at the one it is
+    // talking to (the nearest other character on the stage), in its head:
+    // { dx, dy }, a unit vector, x right and y down. null: nobody else there.
+    listener: function () {
+      var v = host.listenerDirection();
+      return (v && v.length === 2) ? { dx: Number(v[0]), dy: Number(v[1]) } : null;
+    },
   };
 
   globalThis.fl = fl;

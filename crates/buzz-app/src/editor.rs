@@ -205,6 +205,16 @@ pub struct SpecksRequest {
 pub struct Editor {
     pub doc: Document,
     pub camera: Camera,
+    /// **What the colour picker reads the stage with**: a GPU renderer of its
+    /// own and a draw cache, made the first time a colour is picked
+    /// ([`Self::seen_color_at`]). `Err` once one could not be made — the
+    /// picker then reads the artwork's paint instead.
+    seen: Option<Result<SeenSampler, ()>>,
+    /// The level of detail the stage was last drawn at (its lighting and
+    /// shadows), set by the window after each stage draw, so the colour
+    /// picker reads the stage at the same level: a busy frame the stage draws
+    /// without its cast shadows is picked without them too. `None`: full.
+    pub stage_detail: Option<buzz_render::document::LightDetail>,
     pub selection: Selection,
     pub style: DrawStyle,
     /// `style` with `brush.size` and `eraser_size` converted to a fixed
@@ -522,6 +532,10 @@ pub struct Editor {
     /// what a talking command (Shift+A) runs over while there are some. Kept
     /// with the tab, never saved.
     pub talk_ranges: Vec<TalkRange>,
+    /// Who the next script run's character looks at, when a talk range
+    /// names one (`TalkRange::talks_to`); `None`, the nearest. Set and
+    /// cleared around each run over the talk ranges.
+    pub script_listener: Option<ObjectId>,
     /// L1 of `docs/LAYER_MANAGEMENT_PLAN.md`: the layer filter's emptiness
     /// cache (measured once per scene revision) and the last rows it hid.
     pub layer_rows: buzz_ui::LayerRowCache,
@@ -767,6 +781,10 @@ pub struct TalkRange {
     pub start: u32,
     pub end: u32,
     pub who: Vec<String>,
+    /// **Talks to** (user 2026-11-21): the character the talkers look at,
+    /// as a [`crate::scene_life::Talker::name`]. `None`, the default: the
+    /// nearest other character on the stage.
+    pub talks_to: Option<String>,
 }
 
 /// **D2: the half of `Editor` that belongs to one open document**, not to the
@@ -872,6 +890,8 @@ impl Editor {
         let mut editor = Self {
             doc,
             camera,
+            seen: None,
+            stage_detail: None,
             selection,
             tool_style: style.clone(),
             style,
@@ -943,6 +963,7 @@ impl Editor {
             scrub_frame: None,
             ruler_marks: Vec::new(),
             talk_ranges: Vec::new(),
+            script_listener: None,
             layer_rows: buzz_ui::LayerRowCache::default(),
             layer_search: String::new(),
             focus_seen: None,
@@ -3669,7 +3690,17 @@ impl Editor {
                 // groups — an imported file is all instances, so the old
                 // top-level-shape-only check sampled nothing. A gradient is taken
                 // as the one colour it stands for rather than loading the ramp.
-                if let Some((color, is_fill)) = self.sampled_paint_at(point) {
+                // **What is seen at the tip** (`picked_at`), the point carried
+                // back out of the open timeline and the shot to the stage.
+                let screen = self
+                    .edit_to_stage()
+                    .map_point(point)
+                    .map(|stage| self.camera.doc_to_screen(stage));
+                let picked = match screen {
+                    Some(screen) => self.picked_at(screen, true),
+                    None => self.sampled_paint_at(point),
+                };
+                if let Some((color, is_fill)) = picked {
                     if is_fill {
                         self.style.fill_color = color;
                         self.style.fill_enabled = true;
@@ -4640,6 +4671,77 @@ impl Editor {
     /// layer walk, so it samples exactly what a click would select into.
     pub fn sampled_paint_at(&self, point: Point) -> Option<(Color, bool)> {
         self.sampled_paint_at_with(point, false)
+    }
+
+    /// **The colour the stage shows at `screen`** (a point on the stage, in
+    /// its own logical pixels) — exactly the pixel under the picker's tip
+    /// (user 2026-11-21: "the color picker is not picking up right colors").
+    ///
+    /// It used to read the paint stored in the artwork there, which is not
+    /// what is seen: a symbol's tint, brightness or alpha, a half-clear shape
+    /// over another, a layer faded, a gradient, a bitmap, lighting — and the
+    /// Eyedropper passed locked layers by, so on a locked background it
+    /// picked nothing or whatever unlocked thing was in front. Now the stage
+    /// is drawn once more through its own encode, for a one-pixel view at the
+    /// tip, at the zoom and turn it is shown at, and that pixel is the colour.
+    /// `None` when no GPU renderer could be made here.
+    pub fn seen_color_at(&mut self, screen: Point) -> Option<Color> {
+        if self.seen.is_none() {
+            self.seen = Some(SeenSampler::new().map_err(|e| tracing::warn!("the colour picker cannot read the stage ({e:#}); it reads the artwork's paint")));
+        }
+        let Some(Ok(mut sampler)) = self.seen.take() else {
+            self.seen = Some(Err(()));
+            return None;
+        };
+        // A small patch around the tip, its middle pixel centred on it: a
+        // one-pixel target is below the rasteriser's tile and drew a shape
+        // much larger than it (the stage itself) only partly.
+        const PATCH: u32 = 17;
+        let doc = self.camera.screen_to_doc(screen);
+        let view = self.camera;
+        let side = f64::from(PATCH);
+        self.camera = Camera { center: doc, viewport: Size::new(side, side), ..view };
+        let mut vello = buzz_render::vello::Scene::new();
+        buzz_render::vello_encoding::set_scale_for_this_thread(sampler.exporter.buffer_scale());
+        // The stage's own level of detail, held: a 17-pixel patch would
+        // otherwise climb to full detail and show shadows the stage dropped.
+        sampler.cache.pin_detail(Some(self.stage_detail.unwrap_or(buzz_render::document::LightDetail::Full)));
+        // Judged against the stage's real size, not the patch's: the encode
+        // weighs its artwork against the pixels it covers, and against a
+        // 17-pixel patch a busy frame reads as far over budget and is drawn
+        // at a lower level of detail than the stage shows.
+        let judged = buzz_geom::Rect::new(0.0, 0.0, view.viewport.width.max(side), view.viewport.height.max(side));
+        crate::stage::build_scene(&mut vello, self, judged, 1.0, &mut sampler.cache);
+        self.camera = view;
+        // Off the stage is the pasteboard, which the window paints grey.
+        let pasteboard = Color::from_rgba8(0x80, 0x80, 0x80, 0xFF);
+        let picked = sampler.exporter.render_scene(&vello, PATCH, PATCH, pasteboard).ok().map(|f| {
+            let [r, g, b, _] = f.pixel(PATCH / 2, PATCH / 2);
+            Color::from_rgba8(r, g, b, 0xFF)
+        });
+        self.seen = Some(Ok(sampler));
+        picked
+    }
+
+    /// **What a click of the colour picker at `screen` takes**: the colour
+    /// seen there ([`Self::seen_color_at`]), as a fill or a stroke by what
+    /// the artwork under it is (a stroke when the tip is on one — strokes
+    /// are drawn over their fills). With no GPU renderer, the paint the
+    /// artwork stores. `locked`: locked layers count when telling fill from
+    /// stroke, as they are seen.
+    pub fn picked_at(&mut self, screen: Point, locked: bool) -> Option<(Color, bool)> {
+        let point = self.screen_to_edit(screen);
+        let paint = self.sampled_paint_at_with(point, locked);
+        // Off the stage, with no artwork there, is the pasteboard: nothing
+        // to pick.
+        let on_stage = self.doc.scene().stage().stage_rect().contains(self.camera.screen_to_doc(screen));
+        if paint.is_none() && !on_stage {
+            return None;
+        }
+        match self.seen_color_at(screen) {
+            Some(colour) => Some((colour, paint.is_none_or(|(_, fill)| fill))),
+            None => paint,
+        }
     }
 
     /// [`Self::sampled_paint_at`], and with `locked` from locked layers and
@@ -9537,6 +9639,16 @@ impl Editor {
             // Measured only for a command that asks (`fl.buzzAnimate`): the
             // shelf's one-key commands run on every press of a key.
             dialogue: source.contains("buzzAnimate").then(|| self.script_dialogue()).flatten(),
+            // Who the selected character is talking to, for a talking
+            // command's eyes (`fl.buzzAnimate.listener()`).
+            listener: source
+                .contains("buzzAnimate")
+                .then(|| {
+                    let mut ids = self.selection.iter();
+                    let one = ids.next().filter(|_| ids.next().is_none())?;
+                    crate::look_at::listener_direction_to(self.doc.scene(), one, self.script_listener, self.current_frame)
+                })
+                .flatten(),
             lip_sync: None,
             master_audio: self.script_master_audio(),
         };
@@ -13397,11 +13509,18 @@ impl Editor {
 
     /// **Mark a talk range**: frames `start..=end` of this scene for `who`.
     pub fn mark_talk_range(&mut self, start: u32, end: u32, who: Vec<String>) {
+        self.mark_talk_range_to(start, end, who, None);
+    }
+
+    /// [`Self::mark_talk_range`], the talkers looking at `talks_to` (a
+    /// character's name; `None`, the nearest one).
+    pub fn mark_talk_range_to(&mut self, start: u32, end: u32, who: Vec<String>, talks_to: Option<String>) {
         let (start, end) = (start.min(end), start.max(end));
         let names = who.join(", ");
-        self.talk_ranges.push(TalkRange { scene: self.doc.active_scene(), start, end, who });
+        let to = talks_to.as_ref().map(|t| format!(", talking to {t}")).unwrap_or_default();
+        self.talk_ranges.push(TalkRange { scene: self.doc.active_scene(), start, end, who, talks_to });
         self.status = Some(format!(
-            "Talk range {}\u{2013}{} marked for {names}; Shift+A runs over every range marked",
+            "Talk range {}\u{2013}{} marked for {names}{to}; Shift+A runs over every range marked",
             start + 1,
             end + 1
         ));
@@ -18003,16 +18122,18 @@ fn sampled_paint(
 
     match &object.kind {
         ObjectKind::Shape(shape) => {
-            if let Some(fill) = &shape.fill
-                && buzz_geom::hit::fill_contains(&shape.path, local, buzz_geom::FillMode::NonZero)
-            {
-                return Some((fill.color(), true));
-            }
+            // The stroke first: it is drawn over the fill, so on its width it
+            // is what is seen.
             if let Some(stroke) = &shape.stroke {
                 let width = if stroke.hairline { 0.0 } else { stroke.width };
                 if buzz_geom::hit::stroke_contains(&shape.path, local, width, tolerance) {
                     return Some((stroke.color(), false));
                 }
+            }
+            if let Some(fill) = &shape.fill
+                && buzz_geom::hit::fill_contains(&shape.path, local, buzz_geom::FillMode::NonZero)
+            {
+                return Some((fill.color(), true));
             }
             None
         }
@@ -18058,6 +18179,22 @@ fn sampled_paint(
         // Posed rig artwork is skipped for now — sampling its deformed fill is
         // recorded as a follow-up.
         ObjectKind::Armature(_) | ObjectKind::Warp(_) => None,
+    }
+}
+
+/// The colour picker's own view of the stage: a GPU renderer and the draw
+/// cache its encodes keep (see [`Editor::seen_color_at`]).
+struct SeenSampler {
+    exporter: buzz_export::Exporter,
+    cache: buzz_render::document::DrawCache,
+}
+
+impl SeenSampler {
+    fn new() -> anyhow::Result<Self> {
+        let exporter = buzz_export::Exporter::new(&buzz_render::GpuPreference::Automatic)?;
+        let mut cache = buzz_render::document::DrawCache::new();
+        cache.set_scale(exporter.buffer_scale());
+        Ok(Self { exporter, cache })
     }
 }
 
@@ -32030,6 +32167,60 @@ mod tests {
         assert!(e.status.as_deref().is_some_and(|s| s.contains("camera")), "{:?}", e.status);
         e.run(Command::Undo);
         assert_eq!(e.doc.scene().camera().keys().iter().map(|k| k.frame).collect::<Vec<_>>(), [0, 60]);
+    }
+
+    /// **The colour picker takes the colour that is seen** (user 2026-11-21:
+    /// "the color picker is not picking up right colors"): a symbol tinted
+    /// blue gives its tinted colour, not the red painted inside it; a
+    /// half-clear white over black gives the grey on screen, not white; and a
+    /// locked background is picked too. Each pick a fill.
+    #[test]
+    fn the_colour_picker_takes_what_the_stage_shows() {
+        let mut e = Editor::default();
+        let stage = e.doc.scene().stage().stage_rect();
+        e.camera = Camera::new(stage.center(), 1.0, Size::new(stage.width(), stage.height()));
+        let back = e.doc_add_layer("Back", LayerKind::Normal);
+        let over = e.doc_add_layer("Over", LayerKind::Normal);
+        let mut symbol = None;
+        e.doc.edit("Draw", |scene| {
+            // A locked black background.
+            scene.add_shape(back, ShapeData::filled(Rect::new(0.0, 0.0, 400.0, 400.0).to_path(1e-9), Color::BLACK));
+            scene.update_layer(back, |l| l.locked = true);
+            // Half-clear white over it, on the left.
+            scene.add_shape(over, ShapeData::filled(Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9), Color::from_rgba8(255, 255, 255, 128)));
+            // A red square in a symbol, tinted fully blue, on the right.
+            let sym = scene.add_symbol("Box", buzz_scene::SymbolKind::Graphic, None);
+            let first = scene.library().get(sym).unwrap().layers.iter().next().unwrap().id;
+            let red = Object::shape(ObjectId(scene.next_object_id().0 + 50), ShapeData::filled(Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9), Color::from_rgba8(255, 0, 0, 255)));
+            scene.library_mut().update(sym, |s| {
+                s.layers.update(first, |l| {
+                    l.frames.set_objects(0, vec![Arc::new(red)]);
+                });
+            });
+            let id = scene.next_object_id();
+            let mut placed = Object::instance_of(id, sym).with_transform(Affine::translate((200.0, 0.0)));
+            if let ObjectKind::Instance(i) = &mut placed.kind {
+                i.color = buzz_scene::ColorTransform::tint(Color::from_rgba8(0, 0, 255, 255), 1.0);
+            }
+            scene.add_object_at(over, 0, placed);
+            symbol = Some(sym);
+        });
+        let screen = |e: &Editor, x: f64, y: f64| e.camera.doc_to_screen(Point::new(x, y));
+        let near = |c: Color, want: [u8; 3]| {
+            let c = c.to_rgba8();
+            [c.r, c.g, c.b].iter().zip(want).all(|(a, b)| (i32::from(*a) - i32::from(b)).abs() <= 6)
+        };
+        let Some(_) = e.seen_color_at(screen(&e, 300.0, 300.0)) else {
+            eprintln!("no GPU here: the picker reads the stored paint");
+            return;
+        };
+        let (black, fill) = e.picked_at(screen(&e, 300.0, 300.0), true).unwrap();
+        assert!(near(black, [0, 0, 0]) && fill, "the locked background: {:?}", black.to_rgba8());
+        let (grey, _) = e.picked_at(screen(&e, 50.0, 50.0), true).unwrap();
+        assert!(near(grey, [128, 128, 128]), "half-clear white over black is grey: {:?}", grey.to_rgba8());
+        let (blue, _) = e.picked_at(screen(&e, 250.0, 50.0), true).unwrap();
+        assert!(near(blue, [0, 0, 255]), "the tinted symbol is blue: {:?}", blue.to_rgba8());
+        let _ = symbol;
     }
 
     /// **A stage copy pastes as often as it is needed** (user 2026-11-21):

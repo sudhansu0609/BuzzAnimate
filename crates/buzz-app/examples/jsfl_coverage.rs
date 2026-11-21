@@ -227,6 +227,7 @@ fn main() {
             })),
             overrides: Vec::new(),
             dialogue: None,
+            listener: None,
             lip_sync: None,
             master_audio: None,
         };

@@ -327,7 +327,7 @@ impl RigPanelState {
             return false;
         }
         if self.slots.len() != pattern.slots.len() {
-            self.slots = vec![None; pattern.slots.len()];
+            self.slots.resize(pattern.slots.len(), None);
         }
         self.extra_parts.push(ExtraPart { pattern: self.pattern, name: name.to_string(), parent });
         self.slots.push(None);
@@ -431,8 +431,14 @@ impl RigPanelState {
     /// Fit the slot list to `pattern`, forgetting drawings that are no longer
     /// on offer — one that has been deleted, or that is already inside a rig.
     fn reconcile(&mut self, pattern: &RigPattern, parts: &[LoosePart]) {
+        // **A list one part longer or shorter keeps what is in it** (user
+        // 2026-11-21: "all my rig vanished and was reset"): the pattern's own
+        // slots keep their places and the user's added parts come after
+        // them, so a part added or taken out — here or in another session,
+        // or a list kept before that — only adds or drops empty slots at the
+        // end. It used to empty every slot.
         if self.slots.len() != pattern.slots.len() {
-            self.slots = vec![None; pattern.slots.len()];
+            self.slots.resize(pattern.slots.len(), None);
             self.armed = None;
         }
         let alive = std::mem::take(&mut self.alive);
@@ -1749,20 +1755,26 @@ mod tests {
     /// Changing the pattern changes the number of slots, and the old
     /// assignment means nothing against the new skeleton.
     #[test]
-    fn a_different_pattern_gets_a_fresh_slot_list() {
-        let mut state = RigPanelState {
-            slots: vec![Some(ObjectId(1)); 11],
-            armed: Some(9),
-            ..Default::default()
-        };
-        state.reconcile(&RigPattern::prop(), &[part(1, "base")]);
+    fn a_slot_list_a_part_longer_or_shorter_keeps_what_is_in_it() {
+        // A different skeleton is picked from the dropdown, which empties the
+        // list itself; here the list differs only by the user's added parts
+        // (one added or taken out since it was filled), and must keep its
+        // drawings (user 2026-11-21: "all my rig vanished and was reset").
+        let full = RigPattern::biped_full();
+        let mut short = vec![None; full.slots.len() - 1];
+        short[0] = Some(ObjectId(1));
+        short[5] = Some(ObjectId(2));
+        let mut state = RigPanelState { slots: short, armed: Some(40), ..Default::default() };
+        let parts = [part(1, "hips"), part(2, "shoulder")];
+        state.reconcile(&full, &parts);
+        assert_eq!(state.slots.len(), full.slots.len());
+        assert_eq!((state.slots[0], state.slots[5]), (Some(ObjectId(1)), Some(ObjectId(2))), "kept");
+        assert_eq!(state.armed, None, "a slot that no longer exists stayed armed");
 
-        assert_eq!(state.slots.len(), 3);
-        assert!(state.slots.iter().all(Option::is_none));
-        assert_eq!(
-            state.armed, None,
-            "a slot that no longer exists stayed armed"
-        );
+        state.slots.push(Some(ObjectId(9)));
+        state.reconcile(&full, &parts);
+        assert_eq!(state.slots.len(), full.slots.len(), "a part gone since: its slot goes");
+        assert_eq!((state.slots[0], state.slots[5]), (Some(ObjectId(1)), Some(ObjectId(2))), "the rest stay");
     }
 
     /// A layer stands for the one drawing on it. Two drawings on it is a

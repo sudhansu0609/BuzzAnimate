@@ -63,6 +63,8 @@ pub mod rig_slots;
 pub mod rhubarb;
 pub mod rigging;
 pub mod scene_life;
+pub mod look_at;
+pub mod mouths;
 pub mod sound;
 pub mod split_artwork;
 pub mod split_cache;

@@ -28,6 +28,11 @@ pub fn path() -> PathBuf {
     let workspace = buzz_ui::workspace::workspace_path();
     match workspace.file_stem().and_then(|s| s.to_str()) {
         Some("workspace") | None => workspace.with_file_name("rig_slots.json"),
+        // Tests run side by side in one process: each thread its own file,
+        // so one test's write never overwrites another's.
+        #[cfg(test)]
+        Some(stem) => workspace.with_file_name(format!("{stem}-{:?}-rig_slots.json", std::thread::current().id()).replace(['(', ')'], "")),
+        #[cfg(not(test))]
         Some(stem) => workspace.with_file_name(format!("{stem}-rig_slots.json")),
     }
 }

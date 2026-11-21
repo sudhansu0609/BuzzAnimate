@@ -98,6 +98,27 @@ fn body(ui: &mut Ui, options: &mut TraceOptions, action: &mut TraceDialogAction)
                 ui.add(egui::Slider::new(&mut options.colours, 2..=64))
                     .on_hover_text("How many colours the fills under the ink are reduced to");
                 ui.end_row();
+
+                // **Even lines** (user 2026-11-21: "smoother lines, more
+                // uniform lines after tracing"): the thin ink as smooth
+                // strokes of one width; the dark masses keep their outlines.
+                ui.label("Even lines");
+                ui.horizontal(|ui| {
+                    let mut on = options.even_lines.is_some();
+                    if ui
+                        .checkbox(&mut on, "")
+                        .on_hover_text("Draw the lines as smooth strokes of one width instead of outlines that follow every bump of the picture; dark masses (hair, shadows) stay filled")
+                        .changed()
+                    {
+                        options.even_lines = on.then_some(0.0);
+                    }
+                    if let Some(width) = options.even_lines.as_mut() {
+                        let suffix = if *width <= 0.0 { " (Auto)" } else { " px" };
+                        ui.add(egui::Slider::new(width, 0.0..=12.0).suffix(suffix))
+                            .on_hover_text("Line width. 0 means the drawing's own line weight, measured off the picture");
+                    }
+                });
+                ui.end_row();
             }
 
             if matches!(options.mode, TraceMode::ColourLines | TraceMode::Auto | TraceMode::Both) {

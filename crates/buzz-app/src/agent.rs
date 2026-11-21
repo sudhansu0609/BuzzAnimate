@@ -822,6 +822,7 @@ fn script(app: &mut App, args: &Value) -> AgentResult {
         hooks: Default::default(),
             overrides: Vec::new(),
             dialogue: None,
+            listener: None,
             lip_sync: None,
             master_audio: editor.script_master_audio(),
     };

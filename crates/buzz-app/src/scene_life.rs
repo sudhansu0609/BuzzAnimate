@@ -307,18 +307,18 @@ pub fn hear_dialogue(
     lines.sort_by(|a, b| a.start.total_cmp(&b.start));
     // **Rhubarb's mouths when it is installed**, the same ones Lip Sync and
     // Shift+A write; the built-in reader otherwise.
-    let rhubarb = match crate::rhubarb::binary() {
-        Some(_) => match crate::rhubarb::cues(clip, cancel) {
-            Ok(cues) => Some(crate::rhubarb::keys_closing_silence(&cues, fps, &clip.frame_levels(fps))),
+    // The speech-sound model when it is installed (`crate::mouths`).
+    let rhubarb = if crate::mouths::available() {
+        match crate::mouths::heard_keys(clip, fps, cancel) {
+            Ok(keys) => Some(keys),
             Err(e) => {
-                notes.push(format!("Rhubarb did not run ({e}); the built-in mouth reader was used"));
+                notes.push(format!("{} did not run ({e}); the built-in mouth reader was used", crate::mouths::ear()));
                 None
             }
-        },
-        None => {
-            notes.push("Rhubarb is not installed; the built-in mouth reader was used".to_string());
-            None
         }
+    } else {
+        notes.push("neither the speech-sound model nor Rhubarb is installed; the built-in mouth reader was used".to_string());
+        None
     };
     let visemes = match &rhubarb {
         Some(keys) => track_from_rhubarb(keys, clip.duration_frames(fps), fps),

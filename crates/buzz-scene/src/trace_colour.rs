@@ -2233,6 +2233,10 @@ fn region_path(
 
 /// **Trace `pixels` into colour fills with the ink on top.** Dispatched from
 /// [`crate::trace::trace`] for `TraceMode::InkAndColour`. See the module docs.
+/// Even lines (`TraceOptions::even_lines`): ink within this many pixels of a
+/// mass is that mass's rim and keeps its outline; ink further out is a line.
+const EVEN_MASS_CLEARANCE_PX: f64 = 3.0;
+
 pub(crate) fn trace_ink_and_colour(width: u32, height: u32, pixels: &[u8], options: &TraceOptions) -> TraceReport {
     trace_ink_and_colour_with(width, height, pixels, options, None, None)
 }
@@ -2264,8 +2268,11 @@ pub(crate) fn trace_ink_and_colour_with(
     // The ink the ink stage will actually emit: a dark-red plaid dash or a
     // bangle that it drops as a colour mark must stay a colour here, or it
     // is under-painted away and lost from both stages.
-    let mut ink = grown_ink(&native_ink_mask(&analysis, pixels, w, h, it), &opaque, w, h, ct);
+    let native = native_ink_mask(&analysis, pixels, w, h, it);
+    let mut ink = grown_ink(&native, &opaque, w, h, ct);
     drop(analysis);
+    // Even lines measure a line by the ink as found, before it was grown.
+    let raw_ink = options.even_lines.is_some().then_some(native);
     // A6a. The sheet's paper showing through inside the figure is transparent
     // from here on, like the outside (and A2 below then takes the soft rim
     // round it).
@@ -2463,7 +2470,28 @@ pub(crate) fn trace_ink_and_colour_with(
     let lines = colour_line_shapes(&fc, &painted_ink, w, h, options.line_smooth, it);
 
     // 9. Output: fills first, then the colour lines, the ink on top.
-    let ink_report = trace_ink_with(width, height, pixels, options, Some(&mass_core));
+    // **Even lines** (user 2026-11-21): the thin ink — the ink with the masses
+    // left out — as smooth strokes of one width rather than filled outlines
+    // that follow every bump of the scan. Off, the ink stage as it always was.
+    let ink_report = match options.even_lines {
+        Some(want) => {
+            // The ink as found, before the colour stage grew it (its width is
+            // the line's own), away from the masses: ink touching a mass is
+            // that mass's rim, which the ink stage still outlines smoothly.
+            let raw = raw_ink.unwrap_or_default();
+            let not_mass: Vec<bool> = mass_core.iter().map(|&m| !m).collect();
+            let to_mass = edt(&not_mass, w, h);
+            // The lines run on into a mass (tucked under its rim, so a strand
+            // of hair meets the hair), but only ink clear of every mass is
+            // taken away from the ink stage's outlines.
+            let thin: Vec<bool> = (0..w * h).map(|i| raw.get(i).copied().unwrap_or(false) && opaque[i] && !mass_core[i]).collect();
+            let exclude: Vec<bool> = (0..w * h).map(|i| mass_core[i] || (thin[i] && to_mass[i] > EVEN_MASS_CLEARANCE_PX)).collect();
+            let mut report = trace_ink_with(width, height, pixels, options, Some(&exclude));
+            report.shapes.extend(crate::trace_even::even_strokes(w, h, pixels, &thin, want, options.line_smooth, options.min_line_length));
+            report
+        }
+        None => trace_ink_with(width, height, pixels, options, Some(&mass_core)),
+    };
     let n_fills = fills.len();
     let n_lines = lines.len();
     let n_ink = ink_report.shapes.len();
@@ -2546,6 +2574,29 @@ mod tests {
             }
         }
         (W as u32, H as u32, pixels)
+    }
+
+    /// **Even lines** (user 2026-11-21: "smoother lines, more uniform lines
+    /// after tracing"): the 3 px outlines round the disc and the square come
+    /// out as strokes, every one of one width near the drawing's own, over
+    /// the same colour fills; off, the ink is filled outlines as before.
+    #[test]
+    fn even_lines_draw_the_ink_as_strokes_of_one_width() {
+        let (w, h, pixels) = disc_and_square_png();
+        let plain = trace_ink_and_colour(w, h, &pixels, &TraceOptions::ink_colour());
+        assert!(plain.shapes.iter().all(|s| s.stroke.is_none()), "off: no strokes");
+        let even = trace_ink_and_colour(w, h, &pixels, &TraceOptions { even_lines: Some(0.0), ..TraceOptions::ink_colour() });
+        assert_eq!(even.fills, plain.fills, "the same colour fills");
+        let widths: Vec<f64> = even.shapes.iter().filter_map(|s| s.stroke.as_ref().map(|k| k.width)).collect();
+        assert!(widths.len() >= 2, "the outlines are strokes: {}", even.message);
+        assert!(widths.windows(2).all(|p| (p[0] - p[1]).abs() < 1e-9), "one width: {widths:?}");
+        assert!((1.5..=4.5).contains(&widths[0]), "near the drawing's 3 px: {}", widths[0]);
+        for shape in &even.shapes {
+            assert!(finite(&shape.path));
+        }
+        // A width asked for is the width given.
+        let asked = trace_ink_and_colour(w, h, &pixels, &TraceOptions { even_lines: Some(5.0), ..TraceOptions::ink_colour() });
+        assert!(asked.shapes.iter().filter_map(|s| s.stroke.as_ref()).all(|k| (k.width - 5.0).abs() < 1e-9));
     }
 
     #[test]

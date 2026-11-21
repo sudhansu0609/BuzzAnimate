@@ -148,6 +148,10 @@ pub fn write_viseme_keys(
         for ((frame, slot, chart_frame), id) in shown.iter().zip(&ids) {
             let at = sound_start + frame;
             target.frames.insert_keyframe(at);
+            // A mouth shape is shown, never tweened into the next, as
+            // Animate's Lip Sync keys them: a tween the layer had here would
+            // otherwise run on through the new key (F6 splits a tween).
+            target.frames.set_tween(at, buzz_scene::Tween::default());
             let mut instance = SymbolInstance::new(mouth);
             instance.first_frame = *chart_frame;
             instance.loop_mode = buzz_scene::LoopMode::SingleFrame;
@@ -175,7 +179,7 @@ pub fn write_viseme_keys(
         keyframes: shown.len() as u32,
         frames: length,
         silent,
-        message: format!("Lip sync (Rhubarb): {} keyframes over {} frames", shown.len(), length),
+        message: format!("Lip sync: {} keyframes over {} frames", shown.len(), length),
     }
 }
 
@@ -230,6 +234,8 @@ pub fn write_track(
         for ((start, viseme, _), id) in runs.iter().zip(&ids) {
             let frame = sound_start + start;
             target.frames.insert_keyframe(frame);
+            // Shown, not tweened (see `write_viseme_keys`).
+            target.frames.set_tween(frame, buzz_scene::Tween::default());
 
             let mut instance = SymbolInstance::new(mouth);
             // The viseme *is* the frame of the mouth symbol. A graphic symbol
@@ -439,6 +445,38 @@ mod tests {
             shapes_seen.len() > 1,
             "the mouth should change shape, saw {shapes_seen:?}"
         );
+    }
+
+    /// **The mouth is shown, never tweened**, as Animate's Lip Sync keys it:
+    /// a classic tween the mouth layer already had over the line does not
+    /// run on through the shapes written there (user 2026-11-21, after a key
+    /// put inside a tween came to split it).
+    #[test]
+    fn lip_sync_keys_carry_no_tween_from_the_layer() {
+        let (mut scene, layer, mouth) = document();
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(60);
+            l.frames.insert_keyframe(60);
+            l.frames.set_tween(0, buzz_scene::Tween::classic());
+        });
+        let keys = [(2u32, 1usize), (6, 3), (11, 0), (15, 5)];
+        let chart = [0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        write_viseme_keys(&mut scene, &keys, 20, 10, layer, mouth, Affine::IDENTITY, &chart);
+        let frames = &scene.layers().get(layer).unwrap().frames;
+        for (at, _) in keys {
+            let key = frames.keyframes().iter().find(|k| k.start == 10 + at).expect("a mouth key");
+            assert!(!key.tween.is_active(), "the shape on frame {} is tweened", 10 + at + 1);
+        }
+
+        let (mut scene, layer, mouth) = document();
+        scene.update_layer(layer, |l| {
+            l.frames.insert_frame(60);
+            l.frames.insert_keyframe(60);
+            l.frames.set_tween(0, buzz_scene::Tween::classic());
+        });
+        apply(&mut scene, &dialogue_clip(), 5, layer, mouth, Affine::IDENTITY, &LipSyncOptions::default()).expect("lip sync");
+        let frames = &scene.layers().get(layer).unwrap().frames;
+        assert!(frames.keyframes().iter().filter(|k| k.start >= 5 && k.start < 60).all(|k| !k.tween.is_active()), "no shape tweened");
     }
 
     /// Keyframes go where the sound is, not at frame zero: dialogue starting

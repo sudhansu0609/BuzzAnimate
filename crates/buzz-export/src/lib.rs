@@ -312,6 +312,35 @@ impl Exporter {
         self.lights = lights;
     }
 
+    /// **Render a scene someone else built** — the stage's own encode, say
+    /// — into a `width`×`height` image on `background`, and read it back.
+    /// What the colour picker uses to read the one pixel under its tip
+    /// exactly as the stage draws it (user 2026-11-21: "the color picker is
+    /// not picking up right colors").
+    pub fn render_scene(
+        &mut self,
+        vello_scene: &buzz_render::vello::Scene,
+        width: u32,
+        height: u32,
+        background: Color,
+    ) -> Result<Frame> {
+        if width == 0 || height == 0 {
+            bail!("a render needs a width and a height");
+        }
+        self.ensure_target(width, height)?;
+        let target = self.target.as_ref().expect("target just ensured");
+        self.gpu
+            .render(vello_scene, &target.view, width, height, background)
+            .context("rendering the scene")?;
+        self.read_back(false)
+    }
+
+    /// The buffer scale this exporter's GPU renders at, for a caller that
+    /// encodes its own scene ([`Self::render_scene`]) against the same budget.
+    pub fn buffer_scale(&self) -> u32 {
+        self.gpu.buffer_scale
+    }
+
     /// Render one frame.
     pub fn render(
         &mut self,

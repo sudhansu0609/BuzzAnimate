@@ -358,6 +358,9 @@ pub(crate) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<State>>) -> JsResult<()>
             .and_then(|d| crate::line_end(d, frame.max(0) as u32, pause))
             .map_or(-1, |f| f as i32))
     });
+    host_fn!(ctx, host, state, "listenerDirection", |state| {
+        Ok(state.borrow().context.listener.map_or_else(Vec::new, |(x, y)| vec![x, y]))
+    });
     host_fn!(ctx, host, state, "requestLipSync", |state, start: i32, end: i32| {
         if start < 0 || end <= start {
             return Err(throw("lipSync needs a start frame and a later end frame"));

@@ -1815,6 +1815,9 @@ pub struct App {
     /// The panel open from the icon strip (`Workspace::icon_strip`), and the
     /// icon it opened from, which it is drawn beside.
     strip_flyout: Option<(buzz_ui::PanelId, egui::Rect)>,
+    /// A First Frame being set in Properties: the frame, and every selected
+    /// instance's timing from before — matched inside once the pointer lets go.
+    retime_pending: Option<(u32, Vec<(buzz_scene::ObjectId, u32, buzz_scene::LoopMode)>)>,
     /// The menus in the macOS menu bar, once built. See `native_menu`.
     #[cfg(target_os = "macos")]
     native_menu: Option<crate::native_menu::NativeMenu>,
@@ -2104,6 +2107,7 @@ impl App {
             tasks: crate::tasks::TaskRegistry::default(),
             dock_rects: Vec::new(),
             strip_flyout: None,
+            retime_pending: None,
             #[cfg(target_os = "macos")]
             native_menu: None,
             #[cfg(target_os = "macos")]
@@ -7712,11 +7716,34 @@ impl App {
                 let style = &mut editor.style;
                 let view = &mut editor.view;
                 let thumbnails = &mut self.thumbnails;
+                let timing = crate::editor::timing_of(editor.doc.scene(), at.frame, &selection.ids());
                 editor.doc.edit("Document Properties", |scene| {
                     panels::properties_panel_with(ui, scene, selection, style, view, at, &mut |symbol, frame| {
                         thumbnails.get_frame(symbol, frame)
                     });
                 });
+                // **A First Frame set here carries into the symbols inside**
+                // (user 2026-11-22), once it is set: dragging the number runs
+                // through every frame on the way, which must not each key the
+                // symbols inside. The timing from before the edit is kept
+                // until the pointer lets go, then compared.
+                let now = crate::editor::timing_of(editor.doc.scene(), at.frame, &editor.selection.ids());
+                if now != timing && self.retime_pending.is_none() {
+                    self.retime_pending = Some((at.frame, timing));
+                }
+                if !ui.input(|i| i.pointer.any_down())
+                    && let Some((frame, before)) = self.retime_pending.take()
+                    && frame == at.frame
+                {
+                    let editor = &mut self.editor;
+                    let mut matched = 0;
+                    editor.doc.edit("Match Frames Inside", |scene| {
+                        matched = crate::editor::match_inside_retimed(scene, frame, &before);
+                    });
+                    if matched > 0 {
+                        editor.status = Some(format!("{matched} symbol(s) inside set to the same frame"));
+                    }
+                }
 
                 // A text object gets its editor here — and in Tool Options with
                 // the Text tool in hand: see `text_editor`.

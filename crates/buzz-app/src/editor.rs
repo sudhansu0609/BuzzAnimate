@@ -16098,7 +16098,16 @@ impl Editor {
 
         let mut report = None;
         let mut renumbered = 0usize;
+        // **A symbol pasted starts on the frame it is pasted on**, its First
+        // Frame that frame's number (user 2026-11-22). Pasted partway into a
+        // keyframe's span it joined that keyframe — appearing from its start
+        // and reading that start's number — so the layer is keyed here
+        // first, carrying on, so the frames before look as they did.
+        let has_symbols = lifted.layers().iter().any(|l| l.frames.keyframes().iter().any(|k| k.objects.iter().any(|o| o.instance().is_some())));
         self.doc.edit(label, |scene| {
+            if has_symbols {
+                scene.ensure_keyframe(layer, frame);
+            }
             report = Some(scene.merge(
                 &lifted,
                 buzz_scene::ImportTarget::Onto {
@@ -17777,6 +17786,40 @@ fn instance_timing(scene: &Scene, frame: u32) -> std::collections::HashMap<Objec
         .collect()
 }
 
+/// The First Frame and Looping of each of `ids` standing at `frame`, to see
+/// after the Properties panel which ones it re-timed.
+pub(crate) fn timing_of(scene: &Scene, frame: u32, ids: &[ObjectId]) -> Vec<(ObjectId, u32, buzz_scene::LoopMode)> {
+    ids.iter()
+        .filter_map(|id| scene.find_object_at(frame, *id).and_then(|(_, o)| o.instance().map(|i| (*id, i.first_frame, i.loop_mode))))
+        .collect()
+}
+
+/// **A First Frame typed in Properties carries inside** (user 2026-11-22:
+/// "if I set the frame number of the main symbols, those in it shall match
+/// the same frame number"): each of `before` whose First Frame or Looping
+/// changed has the symbols inside it set to the frame it now shows at
+/// `frame`, as F and Paste do ([`match_frames_inside`]). How many changed.
+pub(crate) fn match_inside_retimed(scene: &mut Scene, frame: u32, before: &[(ObjectId, u32, buzz_scene::LoopMode)]) -> usize {
+    let mut retimed: Vec<(buzz_scene::SymbolId, u32)> = Vec::new();
+    for (id, first, looping) in before {
+        let Some((layer, object)) = scene.find_object_at(frame, *id) else { continue };
+        let Some(instance) = object.instance() else { continue };
+        if (instance.first_frame, instance.loop_mode) == (*first, *looping) || instance.sync_to_root {
+            continue;
+        }
+        let Some(def) = scene.library().get(instance.symbol) else { continue };
+        if !def.kind.follows_parent_timeline() {
+            continue;
+        }
+        let elapsed = scene.layers().get(layer).map_or(0, |l| elapsed_on(l, frame));
+        retimed.push((instance.symbol, instance.resolve_frame(def.kind, elapsed, def.length())));
+    }
+    retimed
+        .into_iter()
+        .map(|(symbol, shows)| match_frames_inside(scene, symbol, shows, &mut std::collections::HashSet::new()))
+        .sum()
+}
+
 /// **Carry "match the frame number" down into the symbols a script matched.**
 ///
 /// The shelf's F (`setFrameOfSymbolsToCurrentFrame`) sets each symbol on the
@@ -18008,6 +18051,17 @@ fn paste_held(frames: &mut buzz_scene::LayerTimeline, at: u32, objects: Vec<Arc<
     }
 }
 
+/// **Inside `symbol`, every instance long enough to reach `frame` shows it,
+/// and its First Frame says so** (user 2026-11-22: "when I copy paste any
+/// stage or character, the frame number shall match the main timeline frame
+/// number; and if I set the frame number of the main symbols, those in it
+/// shall match the same frame number"). The head inside a body at its own
+/// frame 1500 showed frame 1500 but read First Frame 1, from a keyframe on
+/// frame 1 inside the body: now that layer is keyed at `frame` — carrying
+/// on, so every frame before looks as it did — and the head there starts on
+/// `frame`. All the way down; a short chart (a mouth, an eye) that does not
+/// reach `frame` keeps the frame it was on, as the shelf's F leaves it.
+/// Returns how many instances changed.
 pub(crate) fn match_frames_inside(
     scene: &mut Scene,
     symbol: buzz_scene::SymbolId,
@@ -18020,34 +18074,53 @@ pub(crate) fn match_frames_inside(
     let Some(def) = scene.library().get(symbol) else {
         return 0;
     };
-    let mut sets: Vec<(LayerId, ObjectId, u32)> = Vec::new();
+    let graphics = scene.graphic_lengths();
+    let reaches = |instance: &buzz_scene::SymbolInstance| {
+        !instance.sync_to_root && graphics.get(&instance.symbol).is_some_and(|len| frame < *len)
+    };
+    let mut layers: Vec<LayerId> = Vec::new();
     let mut inside: Vec<buzz_scene::SymbolId> = Vec::new();
     for layer in def.layers.iter() {
         let elapsed = elapsed_on(layer, frame);
+        let keyed_here = layer.frames.is_keyframe(frame);
+        let mut needs = false;
         for object in layer.objects_at(frame) {
             let Some(instance) = object.instance() else { continue };
-            let Some(nested) = scene.library().get(instance.symbol) else { continue };
-            if !nested.kind.follows_parent_timeline() || instance.sync_to_root || frame >= nested.length() {
+            if !reaches(instance) {
                 continue;
             }
-            if instance.resolve_frame(nested.kind, elapsed, nested.length()) != frame {
-                let first = instance.first_frame_showing(frame, elapsed, nested.length());
-                sets.push((layer.id, object.id, first));
+            let length = graphics[&instance.symbol];
+            let kind = scene.library().get(instance.symbol).map_or(buzz_scene::SymbolKind::Graphic, |d| d.kind);
+            if !keyed_here || instance.resolve_frame(kind, elapsed, length) != frame || instance.first_frame != instance.first_frame_showing(frame, 0, length) {
+                needs = true;
             }
             inside.push(instance.symbol);
         }
+        if needs {
+            layers.push(layer.id);
+        }
     }
-    let changed = sets.len();
-    if !sets.is_empty() {
+    let mut changed = 0usize;
+    if !layers.is_empty() {
         scene.library_mut().update(symbol, |def| {
-            for (layer, id, first) in sets {
+            for layer in layers {
                 def.layers.update(layer, |layer| {
+                    if !layer.frames.is_keyframe(frame) {
+                        layer.frames.insert_keyframe_carrying_on(frame, &graphics);
+                    }
                     let Some(keyframe) = layer.frames.keyframe_at_mut(frame) else { return };
-                    let objects = Arc::make_mut(&mut keyframe.objects);
-                    if let Some(object) = objects.iter_mut().find(|o| o.id == id)
-                        && let ObjectKind::Instance(instance) = &mut Arc::make_mut(object).kind
-                    {
-                        instance.first_frame = first;
+                    for object in Arc::make_mut(&mut keyframe.objects).iter_mut() {
+                        let Some(instance) = object.instance() else { continue };
+                        if !reaches(instance) {
+                            continue;
+                        }
+                        let first = instance.first_frame_showing(frame, 0, graphics[&instance.symbol]);
+                        if first != instance.first_frame
+                            && let ObjectKind::Instance(instance) = &mut Arc::make_mut(object).kind
+                        {
+                            instance.first_frame = first;
+                            changed += 1;
+                        }
                     }
                 });
             }
@@ -32359,6 +32432,61 @@ mod tests {
         }
     }
 
+    /// **A First Frame set on a character carries inside** (user 2026-11-22:
+    /// "if I set the frame number of the main symbols, those in it shall
+    /// match the same frame number"): the body set to First Frame 201 shows
+    /// its frame 200, and the head inside it then reads and shows 200 too;
+    /// the mouth chart, ten frames long, keeps its pose.
+    #[test]
+    fn a_first_frame_set_on_a_character_carries_inside() {
+        let mut e = editor();
+        let (body, _, head, mouth) = body_with_rekeyed_head(&mut e, 0);
+        let before = timing_of(e.scene(), 0, &[body]);
+        e.doc.edit("Properties", |scene| {
+            scene.update_object(body, |o| if let ObjectKind::Instance(i) = &mut o.kind { i.first_frame = 200; });
+            match_inside_retimed(scene, 0, &before);
+        });
+        let scene = e.scene();
+        let body_symbol = scene.find_object(body).and_then(|(_, o)| o.instance().map(|i| i.symbol)).unwrap();
+        let layer = scene.library().get(body_symbol).unwrap().layers.iter().next().unwrap().clone();
+        let key = layer.frames.keyframe_at(200).unwrap();
+        let shown = key.objects.iter().find_map(|o| o.instance().filter(|i| i.symbol == head).map(|i| i.first_frame));
+        assert_eq!(key.start, 200, "keyed at 200 inside the body");
+        assert_eq!(shown, Some(200), "the head reads First Frame 200");
+        let in_head = scene.library().get(head).unwrap().layers.iter().next().unwrap().objects_at(200).iter().find_map(|o| o.instance().filter(|i| i.symbol == mouth).map(|i| i.first_frame));
+        assert_eq!(in_head, Some(3), "the mouth chart keeps its pose");
+        assert_eq!(layer.objects_at(150).iter().find_map(|o| o.instance().map(|i| i.first_frame)), Some(0), "frame 150 inside looks as it did");
+    }
+
+    /// **A character pasted partway into a span starts on that frame** (user
+    /// 2026-11-22: "when I copy paste any stage or character, the frame
+    /// number shall match the main timeline frame number"): pasted on frame
+    /// 151 of a layer keyed only on frame 1, it lands on a keyframe of its
+    /// own at 151 reading First Frame 151, the head inside reads 151 too,
+    /// and frame 100 has only what it had.
+    #[test]
+    fn a_pasted_character_reads_the_frame_it_is_pasted_on() {
+        let mut e = editor();
+        let (body, _, head, _) = body_with_rekeyed_head(&mut e, 0);
+        let layer = e.scene().find_object(body).map(|(l, _)| l).unwrap();
+        e.selection.set_active_layer(Some(layer));
+        e.selection.set([body]);
+        e.run(Command::Copy);
+        e.set_frame(150);
+        e.selection.set_active_layer(Some(layer));
+        e.run(Command::Paste);
+        let scene = e.scene();
+        let frames = &scene.layers().get(layer).unwrap().frames;
+        assert!(frames.is_keyframe(150), "keyed where it was pasted");
+        assert_eq!(frames.objects_at(100).len(), 1, "frame 100 has only the original");
+        let pasted = e.selection.ids();
+        let first = pasted.iter().find_map(|id| scene.find_object_at(150, *id).and_then(|(_, o)| o.instance().map(|i| (i.symbol, i.first_frame)))).unwrap();
+        assert_eq!(first.1, 150, "First Frame 151, the frame it was pasted on");
+        let inside = scene.library().get(first.0).unwrap().layers.iter().next().unwrap();
+        let head_first = inside.frames.keyframe_at(150).filter(|k| k.start == 150).and_then(|k| k.objects.iter().find_map(|o| o.instance().filter(|i| i.symbol == head).map(|i| i.first_frame)));
+        assert_eq!(head_first, Some(150), "the head inside reads 151 too");
+    }
+
     /// **F on the stage takes the head inside the body with it.** The shelf's
     /// `setFrameOfSymbolsToCurrentFrame` sets the body to show frame 200; the
     /// head inside it, keyed to play from its own frame 0, now shows 200 as
@@ -32408,7 +32536,13 @@ mod tests {
         assert_eq!(stage.iter().map(|s| s.2).collect::<Vec<_>>(), [200], "the body shows frame 200");
         let body_symbol = stage[0].0;
         let inside = shown(scene, &scene.library().get(body_symbol).unwrap().layers, 200);
-        assert_eq!(inside, [(head, 120, 200)], "the head inside shows the body's frame 200");
+        // Shows frame 200 and reads First Frame 200 (user 2026-11-22: the
+        // frame numbers inside match the main timeline's too) — keyed at 200
+        // inside the body, so the frames before look as they did.
+        assert_eq!(inside, [(head, 200, 200)], "the head inside shows the body's frame 200, and says so");
+        let body_def = scene.library().get(body_symbol).unwrap();
+        let before_200 = shown(scene, &body_def.layers, 150);
+        assert_eq!(before_200.iter().map(|s| s.2).collect::<Vec<_>>(), [30], "frame 150 inside the body looks as it did");
         let in_head = shown(scene, &scene.library().get(head).unwrap().layers, 200);
         assert_eq!(in_head, [(mouth, 3, 3)], "the mouth chart keeps its pose");
         assert!(
@@ -35022,4 +35156,3 @@ mod tests {
         );
     }
 }
-

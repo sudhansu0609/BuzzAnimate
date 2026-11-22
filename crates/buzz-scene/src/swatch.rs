@@ -167,6 +167,53 @@ impl Swatches {
         }
     }
 
+    /// **Rename a folder** — the last part of its path — carrying its
+    /// subfolders and every colour inside along. The new path, or `None`
+    /// when the name is empty, has a `/`, or is already a folder there.
+    pub fn rename_folder(&mut self, path: &str, name: &str) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty() || name.contains('/') || !self.folders.contains(path) {
+            return None;
+        }
+        let renamed = match path.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/{name}"),
+            None => name.to_string(),
+        };
+        if renamed == path {
+            return Some(renamed);
+        }
+        if self.folders.contains(&renamed) {
+            return None;
+        }
+        let prefix = format!("{path}/");
+        let moved = |f: &str| -> Option<String> {
+            if f == path {
+                Some(renamed.clone())
+            } else {
+                f.strip_prefix(&prefix).map(|rest| format!("{renamed}/{rest}"))
+            }
+        };
+        self.folders = self.folders.iter().map(|f| moved(f).unwrap_or_else(|| f.clone())).collect();
+        for swatch in self.swatches.values_mut() {
+            if let Some(to) = swatch.folder.as_deref().and_then(moved) {
+                swatch.folder = Some(to);
+            }
+        }
+        Some(renamed)
+    }
+
+    /// A folder path under `parent` not already taken, from `wanted`.
+    pub fn unique_folder(&self, parent: Option<&str>, wanted: &str) -> String {
+        let at = |leaf: &str| match parent {
+            Some(parent) => format!("{parent}/{leaf}"),
+            None => leaf.to_string(),
+        };
+        if !self.folders.contains(&at(wanted)) {
+            return at(wanted);
+        }
+        (2..10_000).map(|n| at(&format!("{wanted} {n}"))).find(|f| !self.folders.contains(f)).unwrap_or_else(|| at(wanted))
+    }
+
     /// Every folder, sorted, including empty ones.
     pub fn folders(&self) -> impl Iterator<Item = &String> {
         self.folders.iter()
@@ -250,6 +297,29 @@ pub fn default_palette() -> Vec<(&'static str, Color)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Renaming a folder carries its subfolders and colours along, and
+    /// refuses a name that is empty, has a `/` or is taken.
+    #[test]
+    fn renaming_a_folder_carries_what_is_inside() {
+        let mut p = Swatches::default();
+        p.add_folder("Hero/Skin");
+        p.add_folder("Villain");
+        let a = p.add("Shadow", Color::BLACK, Some("Hero/Skin".into()));
+        let b = p.add("Coat", Color::WHITE, Some("Hero".into()));
+        assert_eq!(p.rename_folder("Hero", "Raju").as_deref(), Some("Raju"));
+        let folders: Vec<&String> = p.folders().collect();
+        assert_eq!(folders, ["Raju", "Raju/Skin", "Villain"]);
+        assert_eq!(p.get(a).unwrap().folder.as_deref(), Some("Raju/Skin"));
+        assert_eq!(p.get(b).unwrap().folder.as_deref(), Some("Raju"));
+        assert_eq!(p.rename_folder("Raju/Skin", "Face").as_deref(), Some("Raju/Face"));
+        assert_eq!(p.get(a).unwrap().folder.as_deref(), Some("Raju/Face"));
+        assert_eq!(p.rename_folder("Raju", "Villain"), None, "taken");
+        assert_eq!(p.rename_folder("Raju", " "), None, "empty");
+        assert_eq!(p.rename_folder("Raju", "a/b"), None, "a slash");
+        assert_eq!(p.unique_folder(None, "Raju"), "Raju 2");
+        assert_eq!(p.unique_folder(Some("Raju"), "Face"), "Raju/Face 2");
+    }
 
     fn palette() -> Swatches {
         default_swatches()

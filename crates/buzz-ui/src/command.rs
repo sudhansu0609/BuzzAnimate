@@ -157,6 +157,14 @@ pub enum Command {
     /// contents, and an image-filled shape bakes its transform so the Lasso,
     /// Eraser and Wand can cut it directly. See `Editor::break_apart_selection`.
     BreakApart,
+    /// **Distribute to Layers** — Animate's Modify ▸ Timeline: each selected
+    /// object on a layer of its own, stacked on one spot. See
+    /// `Editor::distribute_to_layers`.
+    DistributeToLayers,
+    /// **Distribute to Keyframes** — each selected object on a keyframe of
+    /// its own, one after another, stacked on one spot so scrubbing flips
+    /// through them. See `Editor::distribute_to_keyframes`.
+    DistributeToKeyframes,
     BringToFront,
     BringForward,
     SendBackward,
@@ -842,6 +850,8 @@ command_table! {
             GroupSelection => "group_selection",
             UngroupSelection => "ungroup_selection",
             BreakApart => "break_apart",
+            DistributeToLayers => "distribute_to_layers",
+            DistributeToKeyframes => "distribute_to_keyframes",
             BringToFront => "bring_to_front",
             BringForward => "bring_forward",
             SendBackward => "send_backward",
@@ -1318,6 +1328,8 @@ impl Command {
             GroupSelection => "Group",
             UngroupSelection => "Ungroup",
             BreakApart => "Break Apart",
+            DistributeToLayers => "Distribute to Layers",
+            DistributeToKeyframes => "Distribute to Keyframes",
             BringToFront => "Bring to Front",
             BringForward => "Bring Forward",
             SendBackward => "Send Backward",
@@ -1614,6 +1626,9 @@ impl Command {
             GroupSelection => sc(ctrl, Key::G),
             UngroupSelection => sc(ctrl_shift, Key::G),
             BreakApart => sc(ctrl, Key::B),
+            // Animate's own keys for the two.
+            DistributeToLayers => sc(ctrl_shift, Key::D),
+            DistributeToKeyframes => sc(ctrl_shift, Key::K),
             BringToFront => sc(ctrl_shift, Key::ArrowUp),
             BringForward => sc(ctrl, Key::ArrowUp),
             SendBackward => sc(ctrl, Key::ArrowDown),
@@ -1856,6 +1871,8 @@ impl Command {
                 | GroupSelection
                 | UngroupSelection
                 | BreakApart
+                | DistributeToLayers
+                | DistributeToKeyframes
                 | BringToFront
                 | BringForward
                 | SendBackward
@@ -1941,6 +1958,8 @@ pub fn palette_commands() -> Vec<Command> {
         GroupSelection,
         UngroupSelection,
         BreakApart,
+        DistributeToLayers,
+        DistributeToKeyframes,
         BringToFront,
         BringForward,
         SendBackward,
@@ -2214,6 +2233,8 @@ mod tests {
             GroupSelection,
             UngroupSelection,
             BreakApart,
+            DistributeToLayers,
+            DistributeToKeyframes,
             BringToFront,
             BringForward,
             SendBackward,
@@ -2472,7 +2493,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            262
+            264
         );
     }
 

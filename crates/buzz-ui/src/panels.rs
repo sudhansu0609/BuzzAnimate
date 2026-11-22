@@ -901,6 +901,9 @@ pub fn build_menus(ui: &mut MenuUi<'_>, state: &MenuState<'_>) -> Vec<Command> {
             });
             // Animate's Modify ▸ Timeline: layer housekeeping (L2).
             ui.menu_button("Timeline", |ui| {
+                item(ui, Command::DistributeToLayers, has_selection, &mut raised);
+                item(ui, Command::DistributeToKeyframes, has_selection, &mut raised);
+                ui.separator();
                 item(ui, Command::CleanUpLayers, true, &mut raised);
                 item(ui, Command::ArrangeLayers, true, &mut raised);
                 item(ui, Command::GroupEmptyLayers, true, &mut raised);
@@ -2906,6 +2909,12 @@ fn bucket_properties(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
                  line art but can spill through wider openings.",
             );
     });
+    ui.checkbox(&mut style.bucket_colour_in, "Colour in")
+        .on_hover_text(
+            "For traced characters: a click fills the whole area the lines close, replacing the \
+             colours already in it (traced colour pieces do not stop it) and the little gaps beside \
+             the lines, under the lines. Off: fill between whatever shapes are there, as Animate does.",
+        );
 }
 
 /// Ink Bottle settings: the line it is about to lay on whatever is clicked.
@@ -4868,6 +4877,7 @@ pub fn color_panel(ui: &mut Ui, scene: &Scene, style: &mut DrawStyle) {
         let changed = ui
             .scope(|ui| crate::widgets::color_picker_sized(ui, egui::Id::new(("color-panel-mixer", stroke)), &mut c, true, field))
             .inner;
+        crate::widgets::add_to_swatches_button(ui, c);
         if changed {
             let c = from_egui(c);
             if stroke {

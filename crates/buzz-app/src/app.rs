@@ -3490,6 +3490,8 @@ pub const KEYBOARD_COMMANDS: &[Command] = &[
     Command::GroupSelection,
     Command::UngroupSelection,
     Command::BreakApart,
+    Command::DistributeToLayers,
+    Command::DistributeToKeyframes,
     Command::BringToFront,
     Command::BringForward,
     Command::SendBackward,
@@ -3598,7 +3600,17 @@ fn keyboard_commands(ctx: &egui::Context, editor: &mut Editor) -> (Vec<Command>,
 
     // A focused text field owns the keyboard; stealing single letters from it
     // would make renaming a layer impossible.
-    if ctx.memory(|m| m.focused().is_some()) {
+    //
+    // **And the key that ends the typing is the field's too** (user
+    // 2026-11-22: "when I rename the swatch, when I press Enter the timeline
+    // starts playing"). Enter, Esc or Tab makes a field let go of the
+    // keyboard on the very frame it is pressed — before this runs — so the
+    // field looked unfocused and Enter went on to Play. A field that had the
+    // keyboard at the last look keeps that frame's keys.
+    let typing_key = egui::Id::new("keyboard-commands-typing");
+    let typing = ctx.memory(|m| m.focused().is_some());
+    let was_typing = ctx.data_mut(|d| std::mem::replace(d.get_temp_mut_or_default::<bool>(typing_key), typing));
+    if typing || was_typing {
         return (out, scripts);
     }
 
@@ -5234,10 +5246,27 @@ impl App {
             self.editor.paste_performance_special_open = open && !paste && !cancel;
         }
 
+        // **+ Swatches in a colour picker**: the colour it asked to keep goes
+        // into the palette here, as one undo step, ready to be named in the
+        // Swatches panel.
+        if let Some(colour) = buzz_ui::swatch_panel::take_add_request(&ctx) {
+            let editor = &mut self.editor;
+            let state = &mut editor.swatch_panel;
+            let mut name = String::new();
+            editor.doc.edit("Add Swatch", |scene| {
+                let id = state.add_colour(scene, colour);
+                name = scene.swatches().get(id).map(|s| s.name.clone()).unwrap_or_default();
+            });
+            let [r, g, b, _] = colour.to_rgba8().to_u8_array();
+            editor.status = Some(format!("Added #{r:02X}{g:02X}{b:02X} to Swatches as \u{201c}{name}\u{201d} \u{2014} name it there"));
+        }
+
         // Ctrl+K opens the command palette, a search box over every command;
         // it runs whatever the list has highlighted. Handled here, ahead of the
         // per-command keymap, so it opens even from a focused field.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+        // Not with Shift: egui ignores an extra Shift, and Ctrl+Shift+K is
+        // Distribute to Keyframes.
+        if ctx.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
             self.command_palette.toggle();
         }
         let has_selection = !self.editor.selection.is_empty();
@@ -11910,6 +11939,8 @@ impl App {
             item(ui, Command::GroupSelection, has_selection);
             item(ui, Command::UngroupSelection, has_selection);
             item(ui, Command::BreakApart, has_selection);
+            item(ui, Command::DistributeToLayers, has_selection);
+            item(ui, Command::DistributeToKeyframes, has_selection);
             ui.separator();
 
             item(ui, Command::ConvertToSymbol, has_selection);
@@ -24649,6 +24680,115 @@ mod idle_tests {
         assert_eq!(press(egui::Key::V, cmd_shift), vec![Command::PasteInPlace]);
     }
 
+    /// **Animate's keys for Distribute to Layers and to Keyframes** —
+    /// Cmd+Shift+D and Cmd+Shift+K — run them, in a whole frame of the app:
+    /// not Duplicate on Cmd+D, nor the command palette on Cmd+K, which egui
+    /// would match with the Shift ignored. Cmd+K still opens the palette.
+    #[test]
+    fn the_distribute_keys_reach_their_commands() {
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0));
+        let setup = || {
+            let mut app = App::new(GpuPreference::Automatic);
+            app.recovery.found.clear();
+            let layer = app.editor.doc.scene().layers().iter().next().expect("a layer").id;
+            let mut ids = Vec::new();
+            app.editor.doc.edit("Draw", |scene| {
+                for x in [0.0, 100.0, 200.0] {
+                    let square = buzz_geom::Shape::to_path(&buzz_geom::Rect::new(x, 0.0, x + 40.0, 40.0), 1e-9);
+                    ids.push(scene.add_shape(layer, buzz_scene::ShapeData::filled(square, peniko::Color::BLACK)).unwrap());
+                }
+            });
+            app.editor.selection.set(ids);
+            (app, layer)
+        };
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let press = |app: &mut App, key: egui::Key, modifiers: egui::Modifiers| {
+            for events in [vec![egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers }], vec![]] {
+                let input = egui::RawInput { events, modifiers, screen_rect: Some(screen), ..Default::default() };
+                let _ = ctx.run_ui(input, |ui| {
+                    app.build_ui(ui);
+                });
+            }
+        };
+        let cmd_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+
+        let (mut app, layer) = setup();
+        press(&mut app, egui::Key::K, cmd_shift);
+        assert!(!app.command_palette.open, "Cmd+Shift+K opened the palette");
+        let keys = app.editor.doc.scene().layers().get(layer).unwrap().frames.keyframe_count();
+        assert_eq!(keys, 3, "a keyframe for each square");
+
+        let (mut app, _) = setup();
+        let layers = app.editor.doc.scene().layers().len();
+        press(&mut app, egui::Key::D, cmd_shift);
+        assert_eq!(app.editor.doc.scene().layers().len(), layers + 3, "a layer for each square");
+        assert_eq!(app.editor.doc.scene().shape_count(), 3, "moved, not duplicated");
+
+        let (mut app, _) = setup();
+        press(&mut app, egui::Key::K, egui::Modifiers::COMMAND);
+        assert!(app.command_palette.open, "Cmd+K opens the palette");
+    }
+
+    /// **+ Swatches in a picker adds the colour to the document's palette**,
+    /// as one undo step, ready to name in the Swatches panel.
+    #[test]
+    fn plus_swatches_from_a_picker_adds_to_the_palette() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut frame = |app: &mut App| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| {
+                app.build_ui(ui);
+            });
+        };
+        frame(&mut app);
+        let before = app.editor.doc.scene().swatches().len();
+        let skin = peniko::Color::from_rgba8(0xE0, 0xB0, 0x90, 255);
+        buzz_ui::swatch_panel::request_add(&ctx, skin);
+        frame(&mut app);
+        let swatches = app.editor.doc.scene().swatches();
+        assert_eq!(swatches.len(), before + 1, "added");
+        assert!(swatches.find_color(skin).is_some(), "in its colour");
+        frame(&mut app);
+        assert_eq!(app.editor.doc.scene().swatches().len(), before + 1, "once");
+        app.editor.run(Command::Undo);
+        assert_eq!(app.editor.doc.scene().swatches().len(), before, "one undo step");
+    }
+
+    /// **The Enter that ends typing does not play the timeline** (user
+    /// 2026-11-22: "when I rename the swatch, when I press Enter the timeline
+    /// starts playing"). A name box lets go of the keyboard on the frame
+    /// Enter is pressed, before the shortcuts are read; that frame's Enter is
+    /// the box's. The next Enter, with no box open, plays as ever.
+    #[test]
+    fn the_enter_that_ends_typing_does_not_play() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let ctx = egui::Context::default();
+        let field = egui::Id::new("a name box");
+        let enter = || egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let mut frame = |events: Vec<egui::Event>, focus: Option<bool>| {
+            let input = egui::RawInput { events, ..Default::default() };
+            let mut got = Vec::new();
+            let _ = ctx.run_ui(input, |ui| {
+                match focus {
+                    Some(true) => ui.memory_mut(|m| m.request_focus(field)),
+                    Some(false) => ui.memory_mut(|m| m.surrender_focus(field)),
+                    None => {}
+                }
+                got = keyboard_commands(ui.ctx(), &mut app.editor).0;
+            });
+            got
+        };
+        assert!(frame(vec![], Some(true)).is_empty(), "typing");
+        assert!(frame(vec![], Some(true)).is_empty(), "typing");
+        let ended = frame(vec![enter()], Some(false));
+        assert!(!ended.contains(&Command::PlayPause), "the Enter that ended the typing played: {ended:?}");
+        assert_eq!(frame(vec![enter()], None), vec![Command::PlayPause], "Enter plays once nothing is being typed");
+    }
+
     /// **A keymap from Animate fires the most specific binding.** egui ignores
     /// an extra Shift or Alt when matching, so with an eye on `1` and its
     /// reverse on Cmd+Option+1, pressing the latter must run the reverse — and
@@ -33600,6 +33740,140 @@ mod tool_follow_tests {
         assert_eq!(docks(&app.editor.workspace.slots), docks(&layout), "the layout is as it was");
     }
 
+    /// **The Brush's colour swatch opens its picker** (user 2026-11-22: "I
+    /// selected the Brush tool and clicked the colour chooser but the colour
+    /// panel did not open"), in the user's own layout, by real clicks.
+    #[test]
+    fn the_brush_colour_swatch_opens_its_picker() {
+        colour_swatch_opens_its_picker_with(buzz_ui::ToolId::Brush);
+    }
+
+    /// **The Paint Bucket's too** (user 2026-11-22: "for brush it's good but
+    /// for paint bucket fix it").
+    #[test]
+    fn the_paint_bucket_colour_swatch_opens_its_picker() {
+        colour_swatch_opens_its_picker_with(buzz_ui::ToolId::PaintBucket);
+    }
+
+    fn colour_swatch_opens_its_picker_with(tool: buzz_ui::ToolId) {
+        let home = std::env::var("HOME").unwrap();
+        let path = std::path::Path::new(&home).join(".config/BuzzAnimate/workspace.json");
+        let workspace = if path.exists() { buzz_ui::Workspace::load_from(&path) } else { buzz_ui::Workspace::default() };
+        let mut app = App::new(GpuPreference::Automatic).with_workspace(workspace);
+        if let Ok(doc) = std::env::var("PICK_DOC") {
+            app = app.with_document(buzz_doc::Document::open(std::path::Path::new(&doc)).expect("opened"));
+        }
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let (sw, sh, ppp) = std::env::var("PICK_SCREEN").ok().and_then(|v| {
+            let p: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+            (p.len() == 3).then(|| (p[0], p[1], p[2]))
+        }).unwrap_or((1600.0, 1000.0, 1.0));
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 1.0 / 60.0;
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(sw, sh))),
+                time: Some(t),
+                viewports: std::iter::once((egui::ViewportId::ROOT, egui::ViewportInfo { native_pixels_per_point: Some(ppp), ..Default::default() })).collect(),
+                ..Default::default()
+            };
+            let mut area = egui::Rect::NOTHING;
+            let discard = std::env::var("PICK_DISCARD").is_ok() && !input.events.is_empty();
+            let out = ctx.run_ui(input, |ui| {
+                area = app.build_ui(ui);
+                if discard && ui.ctx().current_pass_index() == 0 {
+                    ui.ctx().request_discard("test: a second pass");
+                }
+            });
+            STAGE.with(|c| c.set(area));
+            out
+        };
+        thread_local!(static STAGE: std::cell::Cell<egui::Rect> = const { std::cell::Cell::new(egui::Rect::NOTHING) });
+        app.editor.run(Command::SelectTool(tool));
+        let mut drops = Vec::new();
+        let mut swap = None;
+        for _ in 0..4 {
+            let out = frame(&mut app, vec![]);
+            drops.clear();
+            thread_local!(static SWAP: std::cell::Cell<Option<egui::Pos2>> = const { std::cell::Cell::new(None) });
+            fn find(shape: &egui::Shape, out: &mut Vec<egui::Pos2>) {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == "\u{1F4A7}" => out.push(t.pos + t.galley.rect.center().to_vec2()),
+                    egui::Shape::Text(t) if t.galley.text() == "X" => SWAP.with(|c| c.set(Some(t.pos + t.galley.rect.center().to_vec2()))),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| find(s, out)),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|s| find(&s.shape, &mut drops));
+            swap = SWAP.with(|c| c.get());
+        }
+        // A red square in the middle of the stage, to pick from.
+        let area = STAGE.with(|c| c.get());
+        let at_stage = area.center();
+        let under = app.editor.screen_to_edit(buzz_geom::Point::new((at_stage.x - area.min.x) as f64, (at_stage.y - area.min.y) as f64));
+        let red = peniko::Color::from_rgba8(0xC0, 0x20, 0x30, 255);
+        app.editor.apply(ToolAction::AddShape {
+            shape: buzz_scene::ShapeData::filled(buzz_geom::Shape::to_path(&buzz_geom::Rect::from_center_size(under, (120.0, 120.0)), 0.1), red),
+            label: "Draw",
+        });
+        app.editor.run(Command::SelectTool(tool));
+        let shapes = app.editor.scene().shape_count();
+        let drop = *drops.last().expect("the tool's colour row is on screen");
+        let swatch = drop - egui::vec2(44.0, 0.0);
+        let press = |at: egui::Pos2, pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        // The Tools panel's Fill well sits just above Swap (X).
+        let fill_well = swap.expect("the Tools panel's Swap button") - egui::vec2(0.0, 27.0);
+        for (what, at) in [("swatch", swatch), ("drop", drop), ("Tools panel Fill well", fill_well)] {
+            frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+            assert!(!egui::Popup::is_any_open(&ctx), "no picker open before the {what} is clicked");
+            frame(&mut app, vec![press(at, true)]);
+            frame(&mut app, vec![press(at, false)]);
+            frame(&mut app, vec![]);
+            frame(&mut app, vec![]);
+            assert!(egui::Popup::is_any_open(&ctx), "{tool:?}: clicking the {what} opens the picker (flyout {:?}, status {:?})", app.strip_flyout, app.editor.status);
+            // The picker's own Pick button: is it on top where it is drawn?
+            let out = frame(&mut app, vec![]);
+            let mut pick_at = None;
+            for cs in &out.shapes {
+                fn find_pick(shape: &egui::Shape, out: &mut Option<egui::Pos2>) {
+                    match shape {
+                        egui::Shape::Text(t) if t.galley.text().ends_with("Pick") => *out = Some(t.pos + t.galley.rect.center().to_vec2()),
+                        egui::Shape::Vec(v) => v.iter().for_each(|s| find_pick(s, out)),
+                        _ => {}
+                    }
+                }
+                let mut found = None;
+                find_pick(&cs.shape, &mut found);
+                if let Some(p) = found {
+                    pick_at = Some((p, cs.clip_rect));
+                }
+            }
+            if let Some((p, _)) = pick_at {
+                eprintln!("{what}: Pick drawn at {p:?}; top layer there {:?}", ctx.layer_id_at(p));
+            } else {
+                eprintln!("{what}: the picker's Pick button is not drawn");
+            }
+            assert!(app.dropper_pick.is_some(), "{tool:?}: opening the {what}'s picker arms the eyedropper");
+            // A click on the red square takes it, and paints nothing.
+            app.editor.style.fill_color = peniko::Color::from_rgba8(0x10, 0x40, 0xF0, 255);
+            frame(&mut app, vec![egui::Event::PointerMoved(at_stage)]);
+            frame(&mut app, vec![press(at_stage, true)]);
+            frame(&mut app, vec![press(at_stage, false)]);
+            frame(&mut app, vec![]);
+            frame(&mut app, vec![]);
+            let got = app.editor.style.fill_color.to_rgba8();
+            assert_eq!((got.r, got.g, got.b), (0xC0, 0x20, 0x30), "{tool:?}: the {what}'s eyedropper took the red (status {:?})", app.editor.status);
+            assert_eq!(app.editor.scene().shape_count(), shapes, "{tool:?}: the pick painted nothing");
+            assert_eq!(app.editor.tool(), tool, "{tool:?} stays in hand");
+            frame(&mut app, vec![egui::Event::PointerMoved(egui::pos2(800.0, 995.0))]);
+            frame(&mut app, vec![]);
+        }
+    }
+
     /// **Picking a tool shows its options** where the layout keeps them — the
     /// far-right strip's pop-out — and they stay open while drawing, until
     /// closed. The Hand, which only pans, opens nothing; the layout never
@@ -34430,7 +34704,3 @@ mod cast_window_tests {
         assert!(app.editor.cast_panel.add_pose.is_none(), "Cancel closes it");
     }
 }
-
-
-
-

@@ -149,6 +149,42 @@ mod tests {
         assert_eq!(color, egui::Color32::from_rgb(200, 40, 90), "drawing it changes nothing");
     }
 
+    /// **+ Swatches** under a colour picker hands its colour on for the
+    /// Swatches panel (user 2026-11-22: "give an option to add to swatches
+    /// from the colour picker").
+    #[test]
+    fn plus_swatches_in_a_picker_asks_to_keep_its_colour() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut color = egui::Color32::from_rgb(200, 40, 90);
+        let id = egui::Id::new("picker-add-test");
+        let mut t = 0.0;
+        let mut frame = |events: Vec<egui::Event>, color: &mut egui::Color32| {
+            t += 0.05;
+            let out = ctx.run_ui(egui::RawInput { events, time: Some(t), ..Default::default() }, |ui| {
+                compact_color_picker(ui, id, color, true);
+            });
+            fn find(shape: &egui::Shape, found: &mut Option<egui::Pos2>) {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == "+ Swatches" => *found = Some(t.pos + t.galley.rect.center().to_vec2()),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| find(s, found)),
+                    _ => {}
+                }
+            }
+            let mut found = None;
+            out.shapes.iter().for_each(|s| find(&s.shape, &mut found));
+            found
+        };
+        let at = frame(vec![], &mut color).expect("+ Swatches is drawn");
+        assert_eq!(crate::swatch_panel::take_add_request(&ctx), None, "nothing asked yet");
+        let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(vec![egui::Event::PointerMoved(at), press(true)], &mut color);
+        frame(vec![press(false)], &mut color);
+        let asked = crate::swatch_panel::take_add_request(&ctx).expect("the colour is handed on");
+        assert_eq!(asked.to_rgba8().to_u8_array(), [200, 40, 90, 255]);
+        assert_eq!(crate::swatch_panel::take_add_request(&ctx), None, "once");
+    }
+
     /// The button draws without panicking, hands back a click, and the
     /// tooltip carries both the name and the shortcut — the whole contract
     /// Stage 2, item 3 asks for.
@@ -312,7 +348,22 @@ fn parse_hex_text(text: &str) -> Option<[u8; 4]> {
 /// twice that. `id` keeps the hue while the colour is grey, which has none.
 /// Whether the colour changed.
 pub fn compact_color_picker(ui: &mut Ui, id: egui::Id, color: &mut egui::Color32, alpha: bool) -> bool {
-    color_picker_sized(ui, id, color, alpha, PICKER_SIZE)
+    let changed = color_picker_sized(ui, id, color, alpha, PICKER_SIZE);
+    add_to_swatches_button(ui, *color);
+    changed
+}
+
+/// **+ Swatches**: keep the colour a picker shows in the Swatches panel,
+/// named there (see [`crate::swatch_panel::request_add`]).
+pub fn add_to_swatches_button(ui: &mut Ui, color: egui::Color32) {
+    if ui
+        .small_button("+ Swatches")
+        .on_hover_text("Add this colour to the Swatches panel, to name it and keep it with the document")
+        .clicked()
+    {
+        let [r, g, b, a] = color.to_srgba_unmultiplied();
+        crate::swatch_panel::request_add(ui.ctx(), peniko::Color::from_rgba8(r, g, b, a));
+    }
 }
 
 /// [`compact_color_picker`] with a colour field `field` points square — the

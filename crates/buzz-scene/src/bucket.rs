@@ -150,21 +150,62 @@ pub fn fill_region(boundaries: &[Boundary], seed: Point, gap: GapSize) -> Option
     let margin = (all.width().max(all.height()) * 0.05).max(8.0);
     let all = all.inflate(margin, margin);
 
-    // The gap closing needs room around the region to grow its walls in.
-    let mut half = FIRST_WINDOW.max(gap.document_units() * 8.0);
-    loop {
-        let window = Rect::new(seed.x - half, seed.y - half, seed.x + half, seed.y + half).intersect(all);
-        let whole = window.x0 <= all.x0 && window.y0 <= all.y0 && window.x1 >= all.x1 && window.y1 >= all.y1;
-        match flood_window(boundaries, seed, gap.document_units(), window) {
-            Flood::Filled(path) => return Some(path),
-            Flood::Nothing => return None,
-            // Out through the window's edge: look further, unless this was
-            // already all the artwork — then the region is open.
-            Flood::Escaped if whole => return None,
-            Flood::Escaped => half *= 4.0,
+    // **Don't Close Gaps fills up to the nearest closed space** (user
+    // 2026-11-22). A flood that runs out of a window carries on from where
+    // it crossed the edge in the next, bigger one — whose coarser grid may
+    // be too coarse to see a small gap it leaked through, and would else
+    // have filled only the small area as if closed, or nothing.
+    let run = |gap: f64| -> Option<BezPath> {
+        // The gap closing needs room around the region to grow its walls in.
+        let mut half = FIRST_WINDOW.max(gap * 8.0);
+        let mut carry: Vec<Point> = Vec::new();
+        loop {
+            let window = Rect::new(seed.x - half, seed.y - half, seed.x + half, seed.y + half).intersect(all);
+            let whole = window.x0 <= all.x0 && window.y0 <= all.y0 && window.x1 >= all.x1 && window.y1 >= all.y1;
+            match flood_window(boundaries, seed, gap, window, &carry) {
+                Flood::Filled(path) => return Some(path),
+                Flood::Nothing => return None,
+                // Out through the window's edge: look further, unless this
+                // was already all the artwork — then the region is open.
+                Flood::Escaped(_) if whole => return None,
+                Flood::Escaped(out) => {
+                    if gap <= 0.0 {
+                        carry.extend(out);
+                    }
+                    half *= 4.0;
+                }
+            }
         }
+    };
+    let gap = gap.document_units();
+    let closed = run(0.0);
+    if gap <= 0.0 {
+        return closed;
+    }
+    // **A closed area fills whole, at any Gap Size** (user 2026-11-22: with
+    // a Gap Size set, "the smaller areas which are closed are also not fully
+    // filled"). The gap closing takes any narrow passage near the end of a
+    // line for a gap — beside a fold line that stops short of the outline —
+    // and an area bigger than the first window went to it before it was
+    // seen to be closed, so only the piece on the click's side was filled.
+    // So the area is looked for closed first, at every size; the gap-closed
+    // fill is used only when the closed one is far larger — the fill run out
+    // through a gap into all the space around the drawing — or there is none.
+    let bridged = run(gap);
+    match (closed, bridged) {
+        (Some(closed), Some(bridged)) => {
+            let (c, b) = (closed.area().abs(), bridged.area().abs());
+            Some(if c <= b * WHOLE_AREA_OVER_BRIDGED { closed } else { bridged })
+        }
+        (closed, None) => closed,
+        (None, bridged) => bridged,
     }
 }
+
+/// How much bigger than the gap-closed fill a closed area may be and still
+/// be the same area (its folds and narrow parts) rather than the space the
+/// fill ran out into through a gap.
+const WHOLE_AREA_OVER_BRIDGED: f64 = 8.0;
 
 /// The nearest pixel to `from` that the grown walls leave open, reached
 /// through no real wall and no further than `reach` pixels: the click moved
@@ -198,8 +239,9 @@ enum Flood {
     Filled(BezPath),
     /// The seed is on a wall, or nothing could be traced.
     Nothing,
-    /// The flood reached the window's edge.
-    Escaped,
+    /// The flood reached the window's edge — with no gap closing, where it
+    /// crossed it, so the next window's flood carries on from there.
+    Escaped(Vec<Point>),
 }
 
 /// Whether `p` is on the ink of any boundary: inside a fill (by its rule),
@@ -268,6 +310,34 @@ fn flood(walls: &Grid, blocked: impl Fn(usize, usize) -> bool, start: (usize, us
     Some(fill)
 }
 
+/// [`flood`] from several pixels at once, run to the end: the pixels it
+/// reaches, and those of them on the grid's edge (none: it is enclosed).
+fn flood_from(walls: &Grid, blocked: impl Fn(usize, usize) -> bool, starts: &[(usize, usize)]) -> (Grid, Vec<(usize, usize)>) {
+    let (w, h) = (walls.w, walls.h);
+    let mut fill = Grid::new(w, h);
+    let mut edges = Vec::new();
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for &(x, y) in starts {
+        if x < w && y < h && !fill.get(x, y) && !blocked(x, y) {
+            fill.set(x, y);
+            stack.push((x, y));
+        }
+    }
+    while let Some((x, y)) = stack.pop() {
+        if x == 0 || y == 0 || x == w - 1 || y == h - 1 {
+            edges.push((x, y));
+            continue;
+        }
+        for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+            if !fill.get(nx, ny) && !blocked(nx, ny) {
+                fill.set(nx, ny);
+                stack.push((nx, ny));
+            }
+        }
+    }
+    (fill, edges)
+}
+
 /// **The area a gap-closed flood `core` stands for, out to its lines.**
 ///
 /// The core stops `grow` short of every line. Growing it back by that much
@@ -280,7 +350,7 @@ fn flood(walls: &Grid, blocked: impl Fn(usize, usize) -> bool, start: (usize, us
 /// closes it. A pixel no further core claims is taken at most three times the
 /// gap setting away (a sharp corner's tip), so a run of empty space with no
 /// core of its own is not followed off round the drawing.
-fn claim(walls: &Grid, to_walls: &[f64], grow: f64, core: &Grid) -> Grid {
+fn claim(walls: &Grid, to_walls: &[f64], grow: f64, core: &Grid, beyond_gaps_outside: bool) -> Grid {
     let (w, h) = (walls.w, walls.h);
     // 0 unclaimed, 1 this core, 2 another; and the steps it took.
     let mut owner = vec![0u8; w * h];
@@ -306,6 +376,81 @@ fn claim(walls: &Grid, to_walls: &[f64], grow: f64, core: &Grid) -> Grid {
             }
         }
     }
+    // **Beyond a closed gap is outside** (user 2026-11-22: "the gaps are
+    // not closed properly"). Only space a full `grow` clear of every line
+    // started as somebody else's, so the band along the outside of an
+    // outline, and any narrow space past a gap, was left for this core to
+    // take: the fill poured out through every gap it closed, an arrowhead
+    // past the gap and a strip along the next lines. So, closing ever
+    // narrower gaps — half the width each time, down to a pixel — open space
+    // that joins somebody else's without passing through this core's own
+    // area at that width is theirs from the start, and the area the core
+    // spreads to at that width is its own. A corner's tip, or a narrow part
+    // of this area, joins nothing else and stays this core's.
+    // Colour In wants the strips beside its stroke, which this would hand
+    // away, and passes `false`.
+    let mut g = if beyond_gaps_outside { grow / 2.0 } else { 0.0 };
+    while g >= 1.0 {
+        let open = |i: usize| to_walls[i] > g;
+        // This core's area at this width.
+        let mut own = vec![false; w * h];
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                if core.get(x, y) {
+                    own[y * w + x] = true;
+                    stack.push((x, y));
+                }
+            }
+        }
+        while let Some((x, y)) = stack.pop() {
+            let near = [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)];
+            for (nx, ny) in near {
+                if nx >= w || ny >= h {
+                    continue;
+                }
+                let j = ny * w + nx;
+                if !own[j] && open(j) {
+                    own[j] = true;
+                    stack.push((nx, ny));
+                }
+            }
+        }
+        // At this width the core has reached somebody else's space: the gap
+        // is wider than this, and the race below splits it down its middle.
+        if (0..w * h).any(|i| own[i] && owner[i] == 2) {
+            break;
+        }
+        // Its own area is its own from the start, as theirs is theirs, so
+        // the two meet in the middle of a gap rather than wherever the one
+        // starting nearer it gets to first.
+        for (i, mine) in own.iter().enumerate() {
+            if *mine && owner[i] == 0 {
+                owner[i] = 1;
+                steps[i] = 0;
+                queue.push_back((i % w, i / w));
+            }
+        }
+        // Everyone else's, spread through the rest of the open space.
+        let mut stack: Vec<(usize, usize)> =
+            (0..w * h).filter(|&i| owner[i] == 2 && !own[i]).map(|i| (i % w, i / w)).collect();
+        while let Some((x, y)) = stack.pop() {
+            let near = [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)];
+            for (nx, ny) in near {
+                if nx >= w || ny >= h {
+                    continue;
+                }
+                let j = ny * w + nx;
+                if owner[j] == 0 && !own[j] && open(j) {
+                    owner[j] = 2;
+                    steps[j] = 0;
+                    queue.push_back((nx, ny));
+                    stack.push((nx, ny));
+                }
+            }
+        }
+        g /= 2.0;
+    }
     let cap = (grow * 3.0).ceil() as u32 + 2;
     while let Some((x, y)) = queue.pop_front() {
         let i = y * w + x;
@@ -313,9 +458,21 @@ fn claim(walls: &Grid, to_walls: &[f64], grow: f64, core: &Grid) -> Grid {
         if who == 1 && n >= cap {
             continue;
         }
-        let near = [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)];
-        for (nx, ny) in near {
+        // Edge steps, and diagonal ones every other step: fronts that grow
+        // as octagons rather than diamonds, nearly round, so the one pushing
+        // straight through a gap does not outrun the one coming at it from
+        // the side and poke an arrowhead out of it. Never diagonally between
+        // two wall pixels.
+        let diagonal = n % 2 == 0;
+        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
+            if dx != 0 && dy != 0 && !diagonal {
+                continue;
+            }
+            let (nx, ny) = ((x as isize + dx) as usize, (y as isize + dy) as usize);
             if nx >= w || ny >= h || walls.get(nx, ny) {
+                continue;
+            }
+            if dx != 0 && dy != 0 && walls.get(nx, y) && walls.get(x, ny) {
                 continue;
             }
             let j = ny * w + nx;
@@ -339,7 +496,7 @@ fn claim(walls: &Grid, to_walls: &[f64], grow: f64, core: &Grid) -> Grid {
 
 /// One flood of the window `area` at the finest resolution its size allows,
 /// with walls grown by `gap` document units to close gaps.
-fn flood_window(boundaries: &[Boundary], seed: Point, gap: f64, area: Rect) -> Flood {
+fn flood_window(boundaries: &[Boundary], seed: Point, gap: f64, area: Rect, carry: &[Point]) -> Flood {
     let extent = area.width().max(area.height());
     if extent <= 0.0 {
         return Flood::Nothing;
@@ -415,15 +572,56 @@ fn flood_window(boundaries: &[Boundary], seed: Point, gap: f64, area: Rect) -> F
     // 2026-11-17: small areas came out as round spots). Gap closing is for
     // an outline that leaks; one that does not is filled to its lines, into
     // every corner and every narrow part.
-    let fill = match flood(&walls, |x, y| walls.get(x, y), (sx, sy)) {
+    // From the click and, with no gap closing, from where a finer window's
+    // flood ran out (`carry`): it follows a leak on even where this coarser
+    // grid is too coarse to see the gap it went through.
+    let mut starts = vec![(sx, sy)];
+    for p in carry {
+        let (x, y) = to_px(*p);
+        if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+            continue;
+        }
+        let (x, y) = (x as usize, y as usize);
+        if !walls.get(x, y) {
+            starts.push((x, y));
+        } else if let Some(open) = nearest_open(&walls, (x, y), 2) {
+            starts.push(open);
+        }
+    }
+    let exact = if starts.len() == 1 {
+        flood(&walls, |x, y| walls.get(x, y), (sx, sy))
+    } else {
+        let (fill, edges) = flood_from(&walls, |x, y| walls.get(x, y), &starts);
+        edges.is_empty().then_some(fill)
+    };
+    let fill = match exact {
         Some(fill) => fill,
-        None if gap <= 0.0 => return Flood::Escaped,
+        None if gap <= 0.0 => {
+            // Where it ran out, to carry the flood on in a bigger window.
+            let (_, edges) = flood_from(&walls, |x, y| walls.get(x, y), &starts);
+            let step = (edges.len() / 512).max(1);
+            return Flood::Escaped(
+                edges.iter().step_by(step).map(|&(x, y)| Point::new(area.x0 + (x as f64 + 0.5) / ppu, area.y0 + (y as f64 + 0.5) / ppu)).collect(),
+            );
+        }
         None => {
             // Leaked: close the gaps. Walls grown by `grow` hold the flood
             // back from every gap up to twice that wide.
             let grow = gap * ppu;
             let to_walls = walls.distances();
-            let blocked = |x: usize, y: usize| to_walls[y * w + x] <= grow;
+            // **Gaps are where lines end** (user 2026-11-22: with a Gap Size
+            // set, closed areas came out "not fully filled"). Every wall grown
+            // by `grow` also sealed the narrow parts of an area — a fold in a
+            // sleeve, a strip between two lines that carry on past each other
+            // — and the fill stopped there. A gap is where a line stops short:
+            // the walls grow only near the ends of lines, so a gap between two
+            // ends, or an end and another line, closes and a narrow passage
+            // between lines that go on stays open.
+            let near_end = line_end_zone(&walls, 2.0 * grow + 2.0);
+            let blocked = |x: usize, y: usize| {
+                let i = y * w + x;
+                walls.get(x, y) || (to_walls[i] <= grow && near_end[i])
+            };
             let (mut sx, mut sy) = (sx, sy);
             if blocked(sx, sy) {
                 // **The gap closing never swallows the click.** Grown walls
@@ -437,16 +635,16 @@ fn flood_window(boundaries: &[Boundary], seed: Point, gap: f64, area: Rect) -> F
                     None => {
                         let room = to_walls[sy * w + sx] / ppu * 0.9;
                         if room * ppu < 1.0 {
-                            return Flood::Escaped;
+                            return Flood::Escaped(Vec::new());
                         }
-                        return flood_window(boundaries, seed, room, area);
+                        return flood_window(boundaries, seed, room, area, &[]);
                     }
                 }
             }
             let Some(core) = flood(&walls, blocked, (sx, sy)) else {
-                return Flood::Escaped;
+                return Flood::Escaped(Vec::new());
             };
-            claim(&walls, &to_walls, grow, &core)
+            claim(&walls, &to_walls, grow, &core, true)
         }
     };
 
@@ -591,7 +789,7 @@ pub fn colour_in_gaps(paint: &BezPath, lines: &[Boundary], colour: &[BezPath], g
     // Each walled-in piece flows back out to its real walls — the lines, the
     // colour and the paint — through the empty space (`claim`), sharing
     // every gap with the open space beyond, as the bucket's fill does.
-    let mut extra = claim(&solid, &to_solid, grow, &core);
+    let mut extra = claim(&solid, &to_solid, grow, &core, false);
     // And the paint flows out too, for the strip a stroke left beside a line
     // that no walled-in piece holds: kept only where it lies in a gap at most
     // twice the gap setting across between the paint and a line or colour,
@@ -605,7 +803,7 @@ pub fn colour_in_gaps(paint: &BezPath, lines: &[Boundary], colour: &[BezPath], g
         }
     }
     let to_walls = walls.distances();
-    let reached = claim(&walls, &to_solid, grow, &seeds);
+    let reached = claim(&walls, &to_solid, grow, &seeds, false);
     for i in 0..w * h {
         if reached.bits[i] && !covered.bits[i] && to_walls[i] + to_paint[i] <= 2.0 * grow + 2.0 {
             extra.bits[i] = true;
@@ -636,6 +834,91 @@ const MAX_EXACT_INK: usize = 3000;
 
 /// `grid`'s set pixels as closed loops in document space, the staircase
 /// smoothed.
+/// **Where the lines in `walls` end**: whether each pixel is within `reach`
+/// of the end of a line. The walls are thinned to their centrelines
+/// ([`thin`]); an end is a centreline pixel with one neighbour on it, or
+/// none (a dot).
+fn line_end_zone(walls: &Grid, reach: f64) -> Vec<bool> {
+    let (w, h) = (walls.w, walls.h);
+    let spine = thin(walls);
+    let mut ends = Grid::new(w, h);
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            if !spine.get(x, y) {
+                continue;
+            }
+            let mut n = 0;
+            for (dx, dy) in [(-1isize, -1isize), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                if spine.get((x as isize + dx) as usize, (y as isize + dy) as usize) {
+                    n += 1;
+                }
+            }
+            if n <= 1 {
+                ends.set(x, y);
+            }
+        }
+    }
+    ends.distances().into_iter().map(|d| d <= reach).collect()
+}
+
+/// **Zhang–Suen thinning**: the set pixels of `grid` worn down to lines one
+/// pixel wide down their middles, keeping every line's ends and joins.
+fn thin(grid: &Grid) -> Grid {
+    let (w, h) = (grid.w, grid.h);
+    let mut g = grid.clone();
+    if w < 3 || h < 3 {
+        return g;
+    }
+    let mut remove: Vec<usize> = Vec::new();
+    loop {
+        let mut changed = false;
+        for pass in 0..2 {
+            remove.clear();
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    if !g.get(x, y) {
+                        continue;
+                    }
+                    // P2..P9 clockwise from north.
+                    let p = [
+                        g.get(x, y - 1),
+                        g.get(x + 1, y - 1),
+                        g.get(x + 1, y),
+                        g.get(x + 1, y + 1),
+                        g.get(x, y + 1),
+                        g.get(x - 1, y + 1),
+                        g.get(x - 1, y),
+                        g.get(x - 1, y - 1),
+                    ];
+                    let b = p.iter().filter(|v| **v).count();
+                    if !(2..=6).contains(&b) {
+                        continue;
+                    }
+                    let a = (0..8).filter(|&i| !p[i] && p[(i + 1) % 8]).count();
+                    if a != 1 {
+                        continue;
+                    }
+                    let (n, e, s, wst) = (p[0], p[2], p[4], p[6]);
+                    let ok = if pass == 0 { !(n && e && s) && !(e && s && wst) } else { !(n && e && wst) && !(n && s && wst) };
+                    if ok {
+                        remove.push(y * w + x);
+                    }
+                }
+            }
+            if !remove.is_empty() {
+                changed = true;
+                for &i in &remove {
+                    g.bits[i] = false;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    g
+}
+
 fn grid_path(grid: &Grid, area: Rect, ppu: f64) -> BezPath {
     let px_to_doc = |gx: usize, gy: usize| Point::new(area.x0 + gx as f64 / ppu, area.y0 + gy as f64 / ppu);
     let mut path = BezPath::new();
@@ -1125,6 +1408,81 @@ mod tests {
     use super::*;
     use buzz_geom::Shape as _;
     use kurbo::Circle;
+
+    /// A ring of ink 3 wide and 50 in radius round `centre`, open on the
+    /// right by `gap`.
+    fn open_ring(cx: f64, gap: f64) -> Boundary {
+        let r: f64 = 50.0;
+        let half = (gap / 2.0 / r).asin();
+        let mut p = BezPath::new();
+        for k in 0..=120 {
+            let a = half + (2.0 * std::f64::consts::PI - 2.0 * half) * k as f64 / 120.0;
+            let pt = Point::new(cx + r * a.cos(), 70.0 + r * a.sin());
+            if k == 0 { p.move_to(pt) } else { p.line_to(pt) }
+        }
+        Boundary { path: outline_stroke(&p, StrokeStyle::new(3.0), 0.05), filled: true, stroke_width: None, even_odd: false }
+    }
+
+    /// **Don't Close Gaps fills up to the nearest closed space** (user
+    /// 2026-11-22). A small box with a 1-unit gap inside a big closed outline
+    /// 600 units across — far wider than the first window, so the outline is
+    /// only seen on a grid too coarse to see the gap: a click in the box
+    /// fills out through the gap to the outline, box and all, and nothing
+    /// past it. With Small gaps the gap closes and the box alone fills.
+    #[test]
+    fn dont_close_gaps_fills_up_to_the_nearest_closed_space() {
+        let outline = thin_lines(&[Point::new(0.0, 0.0), Point::new(600.0, 0.0), Point::new(600.0, 400.0), Point::new(0.0, 400.0)], true, 1.0);
+        let box_ = [Point::new(310.0, 200.0), Point::new(300.0, 200.0), Point::new(300.0, 210.0), Point::new(310.0, 210.0), Point::new(310.0, 205.6)];
+        let walls = [outline, thin_lines(&box_, false, 0.4), thin_lines(&[Point::new(310.0, 204.4), Point::new(310.0, 200.0)], false, 0.4)];
+        let click = Point::new(305.0, 205.0);
+        let region = fill_region(&walls, click, GapSize::None).expect("it fills to the outline");
+        let painted = |x: f64, y: f64| region.winding(Point::new(x, y)) != 0;
+        assert!(painted(305.0, 205.0), "the box");
+        assert!(painted(50.0, 50.0) && painted(550.0, 350.0), "out to the outline");
+        let b = region.bounding_box();
+        assert!(b.x0 > -1.0 && b.y0 > -1.0 && b.x1 < 601.0 && b.y1 < 401.0, "nothing past it: {b:?}");
+        let boxed = fill_region(&walls, click, GapSize::Small).expect("the box fills");
+        assert!(boxed.bounding_box().width() < 12.0, "Small closes the gap: {:?}", boxed.bounding_box());
+    }
+
+    /// **A closed area fills whole at any Gap Size** (user 2026-11-22: with a
+    /// Gap Size set, "the smaller areas which are closed are also not fully
+    /// filled"). A closed band longer than the first window, with a fold
+    /// line from its top that stops 5 units short of its bottom — a passage
+    /// Small closes: every setting fills the whole band, both sides of the
+    /// fold, and nothing outside it.
+    #[test]
+    fn a_closed_area_with_a_fold_fills_whole_at_every_gap_size() {
+        let band = thin_lines(&[Point::new(100.0, 100.0), Point::new(600.0, 100.0), Point::new(600.0, 140.0), Point::new(100.0, 140.0)], true, 1.0);
+        let fold = thin_lines(&[Point::new(350.0, 100.0), Point::new(350.0, 135.0)], false, 1.0);
+        let walls = [band, fold];
+        for gap in GapSize::ALL {
+            let region = fill_region(&walls, Point::new(150.0, 120.0), gap).unwrap_or_else(|| panic!("{gap:?}: nothing filled"));
+            let painted = |x: f64, y: f64| region.winding(Point::new(x, y)) != 0;
+            assert!(painted(150.0, 120.0) && painted(550.0, 120.0) && painted(350.5, 138.0), "{gap:?}: not the whole band");
+            let b = region.bounding_box();
+            assert!(b.x0 > 99.0 && b.x1 < 601.0 && b.y0 > 99.0 && b.y1 < 141.0, "{gap:?}: spilled: {b:?}");
+        }
+    }
+
+    /// **A closed gap holds the fill at the gap** (user 2026-11-22: "the
+    /// gaps are not closed properly"). With the gap closing far wider than
+    /// the gap, the fill used to pour out through it — an arrowhead past
+    /// the gap and a strip along the narrow space to the next drawing. It
+    /// must stop at the line, and fill the ring up to it.
+    #[test]
+    fn a_closed_gap_holds_the_fill_at_the_gap() {
+        for gap in [4.0, 8.0, 14.0, 24.0] {
+            // The next ring 27 to the right: narrower than the closing.
+            let walls = [open_ring(70.0, gap), open_ring(200.0, 2.0)];
+            let fill = fill_region(&walls, Point::new(60.0, 70.0), GapSize::ExtraLarge).expect("the gap closes");
+            let b = fill.bounding_box();
+            assert!(b.x1 < 70.0 + 51.5 + 4.0, "gap {gap}: the fill reaches {:.1}, out past the ring at 121.5", b.x1);
+            let inside = std::f64::consts::PI * 48.5 * 48.5;
+            let area = fill.area().abs();
+            assert!(area > inside * 0.97 && area < inside * 1.03, "gap {gap}: fill {area:.0} for a ring of {inside:.0}");
+        }
+    }
 
     /// A closed square outline: clicking inside fills, and the filled region is
     /// roughly the square's interior.

@@ -335,6 +335,14 @@ pub struct DrawStyle {
     /// Paint Bucket gap closing — how large a gap in the outline the bucket
     /// bridges before filling. Animate's Gap Size.
     pub gap_size: buzz_scene::GapSize,
+    /// **The Paint Bucket colours in** (user 2026-11-22: "was it not
+    /// supposed to be in the paint bucket tool? I use that to colour"): a
+    /// click fills the area the *lines* close — traced colour pieces inside
+    /// do not stop it — replaces the colours in it, closes the little gaps
+    /// beside the lines, and goes under the lines, as the Colour In brush
+    /// does. Off, the bucket fills between whatever shapes are there, as
+    /// Animate's does. On by default.
+    pub bucket_colour_in: bool,
     /// Symmetry drawing — every stroke mirrored across the stage centre.
     pub symmetry: SymmetrySettings,
     /// Recently used colours, most recent first.
@@ -535,6 +543,7 @@ impl Default for DrawStyle {
             brush_zoom_size: true,
             wand: buzz_scene::WandOptions::default(),
             gap_size: buzz_scene::GapSize::default(),
+            bucket_colour_in: true,
             symmetry: SymmetrySettings::default(),
             swatches: default_swatches(),
         }

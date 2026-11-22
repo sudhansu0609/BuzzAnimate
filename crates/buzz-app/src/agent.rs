@@ -146,7 +146,7 @@ pub fn route(command: Command) -> Route {
         | LipSyncFromCaptions | Undo | Redo | Cut | Copy | Paste | PasteInPlace | Delete | SelectAll | Deselect
         | DuplicateSelection | ZoomIn | ZoomOut | ZoomActual | ZoomFitInWindow | ZoomShowFrame
         | ZoomShowAll | ToggleRulers | ToggleAutoSave | ToggleGrid | ToggleGuides | ToggleSnapping
-        | TogglePasteboard | ToggleNeighbours | GroupSelection | UngroupSelection | BreakApart | BringToFront
+        | TogglePasteboard | ToggleNeighbours | GroupSelection | UngroupSelection | BreakApart | DistributeToLayers | DistributeToKeyframes | BringToFront
         | BringForward | SendBackward | SendToBack | RetargetPerformance | SwapSymbol | NextPose | PreviousPose
         | PaintThrough | ExposeOnTwos | ExposeOnThrees | SelectSameColour | ThickenStroke
         | ThinStroke | TraceBitmap | TraceLineArt | ConvertLinesToFills | ExpandFill

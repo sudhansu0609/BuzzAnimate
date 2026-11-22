@@ -3647,6 +3647,13 @@ impl Editor {
                 // A click right on a line (traced line art is a fill too)
                 // recolours the line, as one on the door's panel does (user
                 // 2026-11-17).
+                // **Colour In**: a click off the lines fills what the lines
+                // close, replacing the colour there — a click on traced
+                // colour too, which recolours only that piece otherwise.
+                let on_line = recolour.is_some_and(|id| self.is_line_art_object(id));
+                if style.bucket_colour_in && !on_line && self.bucket_colour_in(point, &style) {
+                    return;
+                }
                 if let Some(id) = recolour {
                     let at = self.edit_at();
                     self.doc.edit("Paint Bucket", |scene| {
@@ -3755,6 +3762,113 @@ impl Editor {
             self.doc.scene().find_object(id),
             Some((_, o)) if matches!(&o.kind, ObjectKind::Shape(s) if s.fill.is_some())
         )
+    }
+
+    /// Whether `id` is a drawn line: a stroke, or a fill in the darkest ink
+    /// on its layer ([`is_line_art`]).
+    fn is_line_art_object(&self, id: ObjectId) -> bool {
+        let scene = self.doc.scene();
+        let Some((layer, object)) = scene.find_object_at(self.current_frame, id) else { return false };
+        let ObjectKind::Shape(shape) = &object.kind else { return false };
+        if shape.stroke.is_some() && shape.fill.is_none() {
+            return true;
+        }
+        let ink = scene.layers().get(layer).map_or(f64::INFINITY, |l| layer_ink(l.objects_at(self.current_frame)));
+        is_line_art(shape, ink)
+    }
+
+    /// **The Paint Bucket's Colour In** ([`DrawStyle::bucket_colour_in`]).
+    ///
+    /// On the layer whose lines close the click — the active one first, then
+    /// the others top first, as [`Self::bucket_flood`] looks — the area the
+    /// lines alone close is found, the Gap Size closing gaps in them: strokes
+    /// and fills in the ink colour ([`is_line_art`]) are walls, the colour
+    /// already there is not. That area is then laid as [`colour_in`] lays a
+    /// brush stroke — the colour inside replaced, the gaps beside the lines
+    /// filled, under the lines — as one undo step. `false` when no lines
+    /// close the click, so the plain bucket can have it.
+    fn bucket_colour_in(&mut self, point: Point, style: &DrawStyle) -> bool {
+        if !style.fill_enabled {
+            return false;
+        }
+        let active = self.artwork_layer().ok();
+        let frame = self.current_frame;
+        let scene = self.doc.scene();
+        let master = self.doc.master_audio().map(|(_, layer)| layer);
+        let mut order: Vec<LayerId> = active.into_iter().collect();
+        let mut others: Vec<LayerId> = scene
+            .layers()
+            .selectable_in_paint_order(scene.stage().sort_by_depth)
+            .into_iter()
+            .filter(|l| l.kind.holds_artwork() && Some(l.id) != master && !l.audio_guide)
+            .map(|l| l.id)
+            .collect();
+        others.reverse();
+        order.extend(others.into_iter().filter(|id| Some(*id) != active));
+
+        let mut found: Option<(LayerId, BezPath)> = None;
+        for layer in order {
+            let Some(layer_ref) = scene.layers().get(layer) else { continue };
+            if scene.layers().is_effectively_locked(layer) {
+                continue;
+            }
+            let Some(local) = scene.view_to_layer(frame, layer_ref.depth, point) else { continue };
+            let seed = match invert(scene.layers().inherited_transform(layer, frame)) {
+                Some(back) => back * local,
+                None => local,
+            };
+            let objects = layer_ref.objects_at(frame);
+            let ink = layer_ink(objects);
+            let mut lines = Vec::new();
+            for object in objects.iter().filter(|o| o.visible) {
+                match &object.kind {
+                    ObjectKind::Shape(s) if s.stroke.is_some() || is_line_art(s, ink) => {
+                        let mut line = buzz_scene::Boundary::from_shape(s, object.transform);
+                        // A stroke's own fill is colour, not a wall.
+                        line.filled = is_line_art(s, ink);
+                        lines.push(line);
+                    }
+                    ObjectKind::Group(_) => collect_bucket_boundaries(object, Affine::IDENTITY, &mut lines),
+                    _ => {}
+                }
+            }
+            let around = lines.iter().map(|b| buzz_geom::Shape::bounding_box(&b.path)).reduce(|a, b| a.union(b));
+            if !around.is_some_and(|r| r.contains(seed)) {
+                continue;
+            }
+            // **The lines alone close it** (user 2026-11-22: the drawing's own
+            // edge as a wall "overfills — in the torso the cloth colours the
+            // skin as well"; an open area is closed by hand, then filled).
+            if let Some(path) = buzz_scene::fill_region(&lines, seed, style.gap_size) {
+                found = Some((layer, path));
+                break;
+            }
+        }
+        let Some((layer, path)) = found else {
+            return false;
+        };
+        let Some(paint) = style.fill_for_new_shape(buzz_geom::Shape::bounding_box(&path)) else {
+            return false;
+        };
+        let shape = ShapeData {
+            path,
+            fill: Some(FillSpec { paint, rule: buzz_scene::bucket::FILL_RULE, swatch: None }),
+            stroke: None,
+            blend: buzz_scene::PaintBlend::default(),
+        };
+        // What counts as a speck to take whole, and the gaps beside the lines
+        // to close: the Gap Size's, at least a couple of units.
+        let width = style.gap_size.document_units().max(2.0) * 2.0;
+        let auto = self.auto_keyframe;
+        let mut painted = None;
+        self.doc.edit("Paint Bucket", |scene| {
+            ensure_keyframe_for_drawing(scene, layer, frame, auto);
+            painted = colour_in(scene, layer, frame, true, shape, Some(width));
+        });
+        if Some(layer) != active {
+            self.selection.set_active_layer(Some(layer));
+        }
+        painted.is_some()
     }
 
     /// Flood-fill the enclosed region under `point`.
@@ -3971,7 +4085,7 @@ impl Editor {
             // left selected — see `add_shape`.
             for copy in copies {
                 created = if mode == PaintMode::ColourIn {
-                    colour_in(scene, layer, frame, merge, copy)
+                    colour_in(scene, layer, frame, merge, copy, None)
                 } else if mode == PaintMode::Behind {
                     // Behind the artwork, and never merged into it: what is
                     // already drawn stays on top, untouched.
@@ -6408,6 +6522,8 @@ impl Editor {
             GroupSelection => self.group_selection(),
             UngroupSelection => self.ungroup_selection(),
             BreakApart => self.break_apart_selection(),
+            DistributeToLayers => self.distribute_to_layers(),
+            DistributeToKeyframes => self.distribute_to_keyframes(),
             BringToFront => self.reorder_selection(Reorder::Front),
             BringForward => self.reorder_selection(Reorder::Forward),
             SendBackward => self.reorder_selection(Reorder::Backward),
@@ -16062,6 +16178,222 @@ impl Editor {
         self.selection.set(created);
     }
 
+    /// The selected objects **on the frame being looked at**, by layer: the
+    /// layer, the start of the keyframe they are on, and the objects as they
+    /// stand there in its stacking order (back first). Layers come bottom row
+    /// first, so the whole list runs back to front.
+    fn selected_on_frame(&self) -> Vec<(LayerId, u32, Vec<Arc<Object>>)> {
+        let scene = self.doc.scene();
+        let frame = self.current_frame;
+        let mut out: Vec<(usize, LayerId, u32, Vec<Arc<Object>>)> = Vec::new();
+        for layer in scene.layers().iter() {
+            let Some(key) = layer.frames.keyframe_at(frame) else {
+                continue;
+            };
+            let picked: Vec<Arc<Object>> =
+                key.objects.iter().filter(|o| self.selection.contains(o.id)).cloned().collect();
+            if !picked.is_empty() {
+                let row = scene.layer_index(layer.id).unwrap_or(0);
+                out.push((row, layer.id, key.start, picked));
+            }
+        }
+        // Index 0 is the top row: the bottom row is the back.
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        out.into_iter().map(|(_, layer, start, objects)| (layer, start, objects)).collect()
+    }
+
+    /// **Stack them on one spot** (user 2026-11-22: "each object shall be
+    /// placed on same location on stage so that they stack one over another
+    /// when scrolled"): how far each of `objects` moves so its centre lands
+    /// on the centre of the first.
+    fn stacking_offsets(scene: &Scene, objects: &[&Arc<Object>]) -> Vec<Vec2> {
+        let centres: Vec<Point> = objects.iter().map(|o| scene.resolved_bounds(o).center()).collect();
+        let Some(&anchor) = centres.first() else {
+            return Vec::new();
+        };
+        centres.iter().map(|c| anchor - *c).collect()
+    }
+
+    /// **Distribute to Layers** — Animate's Modify ▸ Timeline ▸ Distribute to
+    /// Layers. Each selected object goes onto a layer of its own, made just
+    /// above the layer it came from (the frontmost object on the top one),
+    /// on the same keyframe span, and is moved so all of them sit centred on
+    /// the first (backmost) one, stacked. A new layer takes the source
+    /// layer's settings (folder, parenting, depth, lighting) and is named
+    /// after the symbol an instance shows, else after the source layer. The
+    /// source layer keeps whatever was not selected. One undo step.
+    fn distribute_to_layers(&mut self) {
+        let groups = self.selected_on_frame();
+        let count: usize = groups.iter().map(|g| g.2.len()).sum();
+        if count == 0 {
+            self.status = Some("Select objects on the stage to distribute to layers".into());
+            return;
+        }
+        let scene = self.doc.scene();
+        let all: Vec<&Arc<Object>> = groups.iter().flat_map(|g| g.2.iter()).collect();
+        let offsets = Self::stacking_offsets(scene, &all);
+        let mut offsets = offsets.into_iter();
+        let mut made: Vec<(LayerId, ObjectId)> = Vec::new();
+        self.doc.edit("Distribute to Layers", |scene| {
+            for (layer, start, objects) in &groups {
+                let Some(source) = scene.layers().get(*layer).map(|l| (**l).clone()) else {
+                    continue;
+                };
+                let length = source.frames.length();
+                let end = source.frames.keyframes().iter().map(|k| k.start).find(|s| s > start).unwrap_or(length);
+                let ids: Vec<ObjectId> = objects.iter().map(|o| o.id).collect();
+                scene.update_layer(*layer, |l| {
+                    if let Some(key) = l.frames.keyframe_at_mut(*start) {
+                        Arc::make_mut(&mut key.objects).retain(|o| !ids.contains(&o.id));
+                    }
+                });
+                let mut below = *layer;
+                for (n, object) in objects.iter().enumerate() {
+                    let delta = offsets.next().unwrap_or_default();
+                    let mut moved = (**object).clone();
+                    moved.id = scene.next_object_id();
+                    moved.transform = Affine::translate(delta) * moved.transform;
+                    let name = moved
+                        .instance()
+                        .and_then(|i| scene.library().get(i.symbol))
+                        .map(|s| s.name.clone())
+                        .or_else(|| moved.name.clone())
+                        .unwrap_or_else(|| format!("{} {}", source.name, n + 1));
+                    let moved_id = moved.id;
+                    let mut key = buzz_scene::Keyframe::new(*start);
+                    key.objects = Arc::new(vec![Arc::new(moved)]);
+                    let mut keys = vec![key];
+                    if end < length {
+                        keys.push(buzz_scene::Keyframe::new(end));
+                    }
+                    let frames = buzz_scene::LayerTimeline::from_parts(keys, length);
+                    let created = scene.add_layer(name.clone(), source.kind.clone());
+                    scene.update_layer(created, |l| {
+                        let mut copy = source.clone();
+                        copy.id = l.id;
+                        copy.name = name;
+                        copy.color = l.color;
+                        copy.frames = frames;
+                        // What belongs to the one layer, not to its copies.
+                        copy.puppet = false;
+                        copy.puppet_instance = None;
+                        copy.main_sound = false;
+                        copy.cast_source = None;
+                        *l = copy;
+                    });
+                    // Just above the one before: the frontmost ends on top.
+                    if let Some(index) = scene.layer_index(below) {
+                        scene.move_layer_to(created, index, source.parent);
+                    }
+                    below = created;
+                    made.push((created, moved_id));
+                }
+            }
+        });
+        let Some(&(top, _)) = made.last() else {
+            return;
+        };
+        self.selection.set(made.iter().map(|(_, id)| *id));
+        self.selection.set_active_layer(Some(top));
+        self.status = Some(format!(
+            "Distributed {} object{} to layers, stacked on one spot",
+            made.len(),
+            if made.len() == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// **Distribute to Keyframes** — Animate's Modify ▸ Timeline ▸ Distribute
+    /// to Keyframes. The selected objects on a layer each get a keyframe of
+    /// their own, one after another from the keyframe they are on, in reading
+    /// order (rows top to bottom, left to right) — a sheet of drawings flips
+    /// in the order it reads. Each is moved so its centre sits on the first
+    /// one's, so scrubbing shows them on one spot rather than jumping around
+    /// the stage. When everything on the keyframe was selected the first
+    /// stays on it; otherwise the rest stay there and the drawings start on
+    /// the next frame. Frames are inserted on that layer for them, so what
+    /// came later on it moves along rather than being covered; the last
+    /// drawing holds for as long as the keyframe held. One undo step.
+    fn distribute_to_keyframes(&mut self) {
+        let groups = self.selected_on_frame();
+        let count: usize = groups.iter().map(|g| g.2.len()).sum();
+        if count == 0 {
+            self.status = Some("Select objects on the stage to distribute to keyframes".into());
+            return;
+        }
+        let scene = self.doc.scene();
+        // Each layer's objects in reading order.
+        let groups: Vec<(LayerId, u32, Vec<Arc<Object>>)> = groups
+            .into_iter()
+            .map(|(layer, start, objects)| {
+                let bounds: Vec<Rect> = objects.iter().map(|o| scene.resolved_bounds(o)).collect();
+                let order = reading_order(&bounds);
+                (layer, start, order.into_iter().map(|i| Arc::clone(&objects[i])).collect())
+            })
+            .collect();
+        let all: Vec<&Arc<Object>> = groups.iter().flat_map(|g| g.2.iter()).collect();
+        let offsets = Self::stacking_offsets(scene, &all);
+        let mut offsets = offsets.into_iter();
+        let current = self.current_frame;
+        let mut here: Vec<ObjectId> = Vec::new();
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        self.doc.edit("Distribute to Keyframes", |scene| {
+            for (layer, start, objects) in groups {
+                let ids: Vec<ObjectId> = objects.iter().map(|o| o.id).collect();
+                let mut drawings: std::collections::VecDeque<Arc<Object>> = objects
+                    .iter()
+                    .map(|o| {
+                        let delta = offsets.next().unwrap_or_default();
+                        let mut moved = (**o).clone();
+                        moved.transform = Affine::translate(delta) * moved.transform;
+                        Arc::new(moved)
+                    })
+                    .collect();
+                scene.update_layer(layer, |l| {
+                    let frames = &mut l.frames;
+                    let Some(key) = frames.keyframe_at(start) else {
+                        return;
+                    };
+                    let rest: Vec<Arc<Object>> = key.objects.iter().filter(|o| !ids.contains(&o.id)).cloned().collect();
+                    let first_stays = rest.is_empty();
+                    let new_keys = drawings.len() as u32 - u32::from(first_stays);
+                    for _ in 0..new_keys {
+                        frames.insert_frame(start + 1);
+                    }
+                    let on_start = if first_stays { drawings.pop_front().into_iter().collect() } else { rest };
+                    frames.set_objects(start, on_start);
+                    if let Some(key) = frames.keyframe_at_mut(start) {
+                        // A tween from one drawing into a different one is
+                        // not what the keyframe was tweening.
+                        if new_keys > 0 {
+                            key.tween = Tween::default();
+                            key.ease_curve = None;
+                        }
+                    }
+                    for i in 1..=new_keys {
+                        frames.insert_blank_keyframe(start + i);
+                        if let Some(drawing) = drawings.pop_front() {
+                            frames.push_object(start + i, drawing);
+                        }
+                    }
+                    let first = if first_stays { start } else { start + 1 };
+                    spans.push((first, start + new_keys));
+                    if let Some(key) = frames.keyframe_at(current) {
+                        here.extend(key.objects.iter().map(|o| o.id).filter(|id| ids.contains(id)));
+                    }
+                });
+            }
+        });
+        self.selection.set(here);
+        let first = spans.iter().map(|s| s.0).min().unwrap_or(current);
+        let last = spans.iter().map(|s| s.1).max().unwrap_or(current);
+        self.status = Some(format!(
+            "Distributed {count} object{} to keyframes {}\u{2013}{}, stacked on one spot",
+            if count == 1 { "" } else { "s" },
+            first + 1,
+            last + 1
+        ));
+    }
+
     fn group_selection(&mut self) {
         // One object groups too, as Animate's Ctrl+G does: a lone drawing in
         // a group stops merging with whatever is drawn over it. Nothing
@@ -17378,6 +17710,27 @@ fn carry_rest_poses(scene: &mut Scene, frame: u32, arrived: &[ObjectId], delta: 
 /// the first one found would move the artwork on frame 0 while the user was
 /// looking at frame 12 — the change would seem to do nothing, and would
 /// quietly damage a frame they were not editing.
+/// **Reading order** of a set of boxes: rows top to bottom, each row left to
+/// right. A box joins the row of the first box of it whose height its centre
+/// falls within.
+fn reading_order(bounds: &[Rect]) -> Vec<usize> {
+    let mut by_height: Vec<usize> = (0..bounds.len()).collect();
+    by_height.sort_by(|&a, &b| bounds[a].center().y.total_cmp(&bounds[b].center().y));
+    let mut rows: Vec<(f64, Vec<usize>)> = Vec::new();
+    for i in by_height {
+        match rows.last_mut() {
+            Some((bottom, row)) if bounds[i].center().y <= *bottom => row.push(i),
+            _ => rows.push((bounds[i].y1, vec![i])),
+        }
+    }
+    rows.into_iter()
+        .flat_map(|(_, mut row)| {
+            row.sort_by(|&a, &b| bounds[a].center().x.total_cmp(&bounds[b].center().x));
+            row
+        })
+        .collect()
+}
+
 fn update_object(scene: &mut Scene, at: EditAt, id: ObjectId, f: impl FnMut(&mut Object)) {
     scene.update_object_where(at, id, f);
 }
@@ -18024,13 +18377,13 @@ pub(crate) fn object_contains(
             // stroke here becomes one — and an exact test on a sliver two
             // pixels wide is a target two pixels wide. See
             // `buzz_geom::hit::fill_contains_near`.
-            if shape.fill.is_some()
-                && buzz_geom::hit::fill_contains_near(
-                    &shape.path,
-                    local,
-                    buzz_geom::FillMode::NonZero,
-                    tolerance,
-                )
+            //
+            // **By the fill's own rule** (user 2026-11-22: a Paint Bucket
+            // click in a white hole of traced line art recoloured all the
+            // lines). Traced ink marks its holes even-odd; tested non-zero, a
+            // hole was ink, so a click in one picked up the whole drawing.
+            if let Some(fill) = &shape.fill
+                && buzz_geom::hit::fill_contains_near(&shape.path, local, fill.rule, tolerance)
             {
                 return true;
             }
@@ -20027,6 +20380,17 @@ fn is_line_art(shape: &ShapeData, ink: f64) -> bool {
     solid_luminance(shape).is_some_and(|l| l <= LINE_ART_DARKEST && l <= ink + INK_SHADES)
 }
 
+/// The darkest solid fill among `objects`: the ink of a traced drawing.
+fn layer_ink(objects: &[Arc<Object>]) -> f64 {
+    objects
+        .iter()
+        .filter_map(|o| match &o.kind {
+            ObjectKind::Shape(s) => solid_luminance(s),
+            _ => None,
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// How dark a fill must be to be taken for a line: ink, not colour.
 const LINE_ART_DARKEST: f64 = 0.3;
 /// How much lighter than the darkest fill around a line may be.
@@ -20051,7 +20415,7 @@ const INK_SHADES: f64 = 0.1;
 ///    covers (cut away, or fused when it is the same colour), as paint does.
 ///
 /// Returns the new shape, `None` when nothing was painted.
-fn colour_in(scene: &mut Scene, layer: LayerId, frame: u32, merge: bool, shape: ShapeData) -> Option<ObjectId> {
+fn colour_in(scene: &mut Scene, layer: LayerId, frame: u32, merge: bool, shape: ShapeData, brush_width: Option<f64>) -> Option<ObjectId> {
     use buzz_geom::{BoolOp, boolean, Shape as _};
     let stroke = shape.path.clone();
     let bb = stroke.bounding_box();
@@ -20060,8 +20424,9 @@ fn colour_in(scene: &mut Scene, layer: LayerId, frame: u32, merge: bool, shape: 
     if !(area > 1e-9) || !(perimeter > 0.0) {
         return None;
     }
-    // A brush stroke's area over half its outline is its width.
-    let width = (2.0 * area / perimeter).max(0.5);
+    // A brush stroke's area over half its outline is its width; a bucket
+    // fill says what to treat as its width (its whole area is no brush).
+    let width = brush_width.unwrap_or(2.0 * area / perimeter).max(0.5);
     let reach = bb.inflate(2.0 * width, 2.0 * width);
     let opts = buzz_geom::BooleanOptions::for_shape_size(reach.width().hypot(reach.height()));
 
@@ -32448,6 +32813,191 @@ mod tests {
     ///   the lines — above, below and at the opening — are filled too;
     /// - nothing outside the outline is painted;
     /// - the lines are untouched and still on top of the paint.
+    /// A row of drawings spread over the stage, and a layer above the one
+    /// they are on, for the distribute tests.
+    fn spread_drawings(e: &mut Editor) -> (LayerId, LayerId, Vec<ObjectId>) {
+        let below = e.doc_add_layer("Below", LayerKind::Normal);
+        let layer = e.doc_add_layer("Poses", LayerKind::Normal);
+        let above = e.doc_add_layer("Above", LayerKind::Normal);
+        let ink = Color::from_rgba8(20, 20, 20, 255);
+        let mut ids = Vec::new();
+        e.doc.edit("Draw", |scene| {
+            // Laid down right to left, so stacking order is not reading order;
+            // the third sits on the second row.
+            ids.push(scene.add_shape(layer, ShapeData::filled(square(300.0, 0.0, 40.0), ink)).unwrap());
+            ids.push(scene.add_shape(layer, ShapeData::filled(square(150.0, 10.0, 20.0), ink)).unwrap());
+            ids.push(scene.add_shape(layer, ShapeData::filled(square(0.0, 200.0, 60.0), ink)).unwrap());
+            ids.push(scene.add_shape(layer, ShapeData::filled(square(0.0, 0.0, 30.0), ink)).unwrap());
+            scene.update_layer(layer, |l| {
+                l.frames.insert_frame(9);
+                l.frames.insert_blank_keyframe(6);
+            });
+        });
+        e.selection.set_active_layer(Some(layer));
+        let _ = (below, above);
+        (layer, above, ids)
+    }
+
+    fn centre_at(e: &Editor, frame: u32, id: ObjectId) -> Point {
+        let (_, o) = e.doc.scene().find_object_at(frame, id).unwrap();
+        e.doc.scene().resolved_bounds(o).center()
+    }
+
+    #[test]
+    fn distribute_to_keyframes_puts_each_drawing_on_its_own_keyframe_on_one_spot() {
+        let mut e = Editor::default();
+        let (layer, _, ids) = spread_drawings(&mut e);
+        let anchor = centre_at(&e, 0, ids[3]);
+        e.selection.set(ids.clone());
+        e.run(Command::DistributeToKeyframes);
+
+        let scene = e.doc.scene();
+        let frames = &scene.layers().get(layer).unwrap().frames;
+        let starts: Vec<u32> = frames.keyframes().iter().map(|k| k.start).collect();
+        // Four drawings on 0–3, the last holding to 5, then the blank that
+        // was at 6 moved along by the three frames made for them.
+        assert_eq!(starts, vec![0, 1, 2, 3, 9], "{starts:?}");
+        assert_eq!(frames.length(), 13);
+        // Reading order: the top row left to right, then the second row.
+        let order: Vec<ObjectId> = (0..4).map(|f| {
+            let on = frames.objects_at(f);
+            assert_eq!(on.len(), 1, "one drawing on frame {f}");
+            on[0].id
+        }).collect();
+        assert_eq!(order, vec![ids[3], ids[1], ids[0], ids[2]]);
+        for f in 0..4 {
+            let c = scene.resolved_bounds(&frames.objects_at(f)[0]).center();
+            assert!((c - anchor).hypot() < 1e-6, "frame {f} centred at {c:?}, not {anchor:?}");
+        }
+        // One undo puts it all back.
+        e.run(Command::Undo);
+        let frames = &e.doc.scene().layers().get(layer).unwrap().frames;
+        assert_eq!(frames.objects_at(0).len(), 4);
+        assert_eq!(frames.length(), 10);
+    }
+
+    #[test]
+    fn distribute_to_keyframes_leaves_the_unselected_where_they_were() {
+        let mut e = Editor::default();
+        let (layer, _, ids) = spread_drawings(&mut e);
+        e.selection.set([ids[0], ids[1]]);
+        e.run(Command::DistributeToKeyframes);
+        let frames = &e.doc.scene().layers().get(layer).unwrap().frames;
+        let on = |f: u32| frames.objects_at(f).iter().map(|o| o.id).collect::<Vec<_>>();
+        assert_eq!(on(0), vec![ids[2], ids[3]], "the rest stay on the keyframe");
+        assert_eq!(on(1), vec![ids[1]]);
+        assert_eq!(on(2), vec![ids[0]]);
+        assert!(frames.is_keyframe(8), "the blank at 6 moved along two");
+    }
+
+    #[test]
+    fn distribute_to_layers_gives_each_object_a_layer_stacked_on_one_spot() {
+        let mut e = Editor::default();
+        let (layer, above, ids) = spread_drawings(&mut e);
+        let anchor = centre_at(&e, 0, ids[0]);
+        e.selection.set([ids[0], ids[1], ids[2]]);
+        e.run(Command::DistributeToLayers);
+
+        let scene = e.doc.scene();
+        let rows: Vec<LayerId> = scene.layers().iter().map(|l| l.id).collect();
+        let source = scene.layer_index(layer).unwrap();
+        assert_eq!(scene.layer_index(above).unwrap() + 4, source, "three new layers between Above and Poses: {rows:?}");
+        let source_frames = &scene.layers().get(layer).unwrap().frames;
+        assert_eq!(source_frames.objects_at(0).iter().map(|o| o.id).collect::<Vec<_>>(), vec![ids[3]]);
+        // From the source up: back to front, each holding one object for
+        // the keyframe's span and blank where the source had its blank.
+        for (n, row) in (source - 3..source).rev().enumerate() {
+            let l = &scene.layers().iter().nth(row).unwrap();
+            assert_eq!(l.name, format!("{} {}", scene.layers().get(layer).unwrap().name, n + 1));
+            assert_eq!(l.frames.length(), 10);
+            assert_eq!(l.frames.objects_at(5).len(), 1, "{} holds its object to frame 5", l.name);
+            assert!(l.frames.objects_at(6).is_empty(), "{} is blank from 6", l.name);
+            let c = scene.resolved_bounds(&l.frames.objects_at(0)[0]).center();
+            assert!((c - anchor).hypot() < 1e-6, "{} centred at {c:?}", l.name);
+        }
+        assert_eq!(e.selection.len(), 3);
+    }
+
+    /// **The Paint Bucket colours in a traced character** (user 2026-11-22:
+    /// "was it not supposed to be in the paint bucket tool? I use that to
+    /// colour"). An ink outline with a gap, traced yellow pieces inside with
+    /// white slivers between them, and an open inner line: one click in a
+    /// sliver fills the whole outline in red — the yellow replaced, the
+    /// slivers filled — under the lines, and nothing outside. A click on a
+    /// line still recolours only that line.
+    #[test]
+    fn the_paint_bucket_colours_in_traced_art() {
+        use buzz_geom::Shape as _;
+        let mut e = Editor::default();
+        let layer = e.doc_add_layer("Character", LayerKind::Normal);
+        let ink = Color::from_rgba8(20, 20, 20, 255);
+        let yellow = Color::from_rgba8(250, 220, 40, 255);
+        let red = Color::from_rgba8(220, 30, 30, 255);
+        let rect = |x0: f64, y0: f64, x1: f64, y1: f64| Rect::new(x0, y0, x1, y1).to_path(1e-9);
+        let outline = {
+            let mut ring = rect(0.0, 0.0, 100.0, 100.0);
+            ring.extend(rect(2.0, 2.0, 98.0, 98.0));
+            let opts = buzz_geom::BooleanOptions { fill: buzz_geom::FillMode::EvenOdd, ..Default::default() };
+            let ring = buzz_geom::boolean(&ring, &ring, buzz_geom::BoolOp::Union, opts);
+            // A 4-unit gap in the right wall.
+            buzz_geom::boolean(&ring, &rect(97.0, 48.0, 101.0, 52.0), buzz_geom::BoolOp::Difference, Default::default())
+        };
+        let mut ids = Vec::new();
+        e.doc.edit("Trace", |scene| {
+            // Yellow pieces with white slivers between them, as a colour trace leaves.
+            ids.push(scene.add_shape(layer, ShapeData::filled(rect(2.0, 2.0, 48.0, 60.0), yellow)).unwrap());
+            ids.push(scene.add_shape(layer, ShapeData::filled(rect(50.0, 2.0, 98.0, 60.0), yellow)).unwrap());
+            ids.push(scene.add_shape(layer, ShapeData::filled(outline.clone(), ink)).unwrap());
+            // An open line inside, from the left wall two thirds across.
+            ids.push(scene.add_shape(layer, ShapeData::filled(rect(2.0, 70.0, 66.0, 72.0), ink)).unwrap());
+        });
+        let (lines, yellows) = ([ids[2], ids[3]], [ids[0], ids[1]]);
+        let before: Vec<BezPath> = lines.iter().map(|id| match &e.doc.scene().find_object(*id).unwrap().1.kind {
+            ObjectKind::Shape(s) => s.path.clone(),
+            _ => unreachable!(),
+        }).collect();
+        e.selection.set_active_layer(Some(layer));
+        e.style.fill_color = red;
+        e.style.fill_enabled = true;
+        e.style.gap_size = buzz_scene::GapSize::Small;
+        assert!(e.style.bucket_colour_in, "on by default");
+
+        // A click in the white sliver between the yellow pieces.
+        e.apply(ToolAction::BucketFill { point: Point::new(49.0, 30.0) });
+        let scene = e.doc.scene();
+        let objects = scene.layers().get(layer).unwrap().objects_at(0).to_vec();
+        for id in yellows {
+            assert!(scene.find_object(id).is_none(), "the yellow inside is replaced");
+        }
+        let reds: Vec<&Object> = objects.iter().map(|o| &**o).filter(|o| matches!(&o.kind, ObjectKind::Shape(s)
+            if matches!(s.fill.as_ref().map(|f| &f.paint), Some(Paint::Solid(c)) if c.to_rgba8().to_u8_array() == red.to_rgba8().to_u8_array()))).collect();
+        assert_eq!(reds.len(), 1, "one red fill");
+        let ObjectKind::Shape(paint) = &reds[0].kind else { unreachable!() };
+        let painted = |x: f64, y: f64| buzz_geom::fill_contains(&paint.path, Point::new(x, y), paint.fill.as_ref().unwrap().rule);
+        for (x, y, what) in [(25.0, 30.0, "where the yellow was"), (49.0, 30.0, "the sliver"), (80.0, 85.0, "below the inner line"), (95.0, 50.0, "by the gap")] {
+            assert!(painted(x, y), "{what} ({x}, {y}) is red");
+        }
+        for (x, y) in [(110.0, 50.0), (50.0, 110.0), (-10.0, 50.0)] {
+            assert!(!painted(x, y), "outside ({x}, {y}) stays clear");
+        }
+        let index = |id: ObjectId| objects.iter().position(|o| o.id == id).unwrap();
+        for (id, was) in lines.iter().zip(&before) {
+            let ObjectKind::Shape(s) = &scene.find_object(*id).unwrap().1.kind else { unreachable!() };
+            assert_eq!(&s.path, was, "a line is never cut");
+            assert!(index(*id) > index(reds[0].id), "the lines stay on top");
+        }
+
+        // One undo puts the yellow back.
+        e.run(Command::Undo);
+        assert!(e.doc.scene().find_object(yellows[0]).is_some());
+
+        // A click on a line recolours only the line.
+        e.apply(ToolAction::BucketFill { point: Point::new(30.0, 71.0) });
+        let ObjectKind::Shape(s) = &e.doc.scene().find_object(lines[1]).unwrap().1.kind else { unreachable!() };
+        assert!(matches!(s.fill.as_ref().map(|f| &f.paint), Some(Paint::Solid(c)) if c.to_rgba8().to_u8_array() == red.to_rgba8().to_u8_array()), "the line takes the colour");
+        assert!(e.doc.scene().find_object(yellows[0]).is_some(), "and nothing else changes");
+    }
+
     #[test]
     fn colour_in_paints_between_open_lines_and_takes_the_colour_whole() {
         use buzz_geom::Shape as _;

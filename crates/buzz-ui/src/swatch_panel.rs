@@ -38,9 +38,53 @@ pub struct SwatchState {
     /// names are known; the list is how the names are read and edited. Both,
     /// because they are good at different moments.
     pub grid: bool,
+    /// The colour the Add row holds: what **+ Add** puts in the palette.
+    /// `None` until it is changed, so it follows the fill colour until then.
+    adding: Option<peniko::Color>,
+    /// A swatch just added, to bring into view once its row is drawn.
+    reveal: Option<SwatchId>,
+    /// The folder (by path) open for renaming, and the text so far.
+    renaming_folder: Option<(String, String)>,
+}
+
+/// **Add to Swatches from any colour picker** (user 2026-11-22: "give an
+/// option to add to swatches from the colour picker"). A picker cannot
+/// reach the document, so its button leaves the colour here and the shell
+/// adds it ([`take_add_request`], [`SwatchState::add_colour`]) in the same
+/// frame, inside an undo step.
+pub fn request_add(ctx: &egui::Context, colour: peniko::Color) {
+    ctx.data_mut(|d| d.insert_temp(add_request_key(), Some(colour)));
+    ctx.request_repaint();
+}
+
+/// The colour a picker asked to keep, once.
+pub fn take_add_request(ctx: &egui::Context) -> Option<peniko::Color> {
+    ctx.data_mut(|d| d.remove_temp::<Option<peniko::Color>>(add_request_key())).flatten()
+}
+
+fn add_request_key() -> egui::Id {
+    egui::Id::new("swatches-add-request")
 }
 
 impl SwatchState {
+    /// Keep `colour` in the palette — in the selected folder — named
+    /// "Swatch N", brought into view with its name box open. Its id.
+    pub fn add_colour(&mut self, scene: &mut Scene, colour: peniko::Color) -> SwatchId {
+        let folder = self.selected_folder.clone();
+        let id = scene.add_swatch("Swatch", colour, folder.clone());
+        // Straight into a rename: a colour called "Swatch 7" is no better
+        // than a hex value, and naming it later never happens. Enter on the
+        // empty box keeps the given name.
+        self.renaming = Some((id, String::new()));
+        self.renaming_folder = None;
+        self.reveal = Some(id);
+        self.search.clear();
+        if let Some(folder) = folder {
+            self.expanded.insert(folder);
+        }
+        id
+    }
+
     fn is_expanded(&self, path: &str) -> bool {
         self.expanded.contains(path)
     }
@@ -120,6 +164,8 @@ pub fn swatch_panel(
             .on_hover_text("The stroke colour");
     });
 
+    add_row(ui, scene, state, style);
+
     ui.horizontal(|ui| {
         ui.label("\u{1F50D}");
         ui.text_edit_singleline(&mut state.search);
@@ -139,8 +185,8 @@ pub fn swatch_panel(
         ui.add_space(6.0);
         ui.label(
             RichText::new(
-                "No swatches yet.\n\nPick a colour, then press + to name it and keep it \
-                 with the document.",
+                "No swatches yet.\n\nChoose a colour in the box above, then press + Add \
+                 to name it and keep it with the document.",
             )
             .weak()
             .italics(),
@@ -149,8 +195,20 @@ pub fn swatch_panel(
         draw_folder(ui, scene, state, None, 0, &mut picked);
     }
 
-    ui.separator();
-    footer(ui, scene, state, style);
+    if let Some(folder) = state.selected_folder.clone() {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("New colours go in {folder}")).small().weak());
+            if ui
+                .small_button("Delete folder")
+                .on_hover_text("Delete the selected folder, keeping its colours")
+                .clicked()
+            {
+                scene.swatches_mut().remove_folder(&folder);
+                state.selected_folder = None;
+            }
+        });
+    }
 
     if let Some((color, to_stroke)) = picked {
         if to_stroke {
@@ -199,9 +257,7 @@ fn draw_folder(
             }
             ui.label(RichText::new("F").small().weak())
                 .on_hover_text("Folder");
-            if ui.selectable_label(selected, &leaf).clicked() {
-                state.selected_folder = if selected { None } else { Some(folder.clone()) };
-            }
+            folder_name(ui, scene, state, &folder, &leaf, selected);
         });
 
         if open {
@@ -277,7 +333,7 @@ fn swatch_row(
     indent: f32,
     picked: &mut Option<(peniko::Color, bool)>,
 ) {
-    ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
         ui.add_space(indent);
 
         if chip(ui, color, 16.0)
@@ -287,9 +343,16 @@ fn swatch_row(
             *picked = Some((color, ui.input(|i| i.modifiers.shift)));
         }
 
+        // The name gets what the controls on the right leave it, so a long
+        // one is cut short rather than drawn under them.
+        const CONTROLS: f32 = 150.0;
+        let name_width = (ui.available_width() - CONTROLS).max(40.0);
+        let height = ui.spacing().interact_size.y;
         if let Some((editing, text)) = state.renaming.as_mut().filter(|(e, _)| *e == id) {
             let editing = *editing;
-            let response = ui.text_edit_singleline(text);
+            // A new swatch's box starts empty, its given name as the hint, so
+            // typing names it rather than adding to "Swatch 3".
+            let response = ui.add(egui::TextEdit::singleline(text).hint_text(name).desired_width(name_width));
             let done = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if done {
                 let new_name = text.trim().to_string();
@@ -297,14 +360,23 @@ fn swatch_row(
                     scene.swatches_mut().update(editing, |s| s.name = new_name);
                 }
                 state.renaming = None;
+            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                state.renaming = None;
+            } else {
+                response.request_focus();
             }
-            response.request_focus();
-        } else if ui
-            .selectable_label(false, name)
-            .on_hover_text("Double-click to rename")
-            .double_clicked()
-        {
-            state.renaming = Some((id, name.to_string()));
+        } else {
+            let label = ui
+                .allocate_ui(egui::vec2(name_width, height), |ui| {
+                    ui.add(egui::Label::new(name).truncate().sense(egui::Sense::click()))
+                })
+                .inner
+                .on_hover_text(format!("{name}\nDouble-click to rename \u{b7} right-click for more"));
+            if label.double_clicked() {
+                state.renaming = Some((id, name.to_string()));
+                state.renaming_folder = None;
+            }
+            row_menu(&label, scene, state, id, name);
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -332,88 +404,147 @@ fn swatch_row(
             {
                 scene.swatches_mut().remove(id);
             }
-
-            // Which folder it lives in. A dropdown rather than drag and drop,
-            // for the same reason the Library moves symbols that way: the drag
-            // is a piece of work in its own right and this is the whole
-            // behaviour without it.
-            let folders: Vec<String> = scene.swatches().folders().cloned().collect();
-            let current = scene
-                .swatches()
-                .get(id)
-                .and_then(|s| s.folder.clone())
-                .unwrap_or_default();
-            let label = if current.is_empty() {
-                "\u{2014}".to_string()
-            } else {
-                current.rsplit('/').next().unwrap_or("").to_string()
-            };
-            egui::ComboBox::from_id_salt(("swatch-folder", id.0))
-                .selected_text(label)
-                .width(64.0)
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(current.is_empty(), "\u{2014} root")
-                        .clicked()
-                    {
-                        scene.swatches_mut().update(id, |s| s.folder = None);
-                    }
-                    for folder in folders {
-                        if ui.selectable_label(current == folder, &folder).clicked() {
-                            scene
-                                .swatches_mut()
-                                .update(id, |s| s.folder = Some(folder.clone()));
-                        }
-                    }
-                });
         });
+    });
+    if state.reveal == Some(id) {
+        row.response.scroll_to_me(Some(egui::Align::Center));
+        state.reveal = None;
+    }
+}
+
+/// A swatch's right-click menu: rename, the folder it lives in, delete.
+/// The folder was a dropdown on every row, drawn over the name.
+fn row_menu(label: &egui::Response, scene: &mut Scene, state: &mut SwatchState, id: SwatchId, name: &str) {
+    label.context_menu(|ui| {
+        if ui.button("Rename").clicked() {
+            state.renaming = Some((id, name.to_string()));
+            state.renaming_folder = None;
+            ui.close();
+        }
+        let current = scene.swatches().get(id).and_then(|s| s.folder.clone());
+        let folders: Vec<String> = scene.swatches().folders().cloned().collect();
+        ui.menu_button("Move to", |ui| {
+            if ui.selectable_label(current.is_none(), "\u{2014} root").clicked() {
+                scene.swatches_mut().update(id, |s| s.folder = None);
+                ui.close();
+            }
+            for folder in folders {
+                if ui.selectable_label(current.as_deref() == Some(folder.as_str()), &folder).clicked() {
+                    scene.swatches_mut().update(id, |s| s.folder = Some(folder.clone()));
+                    ui.close();
+                }
+            }
+        });
+        if ui.button("Delete").clicked() {
+            scene.swatches_mut().remove(id);
+            ui.close();
+        }
     });
 }
 
-/// New swatch, new folder, and the colour a new swatch would take.
-fn footer(ui: &mut Ui, scene: &mut Scene, state: &mut SwatchState, style: &DrawStyle) {
-    ui.horizontal(|ui| {
-        if ui
-            .small_button("+")
-            .on_hover_text("Add the current fill colour to the palette")
-            .clicked()
-        {
-            let folder = state.selected_folder.clone();
-            let id = scene.add_swatch("Swatch", style.fill_color, folder);
-            // Straight into a rename: a colour called "Swatch 7" is no better
-            // than a hex value, and naming it later never happens.
-            let name = scene
-                .swatches()
-                .get(id)
-                .map(|s| s.name.clone())
-                .unwrap_or_default();
-            state.renaming = Some((id, name));
-        }
+/// Make a folder under `parent` (the root for `None`), select it so new
+/// colours go in, and open its name for typing.
+fn new_folder(scene: &mut Scene, state: &mut SwatchState, parent: Option<&str>) {
+    let path = scene.swatches().unique_folder(parent, "Folder");
+    scene.swatches_mut().add_folder(&path);
+    if let Some(parent) = parent {
+        state.expanded.insert(parent.to_string());
+    }
+    state.selected_folder = Some(path.clone());
+    state.renaming_folder = Some((path, String::new()));
+    state.renaming = None;
+    state.search.clear();
+}
 
-        if ui.small_button("Fld").on_hover_text("New folder").clicked() {
-            let base = "Folder";
-            let mut name = base.to_string();
-            let existing: Vec<String> = scene.swatches().folders().cloned().collect();
-            for n in 2..1000 {
-                if !existing.contains(&name) {
-                    break;
-                }
-                name = format!("{base} {n}");
-            }
-            scene.swatches_mut().add_folder(&name);
-            state.selected_folder = Some(name);
-        }
-
-        if let Some(folder) = state.selected_folder.clone() {
-            if ui
-                .small_button("Del Fld")
-                .on_hover_text("Delete the selected folder, keeping its colours")
-                .clicked()
+/// **A folder's name: click selects it, double-click renames it, and
+/// right-click offers Rename, New Folder Inside and Delete** (user
+/// 2026-11-22: "I am not able to rename the swatch group and add folders").
+/// A new folder opens with its name ready to type; Enter keeps it, an empty
+/// box keeps the name it had, Esc leaves it.
+fn folder_name(ui: &mut Ui, scene: &mut Scene, state: &mut SwatchState, folder: &str, leaf: &str, selected: bool) {
+    if let Some((_, text)) = state.renaming_folder.as_mut().filter(|(f, _)| f == folder) {
+        let response = ui.add(egui::TextEdit::singleline(text).hint_text(leaf).desired_width(140.0));
+        let done = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if done {
+            let name = text.trim().to_string();
+            if !name.is_empty()
+                && let Some(renamed) = scene.swatches_mut().rename_folder(folder, &name)
             {
-                scene.swatches_mut().remove_folder(&folder);
+                if state.selected_folder.as_deref() == Some(folder) {
+                    state.selected_folder = Some(renamed.clone());
+                }
+                if state.expanded.remove(folder) {
+                    state.expanded.insert(renamed);
+                }
+            }
+            state.renaming_folder = None;
+        } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            state.renaming_folder = None;
+        } else {
+            response.request_focus();
+        }
+        return;
+    }
+    let label = ui
+        .selectable_label(selected, leaf)
+        .on_hover_text("Click: new colours go in this folder \u{b7} double-click to rename \u{b7} right-click for more");
+    if label.double_clicked() {
+        // Its first click toggled the selection; the folder being renamed is
+        // the one being worked in.
+        state.selected_folder = Some(folder.to_string());
+        state.renaming_folder = Some((folder.to_string(), leaf.to_string()));
+        state.renaming = None;
+    } else if label.clicked() {
+        state.selected_folder = if selected { None } else { Some(folder.to_string()) };
+    }
+    label.context_menu(|ui| {
+        if ui.button("Rename").clicked() {
+            state.renaming_folder = Some((folder.to_string(), leaf.to_string()));
+            state.renaming = None;
+            ui.close();
+        }
+        if ui.button("New folder inside").clicked() {
+            new_folder(scene, state, Some(folder));
+            ui.close();
+        }
+        if ui.button("Delete folder (keep its colours)").clicked() {
+            scene.swatches_mut().remove_folder(folder);
+            if state.selected_folder.as_deref().is_some_and(|f| f == folder || f.starts_with(&format!("{folder}/"))) {
                 state.selected_folder = None;
             }
-            ui.label(RichText::new(folder).small().weak());
+            ui.close();
+        }
+    });
+}
+
+/// **Add a colour, at the top where it is always in reach** (user
+/// 2026-11-22: "I am not able to manually create swatches and add a new
+/// colour"). It was a `+` at the very bottom, under every colour — in the
+/// icon strip's pop-out, below its edge — and it could only add the fill
+/// colour already set somewhere else, at the bottom of the list, out of
+/// sight. Now the colour to add is chosen right here (it starts as the fill
+/// colour), **+ Add** keeps it, and the new swatch comes into view with its
+/// name ready to type.
+fn add_row(ui: &mut Ui, scene: &mut Scene, state: &mut SwatchState, style: &DrawStyle) {
+    ui.horizontal(|ui| {
+        let mut colour = state.adding.unwrap_or(style.fill_color);
+        if crate::panels::color_row(ui, "swatch-new", &mut colour) {
+            state.adding = Some(colour);
+        }
+        if ui
+            .button("+ Add")
+            .on_hover_text("Keep this colour in the palette, named \u{2014} choose it in the box first (it starts as the fill colour)")
+            .clicked()
+        {
+            state.add_colour(scene, colour);
+            state.adding = None;
+        }
+        if ui
+            .button("New folder")
+            .on_hover_text("A folder for colours, named as you type \u{2014} right-click a folder for one inside it")
+            .clicked()
+        {
+            new_folder(scene, state, None);
         }
     });
 }
@@ -451,6 +582,120 @@ mod tests {
                 swatch_panel(ui, &mut scene, &mut state, &mut style);
             });
         }
+    }
+
+    /// **+ Add keeps the colour chosen in the Add row, named as typed**
+    /// (user 2026-11-22: "I am not able to manually create swatches and add
+    /// a new colour"): clicked in a real frame of the panel, a new swatch of
+    /// that colour appears with its name box open, and what is typed is its
+    /// name. Enter on the empty box keeps the given name.
+    #[test]
+    fn plus_add_keeps_the_chosen_colour_under_the_typed_name() {
+        let ctx = egui::Context::default();
+        let mut scene = Scene::default();
+        let mut state = SwatchState::default();
+        let mut style = DrawStyle::default();
+        let skin = peniko::Color::from_rgba8(0xE0, 0xB0, 0x90, 255);
+        state.adding = Some(skin);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 900.0));
+        let mut frame = |scene: &mut Scene, state: &mut SwatchState, events: Vec<egui::Event>| {
+            let input = egui::RawInput { events, screen_rect: Some(screen), ..Default::default() };
+            let out = ctx.run_ui(input, |ui| swatch_panel(ui, scene, state, &mut style));
+            let mut found = None;
+            fn find(shape: &egui::Shape, found: &mut Option<egui::Pos2>) {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == "+ Add" => *found = Some(t.pos + t.galley.rect.center().to_vec2()),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| find(s, found)),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|s| find(&s.shape, &mut found));
+            found
+        };
+        let add = frame(&mut scene, &mut state, vec![]).expect("+ Add is drawn");
+        let before = scene.swatches().len();
+        let press = |pressed| egui::Event::PointerButton { pos: add, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&mut scene, &mut state, vec![egui::Event::PointerMoved(add), press(true)]);
+        frame(&mut scene, &mut state, vec![press(false)]);
+        assert_eq!(scene.swatches().len(), before + 1, "+ Add adds a swatch");
+        frame(&mut scene, &mut state, vec![]);
+        frame(&mut scene, &mut state, vec![egui::Event::Text("Skin".into())]);
+        frame(&mut scene, &mut state, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        let added = scene.swatches().iter().last().expect("the new swatch");
+        assert_eq!(added.name, "Skin");
+        assert_eq!(added.color.to_rgba8().to_u8_array(), skin.to_rgba8().to_u8_array());
+        assert!(state.renaming.is_none(), "the name box closes on Enter");
+
+        // Enter on the empty box keeps the name it was given.
+        let add = frame(&mut scene, &mut state, vec![]).expect("+ Add is drawn");
+        let press = |pressed| egui::Event::PointerButton { pos: add, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&mut scene, &mut state, vec![egui::Event::PointerMoved(add), press(true)]);
+        frame(&mut scene, &mut state, vec![press(false)]);
+        frame(&mut scene, &mut state, vec![]);
+        frame(&mut scene, &mut state, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        let added = scene.swatches().iter().last().expect("the second swatch");
+        assert!(added.name.starts_with("Swatch"), "kept {:?}", added.name);
+    }
+
+    /// **New folder opens with its name ready to type, and a folder renames
+    /// by double-click** (user 2026-11-22: "I am not able to rename the
+    /// swatch group and add folders"), clicked in real frames of the panel.
+    #[test]
+    fn a_new_folder_is_named_as_typed_and_renames_by_double_click() {
+        let ctx = egui::Context::default();
+        let mut scene = Scene::default();
+        let mut state = SwatchState::default();
+        let mut style = DrawStyle::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 900.0));
+        let mut t = 0.0;
+        let mut frame = |scene: &mut Scene, state: &mut SwatchState, events: Vec<egui::Event>, text: &str| {
+            t += 0.05;
+            let input = egui::RawInput { events, screen_rect: Some(screen), time: Some(t), ..Default::default() };
+            let out = ctx.run_ui(input, |ui| swatch_panel(ui, scene, state, &mut style));
+            fn find(shape: &egui::Shape, text: &str, found: &mut Option<egui::Pos2>) {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => *found = Some(t.pos + t.galley.rect.center().to_vec2()),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| find(s, text, found)),
+                    _ => {}
+                }
+            }
+            let mut found = None;
+            out.shapes.iter().for_each(|s| find(&s.shape, text, &mut found));
+            found
+        };
+        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let enter = || egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+
+        let at = frame(&mut scene, &mut state, vec![], "New folder").expect("New folder is drawn");
+        frame(&mut scene, &mut state, vec![egui::Event::PointerMoved(at), button(at, true)], "");
+        frame(&mut scene, &mut state, vec![button(at, false)], "");
+        frame(&mut scene, &mut state, vec![], "");
+        frame(&mut scene, &mut state, vec![egui::Event::Text("Skin".into())], "");
+        frame(&mut scene, &mut state, vec![enter()], "");
+        let folders: Vec<String> = scene.swatches().folders().cloned().collect();
+        assert_eq!(folders, ["Skin"], "the new folder is named as typed");
+        assert_eq!(state.selected_folder.as_deref(), Some("Skin"), "and new colours go in it");
+
+        // Double-click its name to rename it — a moment later, or egui counts
+        // the clicks with New folder's as a triple-click.
+        for _ in 0..20 {
+            frame(&mut scene, &mut state, vec![], "");
+        }
+        let at = frame(&mut scene, &mut state, vec![], "Skin").expect("the folder's name is drawn");
+        for _ in 0..2 {
+            frame(&mut scene, &mut state, vec![egui::Event::PointerMoved(at), button(at, true)], "");
+            frame(&mut scene, &mut state, vec![button(at, false)], "");
+        }
+        frame(&mut scene, &mut state, vec![], "");
+        assert!(state.renaming_folder.is_some(), "double-click opens the name (at {at:?}, selected {:?})", state.selected_folder);
+        for key in [egui::Key::A] {
+            frame(&mut scene, &mut state, vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND }], "");
+        }
+        frame(&mut scene, &mut state, vec![egui::Event::Text("Face".into())], "");
+        frame(&mut scene, &mut state, vec![enter()], "");
+        let folders: Vec<String> = scene.swatches().folders().cloned().collect();
+        assert_eq!(folders, ["Face"], "renamed by double-click");
+        assert_eq!(state.selected_folder.as_deref(), Some("Face"));
     }
 
     /// Adding a colour names it and opens the rename box, because a palette of

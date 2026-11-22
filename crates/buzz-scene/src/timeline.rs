@@ -735,6 +735,19 @@ impl LayerTimeline {
         }
     }
 
+    /// Add an object to the keyframe governing `frame` at `index` in its
+    /// stacking order (0 is the back); past the end it goes on top.
+    pub fn insert_object_at_index(&mut self, frame: u32, index: usize, object: Arc<Object>) -> bool {
+        match self.keyframe_at_mut(frame) {
+            Some(k) => {
+                let objects = Arc::make_mut(&mut k.objects);
+                objects.insert(index.min(objects.len()), object);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Remove an object from wherever it appears.
     pub fn remove_object(&mut self, id: ObjectId) -> Option<Arc<Object>> {
         for keyframe in &mut self.keyframes {

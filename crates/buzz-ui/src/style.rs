@@ -152,15 +152,21 @@ pub enum PaintMode {
     Selection,
     /// Only inside the fill the stroke began on — colour inside the lines.
     Inside,
+    /// **Colour between the lines, open or closed** (user 2026-11-22): under
+    /// every line it crosses, replacing the colour it paints over — whole,
+    /// where it covers most of a piece — and filling the small gaps it leaves
+    /// beside the lines. For traced line art with many inner lines.
+    ColourIn,
 }
 
 impl PaintMode {
-    pub const ALL: [PaintMode; 5] = [
+    pub const ALL: [PaintMode; 6] = [
         Self::Normal,
         Self::Fills,
         Self::Behind,
         Self::Selection,
         Self::Inside,
+        Self::ColourIn,
     ];
 
     pub fn label(self) -> &'static str {
@@ -170,6 +176,7 @@ impl PaintMode {
             Self::Behind => "Paint behind",
             Self::Selection => "Paint selection",
             Self::Inside => "Paint inside",
+            Self::ColourIn => "Colour in",
         }
     }
 
@@ -182,6 +189,11 @@ impl PaintMode {
             Self::Inside => {
                 "Paint only inside the fill the stroke starts on \u{2014} never over its lines. \
                  Starting on empty stage paints behind."
+            }
+            Self::ColourIn => {
+                "Colour between the lines, closed or open: the paint goes under every line, \
+                 replaces the colour it paints over (a piece it mostly covers turns whole) and \
+                 fills the little gaps left beside the lines."
             }
         }
     }

@@ -83,7 +83,7 @@ use serde::{Deserialize, Serialize};
 
 pub use arrange::{ArrangeOptions, ArrangeReport, LayerGroup};
 pub use art::ArtPiece;
-pub use bucket::{Boundary, GapSize, fill_region};
+pub use bucket::{Boundary, GapSize, colour_in_gaps, fill_region};
 pub use buzz_fx::{BevelKind, Blend, ColorAdjust, Filter, FilterKind, GradientMap, Quality};
 pub use buzz_light::{
     DEFAULT_GLINT, EdgeMode, Light, LightId, LightKey, LightKind, LightRig, LightTrack,
@@ -2692,6 +2692,28 @@ impl Scene {
         let mut placed = false;
         self.active_layers_mut().update(layer, |l| {
             placed = l.frames.insert_object_behind(frame, object)
+        });
+        placed.then(|| {
+            self.bump();
+            id
+        })
+    }
+
+    /// Place a shape at `index` in the stacking order of the keyframe
+    /// governing `frame` (0 is the back, past the end the top) — for paint
+    /// laid under the lines it colours between, above the colour below them.
+    pub fn add_shape_at_index(
+        &mut self,
+        layer: LayerId,
+        frame: u32,
+        index: usize,
+        shape: ShapeData,
+    ) -> Option<ObjectId> {
+        let id = ObjectId(self.ids.take());
+        let object = Arc::new(Object::shape(id, shape));
+        let mut placed = false;
+        self.active_layers_mut().update(layer, |l| {
+            placed = l.frames.insert_object_at_index(frame, index, object)
         });
         placed.then(|| {
             self.bump();

@@ -473,6 +473,161 @@ fn flood_window(boundaries: &[Boundary], seed: Point, gap: f64, area: Rect) -> F
     if path.elements().is_empty() { Flood::Nothing } else { Flood::Filled(path) }
 }
 
+/// **The empty gaps a Colour In stroke walls in, to paint too** (user
+/// 2026-11-22: on a traced character "when there are too many internal lines
+/// it's difficult to fill colours … a mode in which when I paint it fills all
+/// the empty gaps … regardless of closed or open lines").
+///
+/// `paint` is what the stroke already covers (with any colour it took
+/// whole), `lines` the linework around it, `colour` the other fills there,
+/// and `gap` the widest gap closed, in document units. Empty space — no line,
+/// no colour, no paint — is painted where it is **walled in** by the lines,
+/// the colour and the paint together and touches the paint: the space a
+/// stroke curved round, the strip it left beside a line, a hole in the
+/// traced colour. A line need not close: with the walls grown by `gap`, as
+/// the bucket's Gap Size grows them, a gap up to twice that wide holds, and
+/// the stroke itself is a wall. Space reaching the edge of the window — the
+/// world outside the drawing — is never painted, nor a walled-in space
+/// bigger than the stroke itself.
+///
+/// The result is tucked a pixel under what it meets, so no seam of paper
+/// shows, and is empty when there is nothing to add.
+pub fn colour_in_gaps(paint: &BezPath, lines: &[Boundary], colour: &[BezPath], gap: f64) -> BezPath {
+    let painted = paint.bounding_box();
+    if !(painted.width() > 0.0 && painted.height() > 0.0) || !(gap > 0.0) {
+        return BezPath::new();
+    }
+    let margin = 3.0 * gap + 2.0;
+    let area = painted.inflate(margin, margin);
+    let extent = area.width().max(area.height());
+    let ppu = (MAX_GRID / extent).min(MAX_PPU);
+    let (w, h) = ((area.width() * ppu).ceil() as usize + 1, (area.height() * ppu).ceil() as usize + 1);
+    if w < 3 || h < 3 {
+        return BezPath::new();
+    }
+
+    // Everything that is not empty: the lines, at least a hairline thick (as
+    // the bucket draws them), the colour, and the paint.
+    let hairline = MIN_WALL_PX / ppu;
+    let mut solid = Grid::new(w, h);
+    for b in lines {
+        let half = b.stroke_width.unwrap_or(0.0);
+        if !b.path.bounding_box().inflate(half, half).overlaps(area) {
+            continue;
+        }
+        if b.filled {
+            rasterise_fill_rule(&b.path, &mut solid, area, ppu, b.even_odd);
+        }
+        let width = match (b.stroke_width, b.filled) {
+            (Some(width), _) => Some(width.max(hairline)),
+            (None, true) => Some(hairline),
+            (None, false) => None,
+        };
+        if let Some(width) = width {
+            for sub in subpaths(&b.path) {
+                rasterise_fill(&outline_stroke(&sub, StrokeStyle::new(width), 0.25 / ppu), &mut solid, area, ppu);
+            }
+        }
+    }
+    for c in colour {
+        if c.bounding_box().overlaps(area) {
+            rasterise_fill(c, &mut solid, area, ppu);
+        }
+    }
+    let mut covered = Grid::new(w, h);
+    rasterise_fill(paint, &mut covered, area, ppu);
+    for i in 0..w * h {
+        if covered.bits[i] {
+            solid.bits[i] = true;
+        }
+    }
+
+    // The walls grown by the gap; the open space they leave, in pieces.
+    let grow = gap * ppu;
+    let to_solid = solid.distances();
+    let to_paint = covered.distances();
+    let blocked = |i: usize| to_solid[i] <= grow;
+    let stroke_px = covered.bits.iter().filter(|b| **b).count();
+    let mut core = Grid::new(w, h);
+    let mut seen = Grid::new(w, h);
+    let mut stack: Vec<usize> = Vec::new();
+    let mut members: Vec<usize> = Vec::new();
+    for start in 0..w * h {
+        if seen.bits[start] || blocked(start) {
+            continue;
+        }
+        members.clear();
+        stack.push(start);
+        seen.bits[start] = true;
+        let (mut edge, mut touches) = (false, false);
+        while let Some(i) = stack.pop() {
+            members.push(i);
+            let (x, y) = (i % w, i / w);
+            if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
+                edge = true;
+            }
+            // Reaching the paint's grown edge is touching the paint.
+            if to_paint[i] <= grow + 1.5 {
+                touches = true;
+            }
+            let mut step = |j: usize| {
+                if !seen.bits[j] && !blocked(j) {
+                    seen.bits[j] = true;
+                    stack.push(j);
+                }
+            };
+            if x > 0 { step(i - 1); }
+            if x + 1 < w { step(i + 1); }
+            if y > 0 { step(i - w); }
+            if y + 1 < h { step(i + w); }
+        }
+        if !edge && touches && members.len() <= stroke_px {
+            for &i in &members {
+                core.bits[i] = true;
+            }
+        }
+    }
+
+    // Each walled-in piece flows back out to its real walls — the lines, the
+    // colour and the paint — through the empty space (`claim`), sharing
+    // every gap with the open space beyond, as the bucket's fill does.
+    let mut extra = claim(&solid, &to_solid, grow, &core);
+    // And the paint flows out too, for the strip a stroke left beside a line
+    // that no walled-in piece holds: kept only where it lies in a gap at most
+    // twice the gap setting across between the paint and a line or colour,
+    // never as a halo round the stroke out in the open.
+    let mut walls = solid.clone();
+    let mut seeds = core.clone();
+    for i in 0..w * h {
+        if covered.bits[i] {
+            walls.bits[i] = false;
+            seeds.bits[i] = true;
+        }
+    }
+    let to_walls = walls.distances();
+    let reached = claim(&walls, &to_solid, grow, &seeds);
+    for i in 0..w * h {
+        if reached.bits[i] && !covered.bits[i] && to_walls[i] + to_paint[i] <= 2.0 * grow + 2.0 {
+            extra.bits[i] = true;
+        }
+    }
+    if !extra.bits.iter().any(|b| *b) {
+        return BezPath::new();
+    }
+
+    // Tucked a pixel under what it meets, so no seam of paper shows.
+    let mut tucked = extra.clone();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let i = y * w + x;
+            if solid.bits[i] && (extra.bits[i - 1] || extra.bits[i + 1] || extra.bits[i - w] || extra.bits[i + w]) {
+                tucked.bits[i] = true;
+            }
+        }
+    }
+    grid_path(&tucked, area, ppu)
+}
+
 /// The most lines the exact pass cuts the fill from. Past this (a fill
 /// across a whole background of thousands of traced strokes) the traced
 /// fill is kept: the booleans would take seconds, and at that size the

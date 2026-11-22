@@ -3970,7 +3970,9 @@ impl Editor {
             // The stroke under the pointer is the last copy, so it is the one
             // left selected — see `add_shape`.
             for copy in copies {
-                created = if mode == PaintMode::Behind {
+                created = if mode == PaintMode::ColourIn {
+                    colour_in(scene, layer, frame, merge, copy)
+                } else if mode == PaintMode::Behind {
                     // Behind the artwork, and never merged into it: what is
                     // already drawn stays on top, untouched.
                     let id = scene.add_shape_behind_at(layer, frame, copy);
@@ -19972,7 +19974,7 @@ fn clip_for_paint_mode(
     };
 
     shape.path = match mode {
-        PaintMode::Normal | PaintMode::Behind => return Some(shape),
+        PaintMode::Normal | PaintMode::Behind | PaintMode::ColourIn => return Some(shape),
         // Everything but the lines: the ink of every stroked shape it crosses
         // is taken out of it, so the linework stays on top.
         PaintMode::Fills => {
@@ -20007,6 +20009,219 @@ fn clip_for_paint_mode(
         }
     };
     (shape.path.area().abs() > 1e-6).then_some(shape)
+}
+
+/// How bright a fill is (0 black, 1 white), when it is one opaque colour.
+fn solid_luminance(shape: &ShapeData) -> Option<f64> {
+    let Paint::Solid(colour) = &shape.fill.as_ref()?.paint else { return None };
+    let c = colour.to_rgba8();
+    (c.a >= 128).then(|| (0.2126 * f64::from(c.r) + 0.7152 * f64::from(c.g) + 0.0722 * f64::from(c.b)) / 255.0)
+}
+
+/// **Is this fill a drawn line** rather than colour? Traced line art comes out
+/// as filled shapes, not strokes, all in the one ink colour, which is the
+/// darkest there is: a fill is a line when it is dark (luminance at most
+/// [`LINE_ART_DARKEST`]) and within [`INK_SHADES`] of `ink`, the darkest fill
+/// around. A grey shading strip a few shades lighter is colour.
+fn is_line_art(shape: &ShapeData, ink: f64) -> bool {
+    solid_luminance(shape).is_some_and(|l| l <= LINE_ART_DARKEST && l <= ink + INK_SHADES)
+}
+
+/// How dark a fill must be to be taken for a line: ink, not colour.
+const LINE_ART_DARKEST: f64 = 0.3;
+/// How much lighter than the darkest fill around a line may be.
+const INK_SHADES: f64 = 0.1;
+
+/// **Lay a Colour In brush stroke** ([`buzz_ui::PaintMode::ColourIn`]; user
+/// 2026-11-22: on a traced character with many inner lines, paint that
+/// "fills all the empty gaps and a particular colour is replaced as well,
+/// regardless of whether it has closed lines or open lines").
+///
+/// On this layer and frame, every stroke and every fill in the ink colour
+/// ([`is_line_art`]) is a line; every other fill is colour. Then:
+///
+/// 1. a piece of colour the stroke covers at least [`TAKE_WHOLE`] of — or a
+///    speck no bigger than a dab of the brush — is taken whole, so the
+///    slivers a stroke leaves at its edges go too;
+/// 2. the empty gaps it walls in with the lines and the colour are added
+///    ([`buzz_scene::colour_in_gaps`]), a gap in the lines a quarter of the
+///    brush across closed, so the lines need not close;
+/// 3. the paint is laid **under the lowest line it meets**, so no line is
+///    painted over or cut, and in Merge Shape it replaces the colour it
+///    covers (cut away, or fused when it is the same colour), as paint does.
+///
+/// Returns the new shape, `None` when nothing was painted.
+fn colour_in(scene: &mut Scene, layer: LayerId, frame: u32, merge: bool, shape: ShapeData) -> Option<ObjectId> {
+    use buzz_geom::{BoolOp, boolean, Shape as _};
+    let stroke = shape.path.clone();
+    let bb = stroke.bounding_box();
+    let area = stroke.area().abs();
+    let perimeter = stroke.perimeter((bb.width().hypot(bb.height()) / 2000.0).max(1e-3));
+    if !(area > 1e-9) || !(perimeter > 0.0) {
+        return None;
+    }
+    // A brush stroke's area over half its outline is its width.
+    let width = (2.0 * area / perimeter).max(0.5);
+    let reach = bb.inflate(2.0 * width, 2.0 * width);
+    let opts = buzz_geom::BooleanOptions::for_shape_size(reach.width().hypot(reach.height()));
+
+    struct Colour {
+        id: ObjectId,
+        placed: BezPath,
+        transform: Affine,
+        paint: Paint,
+        movable: bool,
+    }
+    let mut lines: Vec<buzz_scene::Boundary> = Vec::new();
+    let mut line_ids: Vec<ObjectId> = Vec::new();
+    let mut colours: Vec<Colour> = Vec::new();
+    if let Some(l) = scene.layers().get(layer) {
+        let near: Vec<(&Object, &ShapeData, BezPath)> = l
+            .objects_at(frame)
+            .iter()
+            .filter(|o| o.visible)
+            .filter_map(|o| match &o.kind {
+                ObjectKind::Shape(s) => {
+                    let placed = o.transform * s.path.clone();
+                    let half = s.stroke.as_ref().map_or(0.0, |k| k.width);
+                    placed.bounding_box().inflate(half, half).overlaps(reach).then_some((&**o, s, placed))
+                }
+                _ => None,
+            })
+            .collect();
+        let ink = near.iter().filter_map(|(_, s, _)| solid_luminance(s)).fold(f64::INFINITY, f64::min);
+        for (o, s, placed) in near {
+            let scale = o.transform.determinant().abs().sqrt();
+            let line_fill = is_line_art(s, ink);
+            if s.stroke.is_some() || line_fill {
+                lines.push(buzz_scene::Boundary {
+                    path: placed.clone(),
+                    filled: line_fill,
+                    stroke_width: s.stroke.as_ref().map(|k| (k.width * scale).max(0.75)),
+                    even_odd: s.fill.as_ref().is_some_and(|f| f.rule == buzz_geom::FillMode::EvenOdd),
+                });
+                line_ids.push(o.id);
+            }
+            if let Some(fill) = s.fill.as_ref().filter(|_| !line_fill) {
+                colours.push(Colour {
+                    id: o.id,
+                    placed,
+                    transform: o.transform,
+                    paint: fill.paint.clone(),
+                    movable: !o.locked && !o.drawing_object && s.blend == buzz_scene::PaintBlend::Normal,
+                });
+            }
+        }
+    }
+
+    // 1. Colour taken whole.
+    let dab = width * width * 2.0;
+    let mut paint = stroke.clone();
+    let mut taken: Vec<ObjectId> = Vec::new();
+    for c in colours.iter().filter(|c| c.movable && c.placed.bounding_box().overlaps(bb)) {
+        let under = boolean(&stroke, &c.placed, BoolOp::Intersect, opts.fast()).area().abs();
+        if under <= 1e-9 {
+            continue;
+        }
+        let whole = buzz_geom::Shape::area(&boolean(&c.placed, &c.placed, BoolOp::Union, opts.fast())).abs();
+        if whole > 0.0 && (under / whole >= TAKE_WHOLE || whole <= dab) {
+            paint = boolean(&paint, &c.placed, BoolOp::Union, opts);
+            taken.push(c.id);
+        }
+    }
+    // 2. The empty gaps it walls in, a gap in the lines a quarter of the
+    // brush across closed.
+    let others: Vec<BezPath> = colours.iter().filter(|c| !taken.contains(&c.id)).map(|c| c.placed.clone()).collect();
+    let gaps = buzz_scene::colour_in_gaps(&paint, &lines, &others, width * 0.25);
+    if !gaps.elements().is_empty() {
+        paint = boolean(&paint, &gaps, BoolOp::Union, opts);
+    }
+    if paint.elements().is_empty() {
+        return None;
+    }
+
+    // 3. Under the lines, replacing the colour.
+    let fill = shape.fill.clone();
+    let same = |a: &Paint| match (a, fill.as_ref().map(|f| &f.paint)) {
+        (Paint::Solid(a), Some(Paint::Solid(b))) => a.to_rgba8().to_u8_array() == b.to_rgba8().to_u8_array(),
+        _ => false,
+    };
+    if merge {
+        for c in colours.iter().filter(|c| c.movable) {
+            if taken.contains(&c.id) {
+                scene.remove_object(c.id);
+                continue;
+            }
+            if !c.placed.bounding_box().overlaps(paint.bounding_box()) {
+                continue;
+            }
+            if boolean(&paint, &c.placed, BoolOp::Intersect, opts.fast()).area().abs() <= 1e-9 {
+                continue;
+            }
+            if same(&c.paint) {
+                paint = boolean(&paint, &c.placed, BoolOp::Union, opts);
+                scene.remove_object(c.id);
+                continue;
+            }
+            // A different colour is cut where the paint goes, and each piece
+            // the cut leaves stays where the colour was in the stacking.
+            let Some(back) = invert(c.transform) else { continue };
+            let cutter = back * paint.clone();
+            let mut emptied = false;
+            let mut pieces: Vec<BezPath> = Vec::new();
+            update_shape(scene, EditAt::exact(frame), c.id, |s| {
+                let cut = boolean(&s.path, &cutter, BoolOp::Difference, opts);
+                emptied = cut.elements().is_empty();
+                let mut parts = buzz_geom::split_disjoint(&cut);
+                s.path = if parts.is_empty() { cut } else { parts.remove(0) };
+                pieces = parts;
+            });
+            if emptied {
+                scene.remove_object(c.id);
+                continue;
+            }
+            let template = scene.find_object(c.id).and_then(|(_, o)| match &o.kind {
+                ObjectKind::Shape(s) => Some((s.clone(), o.transform)),
+                _ => None,
+            });
+            if let Some((template, transform)) = template {
+                // A hairline offcut from the cut's own rounding is no piece.
+                let speck = opts.tolerance * opts.tolerance * 100.0;
+                for path in pieces.into_iter().filter(|p| p.area().abs() > speck) {
+                    let at = object_index(scene, layer, frame, c.id).map_or(usize::MAX, |i| i + 1);
+                    if let Some(id) = scene.add_shape_at_index(layer, frame, at, ShapeData { path, ..template.clone() }) {
+                        scene.update_object_at(frame, id, |o| o.transform = transform);
+                    }
+                }
+            }
+        }
+    }
+    let painted_bb = paint.bounding_box();
+    let lowest_line = line_ids
+        .iter()
+        .filter(|id| {
+            scene.find_object(**id).is_some_and(|(_, o)| match &o.kind {
+                ObjectKind::Shape(s) => (o.transform * s.path.clone()).bounding_box().overlaps(painted_bb),
+                _ => false,
+            })
+        })
+        .filter_map(|id| object_index(scene, layer, frame, *id))
+        .min();
+    let shape = ShapeData { path: paint, ..shape };
+    let id = scene.add_shape_at_index(layer, frame, lowest_line.unwrap_or(usize::MAX), shape)?;
+    if !merge {
+        scene.update_object_at(frame, id, |o| o.drawing_object = true);
+    }
+    Some(id)
+}
+
+/// How much of a piece of colour a Colour In stroke must cover to take it
+/// whole.
+const TAKE_WHOLE: f64 = 0.4;
+
+/// Where `id` stands in the stacking order of the keyframe governing `frame`.
+fn object_index(scene: &Scene, layer: LayerId, frame: u32, id: ObjectId) -> Option<usize> {
+    scene.layers().get(layer)?.objects_at(frame).iter().position(|o| o.id == id)
 }
 
 /// Place a shape drawn in Object Drawing mode, flagged so later Merge strokes
@@ -32221,6 +32436,85 @@ mod tests {
         let (blue, _) = e.picked_at(screen(&e, 250.0, 50.0), true).unwrap();
         assert!(near(blue, [0, 0, 255]), "the tinted symbol is blue: {:?}", blue.to_rgba8());
         let _ = symbol;
+    }
+
+    /// **Colour In colours between traced lines, open or closed** (user
+    /// 2026-11-22). A traced-style drawing: a dark ink outline (filled
+    /// shapes, as Trace makes them) with an opening in its right side and an
+    /// inner line down the middle; yellow colour on the left half, nothing on
+    /// the right. One red stroke across both halves:
+    /// - the yellow it mostly covers turns red whole, edge slivers and all;
+    /// - the empty right half is painted, and the gaps the stroke left beside
+    ///   the lines — above, below and at the opening — are filled too;
+    /// - nothing outside the outline is painted;
+    /// - the lines are untouched and still on top of the paint.
+    #[test]
+    fn colour_in_paints_between_open_lines_and_takes_the_colour_whole() {
+        use buzz_geom::Shape as _;
+        let mut e = Editor::default();
+        let layer = e.doc_add_layer("Character", LayerKind::Normal);
+        let ink = Color::from_rgba8(20, 20, 20, 255);
+        let yellow = Color::from_rgba8(250, 220, 40, 255);
+        let red = Color::from_rgba8(220, 30, 30, 255);
+        let rect = |x0: f64, y0: f64, x1: f64, y1: f64| Rect::new(x0, y0, x1, y1).to_path(1e-9);
+        // The outline as one even-odd ink shape: outer square less inner,
+        // with a notch out of the right wall (the opening, y 40–60).
+        let mut outline = rect(0.0, 0.0, 100.0, 100.0);
+        outline.extend(rect(2.0, 2.0, 98.0, 98.0));
+        let outline = {
+            let opts = buzz_geom::BooleanOptions { fill: buzz_geom::FillMode::EvenOdd, ..Default::default() };
+            let ring = buzz_geom::boolean(&outline, &outline, buzz_geom::BoolOp::Union, opts);
+            buzz_geom::boolean(&ring, &rect(97.0, 40.0, 101.0, 60.0), buzz_geom::BoolOp::Difference, Default::default())
+        };
+        let mut ids = Vec::new();
+        e.doc.edit("Trace", |scene| {
+            ids.push(scene.add_shape(layer, ShapeData::filled(rect(2.0, 2.0, 49.0, 98.0), yellow)).unwrap());
+            ids.push(scene.add_shape(layer, ShapeData::filled(outline.clone(), ink)).unwrap());
+            ids.push(scene.add_shape(layer, ShapeData::filled(rect(49.0, 2.0, 51.0, 98.0), ink)).unwrap());
+        });
+        let (yellow_id, lines) = (ids[0], [ids[1], ids[2]]);
+        let before: Vec<BezPath> = lines.iter().map(|id| match &e.doc.scene().find_object(*id).unwrap().1.kind {
+            ObjectKind::Shape(s) => s.path.clone(),
+            _ => unreachable!(),
+        }).collect();
+
+        e.selection.set_active_layer(Some(layer));
+        e.style.fill_color = red;
+        e.style.fill_enabled = true;
+        e.apply(ToolAction::PaintStroke {
+            shape: ShapeData::filled(rect(10.0, 20.0, 90.0, 80.0), red),
+            label: "Brush",
+            spine: None,
+            start: Point::new(10.0, 50.0),
+            mode: buzz_ui::PaintMode::ColourIn,
+        });
+
+        let scene = e.doc.scene();
+        let objects = scene.layers().get(layer).unwrap().objects_at(0).to_vec();
+        assert!(scene.find_object(yellow_id).is_none(), "the yellow, mostly covered, is taken whole");
+        let reds: Vec<&Object> = objects.iter().map(|o| &**o).filter(|o| matches!(&o.kind, ObjectKind::Shape(s)
+            if matches!(s.fill.as_ref().map(|f| &f.paint), Some(Paint::Solid(c)) if c.to_rgba8().to_u8_array() == red.to_rgba8().to_u8_array()))).collect();
+        assert_eq!(reds.len(), 1, "one red shape");
+        let ObjectKind::Shape(paint) = &reds[0].kind else { unreachable!() };
+        let painted = |x: f64, y: f64| paint.path.winding(Point::new(x, y)) != 0;
+        for (x, y, what) in [
+            (30.0, 50.0, "under the stroke"),
+            (5.0, 5.0, "the yellow's corner the stroke never reached"),
+            (94.0, 50.0, "the sliver by the opening"),
+            (70.0, 10.0, "the gap above the stroke"),
+            (70.0, 92.0, "the gap below the stroke"),
+        ] {
+            assert!(painted(x, y), "{what} ({x}, {y}) is painted");
+        }
+        for (x, y) in [(130.0, 50.0), (50.0, 130.0), (-20.0, 50.0)] {
+            assert!(!painted(x, y), "outside the outline ({x}, {y}) stays clear");
+        }
+        let index = |id: ObjectId| objects.iter().position(|o| o.id == id).unwrap();
+        for (id, was) in lines.iter().zip(&before) {
+            let ObjectKind::Shape(s) = &scene.find_object(*id).unwrap().1.kind else { unreachable!() };
+            assert_eq!(&s.path, was, "a line is never cut");
+            assert!(index(*id) > index(reds[0].id), "the lines stay on top of the paint");
+        }
     }
 
     /// **A stage copy pastes as often as it is needed** (user 2026-11-21):

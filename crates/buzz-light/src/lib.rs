@@ -1244,6 +1244,18 @@ pub struct LightRig {
     /// flat cartoon look that still has people standing on the ground.
     #[serde(default)]
     pub shadows_only: bool,
+    /// **Keep painted colours** (user 2026-11-22: with the lights on "the
+    /// screen becomes dark and dull; shadows only is much clearer and
+    /// crisp"). Light is the artwork's colour times what arrives, and with a
+    /// dim base and lamps that fall off, what arrives is under full nearly
+    /// everywhere — lit white came out a fifth darker, its shaded side half
+    /// and blue. With this on, the lit side is the painted colour at full
+    /// brightness (a lamp's colour still warms it), artwork no light reaches
+    /// keeps its painted colour, and the shaded side darkens only where light
+    /// falls, half as deep ([`PAINTED_SHADE_DEPTH`]). Cast shadows, pools and
+    /// gloom are as ever. Off by default.
+    #[serde(default)]
+    pub painted_colours: bool,
     /// **Character shadows with no light set up** turned off. Off by default
     /// (so the shadows are on): with no light of its own, a document still
     /// gives its characters the cast shadow a light would give them, from a
@@ -1456,6 +1468,7 @@ impl LightRig {
         self.edges.hash(&mut hasher);
         self.model.hash(&mut hasher);
         self.shadows_only.hash(&mut hasher);
+        self.painted_colours.hash(&mut hasher);
         self.lights.len().hash(&mut hasher);
 
         // Each light hashes itself, through the same routine `Light::fingerprint`
@@ -1485,6 +1498,7 @@ impl Default for LightRig {
             // `#[serde(default)]` answers it `Crescent` instead.
             model: ShadeModel::Form,
             shadows_only: false,
+            painted_colours: false,
             no_character_shadows: false,
             character_light: None,
             characters_only: false,
@@ -1588,6 +1602,7 @@ impl LightRig {
             edges: self.edges,
             model: self.model,
             shadows_only: self.shadows_only,
+            painted_colours: self.painted_colours,
             no_character_shadows: self.no_character_shadows,
             character_light: self.character_light.clone(),
             characters_only: self.characters_only,
@@ -1913,6 +1928,7 @@ impl LightRig {
             direct[2] += d[2];
         }
 
+        let (ambient, direct) = if self.painted_colours { painted(ambient, direct) } else { (ambient, direct) };
         Illumination {
             ambient,
             direct,
@@ -1958,6 +1974,13 @@ impl LightRig {
             return LightField::unlit();
         }
         let here = bounds.center();
+        // Keep Painted Colours scales the light at each place by what arrives
+        // there, which a straight ramp across a shape cannot carry: each shape
+        // takes the light at its middle.
+        if self.painted_colours {
+            let at = self.illuminate(here, depth, stage_height);
+            return LightField { ambient: at.ambient, uniform: at.direct, lamp: None, key: at.key };
+        }
 
         let mut ambient = to_linear(self.base);
         for light in self.lights.iter().filter(|l| l.enabled) {
@@ -2090,6 +2113,33 @@ fn radii(bounds: Rect, at: Point) -> (f64, f64) {
     let fy = (at.y - bounds.y0).abs().max((at.y - bounds.y1).abs());
     (near, fx.hypot(fy))
 }
+
+/// **Keep Painted Colours**: the light arriving (`ambient`, `direct`, linear)
+/// scaled so the lit side is at full — its strongest channel exactly one, so
+/// the painted colour, warmed or cooled by the light's own colour and never
+/// brightened past it — with the fill taken as neutral, and
+/// the shaded side darkened by [`PAINTED_SHADE_DEPTH`] of what the light
+/// would darken it. Where no direct light falls, the painted colour exactly.
+fn painted(ambient: [f32; 3], direct: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let fill = luma(ambient).max(0.0);
+    let total = [fill + direct[0].max(0.0), fill + direct[1].max(0.0), fill + direct[2].max(0.0)];
+    // By the strongest channel, not the brightness: no channel is ever over
+    // full, which the renderer would make up by screening towards white — a
+    // warm lamp then lifted every dark colour towards red. The light's colour
+    // warms (or cools) by holding the other channels a little under.
+    let full = total[0].max(total[1]).max(total[2]);
+    if !(full > 1e-4) {
+        return ([1.0; 3], [0.0; 3]);
+    }
+    let lit = total.map(|c| c / full);
+    let shade = 1.0 - (1.0 - (fill / full).clamp(0.0, 1.0)) * PAINTED_SHADE_DEPTH;
+    ([shade; 3], lit.map(|c| (c - shade).max(0.0)))
+}
+
+/// How deep the shaded side goes under Keep Painted Colours, as a share of
+/// how deep the light alone would take it: half, so a form reads without the
+/// shaded side going muddy.
+pub const PAINTED_SHADE_DEPTH: f32 = 0.5;
 
 /// Perceived brightness of a linear-light triple, for comparing two lights.
 fn luma(c: [f32; 3]) -> f32 {
@@ -2528,6 +2578,44 @@ mod tests {
 
     fn sun(azimuth: f64, elevation: f64) -> Light {
         Light::new(LightId(1), "Sun", LightKind::Sun { azimuth, elevation })
+    }
+
+    /// **Keep Painted Colours** (user 2026-11-22: with the lights on "the
+    /// screen becomes dark and dull"): under a warm lamp the lit side of
+    /// white is full — its strongest channel 255, none screened past it, so a
+    /// dark colour is not lifted towards the lamp's colour — far from the
+    /// lamp a colour is as painted, and the shaded side is gentler than the
+    /// light alone makes it. Off, the same rig dims the lit side.
+    #[test]
+    fn keep_painted_colours_lights_without_dimming() {
+        let mut rig = LightRig { enabled: true, ..LightRig::default() };
+        let mut lamp = Light::new(LightId(1), "Lamp", LightKind::Lamp { position: Point::new(1250.0, 100.0), height: 160.0, radius: 900.0 });
+        lamp.color = Color::from_rgb8(255, 242, 216);
+        lamp.intensity = 1.15;
+        rig.lights.push(lamp);
+        let skin = Color::from_rgb8(230, 180, 140);
+        let at = |rig: &LightRig, p: Point| rig.illuminate(p, 0.0, 1080.0);
+        let centre = Point::new(960.0, 540.0);
+
+        let dim = at(&rig, centre).apply(Color::WHITE).to_rgba8();
+        assert!(dim.r < 230, "off: the lit side of white is dimmed ({dim:?})");
+
+        rig.painted_colours = true;
+        let lit = at(&rig, centre);
+        let white = lit.apply(Color::WHITE).to_rgba8();
+        assert_eq!(white.r.max(white.g).max(white.b), 255, "the lit side is at full: {white:?}");
+        assert!(white.b < white.r, "and warmed by the lamp: {white:?}");
+        assert!(lit.as_filter(true).screen.is_none(), "nothing is screened past full");
+        let dark = lit.apply(Color::from_rgb8(6, 5, 1)).to_rgba8();
+        assert!(dark.r <= 8 && dark.g <= 6, "a dark colour stays dark: {dark:?}");
+
+        let far = at(&rig, Point::new(-3000.0, 3000.0)).apply(skin).to_rgba8();
+        assert!(far.r.abs_diff(230) <= 2 && far.g.abs_diff(180) <= 2 && far.b.abs_diff(140) <= 2, "no light: as painted ({far:?})");
+
+        let shaded = lit.apply_shaded(skin).to_rgba8();
+        rig.painted_colours = false;
+        let real = at(&rig, centre).apply_shaded(skin).to_rgba8();
+        assert!(shaded.r > real.r + 40 && shaded.r < 230, "the shaded side is gentler, still shaded: {shaded:?} vs {real:?}");
     }
 
     /// **The built-in character shadows can be set**: a sun turned and a

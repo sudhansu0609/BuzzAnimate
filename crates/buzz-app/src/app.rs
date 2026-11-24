@@ -9427,6 +9427,11 @@ impl App {
                 scene.lights_mut().shadows_only = only;
             });
         }
+        if let Some(painted) = response.set_painted_colours {
+            editor.doc.edit("Keep Painted Colours", |scene| {
+                scene.lights_mut().painted_colours = painted;
+            });
+        }
 
         if let Some(edges) = response.set_edges {
             editor.doc.edit("Light Edges", |scene| {

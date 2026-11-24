@@ -382,6 +382,9 @@ pub struct LightRigDto {
     /// Cast shadows without the light's shading and tint. Absent → off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shadows_only: bool,
+    /// Lit artwork keeps its painted colours. Absent → off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub painted_colours: bool,
     /// The built-in character shadows turned off. Absent → on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_character_shadows: bool,
@@ -3066,6 +3069,7 @@ impl DocumentDto {
                 edges: scene.lights().edges,
                 model: scene.lights().model,
                 shadows_only: scene.lights().shadows_only,
+                painted_colours: scene.lights().painted_colours,
                 no_character_shadows: scene.lights().no_character_shadows,
                 lights: scene
                     .lights()
@@ -3336,6 +3340,7 @@ impl DocumentDto {
             lights.edges = rig.edges;
             lights.model = rig.model;
             lights.shadows_only = rig.shadows_only;
+            lights.painted_colours = rig.painted_colours;
             lights.no_character_shadows = rig.no_character_shadows;
 
             for dto in &rig.lights {

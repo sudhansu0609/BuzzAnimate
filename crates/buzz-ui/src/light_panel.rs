@@ -52,6 +52,7 @@ pub struct LightResponse {
     pub set_modelling: Option<f32>,
     /// Cast shadows only, with no shading, tint, pools or gloom.
     pub set_shadows_only: Option<bool>,
+    pub set_painted_colours: Option<bool>,
     /// The built-in character shadows (no light needed) on or off.
     pub set_character_shadows: Option<bool>,
     /// The built-in character shadows' direction, length, darkness or
@@ -845,6 +846,22 @@ pub fn light_panel(ui: &mut Ui, rig: &LightRig, state: &mut LightPanelState) -> 
             .changed()
         {
             out.set_shadows_only = Some(only);
+        }
+
+        // **Keep painted colours**: the light shades and warms the artwork
+        // without dimming it — the lit side stays the colour it was painted.
+        ui.label("Keep painted colours");
+        let mut painted = rig.painted_colours;
+        if ui
+            .checkbox(&mut painted, "")
+            .on_hover_text(
+                "The lit side keeps the colour it was painted, at full brightness (a lamp's colour still warms it); \
+                 artwork no light reaches is unchanged, and the shaded side darkens gently only where light falls. \
+                 Cast shadows, pools and gloom work as ever. Off: light can only dim the artwork, as real light does.",
+            )
+            .changed()
+        {
+            out.set_painted_colours = Some(painted);
         }
 
         // **Edges before strength**, because it is the bigger decision. See

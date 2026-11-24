@@ -200,6 +200,7 @@ impl AssetLibrary {
         }
         self.assets.sort_by_key(|a| a.label());
         self.folders.sort();
+        scan_cache::flush();
     }
 
     fn walk(&mut self, dir: &Path, folder: &str) -> std::io::Result<()> {
@@ -253,18 +254,32 @@ impl AssetLibrary {
     /// read; one that cannot be read counts as static rather than being dropped.
     /// The asset's [`Asset::rig_kind`] comes from the same read.
     fn resolve_animated(&mut self, path: &Path) -> (bool, Option<RigKind>) {
-        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let meta = std::fs::metadata(path).ok();
+        let mtime = meta.as_ref().and_then(|m| m.modified().ok());
         if let Some(mtime) = mtime
             && let Some((seen, animated, rig_kind)) = self.animation.get(path)
             && *seen == mtime
         {
             return (*animated, *rig_kind);
         }
+        // **Every library in the program shares what it has read**, and so
+        // does the next run: a new library (every `Editor::new`, so every
+        // test) used to open all ~840 asset files — 573 MB, pictures decoded —
+        // to tell animated from still, 4.5 s each time (user 2026-11-24: the
+        // full test suite "shall finish in max 10 mins").
+        let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        if let Some(mtime) = mtime
+            && let Some(known) = scan_cache::get(path, mtime, len)
+        {
+            self.animation.insert(path.to_path_buf(), (mtime, known.0, known.1));
+            return known;
+        }
         let (animated, rig_kind) = format::load(path)
             .map(|s| (s.is_animated(), rig_kind_of(&s)))
             .unwrap_or((false, None));
         if let Some(mtime) = mtime {
             self.animation.insert(path.to_path_buf(), (mtime, animated, rig_kind));
+            scan_cache::put(path, mtime, len, (animated, rig_kind));
         }
         (animated, rig_kind)
     }
@@ -953,5 +968,97 @@ mod tests {
         library.create_folder("Backgrounds").expect("folder");
         assert_eq!(library.folders(), ["Backgrounds"]);
         assert!(library.is_empty(), "and holds no assets");
+    }
+}
+
+/// **What each asset file holds — animated or still, how it is rigged —
+/// shared by every [`AssetLibrary`] in the program and kept on disk**, so an
+/// unchanged file is read once, not once per library. Keyed by the file's
+/// path, modification time and size; a file that changed is read again.
+///
+/// Only files under [`default_root`] are written to disk (beside it, as
+/// `asset_scan_cache.json`, never inside it), so a test's temporary library
+/// leaves nothing behind.
+mod scan_cache {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use buzz_rig::RigKind;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Copy, Serialize, Deserialize)]
+    struct Entry {
+        secs: u64,
+        nanos: u32,
+        len: u64,
+        animated: bool,
+        rig_kind: Option<RigKind>,
+    }
+
+    struct Cache {
+        entries: HashMap<PathBuf, Entry>,
+        /// Something new to write to disk.
+        dirty: bool,
+    }
+
+    fn file() -> Option<PathBuf> {
+        let root = super::default_root();
+        Some(root.parent()?.join("asset_scan_cache.json"))
+    }
+
+    fn cache() -> &'static Mutex<Cache> {
+        static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+        CACHE.get_or_init(|| {
+            let entries = file()
+                .and_then(|f| std::fs::read(f).ok())
+                .and_then(|bytes| serde_json::from_slice::<HashMap<PathBuf, Entry>>(&bytes).ok())
+                .unwrap_or_default();
+            Mutex::new(Cache { entries, dirty: false })
+        })
+    }
+
+    fn stamp(time: SystemTime) -> (u64, u32) {
+        let d = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+        (d.as_secs(), d.subsec_nanos())
+    }
+
+    pub(super) fn get(path: &Path, mtime: SystemTime, len: u64) -> Option<(bool, Option<RigKind>)> {
+        let (secs, nanos) = stamp(mtime);
+        let cache = cache().lock().ok()?;
+        let e = cache.entries.get(path)?;
+        (e.secs == secs && e.nanos == nanos && e.len == len).then_some((e.animated, e.rig_kind))
+    }
+
+    pub(super) fn put(path: &Path, mtime: SystemTime, len: u64, (animated, rig_kind): (bool, Option<RigKind>)) {
+        let (secs, nanos) = stamp(mtime);
+        let Ok(mut cache) = cache().lock() else { return };
+        cache.entries.insert(path.to_path_buf(), Entry { secs, nanos, len, animated, rig_kind });
+        if path.starts_with(super::default_root()) {
+            cache.dirty = true;
+        }
+    }
+
+    /// Write what is new to disk: the files under the user's library, and
+    /// only those still there.
+    pub(super) fn flush() {
+        let Some(to) = file() else { return };
+        let root = super::default_root();
+        let kept: HashMap<PathBuf, Entry> = {
+            let Ok(mut cache) = cache().lock() else { return };
+            if !cache.dirty {
+                return;
+            }
+            cache.dirty = false;
+            cache.entries.iter().filter(|(p, _)| p.starts_with(&root) && p.exists()).map(|(p, e)| (p.clone(), *e)).collect()
+        };
+        let Ok(bytes) = serde_json::to_vec(&kept) else { return };
+        // Whole or not at all: another BuzzAnimate (or test run) may be
+        // reading it.
+        let tmp = to.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &to).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }

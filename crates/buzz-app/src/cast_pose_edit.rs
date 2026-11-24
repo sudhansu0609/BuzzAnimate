@@ -245,11 +245,20 @@ pub fn line_up_linked_poses(scene: &mut Scene, cast: &Scene, name: &str) -> bool
     };
     let set = scene.library().symbol_set(main);
     let cast_poses = pose_names(cast);
-    // The main is the film's own drawing, whatever it is called.
-    if set.len() < 2 || !set.iter().filter(|id| **id != main).all(|id| cast_poses.contains(&name_of(scene, *id))) {
+    // The main is the film's own drawing, whatever it is called; a pose
+    // copied in under a taken name (`DeepakFront deepakSide 1`) is still the
+    // Cast's, and stands where the main does like the rest (user 2026-11-24:
+    // "all poses shall be placed in same spot and same size").
+    if set.len() < 2 || !set.iter().filter(|id| **id != main).all(|id| is_cast_pose(&name_of(scene, *id), &cast_poses)) {
         return false;
     }
     !crate::cast_combine::normalise_poses(scene, main).is_empty()
+}
+
+/// Whether `name` is one of `cast_poses`, under its own name or the one an
+/// import gave it when that was taken (` 1`, ` 2`…).
+fn is_cast_pose(name: &str, cast_poses: &[String]) -> bool {
+    cast_poses.iter().any(|p| p == name) || cast_poses.iter().any(|p| p == crate::cast_combine::without_copy_number(name))
 }
 
 /// Whether the poses linked to the film's symbol `name` all come from `cast`
@@ -260,7 +269,7 @@ pub fn linked_from_cast(scene: &Scene, cast: &Scene, name: &str) -> bool {
     };
     let cast_poses = pose_names(cast);
     let set = scene.library().symbol_set(main);
-    set.len() >= 2 && set.iter().filter(|id| **id != main).all(|id| cast_poses.contains(&name_of(scene, *id)))
+    set.len() >= 2 && set.iter().filter(|id| **id != main).all(|id| is_cast_pose(&name_of(scene, *id), &cast_poses))
 }
 
 /// The parts a pose draws: the names of the symbols on its layers, less the
@@ -1352,6 +1361,41 @@ mod tests {
         assert_eq!(film.library().symbol_set(other).len(), 3, "the second copy gets every pose too");
         assert_eq!(film.library().symbol_set(shirt).len(), 3, "the first keeps its own");
         assert!(!link_cast_poses_as(&mut film, &cast, "DeepakFront 2", StandsFor::Main), "its renamed poses are kept, not copied again");
+    }
+
+    /// **Every pose stands where the main does, as tall — renamed copies
+    /// too** (user 2026-11-24: "all poses shall be placed in same spot and
+    /// same size, it broke"): a Cast pose copied in under a taken name
+    /// (`Deepak Back 1`) was skipped by the line-up and stood off at another
+    /// size; it is lined up like the rest, once.
+    #[test]
+    fn a_renamed_copy_of_a_cast_pose_is_lined_up_on_the_main() {
+        fn drawn(scene: &mut Scene, name: &str, rect: buzz_geom::Rect) -> SymbolId {
+            let id = scene.add_symbol(name, SymbolKind::Graphic, None);
+            let layers = scene.library_mut().layers_mut(id).unwrap();
+            let first = layers.iter().next().map(|l| l.id).unwrap();
+            let shape = buzz_scene::ShapeData::filled(buzz_geom::Shape::to_path(&rect, 1e-9), peniko::Color::BLACK);
+            let object = buzz_scene::Object::shape(buzz_scene::ObjectId(80_000 + id.0 as u64), shape);
+            layers.update(first, |l| { l.push_object_at(0, std::sync::Arc::new(object)); });
+            id
+        }
+        let mut cast = Scene::default();
+        let body = cast.add_stage_layer("Body", buzz_scene::LayerKind::Normal);
+        let front = drawn(&mut cast, "Deepak", buzz_geom::Rect::new(0.0, 0.0, 50.0, 100.0));
+        let back = drawn(&mut cast, "Deepak Back", buzz_geom::Rect::new(0.0, 0.0, 50.0, 100.0));
+        assert!(cast.library_mut().include_in_set(front, back));
+        cast.add_instance_at(body, 0, front, buzz_geom::Affine::IDENTITY).expect("placed");
+
+        let mut film = Scene::default();
+        let main = drawn(&mut film, "shirtFront 3", buzz_geom::Rect::new(400.0, 200.0, 500.0, 400.0));
+        let copy = drawn(&mut film, "Deepak Back 1", buzz_geom::Rect::new(-900.0, 900.0, -840.0, 1020.0));
+        assert!(film.library_mut().include_in_set(main, copy));
+        assert!(linked_from_cast(&film, &cast, "shirtFront 3"), "a renamed copy is still the Cast's pose");
+        assert!(line_up_linked_poses(&mut film, &cast, "shirtFront 3"), "it is moved");
+        let (m, b) = (crate::cast_combine::pose_box(&film, main, 0).unwrap(), crate::cast_combine::pose_box(&film, copy, 0).unwrap());
+        assert!((b.center().x - m.center().x).abs() < 0.5 && (b.y1 - m.y1).abs() < 0.5, "same spot: {m:?} {b:?}");
+        assert!((b.height() - m.height()).abs() < 0.5, "same size: {m:?} {b:?}");
+        assert!(!line_up_linked_poses(&mut film, &cast, "shirtFront 3"), "once");
     }
 
     /// **Extra pose tags** (user 2026-11-17): a character with poses takes

@@ -42,6 +42,8 @@ fn state() -> TimelineState {
         range_anchor: None,
         timeline_selection: None,
         camera_selected: false,
+        master_audio_layer: None,
+        reveal_layer: None,
         selected_light: None,
         light_row_selected: false,
         light_cells: None,
@@ -56,6 +58,8 @@ fn state() -> TimelineState {
         compact: false,
         focus_folders: false,
         protect_keyframes: None,
+        frames_on_locked_layers: false,
+        key_names: Default::default(),
         layer_filter: Default::default(),
         layer_search: String::new(),
         row_filter: Default::default(),
@@ -67,6 +71,8 @@ fn state() -> TimelineState {
         beats: Vec::new(),
         shot_end: None,
         stage_copied: None,
+        talk_ranges: Vec::new(),
+        talk_range_marking: None,
     }
 }
 
@@ -108,6 +114,7 @@ fn the_waveform_type_holds_its_levels_by_arc() {
         levels: std::sync::Arc::new(vec![0.1, 0.2, 0.3]),
         level_start: 0,
         level_end: None,
+        peaks: std::sync::Arc::new(Vec::new()),
     };
     let clone = w.clone();
     assert!(std::sync::Arc::ptr_eq(&w.levels, &clone.levels));

@@ -647,6 +647,17 @@ impl ToolMachine {
         matches!(self.gesture, Gesture::Pivot { .. })
     }
 
+    /// Is a Free Transform drag **scaling, turning or skewing** the selection
+    /// (rather than moving it)? Decided when the drag began.
+    pub(crate) fn transforming(&self) -> bool {
+        matches!(self.gesture, Gesture::Dragging { transforming: Some(_), .. })
+    }
+
+    /// No gesture under way: the next pointer event is a press.
+    pub(crate) fn idle(&self) -> bool {
+        matches!(self.gesture, Gesture::Idle)
+    }
+
     /// Did the press begin a **move of the selection**?
     ///
     /// The editor asks right after the press, to know whether an Alt-drag is a
@@ -2618,11 +2629,6 @@ pub(crate) fn transform_zone(
     if nearest <= grab {
         return TransformZone::Corner;
     }
-    // Animate's rotate ring: just *outside* a corner, where the pointer turns
-    // into the rotation cursor.
-    if nearest <= grab * 3.0 && !frame.contains(at) {
-        return TransformZone::Rotate;
-    }
 
     // **The mid-edge handles**, which are drawn as squares exactly here — see
     // `stage::draw_selection_chrome`. Tested before the edge lines they sit
@@ -2658,6 +2664,19 @@ pub(crate) fn transform_zone(
     }
     if near_edge(corners[0], corners[3]) || near_edge(corners[1], corners[2]) {
         return TransformZone::Edge(false);
+    }
+
+    // Animate's rotate ring: just *outside* a corner, where the pointer turns
+    // into the rotation cursor.
+    //
+    // **After the edges, not before** (user 2026-11-25: skew "shall work
+    // smooth"). The ring reaches three handles out from each corner, so on a
+    // small part — an arm inside a character, a few dozen pixels long — the
+    // rings of its two corners met along the whole edge, and a press on the
+    // edge turned the part instead of skewing it. The edge line is skew all
+    // the way between its handles; the ring is what is left round the corner.
+    if nearest <= grab * 3.0 && !frame.contains(at) {
+        return TransformZone::Rotate;
     }
 
     TransformZone::Inside
@@ -3389,9 +3408,6 @@ mod tests {
         if nearest <= grab {
             return TransformZone::Corner;
         }
-        if nearest <= grab * 3.0 && !contains(bounds, at) {
-            return TransformZone::Rotate;
-        }
         let mid = bounds.center();
         for (p, horizontal) in [
             (Point::new(mid.x, bounds.y0), true),
@@ -3416,6 +3432,9 @@ mod tests {
         }
         if near_vertical_edge {
             return TransformZone::Edge(false);
+        }
+        if nearest <= grab * 3.0 && !contains(bounds, at) {
+            return TransformZone::Rotate;
         }
         TransformZone::Inside
     }

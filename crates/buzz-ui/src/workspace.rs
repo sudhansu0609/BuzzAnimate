@@ -2878,11 +2878,15 @@ pub fn workspace_path() -> std::path::PathBuf {
     }
 
     // Nobody has claimed the user's layout, so this is not the application:
-    // a scratch file per process, which behaves exactly like the real one and
-    // is nobody's to lose.
+    // a scratch file per process and thread, which behaves exactly like the
+    // real one and is nobody's to lose. **Per thread** because a test runner
+    // runs each test on a thread of its own in one process: one test moving a
+    // panel and saving used to rearrange the layout every other test then
+    // loaded, so tests passed alone and failed together.
     if !IS_THE_APPLICATION.load(std::sync::atomic::Ordering::Relaxed) {
+        let thread = format!("{:?}", std::thread::current().id()).replace(|c: char| !c.is_ascii_alphanumeric(), "");
         return std::env::temp_dir().join(format!(
-            "buzzanimate-scratch-workspace-{}.json",
+            "buzzanimate-scratch-workspace-{}-{thread}.json",
             std::process::id()
         ));
     }

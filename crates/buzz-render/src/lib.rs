@@ -569,6 +569,22 @@ fn blend_mode(blend: buzz_fx::Blend) -> peniko::BlendMode {
 /// going wider only disturbs more of the silhouette.
 pub(crate) const SEAM_SEAL_PX: f64 = 0.9;
 
+/// The thinnest a filled line is drawn, in device pixels. See
+/// [`SceneBuilder::hold_thin_line`].
+pub(crate) const THIN_LINE_PX: f64 = 1.0;
+
+/// Shorter than this on screen, a thin fill is a speck rather than a line, and
+/// is left at its true coverage.
+const THIN_LINE_MIN_EXTENT_PX: f64 = 3.0;
+
+/// A fill with at least this many holes is line art cut out of one shape. See
+/// `thin_pieces`.
+const LINE_ART_HOLES: usize = 8;
+
+/// Below this mean line width, in device pixels, line art cut out of one fill
+/// is held. See `thin_pieces`.
+const LINE_ART_HOLD_PX: f64 = 4.0;
+
 /// The largest share of a shape's own size a seam seal (or a mask's growth,
 /// which is the same idea) may take. See [`seal_width_px`]. A quarter: any
 /// shape at least 3.6 px thick or 14.4 px long — a 200 px shape by a wide
@@ -983,6 +999,144 @@ struct PathLineStats {
 /// segment's chord and control polygon averaged, within a few percent for any
 /// curve that is not a cusp.
 fn path_thickness(path: &BezPath) -> f64 {
+    path_els_thickness(path.elements())
+}
+
+/// **The thin pieces of a fill**, grouped by how much each needs to reach
+/// [`THIN_LINE_PX`] on screen: `(those pieces, the stroke width in device
+/// pixels)`, at most four groups. `per_unit` is device pixels per path unit.
+/// See [`SceneBuilder::hold_thin_line`].
+fn thin_pieces(elements: &[PathEl], per_unit: f64) -> Vec<(BezPath, f64)> {
+    use kurbo::ParamCurveArea as _;
+    struct Piece {
+        start: usize,
+        end: usize,
+        area: f64,
+        length: f64,
+        bounds: kurbo::Rect,
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut open: Option<Piece> = None;
+    let (mut first, mut current) = (Point::ORIGIN, Point::ORIGIN);
+    let finish = |piece: &mut Piece, current: Point, first: Point| {
+        if current != first {
+            piece.area += kurbo::Line::new(current, first).signed_area();
+            piece.length += (first - current).hypot();
+        }
+    };
+    for (i, el) in elements.iter().enumerate() {
+        match *el {
+            PathEl::MoveTo(p) => {
+                if let Some(mut piece) = open.take() {
+                    finish(&mut piece, current, first);
+                    piece.end = i;
+                    pieces.push(piece);
+                }
+                open = Some(Piece { start: i, end: i, area: 0.0, length: 0.0, bounds: kurbo::Rect::from_points(p, p) });
+                first = p;
+                current = p;
+            }
+            PathEl::LineTo(p) => {
+                if let Some(piece) = open.as_mut() {
+                    piece.area += kurbo::Line::new(current, p).signed_area();
+                    piece.length += (p - current).hypot();
+                    piece.bounds = piece.bounds.union_pt(p);
+                }
+                current = p;
+            }
+            PathEl::QuadTo(p1, p2) => {
+                if let Some(piece) = open.as_mut() {
+                    let (c0, c1, c2, c3) = quad_to_cubic(current, p1, p2);
+                    piece.area += kurbo::CubicBez::new(c0, c1, c2, c3).signed_area();
+                    piece.length += cubic_length_estimate(c0, c1, c2, c3);
+                    piece.bounds = piece.bounds.union_pt(p1).union_pt(p2);
+                }
+                current = p2;
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                if let Some(piece) = open.as_mut() {
+                    piece.area += kurbo::CubicBez::new(current, p1, p2, p3).signed_area();
+                    piece.length += cubic_length_estimate(current, p1, p2, p3);
+                    piece.bounds = piece.bounds.union_pt(p1).union_pt(p2).union_pt(p3);
+                }
+                current = p3;
+            }
+            PathEl::ClosePath => {
+                if let Some(piece) = open.as_mut() {
+                    finish(piece, current, first);
+                }
+                current = first;
+            }
+        }
+    }
+    if let Some(mut piece) = open.take() {
+        finish(&mut piece, current, first);
+        piece.end = elements.len();
+        pieces.push(piece);
+    }
+    // A closed piece already had its closing edge counted at `ClosePath`;
+    // `finish` adds nothing for it then, as `current` is back at `first`.
+    let Some(main) = pieces.iter().max_by(|a, b| a.area.abs().total_cmp(&b.area.abs())) else {
+        return Vec::new();
+    };
+    let sign = main.area.signum();
+    let mut groups: [Option<BezPath>; 4] = Default::default();
+
+    // **Line art cut out of one fill**: a solid shape with many holes, the
+    // colour regions sitting in the holes and the lines being the fill left
+    // between them (a traced shirt's checks: one black shape, four hundred
+    // holes). No piece is thin — the lines are the gaps between holes — so
+    // their width is the fill's area spread along the holes' edges, each line
+    // lying between two of them. Under a pixel, every hole's edge is traced
+    // over the regions by the shortfall, which widens every line by it.
+    let holes: Vec<&Piece> = pieces.iter().filter(|p| p.area.signum() != sign && p.length > 0.0).collect();
+    if holes.len() >= LINE_ART_HOLES {
+        let net = pieces.iter().map(|p| p.area).sum::<f64>().abs();
+        let edges: f64 = holes.iter().map(|p| p.length).sum();
+        let line_px = 2.0 * net / edges * per_unit;
+        // The mean counts the thick outline round the shape too, so the fine
+        // lines inside are thinner than it says: half a pixel more for every
+        // line while the mean is under `LINE_ART_HOLD_PX`, the whole shortfall
+        // once it is under a pixel.
+        if line_px > 0.0 && line_px < LINE_ART_HOLD_PX {
+            let mut path = BezPath::new();
+            for hole in &holes {
+                for el in &elements[hole.start..hole.end] {
+                    path.push(*el);
+                }
+            }
+            let short = (THIN_LINE_PX - line_px).max(THIN_LINE_PX / 2.0);
+            let step = ((short / THIN_LINE_PX) * 4.0).ceil().clamp(1.0, 4.0) as usize - 1;
+            groups[step].get_or_insert_with(BezPath::new).extend(path);
+        }
+    }
+
+    for piece in &pieces {
+        if piece.length <= 0.0 || piece.area.signum() != sign {
+            continue;
+        }
+        let extent_px = piece.bounds.width().max(piece.bounds.height()) * per_unit;
+        let thickness_px = 2.0 * piece.area.abs() / piece.length * per_unit;
+        if extent_px < THIN_LINE_MIN_EXTENT_PX || !(thickness_px > 0.0) || thickness_px >= THIN_LINE_PX {
+            continue;
+        }
+        // Quarter-pixel steps of what is missing, so a fill of hundreds of
+        // lines is a few strokes rather than hundreds.
+        let step = (((THIN_LINE_PX - thickness_px) / THIN_LINE_PX) * 4.0).ceil().clamp(1.0, 4.0) as usize - 1;
+        let path = groups[step].get_or_insert_with(BezPath::new);
+        for el in &elements[piece.start..piece.end] {
+            path.push(*el);
+        }
+    }
+    groups
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, g)| g.map(|g| (g, THIN_LINE_PX * (i as f64 + 1.0) / 4.0)))
+        .collect()
+}
+
+/// [`path_thickness`] of a path's elements.
+fn path_els_thickness(elements: &[PathEl]) -> f64 {
     use kurbo::ParamCurveArea as _;
     let mut area = 0.0f64;
     let mut length = 0.0f64;
@@ -994,7 +1148,7 @@ fn path_thickness(path: &BezPath) -> f64 {
             *length += (start - current).hypot();
         }
     };
-    for el in path.elements() {
+    for el in elements {
         match *el {
             PathEl::MoveTo(p) => {
                 close(current, start, &mut area, &mut length);
@@ -1338,6 +1492,12 @@ pub struct SceneBuilder<'a> {
     /// Scenes of closed runs, reset and kept for the next run, so a frame of
     /// a thousand symbols does not allocate a thousand encodings.
     pub(crate) spare_runs: Vec<Scene>,
+    /// Hold thin line art to a pixel (the stage only). See
+    /// [`Self::hold_thin_line`].
+    pub(crate) hold_lines: bool,
+    /// One frame per symbol being drawn while `hold_lines` is on. See
+    /// [`Self::begin_tops`].
+    pub(crate) tops: Vec<TopsFrame>,
 }
 
 /// One open seal run: the artwork drawn since it began, and how many groups
@@ -1350,6 +1510,15 @@ pub(crate) struct SealRun {
     /// The seals lifted out of the run, in draw order, drawn beneath its
     /// artwork — in *reverse* — when it closes. See [`SceneBuilder::end_seal_run`].
     seals: Vec<SealOp>,
+}
+
+/// Thin lines held to a pixel inside one symbol, drawn over its artwork when
+/// it is finished. See [`SceneBuilder::hold_thin_line`].
+pub(crate) struct TopsFrame {
+    ops: Vec<SealOp>,
+    /// Groups (a mask's clip, a blend) open since the frame began: a line
+    /// held inside one is drawn in place, so it stays inside it.
+    open_groups: u32,
 }
 
 /// One seam seal, held until its run closes.
@@ -1391,7 +1560,46 @@ impl<'a> SceneBuilder<'a> {
             last_stats: PathLineStats::default(),
             runs: Vec::new(),
             spare_runs: Vec::new(),
+            hold_lines: false,
+            tops: Vec::new(),
         }
+    }
+
+    /// **Begin a symbol's held lines**: until [`Self::end_tops`], thin line
+    /// art held to a pixel ([`Self::hold_thin_line`]) is kept, and drawn over
+    /// the next fill — the colour laid into its gaps — or, failing one, when
+    /// the symbol ends.
+    pub fn begin_tops(&mut self) {
+        if self.hold_lines {
+            self.tops.push(TopsFrame { ops: Vec::new(), open_groups: 0 });
+        }
+    }
+
+    /// Draw the innermost symbol's held lines, over its artwork. See
+    /// [`Self::begin_tops`].
+    pub fn end_tops(&mut self) {
+        if !self.hold_lines {
+            return;
+        }
+        let Some(frame) = self.tops.pop() else {
+            return;
+        };
+        let into = target(&mut *self.scene, &mut self.runs);
+        for op in &frame.ops {
+            into.stroke(&kurbo::Stroke::new(op.width), op.view, &op.brush, op.brush_transform, &op.path);
+        }
+    }
+
+    /// **Hold thin line art to a pixel** on this builder: the stage's, not
+    /// the exporter's. See [`Self::hold_thin_line`].
+    pub fn with_held_lines(mut self, on: bool) -> Self {
+        self.hold_lines = on;
+        self
+    }
+
+    /// Is thin line art held to a pixel here? Part of a stamped symbol's key.
+    pub fn holds_lines(&self) -> bool {
+        self.hold_lines
     }
 
     /// **Begin a seal run**: until [`Self::end_seal_run`], every fill's seam
@@ -1469,12 +1677,18 @@ impl<'a> SceneBuilder<'a> {
         if let Some(run) = self.runs.last_mut() {
             run.open_groups += 1;
         }
+        if let Some(frame) = self.tops.last_mut() {
+            frame.open_groups += 1;
+        }
     }
 
     /// A group was closed in the current run; see [`SealRun`].
     fn group_closed(&mut self) {
         if let Some(run) = self.runs.last_mut() {
             run.open_groups = run.open_groups.saturating_sub(1);
+        }
+        if let Some(frame) = self.tops.last_mut() {
+            frame.open_groups = frame.open_groups.saturating_sub(1);
         }
     }
 
@@ -1883,10 +2097,35 @@ impl<'a> SceneBuilder<'a> {
         to_doc: Affine,
         extent: f64,
     ) {
+        // Lines the fill before this one held to a pixel go over *this* fill
+        // — the colour laid into their gaps — and under whatever comes after
+        // it (a pocket over a check, a hand over a sleeve). See
+        // [`Self::hold_thin_line`].
+        let earlier = match self.tops.last_mut() {
+            Some(frame) if frame.open_groups == 0 => std::mem::take(&mut frame.ops),
+            _ => Vec::new(),
+        };
+        self.fill_shape_paint_sealed_unheld(shape, paint, to_doc, extent);
+        if !earlier.is_empty() {
+            let into = target(&mut *self.scene, &mut self.runs);
+            for op in &earlier {
+                into.stroke(&kurbo::Stroke::new(op.width), op.view, &op.brush, op.brush_transform, &op.path);
+            }
+        }
+    }
+
+    fn fill_shape_paint_sealed_unheld(
+        &mut self,
+        shape: &impl Shape,
+        paint: &Paint,
+        to_doc: Affine,
+        extent: f64,
+    ) {
         self.fill_shape_paint(shape, paint, to_doc);
         if !is_opaque(paint) {
             return;
         }
+        self.hold_thin_line(shape, paint, to_doc, extent);
         // In screen pixels: the seam is a property of the *rasteriser*, not of
         // the document, so it is the same width at every zoom. Slightly under a
         // pixel — a full pixel of overlap is enough to close the gap, and less
@@ -1922,6 +2161,60 @@ impl<'a> SceneBuilder<'a> {
             }
         }
         self.stroke_shape_paint_into(shape, paint, width, to_doc, true);
+    }
+
+    /// **A line thinner than a pixel is drawn a pixel wide**, as Animate
+    /// draws it (user 2026-11-25: "some of the character lines on the shirt
+    /// vanish or become light while I zoom in or out").
+    ///
+    /// Traced line work is filled outlines, not strokes: a shirt's check and
+    /// fold lines are hundreds of thin pieces of one black fill, each a
+    /// document unit or two wide. Zoomed out, a piece is a fraction of a
+    /// pixel on screen, and drawn at its true coverage it went pale and broke
+    /// up — differently at every zoom step, so the lines flickered lighter
+    /// and darker as the zoom moved. Animate scan-converts thin regions to at
+    /// least a pixel, so its lines stay dark at every zoom.
+    ///
+    /// Each piece (subpath) of an opaque fill whose mean thickness
+    /// (`2·area / perimeter`) is under [`THIN_LINE_PX`] device pixels, and
+    /// which is longer than a speck, is stroked once more with the fill's own
+    /// paint, over itself, by about the difference. A piece wound against the
+    /// fill's largest one is a hole and is left alone, so a thin gap is never
+    /// filled in; nothing a pixel thick or more is touched.
+    fn hold_thin_line(&mut self, shape: &impl Shape, paint: &Paint, to_doc: Affine, extent: f64) {
+        if !self.hold_lines {
+            return;
+        }
+        let per_unit = self.pixels_per_unit();
+        if !(per_unit > 0.0) || extent * per_unit < THIN_LINE_MIN_EXTENT_PX {
+            return;
+        }
+        let Some(elements) = shape.as_path_slice() else {
+            return;
+        };
+        for (path, width_px) in thin_pieces(elements, per_unit) {
+            let width = width_px / per_unit;
+            // **Over the artwork the line was drawn under.** Traced line work
+            // is a black fill beneath the colour regions, showing through the
+            // gaps they leave; held to a pixel beneath them it would only be
+            // covered again. Inside a symbol it is drawn when the symbol is
+            // finished, over its own regions and under whatever is drawn after
+            // it — an arm in front of the shirt still covers the shirt's
+            // lines. Outside any symbol, or inside a clip or a group, it is
+            // drawn in place.
+            if self.tops.last().is_some_and(|f| f.open_groups == 0) {
+                let render_width = self.split.scale_length(width).max(f64::MIN_POSITIVE);
+                let render_path = self.to_render_space_for_stroke(&path, Some(render_width * self.device_scale));
+                let (brush, brush_transform) = self.brush_for(paint, to_doc);
+                let view = self.split.gpu_view;
+                if let Some(frame) = self.tops.last_mut() {
+                    frame.ops.push(SealOp { path: render_path, brush, brush_transform, width: render_width, view });
+                }
+                self.add_stroke_lines(render_width);
+            } else {
+                self.stroke_shape_paint_into(&path, paint, width, to_doc, false);
+            }
+        }
     }
 
     /// Stroke a document-space shape with a paint, which may be a gradient.
@@ -2441,6 +2734,54 @@ mod tests {
 
     /// `path_thickness` is a strip's width and a disc's radius,
     /// holes subtracted.
+    #[test]
+    fn line_art_cut_out_of_one_fill_is_held_only_while_its_lines_are_thin() {
+        // A black sheet with a 10 × 10 grid of holes, lines 1 unit wide between
+        // them: line art cut out of one fill, as a traced shirt's checks are.
+        let mut sheet = Rect::new(0.0, 0.0, 101.0, 101.0).to_path(1e-9);
+        for i in 0..10 {
+            for j in 0..10 {
+                let (x, y) = (1.0 + f64::from(i) * 10.0, 1.0 + f64::from(j) * 10.0);
+                // Wound the other way: a hole.
+                let hole = Rect::new(x, y, x + 9.0, y + 9.0).to_path(1e-9);
+                let mut reversed = BezPath::new();
+                let pts: Vec<Point> = hole.elements().iter().filter_map(|e| match e {
+                    PathEl::MoveTo(p) | PathEl::LineTo(p) => Some(*p),
+                    _ => None,
+                }).collect();
+                reversed.move_to(pts[0]);
+                for p in pts.iter().skip(1).rev() {
+                    reversed.line_to(*p);
+                }
+                reversed.close_path();
+                sheet.extend(reversed);
+            }
+        }
+        // Zoomed out, a line is a fraction of a pixel: the holes' edges are held.
+        let far = thin_pieces(sheet.elements(), 0.3);
+        assert_eq!(far.len(), 1, "one group: {far:?}");
+        assert!(far[0].1 > 0.0 && far[0].1 <= THIN_LINE_PX);
+        assert_eq!(far[0].0.elements().iter().filter(|e| matches!(e, PathEl::MoveTo(_))).count(), 100, "every hole's edge");
+        // Zoomed in, the lines are pixels wide: nothing is touched.
+        assert!(thin_pieces(sheet.elements(), 10.0).is_empty());
+        // A plain shape with no holes and no thin piece: nothing either.
+        assert!(thin_pieces(Rect::new(0.0, 0.0, 50.0, 50.0).to_path(1e-9).elements(), 0.3).is_empty());
+        // A lone thin line is a thin piece of its own.
+        let line = Rect::new(0.0, 0.0, 100.0, 1.0).to_path(1e-9);
+        let held = thin_pieces(line.elements(), 0.5);
+        assert_eq!(held.len(), 1);
+        assert!(thin_pieces(line.elements(), 5.0).is_empty(), "a pixel thick or more is left alone");
+    }
+
+    #[test]
+    fn only_a_builder_asked_to_holds_lines() {
+        let mut scene = Scene::new();
+        let cam = Camera::new(Point::ORIGIN, 1.0, Size::new(800.0, 600.0));
+        assert!(!SceneBuilder::new(&mut scene, &cam).holds_lines(), "the exporter's draws are untouched");
+        let mut scene = Scene::new();
+        assert!(SceneBuilder::new(&mut scene, &cam).with_held_lines(true).holds_lines());
+    }
+
     #[test]
     fn path_thickness_measures_strips_discs_and_rings() {
         let strip = Rect::new(0.0, 0.0, 100.0, 2.0).to_path(1e-9);

@@ -157,7 +157,11 @@ fn lighting_cost_grows_with_the_artwork_rather_than_its_square() {
 #[test]
 fn editing_artwork_does_not_rebuild_every_light() {
     with_exporter(|_exporter| {
-        let mut scene = artwork(600, 120);
+        // 400 props, not 600: past `TRACED_SHAPES` (500) a layer of plain
+        // shapes is a traced picture and is lit as one surface — one build,
+        // rebuilt as a unit, off the window's thread while a drag goes on.
+        // This is about a layer of separate pieces each keeping its own.
+        let mut scene = artwork(400, 120);
         light_it(&mut scene);
 
         // The window holds one cache across frames; the exporter builds one per

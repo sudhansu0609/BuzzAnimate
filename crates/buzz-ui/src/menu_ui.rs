@@ -68,6 +68,9 @@ pub enum MenuResponse {
     Record { clicked: bool },
 }
 
+/// The narrowest a menu-bar title is drawn: the hit-target minimum.
+const MENU_TITLE_MIN_WIDTH: f32 = 24.0;
+
 impl MenuResponse {
     pub fn clicked(&self) -> bool {
         match self {
@@ -106,7 +109,19 @@ impl<'a> MenuUi<'a> {
         let title = title.into();
         match self {
             Self::Egui(ui) => {
-                let inner = ui.menu_button(title, |ui| add(&mut MenuUi::Egui(ui)));
+                // **At least a hit target wide**: "AI", the shortest title in
+                // the menu bar, came out 15.6 px — under the 24 px minimum
+                // every other clickable clears. Longer titles are wider than
+                // this anyway. Nested submenus keep egui's own row.
+                let inner = if egui::containers::menu::is_in_menu(ui) {
+                    ui.menu_button(title, |ui| add(&mut MenuUi::Egui(ui)))
+                } else {
+                    let (response, inner) = egui::containers::menu::MenuButton::from_button(
+                        egui::Button::new(title).min_size(egui::vec2(MENU_TITLE_MIN_WIDTH, 0.0)),
+                    )
+                    .ui(ui, |ui| add(&mut MenuUi::Egui(ui)));
+                    egui::InnerResponse::new(inner.map(|i| i.inner), response)
+                };
                 MenuInner { response: MenuResponse::Egui(inner.response) }
             }
             Self::Record(rec) => {

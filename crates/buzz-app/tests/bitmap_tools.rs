@@ -345,8 +345,10 @@ fn a_tolerance_of_zero_takes_only_the_exact_colour() {
 
     let area = Rect::new(0.0, 0.0, 64.0, 64.0);
 
+    // The plain wand: tolerance alone. The default one also stops at edges,
+    // and a crisp step between two flat shades is exactly such an edge.
     let mut tight = editor_with_picture(area, Arc::clone(&asset));
-    tight.style.wand.tolerance = 0.0;
+    tight.style.wand = buzz_scene::WandOptions::plain(0.0, true);
     tight.apply(ToolAction::WandAt {
         point: Point::new(32.0, 8.0),
         additive: false,
@@ -362,7 +364,7 @@ fn a_tolerance_of_zero_takes_only_the_exact_colour() {
     );
 
     let mut loose = editor_with_picture(area, asset);
-    loose.style.wand.tolerance = 32.0 / 255.0;
+    loose.style.wand = buzz_scene::WandOptions::plain(32.0 / 255.0, true);
     loose.apply(ToolAction::WandAt {
         point: Point::new(32.0, 8.0),
         additive: false,

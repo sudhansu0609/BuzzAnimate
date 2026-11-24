@@ -23,6 +23,10 @@ tracing.workspace = true
 serde.workspace = true
 
 png = "0.18"
+# Animated WebP written here when the ffmpeg on the machine has no WebP
+# encoder (Homebrew's, for one): each frame lossless, wrapped in the animation
+# container by hand. Already in the tree through `image`.
+image-webp = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

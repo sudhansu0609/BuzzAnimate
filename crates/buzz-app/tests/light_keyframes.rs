@@ -78,30 +78,55 @@ fn two_keys_interpolate_the_light_between_them() {
     let id = editor.light_panel.selected.unwrap();
 
     editor.current_frame = 0;
-    editor.run(Command::AddLightKeyframe); // key at x=100
+    editor.run(Command::AddLightKeyframe);
+    let start = match editor.doc.scene().lights().get(id).unwrap().kind {
+        LightKind::Lamp { position, .. } => position,
+        _ => panic!("expected a lamp"),
+    };
 
-    // Move the lamp, then key at frame 20 (x=300).
-    editor.doc.edit("Move Lamp", |scene| {
-        if let Some(light) = scene.lights_mut().get_mut(id)
-            && let LightKind::Lamp { position, .. } = &mut light.kind
-        {
-            *position = Point::new(300.0, 200.0);
-        }
-    });
+    // Move the lamp at frame 20 as the stage's own drag does — onto the
+    // frame's state, then keyed there — 200 to the right.
     editor.current_frame = 20;
     editor.run(Command::AddLightKeyframe);
+    editor.doc.edit("Move Lamp", |scene| {
+        if let Some(light) = scene.lights_mut().get_mut(id)
+            && let Some(track) = light.track.as_mut()
+        {
+            let mut keys: Vec<_> = track.keys().to_vec();
+            for key in &mut keys {
+                if key.frame == 20
+                    && let LightKind::Lamp { position, .. } = &mut key.kind
+                {
+                    position.x += 200.0;
+                }
+                // A light's keys hold, as Animate's do, until the span between
+                // them is tweened.
+                if key.frame == 0 {
+                    key.tween = true;
+                }
+            }
+            for key in keys {
+                track.set_key(key);
+            }
+        }
+    });
 
     // Half way between, the resolved lamp sits between the two keyed positions.
     let rig = editor.doc.scene().lights().resolved_at(10);
     let light = rig.get(id).expect("the light");
     match light.kind {
         LightKind::Lamp { position, .. } => assert!(
-            position.x > 120.0 && position.x < 280.0,
-            "midpoint x was {}, not between the keys",
-            position.x
+            position.x > start.x + 20.0 && position.x < start.x + 180.0,
+            "midpoint x was {}, not between {} and {}",
+            position.x,
+            start.x,
+            start.x + 200.0
         ),
         _ => panic!("expected a lamp"),
     }
+    // And untweened, it holds the first key's position until the second.
+    let rig = editor.doc.scene().lights().resolved_at(19);
+    assert!(rig.get(id).is_some());
 }
 
 #[test]
@@ -111,8 +136,11 @@ fn keying_is_one_undo_step() {
     let id = editor.light_panel.selected.unwrap();
     editor.current_frame = 5;
     editor.run(Command::AddLightKeyframe);
-    assert_eq!(key_count(&editor, id), 1);
+    // A first key after frame 1 also keys frame 1 as the light stands, so the
+    // change made at this key does not reach back to the start.
+    assert_eq!(key_count(&editor, id), 2);
+    assert!(has_key(&editor, id, 0) && has_key(&editor, id, 5));
 
     editor.doc.undo();
-    assert_eq!(key_count(&editor, id), 0, "one Ctrl+Z takes the key back");
+    assert_eq!(key_count(&editor, id), 0, "one Ctrl+Z takes both back");
 }

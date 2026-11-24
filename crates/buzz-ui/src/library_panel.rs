@@ -378,6 +378,11 @@ impl LibraryState {
         self.renaming = Some((id, name.into()));
     }
 
+    /// Put the name field away without renaming anything.
+    pub fn stop_naming(&mut self) {
+        self.renaming = None;
+    }
+
     /// The symbol whose name is being typed, if one is. For tests and for
     /// anything that needs to know a field has the keyboard.
     pub fn naming(&self) -> Option<SymbolId> {

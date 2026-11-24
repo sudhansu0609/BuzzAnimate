@@ -2648,6 +2648,8 @@ pub struct SymKey {
     light_print: u64,
     light_depth_bits: u64,
     stage_height_bits: u64,
+    /// Built with thin line art held to a pixel (the stage) or not.
+    hold_lines: bool,
 }
 
 /// Pack a [`buzz_scene::ColorTransform`]'s eight channels into exact bits for
@@ -4859,6 +4861,8 @@ fn draw_layer(
                             last_stats: PathLineStats::default(),
                             runs: Vec::new(),
                             spare_runs: Vec::new(),
+                            hold_lines: builder.hold_lines,
+            tops: Vec::new(),
                         };
                         if let Some(cast) =
                             shadow_group_bounds(&resolved, &shadow, &ctx, &mut cache.bounds)
@@ -6761,6 +6765,9 @@ fn draw_symbol_contents(
                 .keyframe_at(inner)
                 .is_some_and(|k| k.objects.iter().any(|o| draws_own_art(o)))
     });
+    // Thin line art held to a pixel goes over this symbol's own regions, not
+    // under them: see `SceneBuilder::hold_thin_line`.
+    builder.begin_tops();
     if seals {
         builder.begin_seal_run();
     }
@@ -6832,6 +6839,7 @@ fn draw_symbol_contents(
     if seals {
         builder.end_seal_run();
     }
+    builder.end_tops();
 }
 
 /// A layer or symbol whose artwork spans fewer device pixels than this, on
@@ -7037,6 +7045,8 @@ fn try_stamp_layer(
             last_stats: PathLineStats::default(),
             runs: Vec::new(),
             spare_runs: Vec::new(),
+            hold_lines: builder.hold_lines,
+            tops: Vec::new(),
         };
         draw_layer(
             &mut child,
@@ -7401,6 +7411,7 @@ fn try_stamp_symbol(
         light_print: if lit { ctx.light_print } else { 0 },
         light_depth_bits: ctx.lighting.map_or(0, |(_, depth)| depth.to_bits()),
         stage_height_bits: ctx.lighting.map_or(0, |(height, _)| height.to_bits()),
+        hold_lines: builder.holds_lines(),
     };
     let generation = cache.symbol_scenes.frame;
 
@@ -7624,6 +7635,8 @@ fn try_stamp_symbol(
             last_stats: PathLineStats::default(),
             runs: Vec::new(),
             spare_runs: Vec::new(),
+            hold_lines: builder.hold_lines,
+            tops: Vec::new(),
         };
         let neutral = DrawCtx {
             cull: None,
@@ -9270,6 +9283,8 @@ fn draw_rig_shadow(
                     last_stats: PathLineStats::default(),
                     runs: Vec::new(),
                     spare_runs: Vec::new(),
+                    hold_lines: builder.hold_lines,
+            tops: Vec::new(),
                 };
                 run_rig_shadow_pass(&mut child, parts, &ctxs, shadow, alpha, &mut cache.bounds);
                 child.lines
@@ -12740,6 +12755,7 @@ mod symbol_scene {
             light_print: 0,
             light_depth_bits: 0,
             stage_height_bits: 0,
+            hold_lines: false,
         }
     }
 
@@ -13060,6 +13076,7 @@ mod symbol_scene {
                     light_print: 0,
                     light_depth_bits: 0,
                     stage_height_bits: 0,
+                    hold_lines: false,
                 },
                 SymEntry {
                     scene: Arc::clone(&dummy),

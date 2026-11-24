@@ -269,10 +269,11 @@ fn a_200px_shape_is_drawn_as_before() {
 }
 
 /// Measured on the pre-fix build (`SEAM_SEAL_PX` drawn in line, no cap), at
-/// the probes above.
+/// the probes above. The left edge's two refreshed 2026-11-25 after the seal's
+/// pen changed (S12c): it now matches the top edge, a few levels in 255.
 const GOLDEN: [[u8; 4]; 10] = [
-    [248, 229, 229, 255],
-    [196, 47, 47, 255],
+    [246, 224, 224, 255],
+    [197, 49, 49, 255],
     [192, 32, 32, 255],
     [192, 32, 32, 255],
     [196, 46, 46, 255],

@@ -187,6 +187,11 @@ pub fn export_webp(
     progress: impl FnMut(u32, u32) -> bool,
 ) -> Result<AnimatedReport> {
     let webp = webp.clone();
+    // **No WebP encoder in this ffmpeg** (Homebrew's ships the muxer and not
+    // libwebp): written here instead, every frame lossless.
+    if crate::ffmpeg_available() && !ffmpeg_has_encoder("libwebp") {
+        return export_webp_native(reel, frames, path, settings, &webp, preference, progress);
+    }
     encode(
         reel,
         frames,
@@ -210,6 +215,119 @@ pub fn export_webp(
                 .arg(output.as_os_str());
         },
     )
+}
+
+/// Does the ffmpeg on this machine have the encoder `name`? Asked once.
+fn ffmpeg_has_encoder(name: &str) -> bool {
+    static ENCODERS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ENCODERS
+        .get_or_init(|| {
+            crate::video::ffmpeg_cmd()
+                .args(["-hide_banner", "-encoders"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        })
+        .split_whitespace()
+        .any(|word| word == name)
+}
+
+/// **An animated WebP written without ffmpeg's encoder**: each frame encoded
+/// lossless (VP8L) and the frames wrapped in WebP's animation container —
+/// `VP8X` (animated, with alpha), `ANIM` (loops) and one `ANMF` per frame,
+/// each frame replacing the last for its share of the second.
+fn export_webp_native(
+    reel: &crate::Reel<'_>,
+    frames: std::ops::Range<u32>,
+    path: &Path,
+    settings: &ExportSettings,
+    webp: &WebpSettings,
+    preference: &GpuPreference,
+    mut progress: impl FnMut(u32, u32) -> bool,
+) -> Result<AnimatedReport> {
+    if frames.is_empty() {
+        bail!("there are no frames in that range to export");
+    }
+    if reel.is_empty() {
+        bail!("there are no scenes to export");
+    }
+    let lead = reel.lead().expect("a non-empty reel has a lead scene");
+    let fps = lead.stage().frame_rate.max(1.0);
+    let mut exporter = Exporter::new(preference)?;
+    let numbers: Vec<u32> = frames.collect();
+    let total = numbers.len() as u32;
+
+    let mut chunks: Vec<u8> = Vec::new();
+    let (mut width, mut height) = (0u32, 0u32);
+    let mut written = 0u32;
+    for (i, &index) in numbers.iter().enumerate() {
+        let (scene, at) = reel.at_clamped(index).expect("a non-empty reel always has a frame to hold on");
+        let frame = exporter.render(scene, at, settings)?;
+        if i == 0 {
+            (width, height) = (frame.width, frame.height);
+            if width == 0 || height == 0 || width > 1 << 24 || height > 1 << 24 {
+                bail!("a {width}×{height} picture cannot be a WebP");
+            }
+        }
+        let mut single = Vec::new();
+        image_webp::WebPEncoder::new(&mut single)
+            .encode(&frame.pixels, frame.width, frame.height, image_webp::ColorType::Rgba8)
+            .map_err(|e| anyhow::anyhow!("encoding frame {}: {e}", index + 1))?;
+        // The simple container is RIFF, size, WEBP, then the one VP8L chunk.
+        let vp8l = single.get(12..).context("an empty WebP frame")?;
+        // Each frame's share of the second, from where it starts to where the
+        // next does, so the whole runs at the film's rate without drift.
+        let start = (f64::from(i as u32) * 1000.0 / fps).round() as u32;
+        let end = (f64::from(i as u32 + 1) * 1000.0 / fps).round() as u32;
+        let mut anmf = Vec::with_capacity(16 + vp8l.len());
+        anmf.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // x / 2, y / 2
+        anmf.extend_from_slice(&(frame.width - 1).to_le_bytes()[..3]);
+        anmf.extend_from_slice(&(frame.height - 1).to_le_bytes()[..3]);
+        anmf.extend_from_slice(&(end - start).max(1).to_le_bytes()[..3]);
+        // Not blended over the last frame: it replaces it, transparency and all.
+        anmf.push(0b10);
+        anmf.extend_from_slice(vp8l);
+        riff_chunk(&mut chunks, b"ANMF", &anmf);
+        written += 1;
+        if !progress(written, total) {
+            bail!("the export was cancelled");
+        }
+    }
+
+    let mut vp8x = vec![(1 << 4) | (1 << 1), 0, 0, 0];
+    vp8x.extend_from_slice(&(width - 1).to_le_bytes()[..3]);
+    vp8x.extend_from_slice(&(height - 1).to_le_bytes()[..3]);
+    let mut anim = vec![0u8, 0, 0, 0]; // background: transparent
+    anim.extend_from_slice(&(webp.loops.min(u32::from(u16::MAX)) as u16).to_le_bytes());
+    let mut body = Vec::new();
+    body.extend_from_slice(b"WEBP");
+    riff_chunk(&mut body, b"VP8X", &vp8x);
+    riff_chunk(&mut body, b"ANIM", &anim);
+    body.extend_from_slice(&chunks);
+    let mut file = Vec::with_capacity(8 + body.len());
+    file.extend_from_slice(b"RIFF");
+    file.extend_from_slice(&u32::try_from(body.len()).context("the WebP is over 4 GB")?.to_le_bytes());
+    file.extend_from_slice(&body);
+
+    let temporary = path.with_extension("webp.part");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&temporary, &file).with_context(|| format!("writing {}", temporary.display()))?;
+    std::fs::rename(&temporary, path).with_context(|| format!("moving the finished file into {}", path.display()))?;
+    Ok(AnimatedReport { path: path.to_path_buf(), frames: written, format: AnimatedFormat::Webp })
+}
+
+/// One RIFF chunk: its four-letter name, its length, its data, padded even.
+fn riff_chunk(out: &mut Vec<u8>, name: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(name);
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        out.push(0);
+    }
 }
 
 /// The shared input arguments: raw straight-alpha RGBA at a given size and rate.
@@ -462,5 +580,10 @@ mod tests {
         assert!(path.exists());
         assert_eq!(report.frames, 4);
         assert_eq!(report.format, AnimatedFormat::Webp);
+        // A real animated WebP, whichever way it was written.
+        let file = std::fs::File::open(&path).expect("the file");
+        let decoder = image_webp::WebPDecoder::new(std::io::BufReader::new(file)).expect("a WebP");
+        assert!(decoder.is_animated(), "animated");
+        assert_eq!(decoder.num_frames(), 4);
     }
 }

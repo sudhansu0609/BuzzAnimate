@@ -365,18 +365,40 @@ pub fn http_request(
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, b)| b)
-        .unwrap_or("");
-    Ok((status, serde_json::from_str(body).unwrap_or(Value::Null)))
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let chunked = head
+        .lines()
+        .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:") && l.to_ascii_lowercase().contains("chunked"));
+    let body = if chunked { dechunk(body) } else { body.to_string() };
+    Ok((status, serde_json::from_str(&body).unwrap_or(Value::Null)))
+}
+
+/// A `Transfer-Encoding: chunked` body, put back together.
+fn dechunk(mut rest: &str) -> String {
+    let mut out = String::new();
+    while let Some((size, after)) = rest.split_once("\r\n") {
+        let Ok(n) = usize::from_str_radix(size.split(';').next().unwrap_or("").trim(), 16) else {
+            break;
+        };
+        if n == 0 || after.len() < n {
+            break;
+        }
+        out.push_str(&after[..n]);
+        rest = after[n..].strip_prefix("\r\n").unwrap_or(&after[n..]);
+    }
+    out
 }
 
 /// Answer one request, on its own thread.
 fn serve(mut request: tiny_http::Request, tx: &Sender<ApiMsg>, ctx: Option<&egui::Context>, port: u16) {
     let reply = answer(&mut request, tx, ctx, port);
     let data = serde_json::to_vec(&reply.body).unwrap_or_else(|_| b"{}".to_vec());
-    let mut response = tiny_http::Response::from_data(data).with_status_code(reply.status);
+    // One piece with its length, never chunked: the catalog is ~60 kB, over
+    // tiny_http's chunking threshold, and a plain client reading to the end
+    // got the chunk sizes mixed into the JSON.
+    let mut response = tiny_http::Response::from_data(data)
+        .with_status_code(reply.status)
+        .with_chunked_threshold(usize::MAX);
     if let Ok(h) = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
         response = response.with_header(h);
     }

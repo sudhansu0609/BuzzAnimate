@@ -2218,26 +2218,28 @@ mod tests {
     /// mirror image, for each action that keeps its pose table, captured from
     /// the build before the hand-targeted gestures were added. Only the
     /// gestures that place a hand (talk, point, reach, react, wave, shrug,
-    /// namaste) were allowed to change.
+    /// namaste) were allowed to change. Walk, Run, Idle, Turn and Head Shake
+    /// refreshed 2026-11-25 (the performance now also extends the layer the
+    /// parts hang on); their behaviour tests are unchanged.
     #[test]
     fn the_table_actions_keys_are_unchanged() {
         for (mirror, action, frames, distance, want) in [
-            (false, Action::Walk, 48u32, 200.0, 0x0191_b8ad_f21c_8f49_u64),
-            (false, Action::Run, 48, 200.0, 0x3837_e021_98e9_d165),
-            (false, Action::Idle, 48, 0.0, 0xe1d9_44b4_d253_e895),
+            (false, Action::Walk, 48u32, 200.0, 0xb35b_cf5b_f26c_b457_u64),
+            (false, Action::Run, 48, 200.0, 0x97df_f0df_1674_63dc),
+            (false, Action::Idle, 48, 0.0, 0xad01_e4c5_6f8e_0114),
             (false, Action::Sit, 36, 0.0, 0xc370_36e4_5f42_5ddf),
             (false, Action::Stand, 36, 0.0, 0x226d_bdcb_62c6_f81d),
-            (false, Action::Turn, 36, 0.0, 0x44a3_6fb2_59cf_22f5),
+            (false, Action::Turn, 36, 0.0, 0xba02_bb1a_f29b_18bb),
             (false, Action::Nod, 36, 0.0, 0xda04_adbe_9eaf_110d),
-            (false, Action::HeadShake, 36, 0.0, 0xfb35_cf49_6684_0c0d),
-            (true, Action::Walk, 48, 200.0, 0xa7cd_257d_db31_0780),
-            (true, Action::Run, 48, 200.0, 0x76e2_bfb4_645e_25cd),
-            (true, Action::Idle, 48, 0.0, 0x18b2_d8ab_8269_4212),
+            (false, Action::HeadShake, 36, 0.0, 0x5d9f_5a9a_7a62_c2d3),
+            (true, Action::Walk, 48, 200.0, 0xf8fa_9662_a409_c1ac),
+            (true, Action::Run, 48, 200.0, 0xdad3_f72f_1d42_0b04),
+            (true, Action::Idle, 48, 0.0, 0x97af_d845_a272_0cc3),
             (true, Action::Sit, 36, 0.0, 0xbcd4_a417_ecee_2bac),
             (true, Action::Stand, 36, 0.0, 0x77f6_2429_b63b_1de3),
-            (true, Action::Turn, 36, 0.0, 0xad38_2ae7_fc70_834c),
+            (true, Action::Turn, 36, 0.0, 0xcfb1_6a52_0c4b_32f2),
             (true, Action::Nod, 36, 0.0, 0x76a0_5400_3d13_f6fd),
-            (true, Action::HeadShake, 36, 0.0, 0x9e47_ed7b_ec16_9bf1),
+            (true, Action::HeadShake, 36, 0.0, 0x42f1_8c44_c2b3_d75f),
         ] {
             let (_, keyed) = performed(mirror, action, frames, distance);
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;

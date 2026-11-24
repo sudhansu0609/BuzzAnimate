@@ -141,6 +141,104 @@ pub fn build_tools() -> Vec<ToolSpec> {
 
 /// [`build_tools`], with the excluded commands listed as runnable when
 /// "Allow all" is on.
+/// **A tool's schema from the signature its hint opens with**: `{location:
+/// the background's key, angle?: wide|low_angle} -> …` gives `location`
+/// (required) and `angle` (optional), each a string unless its words say it
+/// is a number, a true/false or a list. A hint with no signature gives a
+/// schema that takes anything.
+fn schema_from_hint(hint: &str) -> Value {
+    let open = hint.trim_start();
+    let Some(inner) = open.strip_prefix('{') else {
+        return json!({"type": "object", "additionalProperties": true});
+    };
+    // The signature's own closing brace, past any nested ones.
+    let mut depth = 1usize;
+    let mut end = None;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(end) = end else {
+        return json!({"type": "object", "additionalProperties": true});
+    };
+    let body = &inner[..end];
+    // Split at top-level commas that start a new `name:` or `name?:`.
+    let mut fields: Vec<(String, bool, String)> = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    for (i, c) in body.char_indices() {
+        match c {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let next = body[i + 1..].trim_start();
+                let key: String = next.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                let after = next[key.len()..].trim_start();
+                // `name:`, `name?:`, or a bare `name` / `name?` (`{scene, out?}`).
+                let bare = after.strip_prefix('?').unwrap_or(after).trim_start();
+                if !key.is_empty() && (bare.starts_with(':') || bare.starts_with(',') || bare.is_empty()) {
+                    parts.push(&body[start..i]);
+                    start = i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.push(&body[start..]);
+    for part in parts {
+        let part = part.trim();
+        let key: String = part.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        if key.is_empty() {
+            continue;
+        }
+        let rest = &part[key.len()..];
+        let (optional, rest) = match rest.strip_prefix('?') {
+            Some(r) => (true, r),
+            None => (false, rest),
+        };
+        let rest = rest.trim_start();
+        let description = match rest.strip_prefix(':') {
+            Some(d) => d.trim().to_string(),
+            // A bare name: the field, with nothing more said about it.
+            None if rest.is_empty() => key.replace('_', " "),
+            None => continue,
+        };
+        fields.push((key, optional, description));
+    }
+    if fields.is_empty() {
+        return json!({"type": "object", "additionalProperties": true});
+    }
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for (key, optional, description) in fields {
+        let words = description.to_ascii_lowercase();
+        let kind = if words.starts_with('[') || words.contains("list of") || words.contains("array") {
+            json!({"type": "array", "description": description})
+        } else if words.starts_with("true") || words.starts_with("false") || words.contains("true|false") || words.contains("boolean") {
+            json!({"type": "boolean", "description": description})
+        } else if words.starts_with("number") || words.starts_with("integer") || words.contains("seconds") || words.starts_with("frame") {
+            json!({"type": "number", "description": description})
+        } else {
+            json!({"type": "string", "description": description})
+        };
+        properties.insert(key.clone(), kind);
+        if !optional {
+            required.push(key);
+        }
+    }
+    json!({"type": "object", "properties": properties, "required": required})
+}
+
 pub fn build_tools_with(allow_all: bool) -> Vec<ToolSpec> {
     let entries = agent::catalog_with(allow_all);
     let entries = entries.as_array().cloned().unwrap_or_default();
@@ -381,7 +479,22 @@ pub fn build_tools_with(allow_all: bool) -> Vec<ToolSpec> {
                 },
                 "required": ["project"]
             }),
-            _ => json!({"type": "object", "additionalProperties": true}),
+            // A local server constrains arguments to the schema: without its
+            // fields listed this could only ever be called with `{}`.
+            "redo_background" => json!({
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "the background's key in backgrounds.json (the scene's location, e.g. courtyard)"},
+                    "angle": {"type": "string", "enum": ["wide", "low_angle", "high_angle", "over_shoulder", "reverse"], "description": "default wide"},
+                    "out": {"type": "string", "description": "the producer's output folder (default: the Producer window's or the open produced .buzz's)"}
+                },
+                "required": ["location"]
+            }),
+            // Every other tool: its fields read off the `{field: …, other?: …}`
+            // signature its hint opens with. A local server constrains the
+            // model's arguments to the schema, so a bare "any object" could
+            // only ever be called with `{}`.
+            _ => schema_from_hint(hint_of(name)),
         };
         tools.push(tool(name, schema));
     }
@@ -1299,6 +1412,18 @@ mod tests {
         // The detached worker finds the app gone and ends; nothing else runs.
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(app.agent_editor().doc.history().undo_depth(), depth0 + 1);
+    }
+
+    #[test]
+    fn a_tool_signature_becomes_its_schema() {
+        let s = schema_from_hint("{location: the key (e.g. yard, street), angle?: wide|low_angle, out?} -> {started:true}");
+        let props = s["properties"].as_object().expect("fields");
+        assert_eq!(props.len(), 3, "{s}");
+        assert_eq!(s["required"], json!(["location"]));
+        assert!(props.contains_key("out"), "a bare optional name is a field too");
+        let bare = schema_from_hint("{scene, out?} -> {job}");
+        assert_eq!(bare["required"], json!(["scene"]));
+        assert_eq!(schema_from_hint("no signature here")["additionalProperties"], true);
     }
 
     #[test]

@@ -768,6 +768,7 @@ dependencies = [
  "buzz-render",
  "buzz-scene",
  "buzz-text",
+ "image-webp",
  "kurbo",
  "peniko",
  "png",

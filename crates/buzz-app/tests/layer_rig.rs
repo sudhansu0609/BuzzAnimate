@@ -89,8 +89,12 @@ fn turning_the_upper_arm_carries_the_forearm_about_the_shoulder() {
     let (arm_id, shoulder) = joint(upper);
     let (_, elbow) = joint(fore);
     let (chest_id, _) = joint(chest);
-    assert!((shoulder - Point::new(200.0, 10.0)).hypot() < 0.5, "shoulder at {shoulder:?}");
-    assert!((elbow - Point::new(140.0, 10.0)).hypot() < 0.5, "elbow at {elbow:?}");
+    // **Each part keeps its own pivot** (user 2026-11-18): the middle of its
+    // drawing, not a joint fitted at the end of the bar — the upper arm turns
+    // about (170, 10), the forearm about (110, 10). What matters below is that
+    // the forearm goes wherever the upper arm takes it.
+    assert!((shoulder - Point::new(170.0, 10.0)).hypot() < 0.5, "upper arm's pivot at {shoulder:?}");
+    assert!((elbow - Point::new(110.0, 10.0)).hypot() < 0.5, "forearm's pivot at {elbow:?}");
     let chest_before = scene.find_object(chest_id).unwrap().1.transform;
 
     // Frame 10: a keyframe on the upper arm, turned 30° about its pivot.

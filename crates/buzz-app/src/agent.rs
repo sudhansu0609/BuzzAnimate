@@ -71,6 +71,13 @@ pub const AGENT_EXCLUDED: &[(&str, &str)] = &[
     ("buzzedit_transcribe", "opens the Transcribe with BuzzEdit dialog; the agent uses the transcribe_with_buzzedit tool"),
     ("studio_import_script", "opens the Import Script from Studio dialog; the agent uses the studio_projects and studio_build_episode tools"),
     ("produce_episode_dialog", "opens the Produce Episode dialog; the agent uses the produce_episode tool"),
+    ("new_episode_window", "opens the New Episode window for the person to fill in; the agent uses the produce_episode tool"),
+    ("story_to_screenplay_dialog", "opens the Story to Screenplay dialog for the person to fill in; the agent uses the produce_episode tool"),
+    ("casting_dialog", "opens the Casting dialog for the person to pick characters; the agent uses the produce_episode tool"),
+    ("producer_panel", "opens the Producer window; the agent uses the producer's own tools"),
+    ("move_stage_frames", "opens the Move Stage Frames dialog for the person to pick a range and a destination"),
+    ("bring_character_here", "opens a picker for the person to choose a character from another shot"),
+    ("mark_talk_range", "a two-press marker on the person's playhead, then a dialog to pick who talks"),
 ];
 
 /// How the agent reaches a command.

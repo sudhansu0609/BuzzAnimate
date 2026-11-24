@@ -265,7 +265,9 @@ pub fn encode_plain(
     let area = inputs.area_px;
     let mut builder = SceneBuilder::new(vello, &inputs.camera)
         .with_output_scale(inputs.scale)
-        .with_viewport_offset(Vec2::new(area.x0, area.y0));
+        .with_viewport_offset(Vec2::new(area.x0, area.y0))
+        // Thin line art stays a pixel wide at every zoom on the stage.
+        .with_held_lines(true);
 
     let scene = &*inputs.scene;
     builder.fill_shape(&scene.stage().stage_rect(), scene.stage().background);
@@ -362,7 +364,9 @@ fn encode(
 ) -> (u32, u64) {
     let mut builder = SceneBuilder::new(vello, &editor.camera)
         .with_output_scale(scale)
-        .with_viewport_offset(Vec2::new(area.x0, area.y0));
+        .with_viewport_offset(Vec2::new(area.x0, area.y0))
+        // Thin line art stays a pixel wide at every zoom on the stage.
+        .with_held_lines(true);
 
     let scene = editor.scene();
 

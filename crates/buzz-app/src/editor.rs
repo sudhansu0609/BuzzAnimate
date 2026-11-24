@@ -553,6 +553,10 @@ pub struct Editor {
     /// The inner frame to open the next entered symbol at (the one showing
     /// at the parent's playhead), set just before entering.
     enter_frame: Option<u32>,
+    /// `(copied from, the copy)` of the last Duplicate Symbol, for the app to
+    /// carry the copy into the Cast and the Rig panel's tags. Taken by
+    /// `App::dispatch`.
+    pub(crate) last_duplicate: Option<(buzz_scene::SymbolId, buzz_scene::SymbolId)>,
     /// The Lip Sync dialog.
     pub lip_sync: buzz_ui::LipSyncState,
     /// Whether the last sound import also landed on the timeline. See
@@ -969,6 +973,7 @@ impl Editor {
             focus_seen: None,
             edit_frames: Vec::new(),
             enter_frame: None,
+            last_duplicate: None,
             lip_sync: buzz_ui::LipSyncState::default(),
             sound_placed: false,
             staging: buzz_ui::StagingState::default(),
@@ -3363,8 +3368,41 @@ impl Editor {
             ToolId::Brush | ToolId::Pencil | ToolId::Eraser | ToolId::Lasso | ToolId::Selection => {
                 point
             }
+            // **Free Transform's handles follow the pointer exactly** (user
+            // 2026-11-25: "scale and rotation, skew, squash shall all work
+            // smooth"). Snapping pulled the pointer onto the edges of nearby
+            // artwork — the part being transformed among them — so a turn
+            // inside a character jumped 14° on a 5° move and then stuck, and a
+            // corner or side handle lagged off the pointer. Animate snaps a
+            // move, not a scale, turn or skew; so does this.
+            ToolId::FreeTransform if self.free_transform_handle_drag(point) => point,
             _ => self.snap(point),
         }
+    }
+
+    /// Is the pointer at `at` scaling, turning or skewing with Free Transform —
+    /// a drag already doing so, or a press on a handle, the ring or an edge
+    /// that is about to (in Rotate Mode, anywhere on the selection)?
+    fn free_transform_handle_drag(&self, at: Point) -> bool {
+        if self.machine.transforming() {
+            return true;
+        }
+        if !self.machine.idle() {
+            return false;
+        }
+        let ctx = ToolContext {
+            style: &self.tool_style,
+            zoom: self.camera.zoom,
+            selection_bounds: self.selection_bounds_drawn(),
+            selection_box: self.selection_box(),
+            anchors: &[],
+            selected_anchors: &[],
+            handles: &[],
+            pivot: self.pivot(),
+            gradient: None,
+        };
+        self.machine.press_on_gizmo(at, &ctx)
+            || self.machine.rotate_only() && ctx.selection_box.is_some_and(|b| b.contains(at))
     }
 
     /// Snap a document point using the current view settings.
@@ -6141,13 +6179,33 @@ impl Editor {
                 let opts = buzz_geom::BooleanOptions::for_shape_size(
                     size.width().hypot(size.height()).max(1.0),
                 );
-                let inside =
-                    buzz_geom::boolean(&shape.path, &region, buzz_geom::BoolOp::Intersect, opts);
+                // **Slivers are not parts.** A traced region follows the
+                // pixels and the picture's own edge does not quite: the
+                // difference leaves hairlines of what was clicked along the
+                // border — sky that stayed behind when the sky was deleted,
+                // and a picture "cut" into everything plus a frame of threads.
+                // Anything thinner than half a pixel of the picture (or a
+                // hair of the shape, for vector artwork) is dropped.
+                let sliver = match shape.fill.as_ref().map(|f| &f.paint) {
+                    Some(buzz_scene::Paint::Image(fill)) => {
+                        let unit = fill.transform * buzz_geom::Point::new(1.0, 1.0) - fill.transform * buzz_geom::Point::ORIGIN;
+                        let px = (unit.x.abs() / f64::from(fill.asset.width.max(1)))
+                            .max(unit.y.abs() / f64::from(fill.asset.height.max(1)));
+                        0.5 * px
+                    }
+                    _ => 1e-3 * size.width().hypot(size.height()),
+                };
+                let inside = without_slivers(
+                    &buzz_geom::boolean(&shape.path, &region, buzz_geom::BoolOp::Intersect, opts),
+                    sliver,
+                );
                 if inside.is_empty() {
                     continue;
                 }
-                let outside =
-                    buzz_geom::boolean(&shape.path, &region, buzz_geom::BoolOp::Difference, opts);
+                let outside = without_slivers(
+                    &buzz_geom::boolean(&shape.path, &region, buzz_geom::BoolOp::Difference, opts),
+                    sliver,
+                );
                 if outside.is_empty() {
                     // The whole shape was caught: nothing to cut.
                     taken.push(id);
@@ -8334,12 +8392,17 @@ impl Editor {
         // where a lip sync goes. A picked mouth's layer under another name is
         // renamed "mouth" when the sync runs (`apply_lip_sync_keys`).
         let only = self.lip_sync.only_layer.then_some(self.lip_sync.layer).flatten();
+        // **A head with no "mouth" layer yet** offers its artwork layers
+        // instead, rather than nothing: the one chosen is renamed "mouth" when
+        // the sync runs. An empty list left no way to sync at all.
+        let any_mouth = scene.layers().iter().any(|layer| is_mouth_layer(&layer.name));
         let layers = scene
             .layers()
             .iter()
             .filter(|layer| match only {
                 Some(id) => layer.id.0 == id,
-                None => is_mouth_layer(&layer.name),
+                None if any_mouth => is_mouth_layer(&layer.name),
+                None => layer.kind.holds_artwork(),
             })
             .map(|layer| buzz_ui::Choice {
                 id: layer.id.0,
@@ -10721,6 +10784,14 @@ impl Editor {
                 s.registration = source.registration;
                 s.tags = source.tags.clone();
             });
+            // **A copy of a pose is another pose of the same character**
+            // (user 2026-11-25: "if I duplicate a symbol from cast or pose that
+            // shall also be added to the cast and poses"): it joins the set the
+            // original is in, so right-click ▸ Pose and Next Pose offer it.
+            let owner = scene.library().symbol_set(id).first().copied();
+            if let Some(owner) = owner {
+                scene.library_mut().include_in_set(owner, new_id);
+            }
             if let Some((object, _)) = instance {
                 scene.update_object_at(frame, object, |o| {
                     if let ObjectKind::Instance(i) = &mut o.kind {
@@ -10730,6 +10801,7 @@ impl Editor {
             }
             created = Some(new_id);
         });
+        self.last_duplicate = created.map(|new_id| (id, new_id));
         if let Some(new_id) = created {
             self.library.selected = Some(new_id);
             let name = self.doc.scene().library().get(new_id).map(|s| s.name.clone()).unwrap_or_default();
@@ -13923,9 +13995,13 @@ impl Editor {
     /// copied, it lets go without pasting; so does Clear Stage Copy
     /// ([`Self::clear_stage_copy`], the ✕ beside the button).
     pub fn copy_paste_stage(&mut self) {
+        // The same frame of **another** file, scene or symbol is somewhere
+        // else: the copy is pasted there, not let go.
+        let here = (self.doc.uid(), self.doc.scene_key(self.doc.active_scene()), self.doc.scene().edit_path().to_vec());
+        let copied_here = self.stage_clip_from.as_ref().is_none_or(|(source, _)| *source == here);
         match self.stage_clip.as_ref().map(|c| c.0) {
             None => self.copy_stage(),
-            Some(from) if from == self.current_frame => self.clear_stage_copy(),
+            Some(from) if from == self.current_frame && copied_here => self.clear_stage_copy(),
             Some(from) => {
                 self.paste_stage();
                 if let Some(status) = &mut self.status
@@ -17762,6 +17838,37 @@ pub fn is_character_symbol(symbol: &buzz_scene::Symbol) -> bool {
 /// case — the one name lip sync looks for and gives.
 pub(crate) fn is_mouth_layer(name: &str) -> bool {
     name.trim().eq_ignore_ascii_case("mouth")
+}
+
+/// `path` less its subpaths thinner than `min_thickness` (mean thickness
+/// `2·|area| / perimeter`, in the path's units): the hairline slivers a
+/// boolean leaves where two boundaries nearly coincide.
+fn without_slivers(path: &BezPath, min_thickness: f64) -> BezPath {
+    use kurbo::{ParamCurveArclen as _, ParamCurveArea as _};
+    let mut out = BezPath::new();
+    let mut piece = BezPath::new();
+    let mut keep = |piece: &mut BezPath, out: &mut BezPath| {
+        if piece.elements().is_empty() {
+            return;
+        }
+        let (mut area, mut length) = (0.0, 0.0);
+        for segment in piece.segments() {
+            area += segment.signed_area();
+            length += segment.arclen(1e-3);
+        }
+        if length > 0.0 && 2.0 * f64::abs(area) / length >= min_thickness {
+            out.extend(piece.elements().iter().copied());
+        }
+        *piece = BezPath::new();
+    };
+    for el in path.elements() {
+        if matches!(el, kurbo::PathEl::MoveTo(_)) {
+            keep(&mut piece, &mut out);
+        }
+        piece.push(*el);
+    }
+    keep(&mut piece, &mut out);
+    out
 }
 
 pub(crate) fn elapsed_on(layer: &buzz_scene::Layer, frame: u32) -> u32 {
@@ -32402,6 +32509,39 @@ mod tests {
         let copied = e.library.selected.expect("the second copy is selected");
         assert_ne!(copied, copy);
         assert!(e.scene().library().get(copied).unwrap().name.starts_with(&format!("{name} copy")));
+    }
+
+    /// **A copy of a pose is another pose of the same character** (user
+    /// 2026-11-25): Duplicate Symbol on a character showing one of its poses
+    /// puts the copy in that set, and says what was copied from what.
+    #[test]
+    fn duplicating_a_pose_adds_the_copy_to_its_set() {
+        let mut e = editor();
+        let character = place_nested_character(&mut e);
+        let front = e.scene().find_object(character).and_then(|(_, o)| o.instance().map(|i| i.symbol)).expect("an instance");
+        let mut side = None;
+        e.doc.edit("fixture", |scene| {
+            let id = scene.add_symbol("Hero Side", buzz_scene::SymbolKind::Graphic, None);
+            scene.library_mut().include_in_set(front, id);
+            side = Some(id);
+        });
+        let side = side.unwrap();
+        e.selection.select_one(character);
+        e.run(Command::DuplicateSymbol);
+        let copy = e.scene().find_object(character).and_then(|(_, o)| o.instance().map(|i| i.symbol)).expect("an instance");
+        let set = e.scene().library().symbol_set(front);
+        assert!(set.contains(&copy), "the copy is one of the poses: {set:?}");
+        assert!(set.contains(&side) && set.contains(&front), "and the others stay");
+        assert_eq!(e.last_duplicate, Some((front, copy)));
+
+        // A symbol in no set stays in none.
+        let mut lone = None;
+        e.doc.edit("fixture", |scene| lone = Some(scene.add_symbol("Tree", buzz_scene::SymbolKind::Graphic, None)));
+        e.library.selected = lone;
+        e.library.duplicate_from_library = true;
+        e.run(Command::DuplicateSymbol);
+        let tree_copy = e.library.selected.expect("copied");
+        assert!(e.scene().library().symbol_set(tree_copy).is_empty());
     }
 
     /// **A head opens on the frame it is showing, whichever way it is

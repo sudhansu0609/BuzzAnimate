@@ -177,7 +177,9 @@ fn layer_index_playhead_and_assets_line_up_for_a_model() {
         .find(|l| l["id"] == selected)
         .expect("the selected light is listed");
     let frames: Vec<u64> = lamp["keys"].as_array().unwrap().iter().map(|k| k["frame"].as_u64().unwrap()).collect();
-    assert_eq!(frames, vec![23], "the key should be at the playhead");
+    // A light's first key after frame 1 also keys frame 1 as the light
+    // stands, so the change made at the playhead does not reach back.
+    assert_eq!(frames, vec![0, 23], "the key should be at the playhead");
 }
 
 /// A model placing a character has to know where things are and how big:

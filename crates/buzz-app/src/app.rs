@@ -1307,6 +1307,11 @@ struct ScriptRun {
     result: crossbeam_channel::Receiver<(buzz_scene::Scene, buzz_script::ScriptOutcome)>,
     /// The undo step's name: "Run Script", or the Animate command that ran.
     label: String,
+    /// The film (`Document::uid`) and scene the script ran on: its result
+    /// goes back there and nowhere else, even when another tab is open by
+    /// the time it finishes.
+    doc: u64,
+    scene: usize,
 }
 
 pub struct App {
@@ -3473,6 +3478,9 @@ pub const KEYBOARD_COMMANDS: &[Command] = &[
     Command::Close,
     Command::Quit,
     Command::VoicePushToTalk,
+    // The right-click Pose menu names these keys (Option+] / Option+[).
+    Command::NextPose,
+    Command::PreviousPose,
     Command::VoiceMute,
     Command::ImportToStage,
     Command::ImportToLibrary,
@@ -5968,6 +5976,52 @@ impl App {
             "{name}: {count} poses of {} linked from the Cast \u{b7} right-click \u{25b8} Pose or Properties \u{25b8} Pose",
             asset.name
         ));
+    }
+
+    /// **Every pose of a Cast character stands where its main pose does, as
+    /// tall** (user 2026-11-24: "all poses shall be placed in same spot and
+    /// same size, it broke"). Poses copied in under a taken name
+    /// (`DeepakFront deepakSide 1`, `bhushan Walk Front 1`) were skipped by the
+    /// line-up and stood hundreds of pixels off at nearly twice the size.
+    ///
+    /// **Only the character being posed, only when a pose is picked** —
+    /// right-click ▸ Pose, Next / Previous Pose — as its own undo step. It
+    /// used to run over every character the moment a film was opened, so
+    /// opening a file changed it (user 2026-11-24: "in same file the
+    /// character rig changed why?").
+    fn line_up_selected_cast_poses(&mut self) {
+        if self.agent_active() || self.editor.selection.len() != 1 {
+            return;
+        }
+        let frame = self.editor.edit_at().frame;
+        let scene = self.editor.doc.scene();
+        let Some(shown) = crate::cast_combine::pose_symbol(scene, self.editor.selection.iter().next(), frame) else {
+            return;
+        };
+        let owner = scene.library().symbol_set(shown).first().copied().unwrap_or(shown);
+        if scene.library().symbol_set(owner).is_empty() {
+            return;
+        }
+        let looks = self.cast_looks();
+        let scene = self.editor.doc.scene();
+        let Some(name) = scene.library().get(owner).map(|s| s.name.clone()) else {
+            return;
+        };
+        let Some((look, _)) = crate::cast_pose_edit::cast_match(scene, owner, &looks) else {
+            return;
+        };
+        let asset = look.asset.clone();
+        let Ok(cast) = self.editor.assets.load(&asset) else {
+            return;
+        };
+        if !crate::cast_pose_edit::linked_from_cast(self.editor.doc.scene(), &cast, &name) {
+            return;
+        }
+        let mut probe = self.editor.doc.scene().clone();
+        if !crate::cast_pose_edit::line_up_linked_poses(&mut probe, &cast, &name) {
+            return;
+        }
+        self.editor.doc.edit("Line Up Poses", |scene| *scene = probe);
     }
 
     /// **Right-click ▸ Pose ▸ Poses from the Cast ▸ `<character>`**: the film's
@@ -12199,6 +12253,7 @@ impl App {
         if let Some((target, pose)) = pose_pick
             && !self.agent_active()
         {
+            self.line_up_selected_cast_poses();
             let frame = self.editor.edit_at().frame;
             self.editor.doc.edit("Pose", |scene| {
                 crate::cast_combine::pick_pose(scene, target, frame, pose);
@@ -12740,6 +12795,9 @@ impl App {
         if command != Command::ToggleMasterAudioMode {
             self.master_audio_confirm = false;
         }
+        if matches!(command, Command::NextPose | Command::PreviousPose) {
+            self.line_up_selected_cast_poses();
+        }
         match command {
             // Animate asks for the name and type first (`symbol_dialog`).
             Command::ConvertToSymbol => self.open_symbol_dialog(crate::symbol_dialog::Purpose::Convert),
@@ -12854,7 +12912,98 @@ impl App {
                     self.storyboard.status = e;
                 }
             }
-            other => self.editor.run(other),
+            other => {
+                self.editor.run(other);
+                if other == Command::DuplicateSymbol {
+                    self.duplicate_follows_cast();
+                }
+            }
+        }
+    }
+
+    /// **A duplicated pose goes into the Cast, with its rig** (user
+    /// 2026-11-25: "if I duplicate a symbol from cast or pose that shall also
+    /// be added to the cast and poses and shall be ready to import. also the
+    /// duplication shall also have the set rigs").
+    ///
+    /// The editor has made the copy and put it in the original's pose set.
+    /// Here: the Rig panel's tags of every timeline through the original are
+    /// kept for the copy too, and when the character's poses come from the
+    /// Cast the copy is added to that Cast character as a new pose — named
+    /// `<Character> <pose> copy`, the film's copy renamed to match — so placing
+    /// or importing the character anywhere brings it. The Cast file is backed
+    /// up first, as every Cast edit is.
+    fn duplicate_follows_cast(&mut self) {
+        let Some((source, copy)) = self.editor.last_duplicate.take() else {
+            return;
+        };
+        let name = |app: &App, id| app.editor.doc.scene().library().get(id).map(|s| s.name.clone());
+        let (Some(from), Some(mut to)) = (name(self, source), name(self, copy)) else {
+            return;
+        };
+        let mut said = Vec::new();
+
+        // Into the Cast, when the character's poses are the Cast's.
+        let owner = self.editor.doc.scene().library().symbol_set(copy).first().copied().filter(|o| *o != copy);
+        let cast = owner.and_then(|owner| {
+            let owner_name = self.editor.doc.scene().library().get(owner)?.name.clone();
+            let looks = self.cast_looks();
+            let scene = self.editor.doc.scene();
+            let (look, _) = crate::cast_pose_edit::cast_match(scene, owner, &looks)?;
+            let asset = look.asset.clone();
+            let main = look.main.clone();
+            let cast = self.editor.assets.load(&asset).ok()?;
+            // Asked of the set as it was: the copy, not in the Cast yet, has
+            // just joined it.
+            let mut before = scene.clone();
+            before.library_mut().remove_from_set(owner, copy);
+            crate::cast_pose_edit::linked_from_cast(&before, &cast, &owner_name).then_some((asset, main, owner_name))
+        });
+        if let Some((asset, main, owner_name)) = cast {
+            // The pose's own label: the original's name less the character's
+            // name and any copy number, then "copy".
+            let bare = crate::cast_combine::without_copy_number(&from);
+            let pose = [main.as_str(), owner_name.as_str()]
+                .iter()
+                .find_map(|prefix| bare.strip_prefix(prefix).map(str::trim))
+                .unwrap_or(bare);
+            let label = if pose.is_empty() { "copy".to_string() } else { format!("{pose} copy") };
+            let stamp = crate::cast_fresh::backup_stamp();
+            match crate::cast_pose_edit::add_pose(
+                &mut self.editor.assets,
+                &asset,
+                &label,
+                crate::cast_pose_edit::PoseInput::LibrarySymbol(self.editor.doc.scene(), &to),
+                &stamp,
+            ) {
+                Ok(full) => {
+                    let unique = {
+                        let library = self.editor.doc.scene().library();
+                        if library.find_by_name(&full).is_none() { full.clone() } else { library.unique_name(&full) }
+                    };
+                    self.editor.doc.edit("Duplicate Symbol", |scene| {
+                        scene.library_mut().update(copy, |s| s.name = unique.clone());
+                    });
+                    to = unique;
+                    // Named by the Cast: renaming it here would part it from
+                    // its Cast pose, so no name field is offered.
+                    self.editor.library.stop_naming();
+                    self.cast_pose_edited();
+                    said.push(format!("added to {} in the Cast as {full}", asset.name));
+                }
+                Err(e) => said.push(format!("not added to the Cast: {e}")),
+            }
+        }
+
+        // The Rig panel's tags.
+        if let Some(film) = self.editor.doc.path().map(|p| p.to_path_buf())
+            && let Ok(copied) = crate::rig_slots::copy_renamed(&film, &from, &to)
+            && copied > 0
+        {
+            said.push("with its Rig tags".into());
+        }
+        if !said.is_empty() {
+            self.editor.status = Some(format!("Duplicated {from} as {to} \u{2014} {}", said.join(", ")));
         }
     }
 
@@ -13701,7 +13850,8 @@ impl App {
                 crate::tasks::TaskOutcome::Finished(summary)
             });
 
-        self.scripting = Some(ScriptRun { id, result, label });
+        let (doc, scene) = (self.editor.doc.uid(), self.editor.doc.active_scene());
+        self.scripting = Some(ScriptRun { id, result, label, doc, scene });
     }
 
     /// A script finished — committed, applied, and reported.
@@ -13714,6 +13864,33 @@ impl App {
             self.editor.status = Some("The script finished but returned nothing".into());
             return;
         };
+
+        // **A script changes only the film it ran on** (user 2026-11-24: "any
+        // change done in one file shall never affect another file"). The run
+        // works on a copy of that film's scene; finished after another tab
+        // or scene was opened, it used to be written over *that* one — the
+        // other file became this one's copy. It goes back to its own film,
+        // as an undo step there, and the open one is left alone.
+        if self.editor.doc.uid() != run.doc || self.editor.doc.active_scene() != run.scene {
+            let index = (0..self.documents.len()).find(|&i| self.tab_document(i).uid() == run.doc);
+            let Some(index) = index else {
+                self.editor.status = Some(format!("{label} finished after its file was closed \u{2014} nothing was changed"));
+                return;
+            };
+            let doc = if index == self.active_document { &mut self.editor.doc } else { &mut self.documents[index].doc };
+            if outcome.changed {
+                doc.edit_scene_at(run.scene, label.as_str(), |scene| *scene = working);
+                doc.end_gesture();
+            }
+            let saved = outcome.save_requested && doc.path().is_some() && doc.save().is_ok();
+            let file = doc.display_name();
+            self.editor.status = Some(if outcome.changed {
+                format!("{label} finished in {file}, the file it ran on{}", if saved { " (saved)" } else { "" })
+            } else {
+                outcome.summary()
+            });
+            return;
+        }
 
         // Committed whether it finished, timed out, or was stopped: a partial
         // result is still the user's work, and a single Ctrl+Z removes it if
@@ -26366,12 +26543,12 @@ mod idle_tests {
                 .collect::<Vec<_>>();
         }
         let all = texts.join("\n");
-        // The column scrolls, so only the top of the panel is on screen (1200 px tall: the
-        // Models list holds SAM 3's three models since S19); the
-        // unit test `ai_panel_renders_every_section_headlessly` draws all
-        // eight sections.
-        for want in ["Models", "Claude API server", "Test connection", "Voice", "Allow all"] {
-            assert!(all.contains(want), "{want} not on screen");
+        // The column scrolls, so only the top of the panel is on screen: the
+        // Assistant, then Models. The unit test
+        // `ai_panel_renders_every_section_headlessly` draws every section,
+        // the Claude API server's and its Test connection among them.
+        for want in ["Assistant", "Models", "Voice", "Allow all", "Local LLM Backends"] {
+            assert!(all.contains(want), "{want} not on screen: {all}");
         }
         assert!(!all.contains("sk-local-d"), "a stored key reached the screen");
     }
@@ -27885,9 +28062,13 @@ mod idle_tests {
         #[test]
         fn a_panel_dropped_on_an_empty_sides_edge_docks_there() {
             let mut d = Drive::new();
-            // The Voices panel lives in the Far Right column by default; close
-            // it so that side is empty.
-            d.app.editor.workspace.move_to(buzz_ui::PanelId::Voices, buzz_ui::Dock::Hidden);
+            // Close whatever the default layout keeps in the Far Right column
+            // (the Voices panel, and the icon strip's panels since) so that
+            // side is empty — in this test's own scratch layout.
+            let far_right: Vec<buzz_ui::PanelId> = d.app.editor.workspace.on(buzz_ui::Dock::RightOuter);
+            for panel in far_right {
+                d.app.editor.workspace.move_to(panel, buzz_ui::Dock::Hidden);
+            }
             d.frame(vec![]);
             d.frame(vec![]);
             assert!(
@@ -34796,3 +34977,91 @@ mod cast_window_tests {
         assert!(app.editor.cast_panel.add_pose.is_none(), "Cancel closes it");
     }
 }
+
+#[cfg(test)]
+mod one_file_tests {
+    use super::*;
+    use buzz_scene::Scene;
+
+    fn layer_names(doc: &buzz_doc::Document) -> Vec<String> {
+        doc.scene().layers().iter().map(|l| l.name.clone()).collect()
+    }
+
+    /// **A script changes only the film it ran on** (user 2026-11-24: "any
+    /// change done in one file shall never affect another file"). A script
+    /// still running when another tab is opened used to be written over that
+    /// tab when it finished — the other file became a copy of this one. Its
+    /// result now goes back to its own film, and the open one is untouched.
+    #[test]
+    fn a_script_finishing_after_a_tab_switch_changes_only_its_own_file() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let mut first = Scene::default();
+        first.add_stage_layer("First film", buzz_scene::LayerKind::Normal);
+        app.open_document_in_new_tab(Document::new(first));
+        let (ran_on, ran_index) = (app.editor.doc.uid(), app.active_document);
+        // Long enough to still be running when the other tab is opened.
+        app.editor.actions.source = "var t0 = new Date().getTime(); while (new Date().getTime() - t0 < 400) {} \
+            fl.getDocumentDOM().getTimeline().addNewLayer('From the script');"
+            .into();
+        app.run_script_async();
+        assert!(app.scripting.is_some(), "running");
+
+        let mut second = Scene::default();
+        second.add_stage_layer("Second film", buzz_scene::LayerKind::Normal);
+        app.open_document_in_new_tab(Document::new(second));
+        let other = app.editor.doc.uid();
+        assert_ne!(other, ran_on);
+        let before = layer_names(&app.editor.doc);
+        let began = std::time::Instant::now();
+        while app.scripting.is_some() {
+            app.poll_tasks();
+            assert!(began.elapsed() < Duration::from_secs(30), "the script did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(app.editor.doc.uid(), other, "the open tab stays open");
+        assert_eq!(layer_names(&app.editor.doc), before, "the other film is not touched");
+        assert!(!app.editor.doc.can_undo(), "no step in the other film's history");
+
+        app.switch_to_tab(ran_index);
+        let names = layer_names(&app.editor.doc);
+        assert!(names.iter().any(|n| n == "From the script"), "the script's film has its change: {names:?}");
+        assert!(names.iter().any(|n| n == "First film"), "and is still itself: {names:?}");
+        app.editor.doc.undo();
+        assert!(!layer_names(&app.editor.doc).iter().any(|n| n == "From the script"), "one undo step there");
+    }
+
+    /// **Copy / Paste Stage in another file at the same frame number pastes.**
+    /// The one button compared only the frame, so pressed on frame 1 of the
+    /// other file it let the copy go instead; on the frame it copied, in its
+    /// own file, it still lets go.
+    #[test]
+    fn copy_paste_stage_pastes_in_another_file_at_the_same_frame() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let mut first = Scene::default();
+        let layer = first.add_stage_layer("Deepak", buzz_scene::LayerKind::Normal);
+        let square = buzz_geom::Shape::to_path(&buzz_geom::Rect::new(0.0, 0.0, 40.0, 40.0), 1e-9);
+        first.add_shape(layer, buzz_scene::ShapeData::filled(square, peniko::Color::BLACK)).expect("drawn");
+        app.open_document_in_new_tab(Document::new(first));
+        let first_tab = app.active_document;
+        app.editor.set_frame(0);
+        app.editor.run(Command::CopyPasteStage);
+        assert!(app.editor.stage_clip.is_some(), "copied");
+
+        app.open_document_in_new_tab(Document::new(Scene::default()));
+        app.editor.set_frame(0);
+        app.editor.run(Command::CopyPasteStage);
+        let drawn = app.editor.doc.scene().layers().iter().any(|l| l.name == "Deepak" && !l.frames.objects_at(0).is_empty());
+        assert!(drawn, "pasted into the other file: {:?}", app.editor.status);
+        assert!(app.editor.stage_clip.is_some(), "and still held");
+
+        app.switch_to_tab(first_tab);
+        app.editor.set_frame(0);
+        app.editor.run(Command::CopyPasteStage);
+        assert!(app.editor.stage_clip.is_none(), "on its own frame in its own file it lets go");
+    }
+}
+
+
+

@@ -77,6 +77,36 @@ fn put_in(file: &Path, film: &Path, timeline: &str, kept: Option<&Kept>) -> std:
     std::fs::write(file, serde_json::to_string_pretty(&store).map_err(std::io::Error::other)?)
 }
 
+/// **A duplicated symbol keeps its Rig panel tags.** Every timeline of
+/// `film` kept under a path through `from` (`Raju`, `Raju/Head`) is kept again
+/// under the same path through `to`. The copy's layers hold the same drawings,
+/// so the same slots point at them. How many were copied.
+pub fn copy_renamed(film: &Path, from: &str, to: &str) -> std::io::Result<usize> {
+    copy_renamed_in(&path(), film, from, to)
+}
+
+fn copy_renamed_in(file: &Path, film: &Path, from: &str, to: &str) -> std::io::Result<usize> {
+    let store = load_from(file);
+    let Some(kept) = store.get(&film.to_string_lossy().to_string()) else {
+        return Ok(0);
+    };
+    let mut copies = Vec::new();
+    for (timeline, slots) in kept {
+        let parts: Vec<&str> = timeline.split('/').collect();
+        if !parts.contains(&from) {
+            continue;
+        }
+        let renamed = parts.iter().map(|p| if *p == from { to } else { p }).collect::<Vec<_>>().join("/");
+        if !kept.contains_key(&renamed) {
+            copies.push((renamed, slots.clone()));
+        }
+    }
+    for (timeline, slots) in &copies {
+        put_in(file, film, timeline, Some(slots))?;
+    }
+    Ok(copies.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +126,23 @@ mod tests {
         put_in(&file, film, "Raju", Some(&Kept { pattern: 1, slots: vec![None] })).unwrap();
         assert_eq!(get_in(&file, film, "Raju"), None);
         assert!(get_in(&file, film, "Raju/Head").is_some());
+    }
+
+    #[test]
+    fn a_duplicate_keeps_the_rig_tags_of_every_timeline_through_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("rig_slots.json");
+        let film = Path::new("/films/a.buzz");
+        let body = Kept { pattern: 1, slots: vec![Some(7)] };
+        let head = Kept { pattern: 4, slots: vec![Some(11)] };
+        put_in(&file, film, "Raju", Some(&body)).unwrap();
+        put_in(&file, film, "Raju/Head", Some(&head)).unwrap();
+        put_in(&file, film, "Mishra", Some(&body)).unwrap();
+        assert_eq!(copy_renamed_in(&file, film, "Raju", "Raju copy").unwrap(), 2);
+        assert_eq!(get_in(&file, film, "Raju copy"), Some(body.clone()));
+        assert_eq!(get_in(&file, film, "Raju copy/Head"), Some(head));
+        assert_eq!(get_in(&file, film, "Raju"), Some(body), "the original keeps its own");
+        assert_eq!(get_in(&file, film, "Mishra copy"), None);
+        assert_eq!(copy_renamed_in(&file, Path::new("/films/b.buzz"), "Raju", "X").unwrap(), 0);
     }
 }

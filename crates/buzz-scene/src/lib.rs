@@ -1958,9 +1958,22 @@ impl Scene {
         {
             return Arc::clone(table);
         }
-        // Stale or missing: build it (linear in the library) with the read lock
-        // released, then store under a write lock.
-        let table = Arc::new(self.symbol_bounds_table());
+        // Stale or missing: build it with the read lock released, then store
+        // under a write lock.
+        //
+        // **Only what changed is measured again.** Editing inside a symbol (a
+        // part of a character opened in place) gives the library a new symbol
+        // map on every pointer move, and measuring every shape of every symbol
+        // again — 668 of them in a real film — made each step of a Free
+        // Transform scale or skew there take milliseconds (user 2026-11-25:
+        // "scale and rotation, skew, squash shall all work smooth"). The
+        // previous table is kept for every symbol that is the same `Arc` as
+        // before and contains nothing that changed.
+        let previous = self.bounds_cache.read().ok().and_then(|guard| guard.clone());
+        let table = Arc::new(match previous {
+            Some((old_symbols, old_table)) => self.symbol_bounds_table_from(&old_symbols, &old_table),
+            None => self.symbol_bounds_table(),
+        });
         if let Ok(mut guard) = self.bounds_cache.write() {
             *guard = Some((Arc::clone(symbols), Arc::clone(&table)));
         }
@@ -1979,6 +1992,76 @@ impl Scene {
     /// [`Self::symbol_bounds`] and [`Self::instance_bounds`] all read it.
     pub fn symbol_bounds_table(&self) -> std::collections::HashMap<SymbolId, Rect> {
         let mut table = std::collections::HashMap::new();
+        let mut visiting = std::collections::HashSet::new();
+        for symbol in self.library.iter() {
+            self.symbol_bounds_memo(symbol.id, &mut table, &mut visiting);
+        }
+        table
+    }
+
+    /// [`Self::symbol_bounds_table`], reusing `old_table` (measured from
+    /// `old_symbols`) for every symbol that has not changed and holds nothing
+    /// that has — directly or through symbols nested in it.
+    fn symbol_bounds_table_from(
+        &self,
+        old_symbols: &std::collections::BTreeMap<SymbolId, Arc<Symbol>>,
+        old_table: &BoundsTable,
+    ) -> BoundsTable {
+        let symbols = self.library.symbol_map();
+        // What changed: replaced, added or removed.
+        let mut dirty: std::collections::HashSet<SymbolId> = symbols
+            .iter()
+            .filter(|(id, symbol)| old_symbols.get(id).is_none_or(|old| !Arc::ptr_eq(old, symbol)))
+            .map(|(id, _)| *id)
+            .chain(old_symbols.keys().filter(|id| !symbols.contains_key(id)).copied())
+            .collect();
+        if dirty.is_empty() {
+            return old_table.clone();
+        }
+        // Who contains whom, to carry a change out to every symbol it is in. A
+        // symbol holding an armature is measured through its posed parts and
+        // is simply measured again.
+        let mut users: std::collections::HashMap<SymbolId, Vec<SymbolId>> = std::collections::HashMap::new();
+        let mut always = Vec::new();
+        fn children(object: &Object, out: &mut Vec<SymbolId>, armature: &mut bool) {
+            match &object.kind {
+                ObjectKind::Instance(instance) => out.push(instance.symbol),
+                ObjectKind::Group(children_of) => children_of.iter().for_each(|c| children(c, out, armature)),
+                ObjectKind::Armature(_) => *armature = true,
+                ObjectKind::Shape(_) | ObjectKind::Warp(_) => {}
+            }
+        }
+        for (id, symbol) in symbols.iter() {
+            let mut inner = Vec::new();
+            let mut armature = false;
+            for layer in symbol.layers.iter() {
+                for key in layer.frames.keyframes() {
+                    key.objects.iter().for_each(|o| children(o, &mut inner, &mut armature));
+                }
+            }
+            if armature {
+                always.push(*id);
+            }
+            inner.sort_unstable();
+            inner.dedup();
+            for child in inner {
+                users.entry(child).or_default().push(*id);
+            }
+        }
+        let mut queue: Vec<SymbolId> = dirty.iter().copied().collect();
+        while let Some(id) = queue.pop() {
+            for user in users.get(&id).into_iter().flatten() {
+                if dirty.insert(*user) {
+                    queue.push(*user);
+                }
+            }
+        }
+        dirty.extend(always);
+        let mut table: BoundsTable = old_table
+            .iter()
+            .filter(|(id, _)| !dirty.contains(id) && symbols.contains_key(id))
+            .map(|(id, rect)| (*id, *rect))
+            .collect();
         let mut visiting = std::collections::HashSet::new();
         for symbol in self.library.iter() {
             self.symbol_bounds_memo(symbol.id, &mut table, &mut visiting);
@@ -5370,6 +5453,52 @@ mod tests {
         // And it still agrees with the table it now reads from.
         let table = scene.symbol_bounds_table();
         assert_eq!(bounds, scene.resolved_bounds_with(object, &table));
+    }
+
+    /// **The bounds table is brought up to date by re-measuring only what
+    /// changed** — the edited symbol and every symbol it is nested in — and
+    /// comes out exactly as a full measure does. Editing a part inside a
+    /// character is a new symbol map on every pointer move.
+    #[test]
+    fn the_cached_bounds_table_follows_an_edit_inside_a_nested_symbol() {
+        let mut scene = Scene::default();
+        let part = scene.add_symbol("Arm", SymbolKind::Graphic, None);
+        let body = scene.add_symbol("Body", SymbolKind::Graphic, None);
+        let other = scene.add_symbol("Tree", SymbolKind::Graphic, None);
+        let put = |scene: &mut Scene, id: SymbolId, layer: u64, object: Object| {
+            scene.library_mut().update(id, |symbol| {
+                let mut inner = Layer::new(LayerId(layer), "art", LayerKind::Normal);
+                Arc::make_mut(&mut inner.frames.keyframes_mut()[0].objects).push(Arc::new(object));
+                symbol.layers.push_front(inner);
+            });
+        };
+        put(&mut scene, part, 7_001, Object::shape(ObjectId(9_201), ShapeData::filled(square(0.0, 0.0, 10.0), Color::WHITE)));
+        let mut arm = Object::instance_of(ObjectId(9_202), part);
+        arm.transform = Affine::translate((100.0, 0.0));
+        put(&mut scene, body, 7_002, arm);
+        put(&mut scene, other, 7_003, Object::shape(ObjectId(9_203), ShapeData::filled(square(0.0, 0.0, 5.0), Color::WHITE)));
+        let before = scene.cached_bounds_table();
+        assert_eq!(before.get(&body).map(|r| r.x1), Some(110.0));
+
+        // The arm grows, as a Free Transform step inside the body makes it.
+        scene.library_mut().update(part, |symbol| {
+            let layer = symbol.layers.iter().next().expect("its layer").id;
+            symbol.layers.update(layer, |l| {
+                let objects = Arc::make_mut(&mut l.frames.keyframes_mut()[0].objects);
+                objects[0] = Arc::new(Object::shape(ObjectId(9_201), ShapeData::filled(square(0.0, 0.0, 30.0), Color::WHITE)));
+            });
+        });
+        let after = scene.cached_bounds_table();
+        assert_eq!(*after, scene.symbol_bounds_table(), "the same as measuring everything");
+        assert_eq!(after.get(&part).map(|r| r.x1), Some(30.0), "the edited symbol");
+        assert_eq!(after.get(&body).map(|r| r.x1), Some(130.0), "the symbol it is in");
+        assert_eq!(after.get(&other), before.get(&other), "an unrelated one kept");
+
+        // Removed from the library: gone from the table.
+        scene.library_mut().remove(other);
+        let removed = scene.cached_bounds_table();
+        assert!(!removed.contains_key(&other));
+        assert_eq!(*removed, scene.symbol_bounds_table());
     }
 
     /// A symbol that contains an instance of itself — which an import can

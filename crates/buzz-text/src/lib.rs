@@ -1255,10 +1255,13 @@ mod style_tests {
             outline_styled(text, 32.0, None, FontStyle::REGULAR, TextAlign::Right).expect("set");
 
         // The block is the same width whichever way it is set — alignment moves
-        // lines inside it, it does not stretch it.
+        // lines inside it, it does not stretch it. Measured on the ink, which
+        // can overhang a glyph's advance by a pixel or so at the end of a line
+        // (the "t" of "short", set flush right): lines align by advance, as
+        // Animate's do.
         let width = |p: &BezPath| p.bounding_box().width();
-        assert!((width(&left) - width(&centred)).abs() < 1.0);
-        assert!((width(&left) - width(&right)).abs() < 1.0);
+        assert!((width(&left) - width(&centred)).abs() < 2.0);
+        assert!((width(&left) - width(&right)).abs() < 2.0);
 
         // But the pictures differ, and centre sits between the two.
         assert_ne!(left.to_svg(), centred.to_svg());

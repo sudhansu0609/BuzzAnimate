@@ -125,6 +125,7 @@ fn the_timeline_panel_is_bounded_on_the_monster() {
         range_anchor: None,
         timeline_selection: None,
         camera_selected: false,
+        master_audio_layer: None,
         selected_light: None,
         light_row_selected: false,
         light_cells: None,
@@ -153,6 +154,8 @@ fn the_timeline_panel_is_bounded_on_the_monster() {
         beats: Vec::new(),
         shot_end: None,
         stage_copied: None,
+        talk_ranges: Vec::new(),
+        talk_range_marking: None,
     };
 
     let ctx = egui::Context::default();
@@ -236,6 +239,7 @@ fn committing_a_merged_monster_and_drawing_is_bounded() {
         range_anchor: None,
         timeline_selection: None,
         camera_selected: false,
+        master_audio_layer: None,
         selected_light: None,
         light_row_selected: false,
         light_cells: None,
@@ -264,6 +268,8 @@ fn committing_a_merged_monster_and_drawing_is_bounded() {
         beats: Vec::new(),
         shot_end: None,
         stage_copied: None,
+        talk_ranges: Vec::new(),
+        talk_range_marking: None,
     };
     let ctx = egui::Context::default();
     buzz_ui::theme::apply(&ctx);

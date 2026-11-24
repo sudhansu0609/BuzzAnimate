@@ -462,11 +462,13 @@ fn a_looping_graphic_at_several_phases() {
             });
         });
         let cast = scene.add_layer("Cast", LayerKind::Normal);
-        // Two instances, held on different first frames — different inner frames,
-        // so the cache must key them apart.
-        for (i, phase) in [0u32, 1u32].iter().enumerate() {
+        // Instances held on different first frames — different inner frames,
+        // so the cache must key them apart. Two of each: the cache builds a
+        // stamp on its second sighting, so one of each would draw both live
+        // and prove nothing.
+        for (i, phase) in [0u32, 1u32, 0, 1].iter().enumerate() {
             let mut obj = Object::instance_of(ObjectId(200 + i as u64), flip)
-                .with_transform(Affine::translate((100.0 + i as f64 * 200.0, 150.0)));
+                .with_transform(Affine::translate((60.0 + i as f64 * 110.0, 150.0)));
             if let ObjectKind::Instance(ref mut inst) = obj.kind {
                 inst.first_frame = *phase;
                 inst.loop_mode = buzz_scene::LoopMode::SingleFrame;

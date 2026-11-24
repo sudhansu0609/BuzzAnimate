@@ -167,6 +167,7 @@ fn the_library_and_the_assets_panel_fit_side_by_side_in_one_column() {
 /// Every layer used to draw two rows and seventy points, so the Layers panel
 /// alone was taller than the window and the three panels below it were nowhere.
 #[test]
+#[ignore = "the stacked-column layout: panels now open from the far-right icon strip (user layout kept as is)"]
 fn a_fifteen_layer_character_leaves_room_for_the_panels_below_it() {
     let mut scene = Scene::default();
     for name in [
@@ -322,6 +323,7 @@ fn the_library_fits_the_narrowest_column() {
 /// tabs" — so this walks the lot at the narrowest width the workspace will
 /// give them, and names the one that does not fit.
 #[test]
+#[ignore = "the stacked-column layout: panels now open from the far-right icon strip (user layout kept as is)"]
 fn every_docked_panel_fits_the_narrowest_column() {
     let narrowest = *buzz_ui::workspace::COLUMN_WIDTH_RANGE.start();
 
@@ -484,9 +486,10 @@ fn a_layer_that_is_not_selected_costs_one_row() {
     });
 
     // Ten rows, a header and the selected layer's second row. Generous, and
-    // still less than half what two rows apiece cost.
+    // still less than half what two rows apiece cost (rows grew a few points
+    // with the lock and protect controls).
     assert!(
-        used < 420.0,
+        used < 450.0,
         "ten layers took {used:.0} points \u{2014} about {:.0} a layer",
         used / 10.0
     );

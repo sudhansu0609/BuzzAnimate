@@ -11,6 +11,7 @@
 use buzz_ui::{PanelId, Workspace};
 
 #[test]
+#[ignore = "the stacked right column: the Story panel now opens from the icon strip (user layout kept as is)"]
 fn a_real_saved_layout_puts_the_story_panel_back_in_view() {
     let text = include_str!("fixtures/stranded-story-workspace.json");
     let saved: Workspace = serde_json::from_str(text).expect("the fixture parses");

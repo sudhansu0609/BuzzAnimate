@@ -63,21 +63,21 @@ fn dropper_key() -> Id {
 
 /// Hand the colour the eyedropper took to the swatch `target`.
 pub fn deliver(target: Id, color: Color) {
-    if let Ok(mut picked) = PICKED.lock() {
-        *picked = Some((target, color));
-    }
+    PICKED.with(|picked| *picked.borrow_mut() = Some((target, color)));
 }
 
 /// The colour picked from the screen for `target`, once.
 pub fn take(target: Id) -> Option<Color> {
-    let mut picked = PICKED.lock().ok()?;
-    match *picked {
-        Some((id, color)) if id == target => {
-            *picked = None;
-            Some(color)
+    PICKED.with(|picked| {
+        let mut picked = picked.borrow_mut();
+        match *picked {
+            Some((id, color)) if id == target => {
+                *picked = None;
+                Some(color)
+            }
+            _ => None,
         }
-        _ => None,
-    }
+    })
 }
 
 /// Show the system Colors window, starting from `color`, linked to `target`.
@@ -100,8 +100,13 @@ pub fn poll_panel(ctx: &egui::Context, target: Id) -> Option<Color> {
     }
 }
 
-/// The last pick, waiting for its swatch to be drawn.
-static PICKED: std::sync::Mutex<Option<(Id, Color)>> = std::sync::Mutex::new(None);
+thread_local! {
+    /// The last pick, waiting for its swatch to be drawn. **The window's
+    /// thread's own**: the eyedropper delivers it and the swatch takes it on
+    /// that one thread, and tests — each on a thread of its own, drawing the
+    /// same swatches — no longer take each other's picks.
+    static PICKED: std::cell::RefCell<Option<(Id, Color)>> = const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -194,7 +199,7 @@ mod tests {
         let red = Color::from_rgba8(0xE5, 0x12, 0x34, 0xFF);
         // Swatch names no panel uses: tests run side by side, and a real panel's
         // swatch drawn by another test would take the pick first.
-        *PICKED.lock().unwrap() = Some((Id::new(("color-row", "screen-pick-test-fill")), red));
+        PICKED.with(|p| *p.borrow_mut() = Some((Id::new(("color-row", "screen-pick-test-fill")), red)));
 
         let mut other = Color::BLACK;
         let mut fill = Color::BLACK;

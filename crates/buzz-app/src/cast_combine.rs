@@ -437,7 +437,7 @@ pub fn pose_choices(scene: &Scene, selected: Option<buzz_scene::ObjectId>, frame
 }
 
 /// A name without the ` 2`, ` 3`… a duplicate symbol is given.
-fn without_copy_number(name: &str) -> &str {
+pub(crate) fn without_copy_number(name: &str) -> &str {
     let mut name = name.trim_end();
     while let Some((head, tail)) = name.rsplit_once(' ')
         && !tail.is_empty()

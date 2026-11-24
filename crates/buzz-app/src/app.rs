@@ -1612,6 +1612,10 @@ pub struct App {
     /// `(document, symbol name)` already looked up in the Cast by
     /// [`Self::link_selection_to_cast`], so each is read at most once.
     cast_pose_links_checked: std::collections::HashSet<(u64, String)>,
+    /// Every Cast character's poses by what they draw, and the files (with
+    /// their modification times) they were read from. See [`Self::cast_looks`].
+    #[allow(clippy::type_complexity)]
+    cast_looks: Option<(Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>, std::sync::Arc<Vec<crate::cast_pose_edit::CastLook>>)>,
     /// What the Eyedropper's cursor last read under its tip: (pointer,
     /// drawing revision, frame) and the colour. See [`Self::eyedropper_peek`].
     #[allow(clippy::type_complexity)]
@@ -2054,6 +2058,7 @@ impl App {
             cast_edited_seen: None,
             cast_main_names: std::collections::HashMap::new(),
             cast_pose_links_checked: std::collections::HashSet::new(),
+            cast_looks: None,
             eyedropper_peek: std::cell::RefCell::new(None),
             dropper_pick: None,
             rig_slots_kept: std::collections::HashMap::new(),
@@ -5800,6 +5805,8 @@ impl App {
     fn cast_pose_edited(&mut self) {
         self.cast_sheet = None;
         self.asset_thumbnails.forget();
+        // The film's own copies follow the Cast the next time they are picked.
+        self.cast_pose_links_checked.clear();
     }
 
     /// **A shot follows its Cast.** After a pose is added, removed or renamed
@@ -5864,13 +5871,42 @@ impl App {
         self.rig_slots_written = Some(now);
     }
 
+    /// Every Cast character with poses, by what they draw
+    /// ([`crate::cast_pose_edit::CastLook`]), read again only when a Cast
+    /// file is added, removed or saved.
+    fn cast_looks(&mut self) -> std::sync::Arc<Vec<crate::cast_pose_edit::CastLook>> {
+        let cast = crate::cast_fresh::cast_characters(&self.editor.assets);
+        let stamps: Vec<(std::path::PathBuf, Option<std::time::SystemTime>)> = cast
+            .iter()
+            .map(|a| (a.path.clone(), std::fs::metadata(&a.path).and_then(|m| m.modified()).ok()))
+            .collect();
+        if let Some((seen, looks)) = &self.cast_looks
+            && *seen == stamps
+        {
+            return looks.clone();
+        }
+        let looks: Vec<_> = cast
+            .iter()
+            .filter_map(|asset| {
+                let scene = self.editor.assets.load(asset).ok()?;
+                crate::cast_pose_edit::cast_look(asset, &scene)
+            })
+            .collect();
+        let looks = std::sync::Arc::new(looks);
+        self.cast_looks = Some((stamps, looks.clone()));
+        looks
+    }
+
     /// **A selected character takes its poses from the Cast.** One symbol
-    /// instance selected whose symbol has no poses linked, named like a Cast
-    /// character that has some (the film's own `bhushan`, imported with the
-    /// FLA, and `Cast/bhushan` posed in the Cast panel): the Cast's poses are
-    /// copied in and linked, as one undo step, so right-click ▸ Pose,
-    /// Properties ▸ Pose and Next/Previous Pose offer them. Each symbol name is
-    /// looked up once per document.
+    /// instance selected that is a copy of a Cast character with poses —
+    /// named like it (the film's own `bhushan`, imported with the FLA, and
+    /// `Cast/bhushan` posed in the Cast panel), or drawing the same parts as
+    /// one of its poses under another name (the film's `shirtFront 3` is
+    /// `Cast/DeepakFront`'s front pose): the Cast's poses are copied in and
+    /// linked, as one undo step, so right-click ▸ Pose, Properties ▸ Pose and
+    /// Next/Previous Pose offer them. Poses added in the Cast since arrive
+    /// the same way. Each symbol name is looked up once per document, again
+    /// after a Cast edit.
     fn link_selection_to_cast(&mut self) {
         if self.agent_active() || self.editor.selection.len() != 1 {
             return;
@@ -5897,35 +5933,77 @@ impl App {
         if from_cast {
             return;
         }
-        let linked = crate::cast_combine::pose_choices(scene, selected, frame).is_some();
-        let Some(asset) = crate::cast_fresh::cast_characters(&self.editor.assets).into_iter().find(|a| a.name == name) else {
+        // A pose of a set (not its main) is that character's; the main is the one to link.
+        let owner = scene.library().symbol_set(shown).first().copied().unwrap_or(shown);
+        if owner != shown {
+            return;
+        }
+        let looks = self.cast_looks();
+        let scene = self.editor.doc.scene();
+        let Some((look, stands_for)) = crate::cast_pose_edit::cast_match(scene, shown, &looks) else {
             return;
         };
+        let asset = look.asset.clone();
         let Ok(cast) = self.editor.assets.load(&asset) else {
             return;
         };
-        let mut probe = self.editor.doc.scene().clone();
-        if linked {
-            // Linked before its poses were lined up: stood on the main pose now.
-            if !crate::cast_pose_edit::line_up_linked_poses(&mut probe, &cast, &name) {
-                return;
-            }
-            self.editor.doc.edit("Line Up Poses", |scene| {
-                crate::cast_pose_edit::line_up_linked_poses(scene, &cast, &name);
-            });
-            self.editor.status = Some(format!("{name}: every pose now stands where the main pose does, at its size"));
+        // Poses linked by hand, not from this Cast character, are left alone.
+        if !scene.library().symbol_set(shown).is_empty() && !crate::cast_pose_edit::linked_from_cast(scene, &cast, &name) {
             return;
         }
-        if !crate::cast_pose_edit::link_cast_poses(&mut probe, &cast, &name) {
+        let stands = if stands_for == look.main {
+            crate::cast_pose_edit::StandsFor::Main
+        } else {
+            crate::cast_pose_edit::StandsFor::Pose(&stands_for)
+        };
+        let mut probe = scene.clone();
+        if !crate::cast_pose_edit::link_cast_poses_as(&mut probe, &cast, &name, stands) {
             return;
         }
         self.editor.doc.edit("Poses from the Cast", |scene| {
-            crate::cast_pose_edit::link_cast_poses(scene, &cast, &name);
+            crate::cast_pose_edit::link_cast_poses_as(scene, &cast, &name, stands);
         });
-        let count = self.editor.doc.scene().library().find_by_name(&name).map_or(0, |s| s.set.len());
+        let count = self.editor.doc.scene().library().symbol_set(shown).len();
         self.editor.status = Some(format!(
-            "{name}: {count} poses linked from the Cast \u{b7} right-click \u{25b8} Pose or Properties \u{25b8} Pose"
+            "{name}: {count} poses of {} linked from the Cast \u{b7} right-click \u{25b8} Pose or Properties \u{25b8} Pose",
+            asset.name
         ));
+    }
+
+    /// **Right-click ▸ Pose ▸ Poses from the Cast ▸ `<character>`**: the film's
+    /// symbol `shown` takes that Cast character's poses, in place of any it
+    /// had, as one undo step. The pose it is a copy of, if any, is not copied
+    /// in again.
+    fn link_poses_from_cast(&mut self, shown: buzz_scene::SymbolId, asset: &buzz_doc::Asset) {
+        let Some(name) = self.editor.doc.scene().library().get(shown).map(|s| s.name.clone()) else {
+            return;
+        };
+        let Ok(cast) = self.editor.assets.load(asset) else {
+            self.editor.status = Some(format!("Could not read {} from the Cast", asset.name));
+            return;
+        };
+        let Some(look) = crate::cast_pose_edit::cast_look(asset, &cast) else {
+            self.editor.status = Some(format!("{} has no poses in the Cast yet \u{2014} add them in the Cast panel", asset.name));
+            return;
+        };
+        let stands_for = crate::cast_pose_edit::match_cast_pose(self.editor.doc.scene(), shown, &look).map(|(pose, _)| pose);
+        let stands = match &stands_for {
+            Some(pose) if *pose == look.main => crate::cast_pose_edit::StandsFor::Main,
+            Some(pose) => crate::cast_pose_edit::StandsFor::Pose(pose),
+            None => crate::cast_pose_edit::StandsFor::Nothing,
+        };
+        let mut linked = false;
+        self.editor.doc.edit("Poses from the Cast", |scene| {
+            linked = crate::cast_pose_edit::link_cast_poses_as(scene, &cast, &name, stands);
+        });
+        let count = self.editor.doc.scene().library().symbol_set(shown).len();
+        self.editor.status = Some(if count >= 2 {
+            format!("{name}: {count} poses of {} from the Cast \u{b7} right-click \u{25b8} Pose", asset.name)
+        } else if linked {
+            format!("{name}: linked to {}", asset.name)
+        } else {
+            format!("Could not link {}'s poses to {name}", asset.name)
+        });
     }
 
     /// [`Self::sync_shot_with_cast`] after poses renamed in the Cast, `(old,
@@ -11856,8 +11934,15 @@ impl App {
         let mut raised: Option<Command> = None;
         let mut save_asset = false;
         let mut pose_pick: Option<(crate::cast_combine::PoseTarget, buzz_scene::SymbolId)> = None;
-        // Right-click ▸ Pose ▸ Add Pose: (the symbol shown, the symbol to link as another pose).
-        let mut pose_add: Option<(buzz_scene::SymbolId, buzz_scene::SymbolId)> = None;
+        // Right-click ▸ Pose ▸ Poses from the Cast: (the symbol shown, the Cast character).
+        let mut pose_from_cast: Option<(buzz_scene::SymbolId, buzz_doc::Asset)> = None;
+        // Only the Cast's characters are offered as poses — never the film's
+        // other symbols (user 2026-11-24: "only suggest poses from cast not random").
+        let cast_characters: Vec<buzz_doc::Asset> = if response.secondary_clicked() || response.context_menu_opened() {
+            self.cast_looks().iter().map(|l| l.asset.clone()).collect()
+        } else {
+            Vec::new()
+        };
         // Right-click ▸ Pose ▸ Edit Poses in Cast…: the character's Cast link.
         let mut pose_in_cast: Option<String> = None;
         // The keys Next / Previous Pose are on, the user's own if they rebound
@@ -12021,36 +12106,20 @@ impl App {
                             }
                         }
                         None => {
-                            ui.label(egui::RichText::new("No other poses linked yet").small().weak());
+                            ui.label(egui::RichText::new("No Cast poses linked yet \u{2014} pick its Cast character below").small().weak());
                         }
                     }
                     if let Some(shown) = pose_symbol {
                         ui.separator();
-                        ui.menu_button("Add Pose", |ui| {
-                            let (similar, rest) = crate::cast_combine::addable_poses(self.editor.doc.scene(), shown);
-                            if similar.is_empty() && rest.is_empty() {
-                                ui.label(egui::RichText::new("No symbol can be added").small().weak());
+                        ui.menu_button("Poses from the Cast", |ui| {
+                            if cast_characters.is_empty() {
+                                ui.label(egui::RichText::new("No Cast character has poses yet \u{2014} add them in the Cast panel").small().weak());
                             }
-                            for (id, name) in &similar {
-                                if ui.button(name).clicked() {
-                                    pose_add = Some((shown, *id));
+                            for asset in &cast_characters {
+                                if ui.button(&asset.name).on_hover_text("Use this Cast character's poses").clicked() {
+                                    pose_from_cast = Some((shown, asset.clone()));
                                     ui.close();
                                 }
-                            }
-                            if !rest.is_empty() {
-                                if !similar.is_empty() {
-                                    ui.separator();
-                                }
-                                ui.menu_button("All symbols", |ui| {
-                                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                                        for (id, name) in &rest {
-                                            if ui.button(name).clicked() {
-                                                pose_add = Some((shown, *id));
-                                                ui.close();
-                                            }
-                                        }
-                                    });
-                                });
                             }
                         });
                     }
@@ -12117,19 +12186,10 @@ impl App {
                 None => self.editor.status = Some(format!("{link} is not in the Cast any more")),
             }
         }
-        if let Some((shown, pose)) = pose_add
+        if let Some((shown, asset)) = pose_from_cast
             && !self.agent_active()
         {
-            let mut linked = false;
-            self.editor.doc.edit("Add Pose", |scene| {
-                linked = scene.library_mut().include_in_set(shown, pose);
-            });
-            let name = |id| self.editor.doc.scene().library().get(id).map(|s| s.name.clone()).unwrap_or_default();
-            self.editor.status = Some(if linked {
-                format!("{} is now a pose of {} \u{b7} switch with right-click \u{25b8} Pose or {pose_keys}", name(pose), name(shown))
-            } else {
-                format!("Could not add {} as a pose", name(pose))
-            });
+            self.link_poses_from_cast(shown, &asset);
         }
         if let Some((target, pose)) = pose_pick
             && !self.agent_active()

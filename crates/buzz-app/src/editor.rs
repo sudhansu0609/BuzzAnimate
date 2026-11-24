@@ -9661,7 +9661,7 @@ impl Editor {
         let Some((target, shown, poses)) =
             crate::cast_combine::pose_choices(self.doc.scene(), self.selection.iter().next(), frame)
         else {
-            self.status = Some("Select a character with linked poses (right-click it \u{25b8} Pose \u{25b8} Add Pose)".into());
+            self.status = Some("Select a character with linked poses (right-click it \u{25b8} Pose \u{25b8} Poses from the Cast)".into());
             return;
         };
         let at = poses.iter().position(|(_, name)| *name == shown).unwrap_or(0) as isize;

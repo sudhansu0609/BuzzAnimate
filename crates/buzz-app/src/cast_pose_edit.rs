@@ -204,10 +204,29 @@ pub fn sync_placed_character(scene: &mut Scene, cast: &Scene, folder: &str, name
 /// [`sync_placed_character`] does for one placed from the Cast. Whether
 /// anything changed; nothing does when the Cast has no other poses.
 pub fn link_cast_poses(scene: &mut Scene, cast: &Scene, name: &str) -> bool {
+    link_cast_poses_as(scene, cast, name, StandsFor::Main)
+}
+
+/// Which of the Cast's poses the film's own symbol is a copy of, when its
+/// poses are linked from the Cast: that one is not copied in again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StandsFor<'a> {
+    /// The Cast's main pose (the film's `bhushan` for `Cast/bhushan`).
+    Main,
+    /// The Cast pose of this full name.
+    Pose(&'a str),
+    /// None of them: every Cast pose is copied in.
+    Nothing,
+}
+
+/// [`link_cast_poses`] for a film symbol that is a copy of the Cast pose
+/// `stands_for` — named differently from the Cast character (the film's
+/// `shirtFront 3` is `Cast/DeepakFront`'s front pose).
+pub fn link_cast_poses_as(scene: &mut Scene, cast: &Scene, name: &str, stands_for: StandsFor<'_>) -> bool {
     if pose_names(cast).len() < 2 {
         return false;
     }
-    let changed = sync_character(scene, cast, "", name, None, true);
+    let changed = sync_character_as(scene, cast, "", name, None, true, stands_for);
     // Every pose stands where the main pose stands, as tall as it is: the
     // Cast's own poses are drawn at their own spot and size, and this film's
     // main is its own drawing, so they are lined up on it here, as placing a
@@ -226,13 +245,111 @@ pub fn line_up_linked_poses(scene: &mut Scene, cast: &Scene, name: &str) -> bool
     };
     let set = scene.library().symbol_set(main);
     let cast_poses = pose_names(cast);
-    if set.len() < 2 || !set.iter().all(|id| cast_poses.contains(&name_of(scene, *id))) {
+    // The main is the film's own drawing, whatever it is called.
+    if set.len() < 2 || !set.iter().filter(|id| **id != main).all(|id| cast_poses.contains(&name_of(scene, *id))) {
         return false;
     }
     !crate::cast_combine::normalise_poses(scene, main).is_empty()
 }
 
+/// Whether the poses linked to the film's symbol `name` all come from `cast`
+/// (so the Cast can be followed without dropping a pose linked by hand).
+pub fn linked_from_cast(scene: &Scene, cast: &Scene, name: &str) -> bool {
+    let Some(main) = scene.library().find_by_name(name).map(|s| s.id) else {
+        return false;
+    };
+    let cast_poses = pose_names(cast);
+    let set = scene.library().symbol_set(main);
+    set.len() >= 2 && set.iter().filter(|id| **id != main).all(|id| cast_poses.contains(&name_of(scene, *id)))
+}
+
+/// The parts a pose draws: the names of the symbols on its layers, less the
+/// copy number a duplicate is given (`armFrontRight 5` is `armFrontRight`).
+pub fn part_names(scene: &Scene, id: SymbolId) -> std::collections::BTreeSet<String> {
+    let library = scene.library();
+    let Some(symbol) = library.get(id) else {
+        return Default::default();
+    };
+    symbol
+        .layers
+        .iter()
+        .flat_map(|l| l.all_objects())
+        .filter_map(|o| library.get(o.instance()?.symbol))
+        .map(|s| crate::cast_combine::without_copy_number(&s.name).to_string())
+        .collect()
+}
+
+/// A Cast character by what its poses draw, to recognise the film's own copy
+/// of it under another name.
+#[derive(Debug, Clone)]
+pub struct CastLook {
+    pub asset: Asset,
+    /// The main pose's full name.
+    pub main: String,
+    /// Every pose (main first): its full name and [`part_names`].
+    pub poses: Vec<(String, std::collections::BTreeSet<String>)>,
+}
+
+/// `cast`'s look, or `None` when it has no poses to offer.
+pub fn cast_look(asset: &Asset, cast: &Scene) -> Option<CastLook> {
+    let main = main_symbol(cast)?;
+    let poses: Vec<_> = cast.library().symbol_set(main).into_iter().map(|id| (name_of(cast, id), part_names(cast, id))).collect();
+    (poses.len() >= 2).then(|| CastLook { asset: asset.clone(), main: name_of(cast, main), poses })
+}
+
+/// The fewest parts two poses share to be taken for the same character.
+const SAME_PARTS: usize = 3;
+/// How much of the parts they share (of all the parts either draws).
+const SAME_SHARE: f64 = 0.6;
+
+/// **Which Cast pose the film's symbol `shown` is a copy of**, and how sure
+/// (0..=1): its name (less a copy number) is the character's or a pose's, or
+/// it draws the same parts as a pose (user 2026-11-24: `shirtFront 3`, the
+/// film's Deepak, draws `armFrontRight 5`, `rajuFaceFront 4`… — the parts of
+/// `Cast/DeepakFront`'s front pose — and right-click ▸ Pose showed nothing).
+pub fn match_cast_pose(scene: &Scene, shown: SymbolId, look: &CastLook) -> Option<(String, f64)> {
+    let name = scene.library().get(shown)?.name.clone();
+    let base = crate::cast_combine::without_copy_number(&name);
+    if base == look.asset.name || base == look.main {
+        return Some((look.main.clone(), 1.0));
+    }
+    if let Some((pose, _)) = look.poses.iter().find(|(p, _)| p == base) {
+        return Some((pose.clone(), 1.0));
+    }
+    let parts = part_names(scene, shown);
+    look.poses
+        .iter()
+        .filter_map(|(pose, theirs)| {
+            let common = parts.intersection(theirs).count();
+            let share = common as f64 / parts.union(theirs).count().max(1) as f64;
+            (common >= SAME_PARTS && share >= SAME_SHARE).then(|| (pose.clone(), share))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+}
+
+/// The Cast character the film's symbol `shown` is a copy of, and the pose it
+/// stands for: the surest of [`match_cast_pose`].
+pub fn cast_match<'a>(scene: &Scene, shown: SymbolId, looks: &'a [CastLook]) -> Option<(&'a CastLook, String)> {
+    looks
+        .iter()
+        .filter_map(|look| match_cast_pose(scene, shown, look).map(|(pose, score)| (look, pose, score)))
+        .max_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(look, pose, _)| (look, pose))
+}
+
 fn sync_character(scene: &mut Scene, cast: &Scene, folder: &str, name: &str, renamed: Option<(&str, &str)>, linking: bool) -> bool {
+    sync_character_as(scene, cast, folder, name, renamed, linking, StandsFor::Main)
+}
+
+fn sync_character_as(
+    scene: &mut Scene,
+    cast: &Scene,
+    folder: &str,
+    name: &str,
+    renamed: Option<(&str, &str)>,
+    linking: bool,
+    stands_for: StandsFor<'_>,
+) -> bool {
     let placed = linking || is_placed(scene, folder, name);
     let Some(main) = scene.library().find_by_name(name).map(|s| s.id) else {
         return false;
@@ -252,11 +369,36 @@ fn sync_character(scene: &mut Scene, cast: &Scene, folder: &str, name: &str, ren
     let Some(cast_main) = main_symbol(cast).or_else(|| cast.library().find_by_name(name).map(|s| s.id)) else {
         return changed;
     };
-    let wanted: Vec<SymbolId> = cast.library().symbol_set(cast_main).into_iter().filter(|id| *id != cast_main).collect();
+    let wanted: Vec<SymbolId> = cast
+        .library()
+        .symbol_set(cast_main)
+        .into_iter()
+        .filter(|id| match stands_for {
+            StandsFor::Main => *id != cast_main,
+            StandsFor::Pose(pose) => name_of(cast, *id) != pose,
+            StandsFor::Nothing => true,
+        })
+        .collect();
     let mut members: Vec<SymbolId> = Vec::new();
     for id in wanted {
         let pose_name = name_of(cast, id);
-        let here = match scene.library().find_by_name(&pose_name).map(|s| s.id) {
+        // Linking a film's own copy: a pose it already has, under its name or
+        // renamed on import (`DeepakFront deepakSide 1`), is kept; one another
+        // copy of the character already holds is copied in afresh, so both
+        // copies (`shirtFront 3` and `DeepakFront 2`) get every pose.
+        let own = linking
+            .then(|| {
+                scene.library().get(main).and_then(|s| {
+                    s.set.iter().copied().find(|m| {
+                        let n = name_of(scene, *m);
+                        n == pose_name || crate::cast_combine::without_copy_number(&n) == pose_name
+                    })
+                })
+            })
+            .flatten();
+        let taken = |scene: &Scene, here: SymbolId| scene.library().iter().any(|s| s.id != main && (s.id == here && !s.set.is_empty() || s.set.contains(&here)));
+        let found = own.or_else(|| scene.library().find_by_name(&pose_name).map(|s| s.id).filter(|here| !(linking && taken(scene, *here))));
+        let here = match found {
             Some(here) => here,
             None => match scene.import_symbol(cast, id) {
                 Some((here, _)) => {
@@ -1153,6 +1295,63 @@ mod tests {
         let mut film = Scene::default();
         film.add_symbol("Solo", SymbolKind::Graphic, None);
         assert!(!link_cast_poses(&mut film, &lone, "Solo"));
+    }
+
+    /// **A film copy under another name is still the Cast character** (user
+    /// 2026-11-24: the film's `shirtFront 3` is `Cast/DeepakFront`'s front
+    /// pose, and right-click ▸ Pose showed nothing): it draws the same parts
+    /// (less copy numbers), so it matches the Cast's main pose and takes the
+    /// Cast's other poses; a prop sharing one part matches nothing; a second
+    /// copy of the character gets every pose too; linking again changes nothing.
+    #[test]
+    fn a_film_copy_named_otherwise_is_known_by_its_parts_and_takes_the_cast_poses() {
+        fn drawing(scene: &mut Scene, name: &str, parts: &[&str]) -> SymbolId {
+            let ids: Vec<SymbolId> = parts
+                .iter()
+                .map(|p| scene.library().find_by_name(p).map(|s| s.id).unwrap_or_else(|| scene.add_symbol(*p, SymbolKind::Graphic, None)))
+                .collect();
+            let id = scene.add_symbol(name, SymbolKind::Graphic, None);
+            let layers = scene.library_mut().layers_mut(id).unwrap();
+            let first = layers.iter().next().map(|l| l.id).unwrap();
+            layers.update(first, |l| {
+                for (n, part) in ids.iter().enumerate() {
+                    let placed = buzz_scene::Object::instance_of(buzz_scene::ObjectId(70_000 + n as u64 + id.0 as u64 * 100), *part);
+                    l.push_object_at(0, std::sync::Arc::new(placed));
+                }
+            });
+            id
+        }
+        let dir = tempfile::tempdir().expect("temp asset folder");
+        let mut library = AssetLibrary::at(dir.path());
+        let mut cast = Scene::default();
+        let body = cast.add_stage_layer("Body", buzz_scene::LayerKind::Normal);
+        let front = drawing(&mut cast, "Deepak", &["armFrontRight", "rajuFaceFront", "shirtFrontbase", "frontLeftThigh"]);
+        let back = drawing(&mut cast, "Deepak Back", &["armBack", "headBack", "shirtBack", "thighBack"]);
+        let side = drawing(&mut cast, "Deepak Side", &["armSide", "faceSide", "shirtSide", "thighSide"]);
+        assert!(cast.library_mut().include_in_set(front, back));
+        assert!(cast.library_mut().include_in_set(front, side));
+        cast.add_instance_at(body, 0, front, buzz_geom::Affine::IDENTITY).expect("placed");
+        library.save("Deepak", "Cast", &cast).expect("saved");
+        let asset = library.assets().iter().find(|a| a.name == "Deepak").cloned().unwrap();
+        let cast = library.load(&asset).unwrap();
+        let looks = vec![cast_look(&asset, &cast).expect("a character with poses")];
+
+        let mut film = Scene::default();
+        let shirt = drawing(&mut film, "shirtFront 3", &["armFrontRight 5", "rajuFaceFront 4", "shirtFrontbase 3", "frontLeftThigh 5"]);
+        let palm = drawing(&mut film, "palm", &["armFrontRight 5", "leaf", "trunk", "root"]);
+        assert!(cast_match(&film, palm, &looks).is_none(), "a prop sharing one part is not Deepak");
+        let (look, pose) = cast_match(&film, shirt, &looks).expect("known by its parts");
+        assert_eq!((look.asset.name.as_str(), pose.as_str()), ("Deepak", "Deepak"));
+        assert!(link_cast_poses_as(&mut film, &cast, "shirtFront 3", StandsFor::Main));
+        let names: Vec<String> = film.library().symbol_set(shirt).into_iter().map(|id| name_of(&film, id)).collect();
+        assert_eq!(names, ["shirtFront 3", "Deepak Back", "Deepak Side"]);
+        assert!(!link_cast_poses_as(&mut film, &cast, "shirtFront 3", StandsFor::Main), "already linked");
+
+        let other = drawing(&mut film, "DeepakFront 2", &["armFrontRight 6", "rajuFaceFront 5", "shirtFrontbase 4", "frontLeftThigh 6"]);
+        assert!(link_cast_poses_as(&mut film, &cast, "DeepakFront 2", StandsFor::Main));
+        assert_eq!(film.library().symbol_set(other).len(), 3, "the second copy gets every pose too");
+        assert_eq!(film.library().symbol_set(shirt).len(), 3, "the first keeps its own");
+        assert!(!link_cast_poses_as(&mut film, &cast, "DeepakFront 2", StandsFor::Main), "its renamed poses are kept, not copied again");
     }
 
     /// **Extra pose tags** (user 2026-11-17): a character with poses takes

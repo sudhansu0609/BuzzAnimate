@@ -701,7 +701,11 @@ fn fixture() -> Fixture {
     assert!(cmd(&mut app, "insert_keyframe").ok);
     assert!(cmd(&mut app, "first_frame").ok);
 
-    let dir = std::env::temp_dir().join(format!("buzz_props_{}", std::process::id()));
+    // One folder per fixture: tests run in parallel, and rewriting a shared
+    // file while another test imports it hands that test a half-written sound.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("buzz_props_{}_{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut sound_names = Vec::new();
     for (file, hz) in [("alpha_tone.wav", 220.0), ("beta_tone.wav", 330.0)] {

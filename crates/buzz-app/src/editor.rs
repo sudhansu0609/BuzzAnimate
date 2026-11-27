@@ -36,6 +36,8 @@ pub use shape_edit::ShapeGrip;
 /// more than that, and the complaint that selecting lines was tedious was
 /// partly this and mostly that a *filled* path was tested with no slack at all.
 const PICK_TOLERANCE_PX: f64 = 6.0;
+/// How far, in screen pixels, a press may wander and still be a click.
+const CLICK_SLOP_PX: f64 = 3.0;
 
 /// Upper bound on the playhead. Roughly 11 hours at 24 fps — far past anything
 /// real, but finite so a stray value cannot produce an absurd timeline.
@@ -489,6 +491,13 @@ pub struct Editor {
     /// The copy is made when the pointer has gone far enough to be a drag, not
     /// at the press, so an Alt-click copies nothing. See [`AltCopy`].
     alt_copy: Option<AltCopy>,
+    /// **A Free Transform press on its gizmo over another part**: that part
+    /// and where the press was on screen. A drag from there scales, turns or
+    /// skews the selection as ever; a click that does not move picks the
+    /// part instead (user 2026-11-27) — on a small part inside a character
+    /// its handles and rotate ring cover the parts beside it, and none of
+    /// them could be picked with Free Transform.
+    gizmo_click: Option<(ObjectId, Point)>,
     /// How far the selection has been moved in the drag under way, so Alt
     /// pressed partway through it can put the original back and make the
     /// copy there instead (`Self::alt_copy_midway`).
@@ -960,6 +969,7 @@ impl Editor {
             light_gesture: None,
             shape_gesture: None,
             alt_copy: None,
+            gizmo_click: None,
             drag_moved: Vec2::ZERO,
             box_session: std::cell::RefCell::new(None),
             sound: crate::sound::SoundBank::new(stage_fps),
@@ -3014,19 +3024,42 @@ impl Editor {
         // **In Rotate Mode a press grabs what it is on**, as the arrow does: a
         // limb is pressed and swung in one go, with no click to select it
         // first. Nothing moves, so there is no copy to worry about.
+        //
+        // **Free Transform picks up what it is pressed on, as the arrow does**
+        // (user 2026-11-27: "fix the selection using free transform tool"):
+        // inside a character, with the arm selected, a press on the palm
+        // inside the arm's box moved the arm; the palm could not be reached
+        // without going to the arrow first. A press on artwork that is not
+        // selected now takes it, its box comes up, and a drag moves it. A
+        // press on the gizmo's handles is still the gizmo's, and one on
+        // empty stage still a marquee.
         let grabs = match tool {
-            ToolId::Selection => !mods.shift,
-            ToolId::FreeTransform => (mods.alt || self.machine.rotate_only()) && !mods.shift,
+            ToolId::Selection | ToolId::FreeTransform => !mods.shift,
             _ => false,
         };
-        let top = (tool == ToolId::Selection || grabs && !on_gizmo)
-            .then(|| self.object_at(doc, self.pick_tolerance()))
-            .flatten();
+        // What is under the pointer is asked where the pointer is, not where
+        // Free Transform's snapping pulled the press (onto the edge of the
+        // part beside it).
+        let raw = self.screen_to_edit(screen);
+        self.gizmo_click = (tool == ToolId::FreeTransform && on_gizmo && !mods.shift && !mods.alt && !mods.ctrl)
+            .then(|| self.object_at(raw, 0.0))
+            .flatten()
+            .filter(|id| !self.selection.contains(*id))
+            .map(|id| (id, screen));
+        let top = match tool {
+            ToolId::Selection => self.pick_at(doc),
+            // Exactly under the pointer: within the box, a near miss on the
+            // edge of another part must not take the selection off this one.
+            ToolId::FreeTransform if grabs && !on_gizmo => self.object_at(raw, 0.0),
+            _ => None,
+        };
+        let mut just_grabbed = false;
         if grabs
             && !on_gizmo
             && let Some(id) = top
             && !self.selection.contains(id)
         {
+            just_grabbed = true;
             self.selection.select_one(id);
             // Its layer becomes the active one, exactly as a click-to-select
             // does, so the timeline lights up the row the grabbed object is on.
@@ -3052,7 +3085,12 @@ impl Editor {
             self.selection_box()
         };
         let pivot = self.pivot();
-        let zoom = self.camera.zoom;
+        // **A press that has just picked a part up moves it** with Free
+        // Transform: the box it brings has its point in the middle and its
+        // handles round a small part, and the drag that picked the part was
+        // meant to carry it, not to drag the point off it. No handle is in
+        // reach for this press (a zoom so close every handle is a pixel).
+        let zoom = if just_grabbed && tool == ToolId::FreeTransform { 1e9 } else { self.camera.zoom };
         let gradient = self.selected_gradient_handles();
 
         // **The handles a press can meet**: those of the selected anchors,
@@ -3228,6 +3266,7 @@ impl Editor {
             pivot,
             gradient,
         };
+        let gizmo_click = self.gizmo_click.take().filter(|(_, at)| (*at - screen).hypot() < CLICK_SLOP_PX);
         let action = match self.machine.pointer_up_at(doc, screen, &ctx, time, pressure) {
             // **A click picks what is under the pointer**, not what snapping
             // pulled the pointer onto. Free Transform and Subselection snap (a
@@ -3241,6 +3280,13 @@ impl Editor {
         };
 
         self.apply(action);
+        if let Some((id, _)) = gizmo_click {
+            // A click, not a drag: the part under it, as the arrow picks it.
+            self.selection.set(vec![id]);
+            if let Some((layer, _)) = self.doc.scene().find_object(id) {
+                self.selection.set_active_layer(Some(layer));
+            }
+        }
         // The copy, if there was one, was made and carried step by step; its
         // release is what ends the one undo step it shares with the drag.
         self.alt_copy = None;
@@ -3513,8 +3559,7 @@ impl Editor {
             } => self.paint_brush_stroke(shape, label, spine, start, mode),
 
             ToolAction::PickAt { point, additive } => {
-                let tolerance = self.pick_tolerance();
-                match self.object_at(point, tolerance) {
+                match self.pick_at(point) {
                     Some(id) => {
                         // **A click picks the one object under it, with either
                         // tool.** A drawing is laid down as separate primitives
@@ -4702,6 +4747,16 @@ impl Editor {
     }
 
     // -- hit testing ---------------------------------------------------------
+
+    /// **What a click picks**: the topmost object *exactly* under `point`,
+    /// else the topmost within the pick tolerance (a thin line, a click just
+    /// off a small part). Inside a character the parts overlap at every joint,
+    /// and the tolerance alone took whichever was on top within a few pixels:
+    /// a click on the palm took the wrist above it, on the thigh the body
+    /// (user 2026-11-27).
+    pub fn pick_at(&self, point: Point) -> Option<ObjectId> {
+        self.object_at(point, 0.0).or_else(|| self.object_at(point, self.pick_tolerance()))
+    }
 
     /// Topmost object under `point`, honouring layer locking and visibility.
     ///
@@ -24597,6 +24652,75 @@ mod tests {
             .map(|(id, _)| id)
             .find(|id| !before.iter().any(|(b, _)| b == id))
             .expect("the new shape")
+    }
+
+    /// A click at `at` (document space) with whatever tool is up.
+    fn click_doc(e: &mut Editor, at: Point) {
+        let screen = e.camera.doc_to_screen(at);
+        e.pointer_down(screen, Mods::default());
+        e.pointer_up(screen);
+    }
+
+    /// **The part under the pointer beats the part beside it** (user
+    /// 2026-11-27: inside a character a click on the palm took the wrist,
+    /// on the thigh the body). The pick tolerance reached a few pixels over
+    /// to the part on top; it is for a click that hits nothing exactly.
+    #[test]
+    fn a_click_picks_the_part_under_it_before_one_beside_it() {
+        for tool in [ToolId::Selection, ToolId::FreeTransform] {
+            let mut e = editor();
+            let palm = draw_square(&mut e, 103.0, 0.0, 40.0, Color::from_rgb8(200, 40, 40)).expect("a palm");
+            let arm = draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).expect("an arm on top");
+            e.set_tool(tool);
+            click_doc(&mut e, Point::new(104.0, 20.0));
+            assert_eq!(e.selection.ids(), vec![palm], "{tool:?}: the palm, which is under the click");
+            // Just off the arm, over nothing: the tolerance still takes it.
+            e.selection.clear();
+            click_doc(&mut e, Point::new(101.5, 70.0));
+            assert_eq!(e.selection.ids(), vec![arm], "{tool:?}: a near miss still picks");
+        }
+    }
+
+    /// **Free Transform picks a part its handles cover** (user 2026-11-27):
+    /// a small part's skew edge and rotate ring lie over the parts beside it,
+    /// and a click there kept the selected part. A click picks what it is on;
+    /// a drag from the same place still skews.
+    #[test]
+    fn free_transform_clicks_through_its_handles_onto_another_part() {
+        let mut e = editor();
+        let palm = draw_square(&mut e, 103.0, 0.0, 100.0, Color::from_rgb8(200, 40, 40)).expect("a palm");
+        let arm = draw_square(&mut e, 0.0, 0.0, 100.0, Color::WHITE).expect("an arm");
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.select_one(arm);
+        // Just outside the arm's bottom-right corner, in its rotate ring, on
+        // the palm (clear of the palm's own edges).
+        let ring = Point::new(115.0, 85.0);
+        click_doc(&mut e, ring);
+        assert_eq!(e.selection.ids(), vec![palm], "the click picks the palm");
+
+        e.selection.select_one(arm);
+        let before = transform_of(&e, arm);
+        drag_with(&mut e, ring, Point::new(60.0, 140.0), Mods::default());
+        assert_eq!(e.selection.ids(), vec![arm], "a drag from the handle keeps the arm");
+        assert_ne!(transform_of(&e, arm), before, "and turns it");
+    }
+
+    /// **Free Transform drags a part it is pressed on** (user 2026-11-27),
+    /// as the arrow does: nothing selected, a press in the middle of a small
+    /// part — where its point will be — picks it and the drag carries it.
+    #[test]
+    fn free_transform_drags_an_unselected_small_part() {
+        let mut e = editor();
+        let palm = draw_square(&mut e, 100.0, 100.0, 30.0, Color::from_rgb8(200, 40, 40)).expect("a palm");
+        e.set_tool(ToolId::FreeTransform);
+        e.selection.clear();
+        drag_with(&mut e, Point::new(118.0, 112.0), Point::new(148.0, 122.0), Mods::default());
+        assert_eq!(e.selection.ids(), vec![palm], "the press picked it");
+        assert!(
+            is_translation(transform_of(&e, palm), Vec2::new(30.0, 10.0)),
+            "the drag moved it, got {:?}",
+            transform_of(&e, palm).as_coeffs()
+        );
     }
 
     /// **E1. The Selection tool has no handles.** Every place the box used to

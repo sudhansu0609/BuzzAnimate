@@ -9612,6 +9612,11 @@ impl App {
                 None => {}
             }
             self.rig_slots_path = Some(path);
+            // **Slots brought back are not tagged again** (user 2026-11-27:
+            // the rig changed by itself). They were the last list seen, so
+            // opening a character never renames or re-links its layers as
+            // though every part had just been put in its slot.
+            self.rig_slots_seen = self.editor.rig_panel.slots.clone();
             if open_head {
                 self.lock_head_base();
             }
@@ -31717,6 +31722,125 @@ mod layer_rig_ui_tests {
         app.rig_character(&pattern.name, &slots);
         let followed = links(&app).into_iter().find(|(n, _)| n == "Dupatta").and_then(|(_, f)| f);
         assert_eq!(followed.as_deref(), Some(chest_name.as_str()), "the added part follows the part it is on: {:?}", links(&app));
+    }
+
+    /// **Tagging sets the rig's parenting without a second layer of one name
+    /// and without moving the animation** (user 2026-11-27: "when rig is done
+    /// the same sequence shall be set in the layer parenting"). A character
+    /// already animated by hand: `body` sways, `leftArm` follows it. The body
+    /// tag put on the `base` drawing parents the arm to `base`, as the rig
+    /// says — `base` keeps its name (a second `body` was the one the shelf's
+    /// commands found) and every key of the arm stands where it stood.
+    #[test]
+    fn tagging_relinks_to_the_rig_keeping_names_unique_and_keys_in_place() {
+        use std::sync::Arc;
+        let mut app = App::new(GpuPreference::Automatic);
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        let _ = painted_text(&mut app);
+        app.editor.rig_panel.kind = buzz_rig::RigKind::Layers;
+        let pattern = app.editor.rig_panel.pattern();
+        let label = |app: &App, slot: &str| buzz_ui::rig_panel::slot_label(&app.editor.rig_panel, slot);
+        let chest_name = label(&app, "Chest");
+        let arm_name = label(&app, "Shoulder L");
+        let (mut base_art, mut arm_art, mut arm_layer) = (None, None, None);
+        app.editor.doc.edit("Character", |scene| {
+            let bar = |x: f64, y: f64| buzz_scene::ShapeData::filled(buzz_geom::Shape::to_path(&buzz_geom::Rect::new(x, y, x + 60.0, y + 40.0), 1e-9), LIMB);
+            let body = scene.add_layer(chest_name.clone(), buzz_scene::LayerKind::Normal);
+            let arm = scene.add_layer("arm", buzz_scene::LayerKind::Normal);
+            let base = scene.add_layer("base", buzz_scene::LayerKind::Normal);
+            let (b, a, s) = (scene.next_object_id(), scene.next_object_id(), scene.next_object_id());
+            let (b2, a2) = (scene.next_object_id(), scene.next_object_id());
+            let body_rest = buzz_scene::Object::shape(b, bar(200.0, 0.0));
+            let body_swayed = buzz_scene::Object::shape(b2, bar(200.0, 0.0)).with_transform(buzz_geom::Affine::translate((30.0, 0.0)));
+            let arm_rest = buzz_scene::Object::shape(a, bar(140.0, 0.0));
+            let arm_raised = buzz_scene::Object::shape(a2, bar(140.0, 0.0)).with_transform(buzz_geom::Affine::translate((0.0, -20.0)));
+            let base_rest = buzz_scene::Object::shape(s, bar(200.0, 60.0));
+            let layers = scene.edit_layers();
+            layers.update(body, |l| {
+                l.frames.set_objects(0, vec![Arc::new(body_rest)]);
+                l.frames.insert_keyframe(20);
+                l.frames.set_objects(20, vec![Arc::new(body_swayed)]);
+            });
+            layers.update(arm, |l| {
+                l.frames.set_objects(0, vec![Arc::new(arm_rest)]);
+                l.frames.insert_keyframe(20);
+                l.frames.set_objects(20, vec![Arc::new(arm_raised)]);
+            });
+            layers.update(base, |l| { l.frames.set_objects(0, vec![Arc::new(base_rest)]); });
+            scene.set_follows(arm, Some(body), 0);
+            (base_art, arm_art, arm_layer) = (Some(s), Some(a), Some(arm));
+        });
+        let (base_art, arm_art, arm_layer) = (base_art.unwrap(), arm_art.unwrap(), arm_layer.unwrap());
+        let _ = painted_text(&mut app);
+        let arm_world = |app: &App, frame: u32| {
+            let scene = app.editor.scene();
+            let o = scene.layers().get(arm_layer).unwrap().objects_at(frame).first().cloned().unwrap();
+            (scene.layers().inherited_transform(arm_layer, frame) * o.transform).as_coeffs()
+        };
+        let before = [arm_world(&app, 0), arm_world(&app, 20)];
+        let _ = arm_art;
+
+        app.editor.rig_panel.assign(pattern.slot_named("Chest").unwrap(), base_art);
+        let _ = painted_text(&mut app);
+        app.editor.rig_panel.assign(pattern.slot_named("Shoulder L").unwrap(), app.editor.scene().layers().get(arm_layer).unwrap().objects_at(0)[0].id);
+        let _ = painted_text(&mut app);
+
+        let names: Vec<String> = app.editor.scene().layers().iter().map(|l| l.name.to_lowercase()).collect();
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "no two layers of one name: {names:?}");
+        assert!(names.contains(&"base".to_string()), "base keeps its name while {chest_name} exists: {names:?}");
+        assert!(links(&app).contains(&(arm_name.clone(), Some("base".into()))), "the arm follows the part tagged {chest_name}: {:?}", links(&app));
+        for (i, frame) in [0u32, 20].into_iter().enumerate() {
+            let now = arm_world(&app, frame);
+            let moved = now.iter().zip(before[i].iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            assert!(moved < 1e-6, "the arm's key at {frame} stands where it stood (moved {moved})");
+        }
+    }
+
+    /// **Opening a character does not tag it again** (user 2026-11-27: the
+    /// rig changed by itself). Its slots come back from `rig_slots.json`
+    /// when it is opened; they used to be taken for parts just put in their
+    /// slots, so every layer was renamed back to its tag and re-linked. A
+    /// layer renamed by hand since keeps the new name, and nothing is edited.
+    #[test]
+    fn opening_a_character_with_kept_slots_edits_nothing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let film = dir.path().join("film.buzz");
+        let mut app = App::new(GpuPreference::Automatic);
+        let mut character = None;
+        app.editor.doc.edit("Character", |scene| {
+            character = Some(scene.add_symbol("Shirt", buzz_scene::SymbolKind::Graphic, None));
+        });
+        let character = character.unwrap();
+        app.editor.workspace.reveal(buzz_ui::PanelId::Rig);
+        let _ = painted_text(&mut app);
+        app.editor.doc.edit_view(|scene| { scene.enter_symbol(character); });
+        let _ = painted_text(&mut app);
+        let parts = three_parts(&mut app);
+        app.editor.doc.save_as(&film).expect("saved");
+        let _ = painted_text(&mut app);
+        app.editor.rig_panel.slots = parts.clone();
+        let _ = painted_text(&mut app);
+        let _ = painted_text(&mut app);
+        // The tagged arm's layer, renamed by hand.
+        let arm = parts[app.editor.rig_panel.pattern().slot_named("Shoulder L").unwrap()].unwrap();
+        let (layer, _) = app.editor.scene().find_object(arm).unwrap();
+        app.editor.doc.edit("Rename", |scene| {
+            scene.update_layer(layer, |l| l.name = "myArm".into());
+        });
+        app.editor.doc.edit_view(|scene| scene.edit_document());
+        let _ = painted_text(&mut app);
+        let depth = app.editor.doc.history().undo_depth();
+        app.editor.doc.edit_view(|scene| { scene.enter_symbol(character); });
+        for _ in 0..3 {
+            let _ = painted_text(&mut app);
+        }
+        assert!(app.editor.rig_panel.slots.iter().any(Option::is_some), "the character's slots are back");
+        assert_eq!(app.editor.doc.history().undo_depth(), depth, "opening it edited the film");
+        let (layer, _) = app.editor.scene().find_object(arm).unwrap();
+        assert_eq!(app.editor.scene().layers().get(layer).unwrap().name, "myArm");
     }
 
     /// **Mapping a part rigs it** (Rig kind: Layers): each part put in a slot

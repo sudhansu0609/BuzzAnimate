@@ -1059,11 +1059,18 @@ pub fn link_tagged_parts(
         let Some(object) = *held else { continue };
         let Some(layer) = own_layer(scene, object) else { continue };
         let name = name_of(slot);
-        scene.edit_layers().update(layer, |l| {
-            if l.name != name {
-                l.name = name;
-            }
-        });
+        // **Never a second layer of one name** (user 2026-11-27): the
+        // shelf's commands find `body`, `leftArm` by name, and the first of
+        // two `body` layers was the wrong one. A layer already called the
+        // slot's name elsewhere keeps it; this one keeps its own.
+        let taken = scene.layers().iter().any(|l| l.id != layer && l.name.eq_ignore_ascii_case(&name));
+        if !taken {
+            scene.edit_layers().update(layer, |l| {
+                if l.name != name {
+                    l.name = name;
+                }
+            });
+        }
         layers.push((slot, layer));
     }
     if layers.is_empty() {
@@ -1130,14 +1137,89 @@ pub fn link_tagged_parts(
         .filter(|slot| ancestor_layer(*slot).is_none())
         .min()
         .and_then(layer_of);
+    // Only the parts just tagged, and the parts hanging off them, are linked
+    // again: tagging a foot never re-parents the arms. Rig Character passes
+    // every filled slot as fresh, and links them all.
+    let ancestor_slot = |slot: usize| {
+        let mut current = parents.get(slot).copied().flatten();
+        for _ in 0..parents.len() {
+            let parent = current?;
+            if layer_of(parent).is_some() {
+                return Some(parent);
+            }
+            current = parents.get(parent).copied().flatten();
+        }
+        None
+    };
+    let touched = |slot: usize| fresh.is_empty() || fresh.contains(&slot) || ancestor_slot(slot).is_some_and(|p| fresh.contains(&p));
+    let wanted: Vec<(LayerId, Option<LayerId>)> = layers
+        .iter()
+        .filter(|(slot, _)| touched(*slot))
+        .map(|&(slot, layer)| (layer, ancestor_layer(slot).or(root.filter(|r| join_roots && *r != layer))))
+        .collect();
     let stack = scene.edit_layers();
-    for &(slot, layer) in &layers {
-        let parent = ancestor_layer(slot).or(root.filter(|r| join_roots && *r != layer));
-        if stack.get(layer).is_some_and(|l| l.follows != parent) {
+    let relinks: Vec<(LayerId, Option<LayerId>)> = wanted
+        .iter()
+        .copied()
+        .filter(|(layer, parent)| stack.get(*layer).is_some_and(|l| l.follows != *parent))
+        .filter(|(layer, parent)| parent.is_none_or(|p| stack.can_follow(*layer, p)))
+        .collect();
+    if relinks.is_empty() {
+        return Some(layers);
+    }
+    // **The parenting is the rig's, and nothing moves** (user 2026-11-27:
+    // "when rig is done the same sequence shall be set in the layer
+    // parenting"). A layer that already followed another, or had animation,
+    // inherited that parent's motion; following another one now would carry
+    // it elsewhere on every animated frame. So the links are set the way
+    // Repair Layer Rigs sets them: every key rebaked to stand where it stood.
+    let relinked_animated = relinks.iter().any(|(layer, _)| {
+        stack.get(*layer).is_some_and(|l| l.follows.is_some() || l.frames.keyframes().len() > 1)
+    });
+    if !relinked_animated {
+        for (layer, parent) in relinks {
             set_follows_in(stack, layer, parent, frame);
         }
+        return Some(layers);
     }
+    let plan = relink_plan(stack, &relinks);
+    apply_rig_repair(stack, &plan);
     Some(layers)
+}
+
+/// The [`RigRepair`] that gives each layer in `relinks` its new parent: every
+/// layer of the stack (all of them may be measured from one that moves),
+/// parents before the layers following them, with its link as it will be.
+fn relink_plan(stack: &buzz_scene::LayerStack, relinks: &[(LayerId, Option<LayerId>)]) -> RigRepair {
+    let target = |id: LayerId| {
+        relinks
+            .iter()
+            .find(|(l, _)| *l == id)
+            .map(|(_, p)| *p)
+            .unwrap_or_else(|| stack.get(id).and_then(|l| l.follows))
+    };
+    let ids: Vec<LayerId> = stack.iter().filter(|l| l.kind != buzz_scene::LayerKind::Folder).map(|l| l.id).collect();
+    let mut order: Vec<LayerId> = Vec::new();
+    let mut placed = std::collections::HashSet::new();
+    // Parents first; bounded by the layer count, against a follow cycle.
+    for _ in 0..=ids.len() {
+        let before = order.len();
+        for &id in &ids {
+            if placed.contains(&id) {
+                continue;
+            }
+            if target(id).is_none_or(|p| placed.contains(&p) || !ids.contains(&p)) {
+                order.push(id);
+                placed.insert(id);
+            }
+        }
+        if order.len() == before {
+            break;
+        }
+    }
+    order.extend(ids.iter().copied().filter(|id| !placed.contains(id)));
+    let follows = order.iter().map(|&id| (id, target(id))).collect();
+    RigRepair { follows, order }
 }
 
 /// The filled part `slot` joins: its nearest filled ancestor in `parents`;

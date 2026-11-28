@@ -20,6 +20,15 @@ pub enum Purpose {
     Convert,
     /// Ctrl+F8: an empty symbol, opened for editing.
     New,
+    /// **Duplicate Symbol** (user 2026-11-28: "when I duplicate a symbol I
+    /// shall be able to write a new name for it"): Animate's own dialog —
+    /// the copy's name, its type and its folder — so the name is typed as
+    /// part of the command, wherever the Library is.
+    Duplicate {
+        /// The instance on the stage it came from, which then shows the copy.
+        instance: Option<buzz_scene::ObjectId>,
+        source: buzz_scene::SymbolId,
+    },
 }
 
 impl Purpose {
@@ -27,6 +36,7 @@ impl Purpose {
         match self {
             Self::Convert => "Convert to Symbol",
             Self::New => "Create New Symbol",
+            Self::Duplicate { .. } => "Duplicate Symbol",
         }
     }
 }
@@ -65,6 +75,24 @@ impl SymbolDialog {
             folder,
             focused: false,
         }
+    }
+
+    /// **Duplicate Symbol**, opened with Animate's suggested name selected
+    /// (`name`: "<original> copy"), the original's type and folder.
+    pub fn duplicate(
+        scene: &Scene,
+        instance: Option<buzz_scene::ObjectId>,
+        source: buzz_scene::SymbolId,
+        name: String,
+    ) -> Option<Self> {
+        let symbol = scene.library().get(source)?;
+        Some(Self {
+            purpose: Purpose::Duplicate { instance, source },
+            name,
+            kind: symbol.kind,
+            folder: symbol.folder.clone(),
+            focused: false,
+        })
     }
 
     /// Draw the dialog and say what, if anything, was chosen.

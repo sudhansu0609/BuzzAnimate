@@ -30,6 +30,13 @@ pub struct TimelineResponse {
     pub toggle_camera: bool,
     /// The camera row's padlock switch was clicked. C1.
     pub toggle_camera_lock: bool,
+    /// The Shadow row was clicked: its shadows are what Properties shows and
+    /// what the frame commands key (user 2026-11-28).
+    pub select_shadow: bool,
+    /// The Shadow row's eye: shadows drawn or not.
+    pub toggle_shadow_eye: bool,
+    /// The Shadow row's padlock.
+    pub toggle_shadow_lock: bool,
     /// A layer row was clicked.
     pub select_layer: Option<LayerId>,
     /// Multiple layers were selected (e.g. from vertical drag across frames on a column).
@@ -251,6 +258,8 @@ pub struct MoveFrames {
 pub const ROW_GEOMETRY: &str = "timeline-row-geometry";
 /// The camera row's rect, stored for tests that drive it with pointer events.
 pub(crate) const CAMERA_ROW_RECT: &str = "timeline-camera-row-rect";
+/// The Shadow row's rect, stored for tests that drive it with pointer events.
+pub(crate) const SHADOW_ROW_RECT: &str = "timeline-shadow-row-rect";
 /// The layer rows painted in the current pass, stamped with it. A row's
 /// [`ROW_GEOMETRY`] outlives the row being on screen, so whatever asks "which
 /// rows are in view now" reads this rather than trusting a stale rectangle.
@@ -807,6 +816,8 @@ pub struct TimelineState {
     /// The camera row is the selected one, so the camera is what the Camera
     /// menu's keyframe commands act on.
     pub camera_selected: bool,
+    /// The Shadow row is the selected one.
+    pub shadow_selected: bool,
     /// The layer carrying the film's master audio, on this timeline: its row
     /// is **pinned right under the Camera's**, wherever the layer sits.
     pub master_audio_layer: Option<LayerId>,
@@ -1436,6 +1447,11 @@ pub fn timeline_panel_with_tools_slot(
             if shows_camera_row(scene) {
                 camera_row(ui, scene, columns, state, &mut response);
             }
+            // The Shadow layer's row, fixed just under the Camera's (user
+            // 2026-11-28: "it sits below camera fixed").
+            if shows_shadow_row(scene) {
+                shadow_row(ui, scene, columns, state, &mut response);
+            }
             // The master audio's row, fixed under the Camera's on the
             // document's own timeline, and not drawn again in its place.
             let master = state
@@ -1677,6 +1693,20 @@ fn layer_tools(ui: &mut Ui, scene: &Scene, state: &TimelineState, out: &mut Time
             .clicked()
         {
             out.command = Some(crate::Command::ToggleCamera);
+        }
+        // The Shadow layer, beside the Camera's button, added and removed the
+        // same way.
+        let shadows_on = scene.shadow_layer().enabled;
+        if ui
+            .add(egui::Button::new("Shadows").selected(shadows_on))
+            .on_hover_text(if shadows_on {
+                "Remove the Shadow layer \u{2014} its keyframes are kept for when it is added again"
+            } else {
+                "Add the Shadow layer: a row under the Camera's that gives each object on the stage its own shadow"
+            })
+            .clicked()
+        {
+            out.command = Some(crate::Command::ToggleShadowLayer);
         }
 
         // **Animate's parenting view**, on the same strip as the layer tools
@@ -3124,6 +3154,153 @@ fn camera_fill() -> Color32 {
     } else {
         Color32::from_rgb(0xD6, 0xE2, 0xF3)
     }
+}
+
+/// Whether the Shadow row belongs on the timeline: the document's own, with
+/// the Shadow layer added. Like the camera's, never inside a symbol.
+fn shows_shadow_row(scene: &Scene) -> bool {
+    scene.edit_path().is_empty() && scene.shadow_layer().enabled
+}
+
+/// The Shadow row's blend between keys: a cool grey-violet, apart from the
+/// camera's blue and a light's amber.
+fn shadow_tween_tint() -> Color32 {
+    if crate::theme::theme().is_dark() {
+        Color32::from_rgb(0x4A, 0x44, 0x5E)
+    } else {
+        Color32::from_rgb(0xDD, 0xD8, 0xEA)
+    }
+}
+
+/// The Shadow row's occupied cells.
+fn shadow_fill() -> Color32 {
+    if crate::theme::theme().is_dark() {
+        Color32::from_rgb(0x3A, 0x37, 0x44)
+    } else {
+        Color32::from_rgb(0xE4, 0xE1, 0xEC)
+    }
+}
+
+/// What one cell of the Shadow row shows: a key, a blank key (no shadows
+/// from there), the span after a key, or its end.
+fn shadow_cell(layer: &buzz_scene::ShadowLayer, frame: u32, end: u32) -> FrameKind {
+    match layer.keys().iter().find(|k| k.frame == frame) {
+        Some(key) if key.shadows.values().any(|s| s.on) => FrameKind::Keyframe,
+        Some(_) => FrameKind::BlankKeyframe,
+        None if !layer.keys().is_empty() && frame > layer.keys()[0].frame && frame < end => FrameKind::Span,
+        None if !layer.keys().is_empty() && frame > layer.keys()[0].frame && frame == end => FrameKind::SpanEnd,
+        None => FrameKind::Empty,
+    }
+}
+
+/// **The Shadow layer's row**, under the Camera's: its keys, its eye and
+/// padlock, a click selecting it, and the same frame menu a layer's frames
+/// have — the editor sends the frame commands to its keys while it is the
+/// row selected.
+fn shadow_row(
+    ui: &mut Ui,
+    scene: &Scene,
+    columns: u32,
+    state: &TimelineState,
+    out: &mut TimelineResponse,
+) {
+    let height = Metrics::LAYER_ROW * state.row_scale;
+    let cell_width = state.frame_width;
+    let width = columns as f32 * cell_width;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(LAYER_COLUMN + width, height), Sense::click());
+    let pinned_left = ui.clip_rect().min.x;
+    let name_row = egui::Rect::from_min_size(egui::pos2(pinned_left, rect.min.y), egui::vec2(LAYER_COLUMN, height));
+    let grid_left = rect.min.x + LAYER_COLUMN;
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(SHADOW_ROW_RECT), rect));
+
+    let painter = ui.painter_at(
+        egui::Rect::from_min_max(egui::pos2(pinned_left + LAYER_COLUMN, rect.min.y), rect.max).intersect(ui.clip_rect()),
+    );
+    let layer = scene.shadow_layer();
+    let last = layer.last_frame();
+    // Held to the end of the film after the last key, as the camera's is.
+    let end = last.max(scene.stage_layers().frame_count().saturating_sub(1));
+    let tint = shadow_tween_tint();
+    for frame in visible_columns(ui.clip_rect(), grid_left, cell_width, columns) {
+        let x = grid_left + frame as f32 * cell_width;
+        let cell = egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_width, height));
+        let kind = shadow_cell(layer, frame, end);
+        let blending = layer.keys().len() > 1 && frame < last && !layer.has_key_at(frame) && layer.keys()[0].frame < frame;
+        let tween = blending.then_some(TweenCell { tint, complete: true, arrow: false });
+        draw_frame_cell(
+            &painter,
+            cell,
+            kind,
+            tween,
+            false,
+            frame == state.current_frame,
+            None,
+            Some(shadow_fill()),
+            !layer.keys().is_empty() && frame == end,
+        );
+    }
+
+    let names = ui.painter_at(name_row.intersect(ui.clip_rect()));
+    names.rect_filled(name_row, 0.0, if state.shadow_selected { Palette::active() } else { names_bg() });
+    if !state.shadow_selected {
+        let [r, g, b, _] = shadow_fill().to_array();
+        names.rect_filled(name_row, 0.0, Color32::from_rgba_unmultiplied(r, g, b, 56));
+    }
+    names.with_clip_rect(name_area(name_row).intersect(name_row)).text(
+        egui::pos2(name_row.min.x + 4.0, name_row.center().y),
+        Align2::LEFT_CENTER,
+        "Shadow",
+        FontId::proportional(11.0),
+        if layer.hidden { Palette::text_dim() } else { Palette::text() },
+    );
+    let hover = ui.ctx().input(|i| i.pointer.hover_pos());
+    let switches = switch_columns(name_row);
+    let (eye, lock) = (switches[0], switches[1]);
+    let ink = crate::panels::from_egui(Palette::text());
+    crate::panels::paint_layer_icon(&names, eye, crate::panels::LayerIcon::Eye, !layer.hidden, ink, hover.is_some_and(|p| eye.contains(p) && response.hovered()));
+    crate::panels::paint_layer_icon(&names, lock, crate::panels::LayerIcon::Lock, layer.locked, ink, hover.is_some_and(|p| lock.contains(p) && response.hovered()));
+
+    if response.clicked() {
+        let hit = ui.ctx().input(|i| i.pointer.interact_pos());
+        if hit.is_some_and(|p| eye.contains(p)) {
+            out.toggle_shadow_eye = true;
+        } else if hit.is_some_and(|p| lock.contains(p)) {
+            out.toggle_shadow_lock = true;
+        } else {
+            out.select_shadow = true;
+            if let Some(pos) = hit
+                && pos.x > grid_left
+            {
+                out.scrub_to = Some((((pos.x - grid_left) / cell_width) as u32).min(columns.saturating_sub(1)));
+            }
+        }
+    }
+    let menu_frame_id = ui.id().with("timeline-shadow-menu-frame");
+    if response.secondary_clicked() {
+        let frame = ui
+            .ctx()
+            .input(|i| i.pointer.interact_pos())
+            .filter(|p| p.x >= grid_left)
+            .map(|p| (((p.x - grid_left) / cell_width) as u32).min(columns.saturating_sub(1)));
+        ui.ctx().data_mut(|d| d.insert_temp(menu_frame_id, frame));
+    }
+    response.context_menu(|ui| {
+        let frame = ui.ctx().data(|d| d.get_temp::<Option<u32>>(menu_frame_id)).flatten();
+        out.select_shadow = true;
+        if let Some(frame) = frame
+            && out.scrub_to.is_none()
+        {
+            out.scrub_to = Some(frame);
+        }
+        frame_action_items(ui, out);
+        ui.separator();
+        for tween in [TweenRequest::Classic, TweenRequest::Motion] {
+            if ui.button(tween.label()).clicked() {
+                out.tween = Some(tween);
+                ui.close();
+            }
+        }
+    });
 }
 
 /// [`camera_tween_tint`], for a light's channel — a warm amber rather than the
@@ -4920,6 +5097,23 @@ fn layer_context_menu(
         }
     });
 
+    // **Tweens on whole layers** (user 2026-11-28): on the layers picked,
+    // or this one when it is not among them — every span on them, as
+    // Animate's layer selection is every frame.
+    ui.separator();
+    for tween in [TweenRequest::Classic, TweenRequest::Remove] {
+        if ui.button(tween.label()).clicked() {
+            let layers = if state.selected_layers.contains(&layer.id) {
+                state.selected_layers.clone()
+            } else {
+                vec![layer.id]
+            };
+            out.select_layers = Some(layers);
+            out.tween = Some(tween);
+            ui.close();
+        }
+    }
+
     ui.separator();
     if ui.button("Select All Layers").clicked() {
         out.select_layers = Some(scene.layers().iter().map(|l| l.id).collect());
@@ -5538,6 +5732,7 @@ mod tests {
             range_anchor: None,
             timeline_selection: None,
             camera_selected: false,
+            shadow_selected: false,
             master_audio_layer: None,
             selected_light: None,
             light_row_selected: false,

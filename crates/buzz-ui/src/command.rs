@@ -671,6 +671,9 @@ pub enum Command {
 
     // Camera
     ToggleCamera,
+    /// **Add or remove the Shadow layer** (user 2026-11-28): its row under
+    /// the Camera's gives each object on the stage a shadow of its own.
+    ToggleShadowLayer,
     AddCameraKeyframe,
     RemoveCameraKeyframe,
     ResetCamera,
@@ -1022,6 +1025,7 @@ command_table! {
             ProtectFromHere => "protect_scope_from_here",
             ToggleEditMultipleFrames => "toggle_edit_multiple_frames",
             ToggleCamera => "toggle_camera",
+            ToggleShadowLayer => "toggle_shadow_layer",
             AddCameraKeyframe => "add_camera_keyframe",
             RemoveCameraKeyframe => "remove_camera_keyframe",
             ResetCamera => "reset_camera",
@@ -1523,6 +1527,7 @@ impl Command {
             ToggleEditMultipleFrames => "Edit Multiple Frames",
 
             ToggleCamera => "Enable Camera",
+            ToggleShadowLayer => "Shadow Layer",
             AddCameraKeyframe => "Add Camera Keyframe",
             RemoveCameraKeyframe => "Remove Camera Keyframe",
             AddLightKeyframe => "Add Light Keyframe",
@@ -1820,6 +1825,7 @@ impl Command {
             ToggleEditMultipleFrames => None,
 
             ToggleCamera => None,
+            ToggleShadowLayer => None,
             AddCameraKeyframe => None,
             RemoveCameraKeyframe => None,
             AddLightKeyframe => None,
@@ -2040,6 +2046,7 @@ pub fn palette_commands() -> Vec<Command> {
         ProtectFromHere,
         ToggleEditMultipleFrames,
         ToggleCamera,
+        ToggleShadowLayer,
         AddCameraKeyframe,
         RemoveCameraKeyframe,
         AddLightKeyframe,
@@ -2310,6 +2317,7 @@ mod tests {
             ToggleEqualLayerLengths,
             ToggleEditMultipleFrames,
             ToggleCamera,
+            ToggleShadowLayer,
             AddCameraKeyframe,
             RemoveCameraKeyframe,
             AddLightKeyframe,
@@ -2493,7 +2501,7 @@ mod tests {
         }
         assert_eq!(
             Command::unit_commands().len() + Command::data_command_hints().len(),
-            264
+            265
         );
     }
 

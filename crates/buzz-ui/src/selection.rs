@@ -114,6 +114,13 @@ pub struct Selection {
     /// Not saved with the document — it is as much a view thing as the rest
     /// of `Selection`.
     range_anchor: Option<LayerId>,
+    /// **The layers were picked by their names** (a click or a sweep down
+    /// the layer list), which in Animate selects every frame on them: a
+    /// tween command then acts on all their spans, not just the one under
+    /// the playhead (user 2026-11-28: "select all classic tween layers and
+    /// remove tween"). Any other way of choosing layers or objects — a
+    /// frame range, a pick on the stage — clears it.
+    whole_layers: bool,
 }
 
 impl Selection {
@@ -147,12 +154,14 @@ impl Selection {
 
     pub fn select_one(&mut self, id: ObjectId) {
         self.timeline = None;
+        self.whole_layers = false;
         self.objects.clear();
         self.objects.insert(id);
     }
 
     pub fn add(&mut self, id: ObjectId) {
         self.timeline = None;
+        self.whole_layers = false;
         self.objects.insert(id);
     }
 
@@ -170,6 +179,7 @@ impl Selection {
 
     pub fn set(&mut self, ids: impl IntoIterator<Item = ObjectId>) {
         self.timeline = None;
+        self.whole_layers = false;
         self.objects = ids.into_iter().collect();
     }
 
@@ -189,7 +199,14 @@ impl Selection {
         self.timeline.as_ref()
     }
 
+    /// The layers picked by their names — every frame on them — or `None`
+    /// when the layers in hand came some other way. See `whole_layers`.
+    pub fn whole_layers(&self) -> Option<&[LayerId]> {
+        (self.whole_layers && self.timeline.is_none() && !self.selected_layers.is_empty()).then_some(&self.selected_layers[..])
+    }
+
     pub fn set_timeline(&mut self, selection: TimelineSelection) {
+        self.whole_layers = false;
         self.selected_layers = selection.layers.iter().copied().collect();
         self.active_layer = Some(selection.anchor_layer);
         self.timeline = Some(selection);
@@ -226,6 +243,7 @@ impl Selection {
     }
 
     pub fn set_selected_layers(&mut self, layers: &[LayerId]) {
+        self.whole_layers = false;
         self.selected_layers = layers.to_vec();
         if self.active_layer.is_none() || !layers.iter().any(|&l| Some(l) == self.active_layer) {
             self.active_layer = layers.first().copied();
@@ -233,6 +251,7 @@ impl Selection {
     }
 
     pub fn set_active_layer(&mut self, layer: Option<LayerId>) {
+        self.whole_layers = false;
         self.active_layer = layer;
         self.selected_layers = layer.into_iter().collect();
         self.timeline = None;
@@ -427,6 +446,7 @@ impl Selection {
         self.active_layer = Some(layer);
         self.selected_layers = vec![layer];
         self.timeline = None;
+        self.whole_layers = true;
         self.objects.clear();
         // I1: a plain click is always the new anchor a Shift+click sweeps from.
         self.range_anchor = Some(layer);
@@ -455,6 +475,7 @@ impl Selection {
         }
         self.selected_layers = layers.to_vec();
         self.timeline = None;
+        self.whole_layers = !layers.is_empty();
         self.objects.clear();
 
         for &layer in layers {

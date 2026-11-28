@@ -18,6 +18,7 @@ pub mod arrange_dialog;
 pub mod assets_panel;
 pub mod brush;
 pub mod camera_panel;
+pub mod shadow_panel;
 pub mod character_panel;
 pub mod clear_keys_dialog;
 pub mod cleanup_dialog;

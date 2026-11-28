@@ -4908,6 +4908,26 @@ fn draw_layer(
             }
         }
 
+        // **The Shadow layer's own shadows** (user 2026-11-28): each object
+        // on the stage that the Shadow row gives a shadow, its silhouette laid
+        // on the ground from its feet, drawn just under it. Only the main
+        // timeline's layers: the Shadow row belongs to the stage.
+        if scene.shadow_layer().draws()
+            && ctx.ghost.is_none()
+            && scene.stage_layers().get(layer.id).is_some()
+        {
+            let state = scene.shadow_layer().state_at(frame);
+            if !state.is_empty() {
+                for (object, owner) in resolved.iter_owned() {
+                    let Some(settings) = state.get(&object.id).filter(|s| s.on && s.darkness > 0.0) else {
+                        continue;
+                    };
+                    let caster = caster_bounds(object, owner, &ctx, &mut cache.bounds);
+                    draw_object_shadow(builder, object, caster, settings, &ctx);
+                }
+            }
+        }
+
         // A layer holding build-up paint is drawn into its own transparent
         // group. Additive compositing sums with the destination, and without
         // the group the destination would include the stage — a dark stroke on
@@ -6862,6 +6882,11 @@ fn draw_symbol_contents(
 /// barish1's whole face at stage size is about 105 px, its mouth about 30.
 const SEAL_RUN_BELOW_PX: f64 = 256.0;
 
+/// Drawn at fewer device pixels per unit of its own than this — shrunk on
+/// screen, by the view's zoom or its symbol's scale — artwork has its seals
+/// lifted beneath it whatever its size. See [`wants_seal_run`].
+const SEAL_RUN_BELOW_SCALE: f64 = 1.0;
+
 /// Should artwork whose own bounds are `bounds` (in its own units), placed by
 /// `doc` and projected by `projection`, open a seal run? See
 /// [`SEAL_RUN_BELOW_PX`]. The same answer live and stamped: a stamped child is
@@ -6879,7 +6904,15 @@ fn wants_seal_run(
     };
     let seen = projection.as_affine().map_or(1.0, det);
     let extent = bounds.width().max(bounds.height());
-    extent > 0.0 && extent * builder.pixels_per_unit() * det(doc) * seen < SEAL_RUN_BELOW_PX
+    let scale = builder.pixels_per_unit() * det(doc) * seen;
+    // **Or drawn smaller than it was made** (user 2026-11-28: "on lesser
+    // zooms the lines of my character seem smudged"): line work a unit or
+    // two wide is then under a pixel or two on screen however big the whole
+    // drawing is — a character's shirt three hundred pixels tall at 40% has
+    // check lines a third of a pixel wide — and the in-line seal of every
+    // colour region ate them from both sides. Beneath a run they keep their
+    // true coverage, as the export draws them.
+    extent > 0.0 && (extent * scale < SEAL_RUN_BELOW_PX || scale < SEAL_RUN_BELOW_SCALE)
 }
 
 /// Does this object draw artwork itself, rather than only placing a symbol
@@ -9109,6 +9142,59 @@ fn cast_shadows(
     caster.draw(builder);
 }
 
+/// **One object's shadow from the Shadow layer** ([`buzz_scene::ObjectShadow`]):
+/// its silhouette — fills and lines alike — thrown onto the ground from the
+/// feet of `caster` (its resolved bounds), softened by the shadow's blur, and
+/// laid in its colour at its darkness. One group per object, so the parts of
+/// a figure overlapping make one silhouette rather than a darker patch.
+fn draw_object_shadow(
+    builder: &mut SceneBuilder<'_>,
+    object: &Object,
+    caster: buzz_geom::Rect,
+    settings: &buzz_scene::ObjectShadow,
+    ctx: &DrawCtx<'_>,
+) {
+    use buzz_geom::Shape as _;
+    let thrown = settings.throw().at(caster);
+    let mut gathered = Caster::default();
+    cast_shadows_within(builder, &mut gathered, object, Affine::IDENTITY, thrown, ctx, 0);
+    // The lines, as filled outlines, so the whole silhouette softens as one.
+    let mut silhouette = gathered.fills;
+    for (path, width) in &gathered.strokes {
+        let outline = buzz_geom::outline_stroke(path, buzz_geom::StrokeStyle::new(width.max(0.5)), builder.tolerance());
+        silhouette.extend(buzz_geom::wound_forward(&outline).elements().iter().copied());
+    }
+    for path in &gathered.hairlines {
+        let outline = buzz_geom::outline_stroke(path, buzz_geom::StrokeStyle::new(1.0), builder.tolerance());
+        silhouette.extend(buzz_geom::wound_forward(&outline).elements().iter().copied());
+    }
+    if silhouette.elements().is_empty() {
+        return;
+    }
+    // The blur is set in document units; the silhouette is already on the
+    // screen, so it is carried through the view's scale at the feet.
+    let feet = buzz_geom::Point::new((caster.x0 + caster.x1) * 0.5, caster.y1);
+    let scale = match (ctx.projection.map_point(feet), ctx.projection.map_point(feet + buzz_geom::Vec2::new(1.0, 0.0))) {
+        (Some(a), Some(b)) => (b - a).hypot(),
+        _ => 1.0,
+    };
+    let radius = (settings.softness.max(0.0) * scale).min(400.0);
+    let area = silhouette.bounding_box().inflate(radius * 2.0 + 1.0, radius * 2.0 + 1.0);
+    if !(area.width() > 0.0 && area.height() > 0.0) {
+        return;
+    }
+    let alpha = settings.darkness.clamp(0.0, 1.0) * if ctx.faded { FADE } else { 1.0 };
+    builder.push_alpha_group(area, alpha);
+    let colour = settings.color.with_alpha(1.0);
+    if radius > 0.25 {
+        let ops = buzz_fx::blur_ops(&silhouette, colour, (radius, radius), buzz_fx::Quality::Medium, builder.tolerance());
+        crate::filters::draw_ops(builder, &ops, &buzz_geom::Projection::IDENTITY, 1.0);
+    } else {
+        builder.fill_shape(&silhouette, colour);
+    }
+    builder.pop_isolation();
+}
+
 /// **Where a layer's shadows land**, as the group they are drawn inside.
 ///
 /// The union of what the layer actually draws, each caster thrown the way the
@@ -11217,6 +11303,120 @@ mod symbol_scene {
         let flat_px = gpu.render_rgba(&draw(&flat), 128, 128);
         assert_ne!(centre(&lit_px), [255, 255, 255], "the sun does shade the square when lit");
         assert_eq!(centre(&flat_px), [255, 255, 255], "shadows only: the square keeps its white");
+    }
+
+    /// **Line work drawn shrunk keeps its line** (user 2026-11-28: "on lesser
+    /// zooms the lines of my character seem smudged"). Traced artwork: a black
+    /// fill under two colour regions, the line the gap between them. Drawn at
+    /// half size, the drawing is far larger than [`SEAL_RUN_BELOW_PX`] but the
+    /// line is under a pixel; the regions' in-line seals ate it from both
+    /// sides. Lifted beneath a seal run, it comes out at its true coverage,
+    /// as a four-times supersample of the same picture shows it.
+    #[test]
+    fn a_thin_line_between_colour_regions_survives_zooming_out() {
+        let Some(mut gpu) = GpuHarness::new() else {
+            return;
+        };
+        let mut scene = Scene::default();
+        let layer = scene.add_layer("Art", buzz_scene::LayerKind::Normal);
+        let colour = Color::from_rgb8(0xD0, 0xD0, 0xD0);
+        scene.add_shape(layer, ShapeData::filled(Rect::new(0.0, 0.0, 1200.0, 1200.0).to_path(1e-9), Color::BLACK));
+        // A line 0.8 units wide (0.4 px at half size) at x = 600.
+        scene.add_shape(layer, ShapeData::filled(Rect::new(0.0, 0.0, 599.6, 1200.0).to_path(1e-9), colour));
+        scene.add_shape(layer, ShapeData::filled(Rect::new(600.4, 0.0, 1200.0, 1200.0).to_path(1e-9), colour));
+        let render = |gpu: &mut GpuHarness, zoom: f64, size: u32| {
+            let camera = Camera::new(Point::new(600.0, 600.0), zoom, Size::new(size as f64, size as f64));
+            let mut cache = DrawCache::new();
+            let mut vs = crate::vello::Scene::new();
+            let mut builder = SceneBuilder::new(&mut vs, &camera);
+            cache.begin();
+            draw_frame_within(&mut builder, &scene, 0, Affine::IDENTITY, &FrameOptions::default(), &mut cache);
+            cache.end();
+            gpu.render_rgba(&vs, size, size)
+        };
+        // The darkest the column at the line gets, on the middle row.
+        let darkest = |px: &[u8], size: u32, from: u32, to: u32| -> u8 {
+            (from..to).map(|x| px[((size / 2 * size + x) * 4) as usize]).min().unwrap()
+        };
+        let small = render(&mut gpu, 0.5, 256);
+        let big = render(&mut gpu, 2.0, 1024);
+        let ours = darkest(&small, 256, 124, 132);
+        // The supersample: the line's column, averaged over the 4x4 pixels.
+        let mut reference = 255u32;
+        for x in 124..132 {
+            let mut sum = 0u32;
+            for dx in 0..4 {
+                for dy in 0..4 {
+                    sum += big[(((512 + dy) * 1024 + x * 4 + dx) * 4) as usize] as u32;
+                }
+            }
+            reference = reference.min(sum / 16);
+        }
+        let region = small[((128 * 256 + 40) * 4) as usize];
+        assert!(ours + 40 < region, "the line shows against the colour: {ours} vs {region}");
+        assert!((ours as i32 - reference as i32).abs() <= 30, "at its true weight: {ours} vs the supersample's {reference}");
+    }
+
+    /// **The Shadow layer gives an object its own shadow** (user 2026-11-28):
+    /// a prop (no character, so no built-in shadow) given one on the Shadow
+    /// row darkens the ground below its feet, in the direction set; with the
+    /// layer's eye shut, or the object's shadow off, nothing is drawn; and a
+    /// change to the shadow is drawn on the next frame through the same cache.
+    #[test]
+    fn the_shadow_layer_draws_each_objects_own_shadow() {
+        let Some(mut gpu) = GpuHarness::new() else {
+            return;
+        };
+        let camera = Camera::new(Point::new(128.0, 128.0), 1.0, Size::new(256.0, 256.0));
+        let mut cache = DrawCache::new();
+        let mut draw = |scene: &Scene, cache: &mut DrawCache| {
+            let mut vs = crate::vello::Scene::new();
+            let mut builder = SceneBuilder::new(&mut vs, &camera);
+            cache.begin();
+            draw_frame_within(&mut builder, scene, 0, Affine::IDENTITY, &FrameOptions::default(), cache);
+            cache.end();
+            gpu.render_rgba(&vs, 256, 256)
+        };
+        let mut scene = Scene::default();
+        let symbol = scene.add_symbol("crate", SymbolKind::Graphic, None);
+        scene.enter_symbol(symbol);
+        let inside = scene.layers().iter().next().unwrap().id;
+        scene.add_shape(inside, ShapeData::filled(Rect::new(-15.0, -60.0, 15.0, 0.0).to_path(1e-9), Color::from_rgb8(0x30, 0x60, 0xC0)));
+        scene.exit_symbol();
+        // White ground under everything, so a shadow shows as dark on it.
+        let ground = scene.add_layer("Ground", buzz_scene::LayerKind::Normal);
+        scene.add_shape(ground, ShapeData::filled(Rect::new(0.0, 0.0, 256.0, 256.0).to_path(1e-9), Color::WHITE));
+        let stage = scene.add_layer("Stage", buzz_scene::LayerKind::Normal);
+        scene.add_object_at(stage, 0, Object::instance_of(ObjectId(900), symbol).with_transform(Affine::translate((128.0, 150.0)))).expect("placed");
+        scene.lights_mut().no_character_shadows = true;
+        // Straight down, as long as the crate is tall, hard-edged and solid.
+        let shadow = buzz_scene::ObjectShadow { angle: 90.0, length: 1.0, softness: 0.0, darkness: 1.0, ..Default::default() };
+        // Just below the feet, in the middle across.
+        let below = |px: &[u8]| -> [u8; 3] {
+            let i = (175 * 256 + 128) * 4;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+
+        let bare = draw(&scene, &mut cache);
+        assert_eq!(below(&bare), [255, 255, 255], "no shadow yet");
+        {
+            let layer = scene.shadow_layer_mut();
+            layer.enabled = true;
+            layer.set_shadow(0, ObjectId(900), shadow, true);
+        }
+        let shaded = draw(&scene, &mut cache);
+        assert!(below(&shaded)[0] < 60, "the ground below is in shadow: {:?}", below(&shaded));
+
+        let mut hidden = scene.clone();
+        hidden.shadow_layer_mut().hidden = true;
+        assert_eq!(below(&draw(&hidden, &mut DrawCache::new())), [255, 255, 255], "the eye shut draws none");
+
+        scene.shadow_layer_mut().set_shadow(0, ObjectId(900), buzz_scene::ObjectShadow { darkness: 0.3, ..shadow }, true);
+        let lighter = draw(&scene, &mut cache);
+        assert!(below(&lighter)[0] > below(&shaded)[0] + 60, "the change is drawn: {:?}", below(&lighter));
+
+        scene.shadow_layer_mut().set_shadow(0, ObjectId(900), buzz_scene::ObjectShadow { on: false, ..shadow }, true);
+        assert_eq!(below(&draw(&scene, &mut cache)), [255, 255, 255], "turned off");
     }
 
     /// **Characters throw their shadow with no light set up**: a character

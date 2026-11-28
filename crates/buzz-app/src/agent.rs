@@ -176,7 +176,7 @@ pub fn route(command: Command) -> Route {
         | FirstFrame | LastFrame | CutFrames | CopyFrames | PasteFrames | SelectAllFrames | CopyMotion | CopyPose | ClearFrames
         | ReverseFrames | CopyPasteStage | ClearStageCopy | ClearTalkRanges | PuppetMode | ToggleOnionSkin | ToggleAutoKeyframe | ToggleFramesOnLockedLayers | ToggleEqualLayerLengths | ToggleEditMultipleFrames
         | ToggleProtectKeyframes | ProtectThisKeyframe | ProtectFromHere
-        | ToggleCamera | AddCameraKeyframe | RemoveCameraKeyframe | ResetCamera
+        | ToggleCamera | ToggleShadowLayer | AddCameraKeyframe | RemoveCameraKeyframe | ResetCamera
         | AddLightKeyframe | RemoveLightKeyframe | SaveAsTemplate | RenameBodyLayers
         | RenameFaceLayers | GroupEmptyLayers | RemoveFolder | RemoveAllFolders => Route::Run,
 

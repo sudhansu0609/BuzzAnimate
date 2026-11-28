@@ -713,6 +713,12 @@ pub fn build_menus(ui: &mut MenuUi<'_>, state: &MenuState<'_>) -> Vec<Command> {
                 raised.push(Command::ToggleCamera);
                 ui.close();
             }
+            let shadows = scene.shadow_layer().enabled;
+            let mark = if shadows { "✔ " } else { "   " };
+            if ui.button(format!("{mark}{}", Command::ToggleShadowLayer.label())).clicked() {
+                raised.push(Command::ToggleShadowLayer);
+                ui.close();
+            }
             ui.separator();
             for c in [
                 Command::AddCameraKeyframe,

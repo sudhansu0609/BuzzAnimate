@@ -400,6 +400,91 @@ fn paint_tip_cursor(painter: &egui::Painter, pos: egui::Pos2, tool: buzz_ui::Too
 /// into half a turn first: the handle at the top-left and the one at the
 /// bottom-right want the same arrow. Screen y runs down, so a positive-slope
 /// line is the north-west/south-east one.
+/// **Free Transform's pointer, as Animate draws it** (user 2026-11-28: "the
+/// free transform tool shall work exactly like Adobe Animate"): the resize
+/// arrows on a handle, the curved arrow just outside a corner, the skew arrows
+/// on an edge, the arrow with a four-way badge inside the box (a drag there
+/// moves), and the arrow with a small circle over the transformation point.
+/// egui has system cursors only for the resize arrows; the others are drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TransformCursor {
+    /// A system cursor (the resize arrows along a handle).
+    System(egui::CursorIcon),
+    /// Turn: a curved arrow round the hotspot.
+    Rotate,
+    /// Skew: two half arrows sliding past each other along the edge, which
+    /// runs in this direction on screen.
+    Skew(egui::Vec2),
+    /// Inside the box: the arrow, with the four-way move badge.
+    Move,
+    /// On the transformation point: the arrow, with a small circle.
+    Pivot,
+}
+
+/// Animate's rotate cursor: three quarters of a circle round `pos` with an
+/// arrowhead, outlined so it reads on any artwork.
+fn paint_rotate_cursor(painter: &egui::Painter, pos: egui::Pos2) {
+    let r = 7.0;
+    let points: Vec<egui::Pos2> = (0..=18)
+        .map(|i| {
+            let a = -std::f32::consts::FRAC_PI_2 + (i as f32 / 18.0) * 1.5 * std::f32::consts::PI;
+            pos + egui::vec2(a.cos(), a.sin()) * r
+        })
+        .collect();
+    let end = *points.last().expect("points");
+    // The arrowhead at the arc's end, pointing on round it.
+    let head = [end + egui::vec2(-4.0, -3.5), end, end + egui::vec2(-4.0, 3.5)];
+    for (stroke, width) in [(egui::Color32::BLACK, 3.5), (egui::Color32::WHITE, 1.5)] {
+        painter.add(egui::Shape::line(points.clone(), egui::Stroke::new(width, stroke)));
+        painter.add(egui::Shape::line(head.to_vec(), egui::Stroke::new(width, stroke)));
+    }
+}
+
+/// Animate's skew cursor: two half arrows, one each side of `pos`, pointing
+/// opposite ways along `along`.
+fn paint_skew_cursor(painter: &egui::Painter, pos: egui::Pos2, along: egui::Vec2) {
+    let d = if along.length() > 0.0 { along.normalized() } else { egui::vec2(1.0, 0.0) };
+    let n = egui::vec2(-d.y, d.x);
+    let half = 8.0;
+    for side in [-1.0f32, 1.0] {
+        let base = pos + n * (3.0 * side);
+        let dir = d * side;
+        let tail = base - dir * half;
+        let tip = base + dir * half;
+        // A half arrowhead on the outside of each line, as Animate draws it.
+        let barb = tip - dir * 4.0 + n * (3.5 * side);
+        for (stroke, width) in [(egui::Color32::BLACK, 3.5), (egui::Color32::WHITE, 1.5)] {
+            painter.add(egui::Shape::line(vec![tail, tip, barb], egui::Stroke::new(width, stroke)));
+        }
+    }
+}
+
+/// The badge Animate puts beside its arrow: the four-way move cross, or the
+/// small circle of the transformation point.
+fn paint_cursor_badge(painter: &egui::Painter, pos: egui::Pos2, cursor: TransformCursor) {
+    let at = pos + egui::vec2(14.0, 16.0);
+    match cursor {
+        TransformCursor::Move => {
+            let a = 5.5;
+            for (stroke, width) in [(egui::Color32::BLACK, 3.5), (egui::Color32::WHITE, 1.5)] {
+                let s = egui::Stroke::new(width, stroke);
+                painter.line_segment([at - egui::vec2(a, 0.0), at + egui::vec2(a, 0.0)], s);
+                painter.line_segment([at - egui::vec2(0.0, a), at + egui::vec2(0.0, a)], s);
+                for d in [egui::vec2(1.0, 0.0), egui::vec2(-1.0, 0.0), egui::vec2(0.0, 1.0), egui::vec2(0.0, -1.0)] {
+                    let tip = at + d * a;
+                    let n = egui::vec2(-d.y, d.x);
+                    painter.add(egui::Shape::line(vec![tip - d * 2.5 + n * 2.5, tip, tip - d * 2.5 - n * 2.5], s));
+                }
+            }
+        }
+        TransformCursor::Pivot => {
+            painter.circle_stroke(at, 3.5, egui::Stroke::new(3.0, egui::Color32::BLACK));
+            painter.circle_stroke(at, 3.5, egui::Stroke::new(1.5, egui::Color32::WHITE));
+        }
+        _ => {}
+    }
+}
+
 fn resize_cursor_along(direction: buzz_geom::Vec2) -> egui::CursorIcon {
     let turn = direction.y.atan2(direction.x).rem_euclid(std::f64::consts::PI);
     match (turn / std::f64::consts::FRAC_PI_4).round() as i32 % 4 {
@@ -7841,6 +7926,11 @@ impl App {
                     self.camera_panel(ui);
                     return;
                 }
+                // And the Shadow row's: every object's shadow.
+                if self.editor.shadow_selected && self.editor.doc.scene().shadow_layer().enabled {
+                    self.shadow_panel(ui);
+                    return;
+                }
 
                 let editor = &mut self.editor;
                 let at = editor.edit_at();
@@ -8253,6 +8343,7 @@ impl App {
                     range_anchor: self.editor.selection.range_anchor(),
                     timeline_selection: self.editor.selection.timeline().cloned(),
                     camera_selected: self.editor.camera_selected,
+                    shadow_selected: self.editor.shadow_selected,
                     master_audio_layer: self
                         .editor
                         .doc
@@ -8386,6 +8477,49 @@ impl App {
     /// Every control keys the camera at the playhead — the same rule the
     /// Camera tool follows when it is dragged, so aiming the camera by hand
     /// and typing a number into a box do the same thing.
+    /// **The Shadow row's properties** ([`buzz_ui::shadow_panel`]): every
+    /// object on the main timeline at the playhead, each with its shadow.
+    fn shadow_panel(&mut self, ui: &mut egui::Ui) {
+        let frame = self.editor.current_frame;
+        let scene = self.editor.doc.scene();
+        let state = scene.shadow_layer().state_at(frame);
+        let master = self.editor.doc.master_audio().map(|(_, layer)| layer);
+        let mut entries = Vec::new();
+        for layer in scene.stage_layers().iter() {
+            if !layer.kind.holds_artwork() || Some(layer.id) == master || layer.audio_guide {
+                continue;
+            }
+            for object in layer.objects_at(frame).iter() {
+                let name = object
+                    .instance()
+                    .and_then(|i| scene.library().get(i.symbol))
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| layer.name.clone());
+                entries.push(buzz_ui::shadow_panel::ShadowEntry { object: object.id, name, shadow: state.get(&object.id).copied() });
+            }
+        }
+        let shadows = scene.shadow_layer();
+        let (locked, keyed) = (shadows.locked, shadows.has_key_at(frame));
+        let auto = self.editor.auto_keyframe;
+        let Some(edit) = egui::ScrollArea::vertical()
+            .id_salt("shadow-panel")
+            .show(ui, |ui| buzz_ui::shadow_panel::shadow_panel(ui, &entries, locked, keyed, auto))
+            .inner
+        else {
+            return;
+        };
+        match edit {
+            buzz_ui::shadow_panel::ShadowEdit::Set(object, shadow) => self.editor.set_object_shadow(object, shadow),
+            buzz_ui::shadow_panel::ShadowEdit::All(on) => {
+                for entry in &entries {
+                    let shadow = entry.shadow.unwrap_or_default();
+                    self.editor.set_object_shadow(entry.object, buzz_scene::ObjectShadow { on, ..shadow });
+                }
+                self.editor.doc.end_gesture();
+            }
+        }
+    }
+
     fn camera_panel(&mut self, ui: &mut egui::Ui) {
         let frame = self.editor.current_frame;
         let response = buzz_ui::camera_panel(
@@ -10755,11 +10889,13 @@ impl App {
             // Clicking a layer takes the camera row's highlight away, as
             // clicking any row takes it from the one before.
             self.editor.camera_selected = false;
+            self.editor.shadow_selected = false;
             self.editor.light_row_selected = false;
         }
         if let Some(layers) = response.select_layers {
             self.editor.select_layers(&layers);
             self.editor.camera_selected = false;
+            self.editor.shadow_selected = false;
             self.editor.light_row_selected = false;
         }
         if clicked_a_layer {
@@ -10801,6 +10937,7 @@ impl App {
                 .selection
                 .select_timeline_contents(self.editor.doc.scene(), frame);
             self.editor.camera_selected = false;
+            self.editor.shadow_selected = false;
             self.editor.light_row_selected = false;
         }
         if let Some(m) = response.move_frames {
@@ -10916,6 +11053,7 @@ impl App {
         }
         if response.select_camera {
             self.editor.camera_selected = true;
+            self.editor.shadow_selected = false;
             self.editor.light_row_selected = false;
             // Selecting the camera row selects the Camera tool, which is what
             // Animate does — the row and the tool are the same idea.
@@ -10932,11 +11070,34 @@ impl App {
                 scene.camera_mut().locked = locked;
             });
         }
+        // **The Shadow row** (user 2026-11-28): selected, its shadows are
+        // what Properties shows — brought forward where it already is, the
+        // layout untouched — and what the frame commands key.
+        if response.select_shadow {
+            self.editor.shadow_selected = true;
+            self.editor.camera_selected = false;
+            self.editor.light_row_selected = false;
+            self.editor.selection.clear_timeline();
+            self.editor.workspace.reveal(buzz_ui::PanelId::Properties);
+        }
+        if response.toggle_shadow_eye {
+            self.editor.doc.edit("Show/Hide Shadows", |scene| {
+                let hidden = !scene.shadow_layer().hidden;
+                scene.shadow_layer_mut().hidden = hidden;
+            });
+        }
+        if response.toggle_shadow_lock {
+            self.editor.doc.edit("Lock Shadow Layer", |scene| {
+                let locked = !scene.shadow_layer().locked;
+                scene.shadow_layer_mut().locked = locked;
+            });
+        }
         if let Some(id) = response.select_light {
             // Clicking a light's channel makes it the active light, the way
             // clicking any row takes the highlight from the one before.
             self.editor.light_panel.selected = Some(id);
             self.editor.camera_selected = false;
+            self.editor.shadow_selected = false;
             // ...and F5/F6/F7 key the light, as they would a layer.
             self.editor.light_row_selected = true;
             self.editor.light_frames = response.select_light_cells.map(|(_, a, b)| (a, b));
@@ -10998,12 +11159,14 @@ impl App {
             });
         }
         if let Some(tween) = response.tween {
-            commands.push(match tween {
-                buzz_ui::TweenRequest::Motion => Command::CreateMotionTween,
-                buzz_ui::TweenRequest::Shape => Command::CreateShapeTween,
-                buzz_ui::TweenRequest::Classic => Command::CreateClassicTween,
-                buzz_ui::TweenRequest::Remove => Command::RemoveTween,
-            });
+            match tween {
+                buzz_ui::TweenRequest::Motion => commands.push(Command::CreateMotionTween),
+                buzz_ui::TweenRequest::Shape => commands.push(Command::CreateShapeTween),
+                // The menu item creates; only the C key (Create Classic
+                // Tween's shortcut) toggles a tween off again.
+                buzz_ui::TweenRequest::Classic => self.editor.apply_tween_request(buzz_scene::Tween::classic()),
+                buzz_ui::TweenRequest::Remove => commands.push(Command::RemoveTween),
+            }
         }
         if response.toggle_play {
             commands.push(Command::PlayPause);
@@ -11343,8 +11506,7 @@ impl App {
             // The ring just outside a corner turns the selection, and with no
             // cursor change nothing distinguished it from the empty stage
             // beside it — where the same drag marquees and throws the selection
-            // away. Grab is the nearest thing egui offers to Animate's curved
-            // arrow, and it reads as "take hold of this and swing it".
+            // away. Each zone shows Animate's own pointer (`TransformCursor`).
             //
             // Only Free Transform has a gizmo to say anything about: the
             // Selection tool is Animate's arrow, with no handles to resize, turn
@@ -11355,7 +11517,25 @@ impl App {
                 && area.contains(pos)
                 && let Some(cursor) = self.transform_cursor(area, pos)
             {
-                ui.ctx().set_cursor_icon(cursor);
+                let painter = ui
+                    .ctx()
+                    .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("stage-tool-cursor")))
+                    .with_clip_rect(area);
+                match cursor {
+                    TransformCursor::System(icon) => ui.ctx().set_cursor_icon(icon),
+                    TransformCursor::Rotate => {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                        paint_rotate_cursor(&painter, pos);
+                    }
+                    TransformCursor::Skew(along) => {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                        paint_skew_cursor(&painter, pos, along);
+                    }
+                    TransformCursor::Move | TransformCursor::Pivot => {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                        paint_cursor_badge(&painter, pos, cursor);
+                    }
+                }
             } else if tool == Selection
                 && let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos())
                 && area.contains(pos)
@@ -11505,11 +11685,11 @@ impl App {
     /// Read against the same box the chrome draws and the same radii
     /// `tools::transform_zone` tests, so the cursor cannot promise a gesture
     /// the release will not make.
-    fn transform_cursor(&self, area: egui::Rect, pos: egui::Pos2) -> Option<egui::CursorIcon> {
+    fn transform_cursor(&self, area: egui::Rect, pos: egui::Pos2) -> Option<TransformCursor> {
         let frame = self.editor.selection_box()?;
         let local = buzz_geom::Point::new((pos.x - area.min.x) as f64, (pos.y - area.min.y) as f64);
         if self.editor.pointer_on_pivot(local) {
-            return Some(egui::CursorIcon::Grab);
+            return Some(TransformCursor::Pivot);
         }
         let at = self.editor.screen_to_edit(local);
         let pivot = self.editor.pivot().unwrap_or_else(|| frame.center());
@@ -11529,16 +11709,15 @@ impl App {
         };
         let centre = on_screen(frame.center());
         let arrow = |towards: Option<buzz_geom::Point>| {
-            Some(resize_cursor_along(towards? - centre?))
+            Some(TransformCursor::System(resize_cursor_along(towards? - centre?)))
         };
         let corners = frame.corners().map(on_screen);
         let edges = frame.mid_edges().map(on_screen);
         // Rotate Mode folded in, so every grip that only turns shows the turn.
         let rotate_only = self.editor.machine.rotate_only();
         return match crate::tools::effective_zone(rotate_only, frame, pivot, at, grab) {
-            crate::tools::TransformZone::Rotate | crate::tools::TransformZone::Pivot => {
-                Some(egui::CursorIcon::Grab)
-            }
+            crate::tools::TransformZone::Rotate => Some(TransformCursor::Rotate),
+            crate::tools::TransformZone::Pivot => Some(TransformCursor::Pivot),
             crate::tools::TransformZone::Corner => {
                 let doc_corners = frame.corners();
                 let (index, _) = doc_corners
@@ -11561,9 +11740,12 @@ impl App {
                 } else {
                     (corners[0], corners[3])
                 };
-                Some(resize_cursor_along(to? - from?))
+                let d = to? - from?;
+                Some(TransformCursor::Skew(egui::vec2(d.x as f32, d.y as f32)))
             }
-            crate::tools::TransformZone::Inside => None,
+            // Inside the box a drag moves the selection: Animate's arrow with
+            // its move badge. Outside it, the tool's own pointer.
+            crate::tools::TransformZone::Inside => frame.contains(at).then_some(TransformCursor::Move),
         };
     }
 
@@ -12807,6 +12989,8 @@ impl App {
             // Animate asks for the name and type first (`symbol_dialog`).
             Command::ConvertToSymbol => self.open_symbol_dialog(crate::symbol_dialog::Purpose::Convert),
             Command::NewSymbol => self.open_symbol_dialog(crate::symbol_dialog::Purpose::New),
+            // Animate's Duplicate Symbol dialog: the copy's name is asked.
+            Command::DuplicateSymbol => self.open_duplicate_dialog(),
             // No longer menu entries: the same dialog as Import to Stage,
             // which takes pictures and sound as well (`import_dialog`).
             Command::ImportSound | Command::ImportImage => {
@@ -12919,9 +13103,7 @@ impl App {
             }
             other => {
                 self.editor.run(other);
-                if other == Command::DuplicateSymbol {
-                    self.duplicate_follows_cast();
-                }
+
             }
         }
     }
@@ -12938,7 +13120,11 @@ impl App {
     /// `<Character> <pose> copy`, the film's copy renamed to match — so placing
     /// or importing the character anywhere brings it. The Cast file is backed
     /// up first, as every Cast edit is.
-    fn duplicate_follows_cast(&mut self) {
+    ///
+    /// `named`: the name was typed in the Duplicate Symbol dialog, so the
+    /// Cast pose is labelled by it (the character's name in front, which is
+    /// how the Cast links a film's pose to its own) rather than "<pose> copy".
+    fn duplicate_follows_cast(&mut self, named: bool) {
         let Some((source, copy)) = self.editor.last_duplicate.take() else {
             return;
         };
@@ -12967,12 +13153,22 @@ impl App {
         if let Some((asset, main, owner_name)) = cast {
             // The pose's own label: the original's name less the character's
             // name and any copy number, then "copy".
-            let bare = crate::cast_combine::without_copy_number(&from);
-            let pose = [main.as_str(), owner_name.as_str()]
-                .iter()
-                .find_map(|prefix| bare.strip_prefix(prefix).map(str::trim))
-                .unwrap_or(bare);
-            let label = if pose.is_empty() { "copy".to_string() } else { format!("{pose} copy") };
+            let label = if named {
+                // The name typed, less the character's own name in front.
+                let typed = to.trim();
+                let pose = [main.as_str(), owner_name.as_str()]
+                    .iter()
+                    .find_map(|prefix| typed.strip_prefix(prefix).map(str::trim))
+                    .unwrap_or(typed);
+                if pose.is_empty() { "copy".to_string() } else { pose.to_string() }
+            } else {
+                let bare = crate::cast_combine::without_copy_number(&from);
+                let pose = [main.as_str(), owner_name.as_str()]
+                    .iter()
+                    .find_map(|prefix| bare.strip_prefix(prefix).map(str::trim))
+                    .unwrap_or(bare);
+                if pose.is_empty() { "copy".to_string() } else { format!("{pose} copy") }
+            };
             let stamp = crate::cast_fresh::backup_stamp();
             match crate::cast_pose_edit::add_pose(
                 &mut self.editor.assets,
@@ -18741,6 +18937,15 @@ impl App {
         ));
     }
 
+    /// **Duplicate Symbol**, asked: the dialog with "<name> copy" selected.
+    fn open_duplicate_dialog(&mut self) {
+        let Some((instance, source)) = self.editor.duplicate_source() else {
+            return;
+        };
+        let name = self.editor.duplicate_default_name(source);
+        self.symbol_dialog = crate::symbol_dialog::SymbolDialog::duplicate(self.editor.doc.scene(), instance, source, name);
+    }
+
     /// Draw the symbol dialog, and convert or create once it is accepted.
     fn symbol_dialog_ui(&mut self, ctx: &egui::Context) {
         use crate::symbol_dialog::{Outcome, Purpose};
@@ -18753,11 +18958,21 @@ impl App {
             Outcome::Cancelled => self.symbol_dialog = None,
             Outcome::Accepted { name, kind } => {
                 self.symbol_dialog = None;
-                // Remembered, as Animate remembers the last type chosen.
-                self.editor.library.new_symbol_kind = kind;
                 match purpose {
-                    Purpose::Convert => self.editor.convert_selection_to_symbol_as(Some(&name), kind),
-                    Purpose::New => self.editor.new_symbol_as(Some(&name), kind),
+                    Purpose::Convert | Purpose::New => {
+                        // Remembered, as Animate remembers the last type chosen.
+                        self.editor.library.new_symbol_kind = kind;
+                        if purpose == Purpose::Convert {
+                            self.editor.convert_selection_to_symbol_as(Some(&name), kind);
+                        } else {
+                            self.editor.new_symbol_as(Some(&name), kind);
+                        }
+                    }
+                    Purpose::Duplicate { instance, source } => {
+                        if self.editor.duplicate_symbol_as((instance, source), &name, Some(kind)).is_some() {
+                            self.duplicate_follows_cast(true);
+                        }
+                    }
                 }
                 self.editor.doc.end_gesture();
             }
@@ -24851,6 +25066,57 @@ mod idle_tests {
         frame(&mut app, vec![escape]);
         assert!(app.symbol_dialog.is_none());
         assert_eq!(app.editor.doc.scene().library().len(), 1, "cancelled");
+    }
+
+    /// **Duplicate Symbol asks for the copy's name** (user 2026-11-28): the
+    /// dialog opens with "<name> copy" selected and the original's type;
+    /// nothing is copied until it is accepted, the typed name is the copy's,
+    /// and the instance on the stage shows the copy.
+    #[test]
+    fn duplicate_symbol_asks_for_the_new_name() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        let layer = app.editor.doc.scene().layers().iter().next().unwrap().id;
+        let mut id = None;
+        app.editor.doc.edit("fixture", |s| {
+            id = s.add_shape(
+                layer,
+                buzz_scene::ShapeData::filled(
+                    buzz_geom::Shape::to_path(&buzz_geom::Rect::new(0.0, 0.0, 50.0, 50.0), 1e-9),
+                    peniko::Color::BLACK,
+                ),
+            );
+        });
+        app.editor.selection.set([id.unwrap()]);
+        app.editor.convert_selection_to_symbol_as(Some("Hero"), buzz_scene::SymbolKind::Graphic);
+        let instance = app.editor.selection.iter().next().expect("the instance is selected");
+        app.dispatch(Command::DuplicateSymbol);
+        assert!(app.symbol_dialog.is_some(), "the dialog is up");
+        assert_eq!(app.symbol_dialog.as_ref().unwrap().name, "Hero copy");
+        assert_eq!(app.editor.doc.scene().library().len(), 1, "nothing copied yet");
+
+        let ctx = egui::Context::default();
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput { events, ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| app.symbol_dialog_ui(ui.ctx()));
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![egui::Event::Text("Hero Waving".into())]);
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![enter]);
+        assert!(app.symbol_dialog.is_none(), "Enter accepts");
+        let scene = app.editor.doc.scene();
+        let copy = scene.library().find_by_name("Hero Waving").expect("named as typed");
+        assert_eq!(copy.kind, buzz_scene::SymbolKind::Graphic, "the original's type");
+        let shown = scene.find_object(instance).and_then(|(_, o)| o.instance().map(|i| i.symbol));
+        assert_eq!(shown, Some(copy.id), "the instance shows the copy");
+        assert_eq!(scene.library().len(), 2);
     }
 
     /// **The stage menu acts on what was right-clicked**, not on whatever the
@@ -31724,6 +31990,32 @@ mod layer_rig_ui_tests {
         assert_eq!(followed.as_deref(), Some(chest_name.as_str()), "the added part follows the part it is on: {:?}", links(&app));
     }
 
+    /// **The Shadow layer on screen** (user 2026-11-28): added, its row is on
+    /// the timeline under the Camera's (added with the Shadows button beside
+    /// the Camera's), and the Properties panel lists each object on the stage with
+    /// its shadow.
+    #[test]
+    fn the_shadow_layer_shows_its_row_and_its_properties() {
+        let mut app = App::new(GpuPreference::Automatic);
+        let layer = app.editor.doc.scene().layers().iter().next().unwrap().id;
+        app.editor.doc.edit("Name", |scene| {
+            scene.update_layer(layer, |l| l.name = "Crate Layer".into());
+            scene.add_shape(layer, buzz_scene::ShapeData::filled(buzz_geom::Shape::to_path(&buzz_geom::Rect::new(0.0, 0.0, 40.0, 40.0), 1e-9), peniko::Color::BLACK));
+        });
+        app.editor.run(Command::ToggleCamera);
+        let before = painted_text(&mut app);
+        assert!(before.iter().any(|t| t == "Shadows"), "the button is there before the layer");
+        assert!(!before.iter().any(|t| t == "Shadow"), "no Shadow row yet");
+        app.dispatch(Command::ToggleShadowLayer);
+        app.editor.workspace.reveal(buzz_ui::PanelId::Properties);
+        let text = painted_text(&mut app);
+        let camera = text.iter().position(|t| t == "Camera").expect("the Camera row");
+        let shadow = text.iter().position(|t| t == "Shadow").expect("the Shadow row");
+        assert!(shadow > camera, "drawn after (under) the Camera row");
+        assert!(text.iter().any(|t| t == "Object Shadows"), "Properties shows the shadows: {text:?}");
+        assert!(text.iter().any(|t| t == "Crate Layer"), "listing the object on the stage");
+    }
+
     /// **Tagging sets the rig's parenting without a second layer of one name
     /// and without moving the animation** (user 2026-11-27: "when rig is done
     /// the same sequence shall be set in the layer parenting"). A character
@@ -34135,6 +34427,57 @@ mod tool_follow_tests {
         assert_eq!(app.strip_flyout.map(|(id, _)| id), Some(PanelId::ToolOptions), "another tool shows its options as before");
         let docks = |slots: &[buzz_ui::Slot]| slots.iter().map(|s| (s.id, s.dock)).collect::<Vec<_>>();
         assert_eq!(docks(&app.editor.workspace.slots), docks(&layout), "the layout is as it was");
+    }
+
+    /// **Free Transform's pointer is Animate's in every zone** (user
+    /// 2026-11-28): resize arrows on a corner, the curved arrow just outside
+    /// it, skew arrows along an edge, the move badge inside the box, the
+    /// circle badge on the transformation point, and the plain tool pointer
+    /// on the empty stage beyond.
+    #[test]
+    fn free_transform_shows_animates_pointer_in_each_zone() {
+        let mut app = App::new(GpuPreference::Automatic);
+        app.recovery.found.clear();
+        app.splash.dismiss();
+        let ctx = egui::Context::default();
+        buzz_ui::theme::apply(&ctx);
+        let mut frame = |app: &mut App| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0))),
+                ..Default::default()
+            };
+            let mut area = egui::Rect::NOTHING;
+            let _ = ctx.run_ui(input, |ui| area = app.build_ui(ui));
+            area
+        };
+        let layer = app.editor.doc.scene().layers().iter().next().unwrap().id;
+        let mut id = None;
+        app.editor.doc.edit("fixture", |s| {
+            id = s.add_shape(
+                layer,
+                buzz_scene::ShapeData::filled(buzz_geom::Shape::to_path(&buzz_geom::Rect::new(100.0, 100.0, 300.0, 300.0), 1e-9), peniko::Color::BLACK),
+            );
+        });
+        app.editor.run(Command::SelectTool(buzz_ui::ToolId::FreeTransform));
+        app.editor.selection.set([id.unwrap()]);
+        let area = frame(&mut app);
+        let frame_box = app.editor.selection_box().expect("a box");
+        let screen = |app: &App, p: buzz_geom::Point| {
+            let s = app.editor.camera.doc_to_screen(app.editor.edit_to_stage().map_point(p).unwrap());
+            area.min + egui::vec2(s.x as f32, s.y as f32)
+        };
+        let [tl, _, br, _] = frame_box.corners();
+        let zoom = app.editor.camera.zoom;
+        let out = 16.0 / zoom;
+        let mid_top = buzz_geom::Point::new((tl.x * 3.0 + br.x) / 4.0, tl.y);
+        assert!(matches!(app.transform_cursor(area, screen(&app, br)), Some(TransformCursor::System(_))), "a corner resizes");
+        assert_eq!(app.transform_cursor(area, screen(&app, br + buzz_geom::Vec2::new(out, out))), Some(TransformCursor::Rotate), "just outside turns");
+        assert!(matches!(app.transform_cursor(area, screen(&app, mid_top)), Some(TransformCursor::Skew(_))), "an edge skews");
+        let inside = buzz_geom::Point::new(tl.x + 30.0, tl.y + 60.0);
+        assert_eq!(app.transform_cursor(area, screen(&app, inside)), Some(TransformCursor::Move), "inside moves");
+        assert_eq!(app.transform_cursor(area, screen(&app, frame_box.center())), Some(TransformCursor::Pivot), "the point");
+        let far = buzz_geom::Point::new(br.x + 400.0 / zoom, br.y + 400.0 / zoom);
+        assert_eq!(app.transform_cursor(area, screen(&app, far)), None, "the empty stage keeps the tool's pointer");
     }
 
     /// **The Brush's colour swatch opens its picker** (user 2026-11-22: "I

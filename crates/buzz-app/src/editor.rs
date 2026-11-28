@@ -94,6 +94,9 @@ pub struct FrameClip {
 
 /// What a camera edit says when the camera is locked: the lock is a small
 /// icon on the Camera row, easy to forget, so the message says where it is.
+/// What a locked Shadow row says when something tries to key it.
+pub const SHADOWS_LOCKED: &str = "The Shadow layer is locked \u{2014} unlock its row to change the shadows";
+
 pub const CAMERA_LOCKED: &str = "The camera is locked \u{2014} click the lock on the Camera row to unlock it";
 
 /// The shortest drag that counts as drawing a bone, in screen pixels.
@@ -465,6 +468,11 @@ pub struct Editor {
     /// not a layer — so which row is current cannot live in `Selection`, which
     /// addresses layers and objects.
     pub camera_selected: bool,
+    /// **The Shadow row is the selected one** (user 2026-11-28): the
+    /// Properties panel shows every object's shadow, and the frame commands
+    /// key the Shadow layer. Not a layer, for the same reason the camera's
+    /// row is not.
+    pub shadow_selected: bool,
     /// A light's row is the current timeline row (the light is
     /// `light_panel.selected`), so F5/F6/F7 and the frame menu key the light
     /// rather than the layers. Cleared whenever the camera row or a layer is.
@@ -821,6 +829,7 @@ pub struct DocView {
     pub onion: Onion,
     pub edit_multiple: bool,
     pub camera_selected: bool,
+    pub shadow_selected: bool,
     pub group_pivot: Option<(Vec<ObjectId>, Point)>,
     pub sequence_scrub: Option<u32>,
     pub ruler_marks: Vec<u32>,
@@ -855,6 +864,7 @@ impl DocView {
             onion: Onion::default(),
             edit_multiple: false,
             camera_selected: false,
+            shadow_selected: false,
             group_pivot: None,
             sequence_scrub: None,
             ruler_marks: Vec::new(),
@@ -963,6 +973,7 @@ impl Editor {
             filter_panel: buzz_ui::FilterPanelState::default(),
             motion_editor: buzz_ui::MotionEditorState::default(),
             camera_selected: false,
+            shadow_selected: false,
             light_row_selected: false,
             light_frames: None,
             workspace,
@@ -1377,6 +1388,7 @@ impl Editor {
             onion: std::mem::replace(&mut self.onion, view.onion),
             edit_multiple: std::mem::replace(&mut self.edit_multiple, view.edit_multiple),
             camera_selected: std::mem::replace(&mut self.camera_selected, view.camera_selected),
+            shadow_selected: std::mem::replace(&mut self.shadow_selected, view.shadow_selected),
             group_pivot: std::mem::replace(&mut self.group_pivot, view.group_pivot),
             sequence_scrub: std::mem::replace(&mut self.sequence_scrub, view.sequence_scrub),
             ruler_marks: std::mem::replace(&mut self.ruler_marks, view.ruler_marks),
@@ -2934,8 +2946,10 @@ impl Editor {
         self.drag_moved = Vec2::ZERO;
         // Capture the visible circle before snapping or picking artwork under
         // it. A pivot can be outside its selection or over another object.
+        self.machine.set_pivot_snapping(self.view.snap.any());
         if self.pointer_on_pivot(screen) && let Some(pivot) = self.pivot() {
-            self.machine.begin_pivot_drag(self.screen_to_edit(screen), screen, pivot);
+            let reach = crate::tools::TRANSFORM_GRAB_PX / self.camera.zoom.max(f64::MIN_POSITIVE);
+            self.machine.begin_pivot_drag_in(self.screen_to_edit(screen), screen, pivot, self.selection_box(), reach);
             return;
         }
         let doc = self.screen_to_edit(screen);
@@ -3041,7 +3055,18 @@ impl Editor {
         // Free Transform's snapping pulled the press (onto the edge of the
         // part beside it).
         let raw = self.screen_to_edit(screen);
-        self.gizmo_click = (tool == ToolId::FreeTransform && on_gizmo && !mods.shift && !mods.alt && !mods.ctrl)
+        // Only the zones nothing is drawn on — the ring that turns and the
+        // edge line that skews. A press on a handle square or the point is
+        // the gizmo's, click or drag, as in Animate.
+        let open_zone = self.selection_box().is_some_and(|frame| {
+            let pivot = self.pivot().unwrap_or_else(|| frame.center());
+            let grab = crate::tools::TRANSFORM_GRAB_PX / self.camera.zoom.max(f64::MIN_POSITIVE);
+            matches!(
+                crate::tools::effective_zone(self.machine.rotate_only(), frame, pivot, doc, grab),
+                crate::tools::TransformZone::Rotate | crate::tools::TransformZone::Edge(_)
+            )
+        });
+        self.gizmo_click = (tool == ToolId::FreeTransform && on_gizmo && open_zone && !mods.shift && !mods.alt && !mods.ctrl)
             .then(|| self.object_at(raw, 0.0))
             .flatten()
             .filter(|id| !self.selection.contains(*id))
@@ -3086,11 +3111,14 @@ impl Editor {
         };
         let pivot = self.pivot();
         // **A press that has just picked a part up moves it** with Free
-        // Transform: the box it brings has its point in the middle and its
-        // handles round a small part, and the drag that picked the part was
-        // meant to carry it, not to drag the point off it. No handle is in
-        // reach for this press (a zoom so close every handle is a pixel).
-        let zoom = if just_grabbed && tool == ToolId::FreeTransform { 1e9 } else { self.camera.zoom };
+        // Transform, as Animate's does: the box it brings has its point in
+        // the middle and its handles round a small part, and the drag that
+        // picked the part was meant to carry it, not the point.
+        // (In Rotate Mode the press turns what it picked up instead.)
+        if just_grabbed && tool == ToolId::FreeTransform && !self.machine.rotate_only() {
+            self.machine.press_moves();
+        }
+        let zoom = self.camera.zoom;
         let gradient = self.selected_gradient_handles();
 
         // **The handles a press can meet**: those of the selected anchors,
@@ -3588,6 +3616,7 @@ impl Editor {
                             self.selection.set_active_layer(Some(layer));
                             // ...and not the camera's or a light's row any more.
                             self.camera_selected = false;
+                            self.shadow_selected = false;
                             self.light_row_selected = false;
                         }
                     }
@@ -6535,6 +6564,7 @@ impl Editor {
                     self.selection
                         .select_timeline_contents(self.doc.scene(), self.current_frame);
                     self.camera_selected = false;
+                    self.shadow_selected = false;
                     self.light_row_selected = false;
                 }
             }
@@ -6820,6 +6850,7 @@ impl Editor {
 
             // -- camera ------------------------------------------------------
             ToggleCamera => self.toggle_camera(),
+            ToggleShadowLayer => self.toggle_shadow_layer(),
             AddCameraKeyframe => self.add_camera_key(),
             RemoveCameraKeyframe => {
                 // C1: a locked camera refuses removing a key too.
@@ -7219,7 +7250,7 @@ impl Editor {
             NewLibraryFolder => self.new_library_folder(),
 
             // -- tweens ------------------------------------------------------
-            CreateClassicTween => self.set_tween(Tween::classic()),
+            CreateClassicTween => self.toggle_classic_tween(),
             CreateMotionTween => self.set_tween(Tween::motion()),
             CreateShapeTween => self.set_tween(Tween::shape()),
             RemoveTween => self.set_tween(Tween::default()),
@@ -9425,6 +9456,7 @@ impl Editor {
 
         self.selection.clear();
         self.camera_selected = false;
+        self.shadow_selected = false;
         self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(0);
@@ -10071,6 +10103,7 @@ impl Editor {
         self.doc.switch_scene(index);
         self.selection.clear();
         self.camera_selected = false;
+        self.shadow_selected = false;
         self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         // A fresh scene may be shorter than where the playhead sat; prune what
@@ -10084,6 +10117,7 @@ impl Editor {
         self.doc.add_scene();
         self.selection.clear();
         self.camera_selected = false;
+        self.shadow_selected = false;
         self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(0);
@@ -10099,6 +10133,7 @@ impl Editor {
         self.doc.duplicate_scene(index);
         self.selection.clear();
         self.camera_selected = false;
+        self.shadow_selected = false;
         self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(0);
@@ -10110,6 +10145,7 @@ impl Editor {
         self.doc.move_scene(from, to);
         self.selection.clear();
         self.camera_selected = false;
+        self.shadow_selected = false;
         self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(self.current_frame);
@@ -10121,6 +10157,7 @@ impl Editor {
         self.doc.delete_scene(index);
         self.selection.clear();
         self.camera_selected = false;
+        self.shadow_selected = false;
         self.light_row_selected = false;
         self.selection.ensure_active_layer(self.doc.scene());
         self.set_frame(self.current_frame);
@@ -10807,6 +10844,22 @@ impl Editor {
     /// original. It used to read the Library selection only, so on the stage
     /// it copied whatever was last clicked in the Library, or nothing.
     fn duplicate_library_symbol(&mut self) {
+        let Some(source) = self.duplicate_source() else {
+            return;
+        };
+        let name = self.duplicate_default_name(source.1);
+        if let Some(new_id) = self.duplicate_symbol_as(source, &name, None) {
+            // The same offer Convert to Symbol and New Symbol make, for a
+            // duplicate made without the dialog (a script, the agent).
+            self.library.start_naming(new_id, name);
+        }
+    }
+
+    /// **What Duplicate Symbol copies**: the symbol of the instance selected
+    /// on the stage (which then shows the copy), or — from the Library's own
+    /// button or menu — the symbol selected there. Takes the Library's
+    /// "from the Library" mark, so it is asked once per command.
+    pub fn duplicate_source(&mut self) -> Option<(Option<ObjectId>, buzz_scene::SymbolId)> {
         let frame = self.current_frame;
         let from_library = std::mem::take(&mut self.library.duplicate_from_library);
         let instance = if from_library {
@@ -10818,20 +10871,49 @@ impl Editor {
                 object.instance().map(|i| (id, i.symbol))
             })
         };
-        let Some(id) = instance.map(|(_, symbol)| symbol).or(self.library.selected) else {
+        let found = match instance {
+            Some((object, symbol)) => Some((Some(object), symbol)),
+            None => self.library.selected.map(|symbol| (None, symbol)),
+        };
+        if found.is_none() {
             self.status = Some("Select an instance on the stage or a symbol in the Library first".into());
-            return;
+        }
+        found
+    }
+
+    /// Animate's suggested name for a duplicate: "<name> copy", numbered on
+    /// when that is taken.
+    pub fn duplicate_default_name(&self, source: buzz_scene::SymbolId) -> String {
+        let library = self.doc.scene().library();
+        let base = format!("{} copy", library.get(source).map(|s| s.name.as_str()).unwrap_or("Symbol"));
+        if library.find_by_name(&base).is_none() { base } else { library.unique_name(&base) }
+    }
+
+    /// **Duplicate `source` as `name`** (of `kind`, else the original's), in
+    /// the original's folder; the instance it came from, if any, shows the
+    /// copy. One undo step. The new symbol, `None` when nothing was copied.
+    pub fn duplicate_symbol_as(
+        &mut self,
+        source: (Option<ObjectId>, buzz_scene::SymbolId),
+        name: &str,
+        kind: Option<buzz_scene::SymbolKind>,
+    ) -> Option<buzz_scene::SymbolId> {
+        let (instance, id) = source;
+        let frame = self.current_frame;
+        let name = {
+            let library = self.doc.scene().library();
+            let wanted = name.trim();
+            if wanted.is_empty() {
+                return None;
+            }
+            if library.find_by_name(wanted).is_none() { wanted.to_string() } else { library.unique_name(wanted) }
         };
         let mut created = None;
         self.doc.edit("Duplicate Symbol", |scene| {
             let Some(source) = scene.library().get(id).cloned() else {
                 return;
             };
-            let new_id = scene.add_symbol(
-                format!("{} copy", source.name),
-                source.kind,
-                source.folder.as_deref(),
-            );
+            let new_id = scene.add_symbol(name.clone(), kind.unwrap_or(source.kind), source.folder.as_deref());
             // Copying the layer stack wholesale shares every `Arc` inside it;
             // the artwork is only cloned if one of the two is edited.
             scene.library_mut().update(new_id, |s| {
@@ -10847,7 +10929,7 @@ impl Editor {
             if let Some(owner) = owner {
                 scene.library_mut().include_in_set(owner, new_id);
             }
-            if let Some((object, _)) = instance {
+            if let Some(object) = instance {
                 scene.update_object_at(frame, object, |o| {
                     if let ObjectKind::Instance(i) = &mut o.kind {
                         i.symbol = new_id;
@@ -10859,11 +10941,9 @@ impl Editor {
         self.last_duplicate = created.map(|new_id| (id, new_id));
         if let Some(new_id) = created {
             self.library.selected = Some(new_id);
-            let name = self.doc.scene().library().get(new_id).map(|s| s.name.clone()).unwrap_or_default();
             self.status = Some(format!("Duplicated as {name}"));
-            // The same offer Convert to Symbol and New Symbol make.
-            self.library.start_naming(new_id, name);
         }
+        created
     }
 
     /// **Keep the selected library symbol in the Assets library.**
@@ -10965,11 +11045,37 @@ impl Editor {
     }
 
     /// Set the tween on every distinct keyframe span touched by the timeline selection.
+    /// The timeline menu's tween items: exactly what they say — Create
+    /// Classic Tween there always creates, only the key toggles.
+    pub fn apply_tween_request(&mut self, tween: Tween) {
+        self.set_tween(tween);
+    }
+
     fn set_tween(&mut self, tween: Tween) {
         if self.light_row_selected
             && let Some(id) = self.light_panel.selected.filter(|id| self.doc.scene().lights().get(*id).is_some())
         {
             self.set_light_tween(id, tween);
+            return;
+        }
+        if self.shadow_selected {
+            // The Shadow row blends between its keys; its tween is how: Motion
+            // eases in and out, anything else is even.
+            let frame = self.current_frame;
+            let ease = if tween.kind == buzz_scene::TweenKind::Motion {
+                buzz_scene::camera_track::SMOOTH
+            } else {
+                buzz_scene::Easing::Linear
+            };
+            if self.doc.scene().shadow_layer().locked {
+                self.status = Some(SHADOWS_LOCKED.into());
+                return;
+            }
+            let mut set = false;
+            self.doc.edit("Shadow Tween", |scene| {
+                set = scene.shadow_layer_mut().set_ease_at(frame, ease);
+            });
+            self.status = Some(if set { "Shadow tween set".into() } else { "Tween: key the Shadow row first (F6)".into() });
             return;
         }
         if self.camera_selected {
@@ -11013,21 +11119,9 @@ impl Editor {
             self.status = Some("Camera tween set".into());
             return;
         }
-        let targets = self.timeline_targets();
-        if targets.is_empty() {
+        let starts = self.tween_starts();
+        if starts.is_empty() {
             return;
-        }
-        let mut starts = std::collections::BTreeSet::new();
-        for (layer, frame) in targets {
-            if let Some(start) = self
-                .doc
-                .scene()
-                .layers()
-                .get(layer)
-                .and_then(|l| l.frames.keyframe_start(frame))
-            {
-                starts.insert((layer, start));
-            }
         }
         let mut changed = 0usize;
         let mut skipped = 0usize;
@@ -11053,6 +11147,54 @@ impl Editor {
         } else {
             format!("Tween: {changed} span(s) changed, {skipped} skipped")
         });
+    }
+
+    /// **The spans a tween command acts on**, as `(layer, keyframe start)`.
+    ///
+    /// Layers picked by their names (`Selection::whole_layers`) are every
+    /// frame on them, as Animate selects them: every keyframe of each is a
+    /// span. Otherwise the frames picked — a frame range, else the playhead
+    /// on the selected layers — each stand for the span they fall in.
+    fn tween_starts(&mut self) -> std::collections::BTreeSet<(LayerId, u32)> {
+        let whole = self.selection.whole_layers().is_some();
+        let targets = self.timeline_targets();
+        let scene = self.doc.scene();
+        let mut starts = std::collections::BTreeSet::new();
+        for (layer, frame) in targets {
+            let Some(l) = scene.layers().get(layer) else { continue };
+            if whole {
+                starts.extend(l.frames.keyframes().iter().map(|k| (layer, k.start)));
+            } else if let Some(start) = l.frames.keyframe_start(frame) {
+                starts.insert((layer, start));
+            }
+        }
+        starts
+    }
+
+    /// **Create Classic Tween, or take it off** (user 2026-11-28: C, which
+    /// is their Create Classic Tween, on tweened layers removes the tweens):
+    /// when every span picked that has a keyframe to run to is a classic
+    /// tween already, they are all removed; otherwise every one is made one.
+    fn toggle_classic_tween(&mut self) {
+        if self.camera_selected || self.light_row_selected || self.shadow_selected {
+            self.set_tween(Tween::classic());
+            return;
+        }
+        let starts = self.tween_starts();
+        let scene = self.doc.scene();
+        let mut tweenable = starts
+            .iter()
+            .filter_map(|(layer, start)| {
+                let l = scene.layers().get(*layer)?;
+                l.frames.keyframes().iter().any(|k| k.start > *start).then(|| l.frames.tween_at(*start).kind)
+            })
+            .peekable();
+        let all_classic = tweenable.peek().is_some() && tweenable.all(|kind| kind == buzz_scene::TweenKind::Classic);
+        if all_classic {
+            self.set_tween(Tween::default());
+        } else {
+            self.set_tween(Tween::classic());
+        }
     }
 
     /// Replace only the *easing* of the tween on the keyframe governing the
@@ -13168,6 +13310,108 @@ impl Editor {
     /// reset (centred, 1x, level), Insert/Remove Frame open or close a span
     /// by moving the later keys, Clear Keyframe removes the key. Returns
     /// `false` for ops the camera has no meaning for, so they fall through.
+    /// **The frame commands on the Shadow row**, as on the camera's: Insert
+    /// Keyframe (F6) keys every object's shadow as it is at the playhead;
+    /// Insert Blank Keyframe (F7) keys none — no shadows from there; Clear
+    /// Keyframe and Clear Frames take the key out; Insert/Remove Frame (F5,
+    /// Shift+F5) move the later keys. `false` for a command the row does not
+    /// take, which then goes to the layers.
+    fn shadow_frame_op(&mut self, op: FrameOp) -> bool {
+        if !matches!(
+            op,
+            FrameOp::InsertFrame
+                | FrameOp::RemoveFrame
+                | FrameOp::InsertKeyframe
+                | FrameOp::InsertBlankKeyframe
+                | FrameOp::ClearKeyframe
+                | FrameOp::ClearFrames
+        ) {
+            return false;
+        }
+        if self.doc.scene().shadow_layer().locked {
+            self.status = Some(SHADOWS_LOCKED.into());
+            return true;
+        }
+        let frame = self.current_frame;
+        let mut changed = false;
+        self.doc.edit(op.label(), |scene| match op {
+            FrameOp::InsertKeyframe => {
+                let had = scene.shadow_layer().has_key_at(frame);
+                scene.shadow_layer_mut().key_for_edit(frame, true);
+                changed = !had;
+            }
+            FrameOp::InsertBlankKeyframe => {
+                let ease = scene.shadow_layer().keys().iter().rev().find(|k| k.frame <= frame).map_or_else(Default::default, |k| k.ease);
+                scene.shadow_layer_mut().set_key(buzz_scene::ShadowKey { ease, ..buzz_scene::ShadowKey::new(frame) });
+                changed = true;
+            }
+            FrameOp::ClearKeyframe | FrameOp::ClearFrames => {
+                if scene.shadow_layer().has_key_at(frame) {
+                    changed = scene.shadow_layer_mut().remove_key(frame);
+                }
+            }
+            FrameOp::InsertFrame | FrameOp::RemoveFrame => {
+                let delta = if matches!(op, FrameOp::InsertFrame) { 1 } else { -1 };
+                if scene.shadow_layer().keys().iter().any(|k| k.frame > frame) {
+                    changed = scene.shadow_layer_mut().shift_after(frame, delta);
+                }
+            }
+            _ => {}
+        });
+        self.status = Some(match (op, changed) {
+            (FrameOp::InsertKeyframe, true) => format!("Shadow keyframe at frame {}", frame + 1),
+            (FrameOp::InsertKeyframe, false) => format!("The Shadow row already has a keyframe at frame {}", frame + 1),
+            (FrameOp::InsertBlankKeyframe, _) => format!("Blank shadow keyframe at frame {}: no shadows from there", frame + 1),
+            (FrameOp::ClearKeyframe | FrameOp::ClearFrames, true) => format!("Shadow keyframe at frame {} removed", frame + 1),
+            (FrameOp::ClearKeyframe | FrameOp::ClearFrames, false) => format!("The Shadow row has no keyframe at frame {}", frame + 1),
+            (_, true) => "Shadow keyframes moved".into(),
+            (_, false) => "No shadow keyframes after the playhead".into(),
+        });
+        true
+    }
+
+    /// **Add or remove the Shadow layer**, as the Camera button adds and
+    /// removes the camera's: its keys are kept while it is away. Added, it
+    /// has a first key at the playhead (no shadows yet) and its row is the
+    /// one selected, so the Properties panel lists the objects to give
+    /// shadows to.
+    fn toggle_shadow_layer(&mut self) {
+        let frame = self.current_frame;
+        self.doc.edit("Shadow Layer", |scene| {
+            let layer = scene.shadow_layer_mut();
+            layer.enabled = !layer.enabled;
+            if layer.enabled && layer.keys().is_empty() {
+                layer.set_key(buzz_scene::ShadowKey::new(frame));
+            }
+        });
+        let on = self.doc.scene().shadow_layer().enabled;
+        self.shadow_selected = on;
+        if on {
+            self.camera_selected = false;
+            self.light_row_selected = false;
+        }
+        self.status = Some(if on {
+            "Shadow layer added \u{2014} its row is under the Camera's; give each object its shadow in Properties".into()
+        } else {
+            "Shadow layer removed \u{2014} its keyframes are kept for when it is added again".into()
+        });
+    }
+
+    /// **Change one object's shadow** from the Properties panel: keyed at the
+    /// playhead with auto-keyframe on (or on a row with no keys yet), else
+    /// on the key governing it.
+    pub fn set_object_shadow(&mut self, object: ObjectId, shadow: buzz_scene::ObjectShadow) {
+        if self.doc.scene().shadow_layer().locked {
+            self.status = Some(SHADOWS_LOCKED.into());
+            return;
+        }
+        let frame = self.current_frame;
+        let make_key = self.auto_keyframe;
+        self.doc.edit("Shadow", |scene| {
+            scene.shadow_layer_mut().set_shadow(frame, object, shadow, make_key);
+        });
+    }
+
     fn camera_frame_op(&mut self, op: FrameOp) -> bool {
         if !matches!(
             op,
@@ -13338,6 +13582,9 @@ impl Editor {
         if self.light_row_selected {
             return Err("A light holds no artwork \u{2014} click a layer to put it on".into());
         }
+        if self.shadow_selected {
+            return Err("The Shadow layer holds no artwork \u{2014} click a layer to put it on".into());
+        }
         let Some(layer) = self.active_layer() else {
             return Err("No layer available to put it on".into());
         };
@@ -13377,6 +13624,9 @@ impl Editor {
     /// Apply a frame operation to all selected cells in one undo transaction.
     fn frame_op(&mut self, op: FrameOp) {
         if self.camera_selected && self.camera_frame_op(op) {
+            return;
+        }
+        if self.shadow_selected && self.shadow_frame_op(op) {
             return;
         }
         if self.light_row_selected
@@ -15534,6 +15784,7 @@ impl Editor {
         if !on {
             // Its row is gone with it.
             self.camera_selected = false;
+            self.shadow_selected = false;
         }
         self.status = Some(if on {
             "Camera enabled — use the Camera tool to move it".into()
@@ -24723,6 +24974,54 @@ mod tests {
         );
     }
 
+    /// **The transformation point catches on its box's handles** as it is
+    /// dragged near them, as Animate's does (user 2026-11-28), and stays
+    /// exactly where it is let go with snapping off.
+    #[test]
+    fn the_transformation_point_snaps_to_the_handles_and_centre() {
+        for snapping in [true, false] {
+            let mut e = editor();
+            let id = draw_square(&mut e, 100.0, 100.0, 200.0, Color::WHITE).expect("a square");
+            e.selection.select_one(id);
+            e.set_tool(ToolId::FreeTransform);
+            e.view.snap = if snapping {
+                buzz_ui::view::SnapSettings::default()
+            } else {
+                buzz_ui::view::SnapSettings { to_guides: false, to_grid: false, to_objects: false, to_pixels: false }
+            };
+            let start = e.pivot().expect("a point");
+            let near_corner = Point::new(104.0, 103.0);
+            e.pointer_down(e.camera.doc_to_screen(start), Mods::default());
+            e.pointer_move(e.camera.doc_to_screen(near_corner), Mods::default());
+            e.pointer_up(e.camera.doc_to_screen(near_corner));
+            let at = e.pivot().unwrap();
+            let want = if snapping { Point::new(100.0, 100.0) } else { near_corner };
+            assert!((at - want).hypot() < 0.51, "snapping {snapping}: the point is at {at:?}, not {want:?}");
+        }
+    }
+
+    /// **Shift holds a move to 45 degrees**, as in Animate (user 2026-11-28),
+    /// with either tool: a drag mostly to the right moves straight right, one
+    /// near the diagonal moves along it.
+    #[test]
+    fn shift_holds_a_move_to_45_degree_lines() {
+        for tool in [ToolId::Selection, ToolId::FreeTransform] {
+            for (drag, want) in [(Vec2::new(60.0, 10.0), Vec2::new(60.0, 0.0)), (Vec2::new(40.0, 44.0), Vec2::new(42.0, 42.0))] {
+                let mut e = editor();
+                let id = draw_square(&mut e, 100.0, 100.0, 100.0, Color::WHITE).expect("a square");
+                e.selection.select_one(id);
+                e.set_tool(tool);
+                let from = Point::new(130.0, 170.0);
+                drag_with(&mut e, from, from + drag, Mods { shift: true, ..Mods::default() });
+                assert!(
+                    is_translation(transform_of(&e, id), want),
+                    "{tool:?} {drag:?}: held to {want:?}, got {:?}",
+                    transform_of(&e, id).as_coeffs()
+                );
+            }
+        }
+    }
+
     /// **E1. The Selection tool has no handles.** Every place the box used to
     /// have a gesture — a corner, a mid-edge handle, a skew edge, the
     /// transformation point — is, to the arrow, just the selected shape: a drag
@@ -30344,6 +30643,109 @@ mod tests {
         assert_eq!(e.current_frame, 2);
     }
 
+    /// **The Shadow layer, row by row like the camera's** (user 2026-11-28):
+    /// added, it is the selected row with a first key; a change to an
+    /// object's shadow keys the playhead (auto-keyframe) and blends from the
+    /// key before; F6 keys every shadow, F7 keys none, Shift+F6 takes a key
+    /// out, F5 moves the later keys; its tween sets the ease; locked, it
+    /// refuses; taken away, it keeps its keys.
+    #[test]
+    fn the_shadow_layer_keys_and_edits_like_the_camera_row() {
+        let mut e = editor();
+        let id = draw_square(&mut e, 100.0, 100.0, 50.0, Color::WHITE).expect("a square");
+        e.auto_keyframe = true;
+        e.current_frame = 0;
+        e.run(Command::ToggleShadowLayer);
+        assert!(e.scene().shadow_layer().enabled && e.shadow_selected, "added and selected");
+        assert!(e.scene().shadow_layer().has_key_at(0));
+        assert!(e.artwork_layer().is_err(), "the row holds no artwork");
+
+        let short = buzz_scene::ObjectShadow { length: 0.2, ..Default::default() };
+        e.set_object_shadow(id, short);
+        e.current_frame = 10;
+        e.set_object_shadow(id, buzz_scene::ObjectShadow { length: 1.0, ..short });
+        let layer = e.scene().shadow_layer();
+        assert!(layer.has_key_at(10), "the change keyed the playhead");
+        assert!((layer.shadow_at(5, id).unwrap().length - 0.6).abs() < 1e-9, "and blends from the key before");
+
+        e.current_frame = 20;
+        e.run(Command::InsertKeyframe);
+        assert!(e.scene().shadow_layer().has_key_at(20), "F6 keys the Shadow row, not a layer");
+        e.current_frame = 30;
+        e.run(Command::InsertBlankKeyframe);
+        assert!(e.scene().shadow_layer().shadow_at(30, id).is_none(), "F7: no shadows from there");
+        e.run(Command::ClearKeyframe);
+        assert!(!e.scene().shadow_layer().has_key_at(30), "Shift+F6 took it out");
+        e.current_frame = 15;
+        e.run(Command::InsertFrame);
+        assert!(e.scene().shadow_layer().has_key_at(21), "F5 moved the later key");
+
+        e.current_frame = 12;
+        e.run(Command::CreateMotionTween);
+        let ease = e.scene().shadow_layer().keys().iter().find(|k| k.frame == 10).unwrap().ease;
+        assert_eq!(ease, buzz_scene::camera_track::SMOOTH, "the row's tween eases its blend");
+
+        e.doc.edit("lock", |s| s.shadow_layer_mut().locked = true);
+        let before = e.scene().shadow_layer().clone();
+        e.set_object_shadow(id, buzz_scene::ObjectShadow { length: 2.0, ..short });
+        e.run(Command::InsertKeyframe);
+        assert_eq!(e.scene().shadow_layer(), &before, "locked: nothing changes");
+
+        e.run(Command::ToggleShadowLayer);
+        assert!(!e.scene().shadow_layer().enabled && !e.shadow_selected);
+        assert_eq!(e.scene().shadow_layer().keys().len(), before.keys().len(), "its keys are kept");
+    }
+
+    /// **C on layers picked by name toggles every classic tween on them**
+    /// (user 2026-11-28: "select all classic tween layers and press C or
+    /// right click and remove tween"). Remove Tween takes every span off too,
+    /// and with only the playhead picked (an object chosen on the stage) C
+    /// tweens the one span it is in.
+    #[test]
+    fn c_toggles_every_classic_tween_on_layers_picked_by_name() {
+        let mut e = editor();
+        let (mut a, mut b) = (LayerId(0), LayerId(0));
+        e.doc.edit("Setup", |s| {
+            a = add_drawn_layer(s, "A", 1, 30);
+            b = add_drawn_layer(s, "B", 1, 30);
+            for id in [a, b] {
+                s.update_layer(id, |l| {
+                    for k in [10, 20] {
+                        l.frames.insert_keyframe(k);
+                    }
+                    for k in [0, 10] {
+                        l.frames.set_tween(k, buzz_scene::Tween::classic());
+                    }
+                });
+            }
+        });
+        let kinds = |e: &Editor, id: LayerId| -> Vec<buzz_scene::TweenKind> {
+            let l = e.scene().layers().get(id).unwrap();
+            [0, 10].iter().map(|k| l.frames.tween_at(*k).kind).collect()
+        };
+        let none = vec![buzz_scene::TweenKind::None; 2];
+        let classic = vec![buzz_scene::TweenKind::Classic; 2];
+
+        e.current_frame = 15;
+        e.select_layers(&[a, b]);
+        e.run(Command::CreateClassicTween);
+        assert_eq!((kinds(&e, a), kinds(&e, b)), (none.clone(), none.clone()), "C took every tween off");
+        e.select_layers(&[a, b]);
+        e.run(Command::CreateClassicTween);
+        assert_eq!((kinds(&e, a), kinds(&e, b)), (classic.clone(), classic.clone()), "C again tweened every span");
+        e.select_layers(&[a, b]);
+        e.run(Command::RemoveTween);
+        assert_eq!((kinds(&e, a), kinds(&e, b)), (none.clone(), none.clone()), "Remove Tween took every span");
+
+        // An object picked on the stage: its layer, at the playhead only.
+        let object = e.scene().layers().get(a).unwrap().objects_at(15)[0].id;
+        e.selection.select_one(object);
+        e.selection.set_active_layer(Some(a));
+        e.run(Command::CreateClassicTween);
+        assert_eq!(kinds(&e, a), vec![buzz_scene::TweenKind::None, buzz_scene::TweenKind::Classic], "only the span at the playhead");
+        assert_eq!(kinds(&e, b), none, "and only on its layer");
+    }
+
     /// Two layers moved down one row: the middle layer both gives its frames
     /// away and receives the ones above it, because every source is lifted
     /// before anything is written.
@@ -31469,13 +31871,17 @@ mod tests {
             "the point should be where it was dragged, not {moved:?}"
         );
 
-        // And a click on it without a drag puts it back, as Animate does.
+        // One click on it leaves it; a double-click puts it back in the
+        // middle, as Animate does (user 2026-11-28).
+        e.pointer_down(e.camera.doc_to_screen(moved), Mods::default());
+        e.pointer_up(e.camera.doc_to_screen(moved));
+        assert!((e.pivot().unwrap() - moved).hypot() < 1e-9, "one click leaves the point where it is");
         e.pointer_down(e.camera.doc_to_screen(moved), Mods::default());
         e.pointer_up(e.camera.doc_to_screen(moved));
         assert_eq!(
             e.pivot(),
             Some(Point::new(200.0, 200.0)),
-            "clicking the point resets it to the centre"
+            "a double-click resets it to the centre"
         );
     }
 

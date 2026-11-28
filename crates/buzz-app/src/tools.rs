@@ -399,6 +399,11 @@ enum Gesture {
         origin_screen: Point,
         pivot: Point,
         current: Point,
+        /// Where it snaps: the box's corners, the middles of its edges and its
+        /// centre, as Animate's transformation point catches on its handles.
+        snaps: Vec<Point>,
+        /// How near, in document units, it must come to catch.
+        reach: f64,
     },
     /// Press-drag-release from a fixed origin.
     Dragging {
@@ -423,6 +428,10 @@ enum Gesture {
         /// second step the selection is no longer where it was when the
         /// question could have been asked.
         transforming: Option<Transforming>,
+        /// How far a move has carried the selection so far: Shift holds the
+        /// whole move to a 45-degree line through where it began, as Animate
+        /// does, so each step is the held move less what was already applied.
+        moved: Vec2,
     },
     /// Accumulating freehand samples.
     ///
@@ -551,6 +560,19 @@ pub struct ToolMachine {
     /// The transformation point itself can still be dragged, because placing
     /// it on the joint is what makes the turns right.
     rotate_only: bool,
+    /// **The next press moves what it lands on** — set by the editor when that
+    /// press has just picked an unselected object up with Free Transform, so
+    /// the drag carries it rather than grabbing the transformation point or a
+    /// handle of the box that has only now appeared under the pointer (Animate
+    /// moves an object dragged with Free Transform from anywhere on it).
+    /// Spent by the press.
+    press_moves: bool,
+    /// When and where the transformation point was last clicked, for
+    /// Animate's double-click that puts it back in the middle; a single click
+    /// leaves it where it is.
+    last_pivot_click: Option<(f64, Point)>,
+    /// The transformation point catches on its box's handles while dragged.
+    snap_pivot: bool,
     /// Where the last Brush or Pencil stroke ended, for Shift-click to draw a
     /// straight stroke on from. Forgotten when the tool changes.
     last_stroke_end: Option<Point>,
@@ -573,8 +595,28 @@ impl ToolMachine {
             last_screen: Point::ORIGIN,
             clock: Clock::Wall(std::time::Instant::now()),
             rotate_only: false,
+            press_moves: false,
+            last_pivot_click: None,
+            snap_pivot: true,
             last_stroke_end: None,
         }
+    }
+
+    /// The next press moves the selection it lands in, whatever part of the
+    /// box that is. See `press_moves`.
+    pub fn press_moves(&mut self) {
+        self.press_moves = true;
+    }
+
+    /// **Animate's double-click on the transformation point**: the second of
+    /// two clicks on it within a double-click's time and a few pixels resets
+    /// it; the first, alone, changes nothing.
+    fn pivot_double_click(&mut self, now: f64, screen: Point) -> bool {
+        let double = self
+            .last_pivot_click
+            .is_some_and(|(t, at)| now - t <= DOUBLE_CLICK_SECS && (at - screen).hypot() <= CLICK_SLOP_PX * 2.0);
+        self.last_pivot_click = if double { None } else { Some((now, screen)) };
+        double
     }
 
     /// Turn Rotate Mode on or off. See [`Self::rotate_only`].
@@ -634,13 +676,37 @@ impl ToolMachine {
     }
 
     pub(crate) fn begin_pivot_drag(&mut self, doc: Point, screen: Point, pivot: Point) {
+        self.begin_pivot_drag_in(doc, screen, pivot, None, 0.0);
+    }
+
+    /// A transformation point drag that **snaps onto the handles of `frame`
+    /// and its centre** within `reach` document units, when snapping is on —
+    /// Animate's point catches on them as it is dragged past.
+    pub(crate) fn begin_pivot_drag_in(&mut self, doc: Point, screen: Point, pivot: Point, frame: Option<TransformBox>, reach: f64) {
         self.last_screen = screen;
+        let snaps = match frame.filter(|_| self.snap_pivot) {
+            Some(frame) => {
+                let mut points = frame.corners().to_vec();
+                points.extend(frame.mid_edges());
+                points.push(frame.center());
+                points
+            }
+            None => Vec::new(),
+        };
         self.gesture = Gesture::Pivot {
             origin: doc,
             origin_screen: screen,
             pivot,
             current: pivot,
+            snaps,
+            reach,
         };
+    }
+
+    /// Whether the transformation point catches on its box's handles (the
+    /// stage's snapping switch).
+    pub fn set_pivot_snapping(&mut self, on: bool) {
+        self.snap_pivot = on;
     }
 
     pub(crate) fn dragging_pivot(&self) -> bool {
@@ -699,6 +765,21 @@ impl ToolMachine {
             Clock::Wall(_) => time.unwrap_or_else(|| self.clock.now()),
         };
         self.last_screen = screen;
+        // A press that has just picked an object up moves it (`press_moves`).
+        if std::mem::take(&mut self.press_moves)
+            && matches!(self.tool, ToolId::FreeTransform | ToolId::Selection)
+            && ctx.selection_box.is_some()
+        {
+            self.gesture = Gesture::Dragging {
+                origin: doc,
+                current: doc,
+                mods,
+                moving: true,
+                transforming: None,
+                moved: Vec2::ZERO,
+            };
+            return ToolAction::None;
+        }
         // **The transformation point belongs to Free Transform alone.** The
         // Selection tool is Animate's arrow: it picks and it moves, and has no
         // white circle to grab.
@@ -708,7 +789,7 @@ impl ToolMachine {
             let pivot = ctx.pivot.unwrap_or_else(|| frame.center());
             let grab = TRANSFORM_GRAB_PX / ctx.zoom.max(f64::MIN_POSITIVE);
             if self.zone_at(frame, pivot, doc, grab) == TransformZone::Pivot {
-                self.begin_pivot_drag(doc, screen, pivot);
+                self.begin_pivot_drag_in(doc, screen, pivot, Some(frame), grab);
                 return ToolAction::None;
             }
         }
@@ -830,6 +911,7 @@ impl ToolMachine {
                     mods,
                     moving: self.begins_a_move(doc, ctx),
                     transforming: self.begins_a_transform(doc, ctx),
+                    moved: Vec2::ZERO,
                 };
             }
             _ => {
@@ -839,6 +921,7 @@ impl ToolMachine {
                     mods,
                     moving: self.begins_a_move(doc, ctx),
                     transforming: self.begins_a_transform(doc, ctx),
+                    moved: Vec2::ZERO,
                 };
             }
         }
@@ -989,8 +1072,14 @@ impl ToolMachine {
 
         match &mut self.gesture {
             Gesture::Idle => ToolAction::None,
-            Gesture::Pivot { origin, pivot, current, .. } => {
-                *current = *pivot + (doc - *origin);
+            Gesture::Pivot { origin, pivot, current, snaps, reach, .. } => {
+                let free = *pivot + (doc - *origin);
+                *current = snaps
+                    .iter()
+                    .map(|p| (*p, (*p - free).hypot()))
+                    .filter(|(_, d)| *d <= *reach)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map_or(free, |(p, _)| p);
                 ToolAction::None
             }
             // **The path is reshaped under the pointer.** An anchor drag used
@@ -1101,6 +1190,7 @@ impl ToolMachine {
                 mods: m,
                 moving,
                 transforming,
+                moved,
             } => {
                 let previous = *current;
                 let moving = *moving;
@@ -1149,7 +1239,11 @@ impl ToolMachine {
                 // last move, exactly as the camera already is, and collapsed
                 // into a single undo step by `end_gesture` on release.
                 if moving {
-                    let delta = doc - previous;
+                    let _ = previous;
+                    let whole = doc - origin;
+                    let held = if mods.shift { along_45(whole) } else { whole };
+                    let delta = held - *moved;
+                    *moved = held;
                     return if delta.hypot() > 0.0 {
                         ToolAction::MoveSelection { delta }
                     } else {
@@ -1189,15 +1283,17 @@ impl ToolMachine {
 
         match gesture {
             Gesture::Idle => ToolAction::None,
-            Gesture::Pivot { origin, origin_screen, pivot, .. } => {
+            Gesture::Pivot { origin_screen, current, .. } => {
                 if (screen - origin_screen).hypot() <= CLICK_SLOP_PX {
-                    if self.tool == ToolId::FreeTransform {
+                    if self.tool == ToolId::FreeTransform && self.pivot_double_click(now, screen) {
                         ToolAction::ResetTransformPoint
                     } else {
                         ToolAction::None
                     }
                 } else {
-                    ToolAction::SetTransformPoint { at: pivot + (doc - origin) }
+                    // Where the drag left it, caught on a handle or not.
+                    let _ = doc;
+                    ToolAction::SetTransformPoint { at: current }
                 }
             }
             Gesture::Anchor {
@@ -1308,7 +1404,7 @@ impl ToolMachine {
                 moving,
                 transforming,
                 ..
-            } => self.finish_drag(origin, doc, mods, moving || transforming.is_some(), ctx),
+            } => self.finish_drag(origin, doc, mods, moving || transforming.is_some(), ctx, now, screen),
         }
     }
 
@@ -1690,12 +1786,14 @@ impl ToolMachine {
     }
 
     fn finish_drag(
-        &self,
+        &mut self,
         origin: Point,
         end: Point,
         mods: Mods,
         moving: bool,
         ctx: &ToolContext<'_>,
+        now: f64,
+        screen: Point,
     ) -> ToolAction {
         let slop = CLICK_SLOP_PX / ctx.zoom.max(f64::MIN_POSITIVE);
         let was_click = (end - origin).hypot() <= slop;
@@ -1801,9 +1899,13 @@ impl ToolMachine {
                 match zone {
                     TransformZone::Pivot => {
                         if was_click {
-                            // A click on the circle without moving it means
-                            // "put it back", which is Animate's double-click.
-                            ToolAction::ResetTransformPoint
+                            // Animate's double-click on the circle puts it
+                            // back in the middle; one click leaves it.
+                            if self.pivot_double_click(now, screen) {
+                                ToolAction::ResetTransformPoint
+                            } else {
+                                ToolAction::None
+                            }
                         } else {
                             ToolAction::SetTransformPoint { at: end }
                         }
@@ -2008,6 +2110,21 @@ fn pencil_shape(
         }),
         blend: buzz_scene::PaintBlend::Normal,
     })
+}
+
+/// **A move held to the nearest 45-degree line**, as Shift holds a drag in
+/// Animate: horizontal, vertical or diagonal, the length along it kept.
+fn along_45(d: Vec2) -> Vec2 {
+    let length = d.hypot();
+    if length == 0.0 {
+        return d;
+    }
+    let step = std::f64::consts::FRAC_PI_4;
+    let angle = (d.y.atan2(d.x) / step).round() * step;
+    let (sin, cos) = angle.sin_cos();
+    // The length projected on that line, so the pointer stays beside it.
+    let along = d.x * cos + d.y * sin;
+    Vec2::new(along * cos, along * sin)
 }
 
 /// `to`, held to the horizontal or vertical through `from` — whichever the
@@ -2435,6 +2552,8 @@ fn star_path(center: Point, radius: f64, points: usize) -> BezPath {
 /// Scale the selection by dragging, anchored at the opposite corner.
 /// How far from a handle a grab still counts, in screen pixels.
 pub(crate) const TRANSFORM_GRAB_PX: f64 = 8.0;
+/// The longest gap between the two clicks of a double-click, in seconds.
+pub(crate) const DOUBLE_CLICK_SECS: f64 = 0.5;
 
 /// Which part of the Free Transform gizmo a drag started on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

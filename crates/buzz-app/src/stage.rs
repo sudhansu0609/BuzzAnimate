@@ -266,8 +266,14 @@ pub fn encode_plain(
     let mut builder = SceneBuilder::new(vello, &inputs.camera)
         .with_output_scale(inputs.scale)
         .with_viewport_offset(Vec2::new(area.x0, area.y0))
-        // Thin line art stays a pixel wide at every zoom on the stage.
-        .with_held_lines(true);
+        // **Thin line art at its true weight** (user 2026-11-28: "on lesser
+        // zooms the lines of my character seem smudged"). Holding every line
+        // to a pixel drew the shirt's checks and the face's lines two and
+        // three times as heavy as they are; with the colour regions' seals
+        // lifted beneath the line work once it is drawn shrunk
+        // (`SEAL_RUN_BELOW_SCALE`), nothing eats the lines any more, and the
+        // stage draws them as the export does.
+        .with_held_lines(false);
 
     let scene = &*inputs.scene;
     builder.fill_shape(&scene.stage().stage_rect(), scene.stage().background);
@@ -365,8 +371,14 @@ fn encode(
     let mut builder = SceneBuilder::new(vello, &editor.camera)
         .with_output_scale(scale)
         .with_viewport_offset(Vec2::new(area.x0, area.y0))
-        // Thin line art stays a pixel wide at every zoom on the stage.
-        .with_held_lines(true);
+        // **Thin line art at its true weight** (user 2026-11-28: "on lesser
+        // zooms the lines of my character seem smudged"). Holding every line
+        // to a pixel drew the shirt's checks and the face's lines two and
+        // three times as heavy as they are; with the colour regions' seals
+        // lifted beneath the line work once it is drawn shrunk
+        // (`SEAL_RUN_BELOW_SCALE`), nothing eats the lines any more, and the
+        // stage draws them as the export does.
+        .with_held_lines(false);
 
     let scene = editor.scene();
 

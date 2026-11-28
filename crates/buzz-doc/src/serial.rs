@@ -232,7 +232,10 @@ use serde::{Deserialize, Serialize};
 /// * **53** — a puppet folder lifted onto the main timeline carries
 ///   `puppet_instance`: the character instance it was lifted from. Absent on
 ///   every other layer, which is every layer of every older document.
-pub const FORMAT_VERSION: u32 = 53;
+/// * **54** — the document carries a **Shadow layer** (`shadow_layer`): each
+///   stage object's own ground shadow, keyed on its row under the camera's.
+///   Absent in every older file and in any document that never added it.
+pub const FORMAT_VERSION: u32 = 54;
 
 /// Anything that can go wrong converting to or from the document model.
 #[derive(Debug, thiserror::Error)]
@@ -335,6 +338,118 @@ pub struct DocumentDto {
     /// makes a cycle impossible to write.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rig_parts: Vec<RigPartDto>,
+    /// The Shadow layer. Version 54. Absent when it was never added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_layer: Option<ShadowLayerDto>,
+}
+
+/// **The Shadow layer**, as written: its switches and its keys. See
+/// [`buzz_scene::shadow_layer`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowLayerDto {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<ShadowKeyDto>,
+}
+
+/// One key on the Shadow row: every object's shadow at its frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowKeyDto {
+    pub frame: u32,
+    #[serde(default)]
+    pub ease: buzz_scene::Easing,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shadows: Vec<ObjectShadowDto>,
+}
+
+/// One object's shadow at one key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectShadowDto {
+    /// The object casting it.
+    pub object: u64,
+    pub on: bool,
+    pub angle: f64,
+    pub length: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset_x: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset_y: f64,
+    pub scale_x: f64,
+    pub scale_y: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skew: f64,
+    pub softness: f64,
+    pub darkness: f32,
+    /// `#RRGGBB` or `#RRGGBBAA`.
+    pub color: String,
+}
+
+impl ShadowLayerDto {
+    fn from_layer(layer: &buzz_scene::ShadowLayer) -> Option<Self> {
+        (!layer.is_unused()).then(|| Self {
+            enabled: layer.enabled,
+            hidden: layer.hidden,
+            locked: layer.locked,
+            keys: layer
+                .keys()
+                .iter()
+                .map(|k| ShadowKeyDto {
+                    frame: k.frame,
+                    ease: k.ease,
+                    shadows: k
+                        .shadows
+                        .iter()
+                        .map(|(id, s)| ObjectShadowDto {
+                            object: id.0,
+                            on: s.on,
+                            angle: s.angle,
+                            length: s.length,
+                            offset_x: s.offset.x,
+                            offset_y: s.offset.y,
+                            scale_x: s.scale_x,
+                            scale_y: s.scale_y,
+                            skew: s.skew,
+                            softness: s.softness,
+                            darkness: s.darkness,
+                            color: color_to_hex(s.color),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+    }
+
+    fn to_layer(&self) -> Result<buzz_scene::ShadowLayer, SerialError> {
+        let finite = |v: f64, or: f64| if v.is_finite() { v } else { or };
+        let mut keys = Vec::with_capacity(self.keys.len());
+        for k in &self.keys {
+            let mut key = buzz_scene::ShadowKey::new(k.frame);
+            key.ease = k.ease;
+            for s in &k.shadows {
+                key.shadows.insert(
+                    buzz_scene::ObjectId(s.object),
+                    buzz_scene::ObjectShadow {
+                        on: s.on,
+                        angle: finite(s.angle, 70.0),
+                        length: finite(s.length, 0.35).max(0.0),
+                        offset: buzz_geom::Vec2::new(finite(s.offset_x, 0.0), finite(s.offset_y, 0.0)),
+                        scale_x: finite(s.scale_x, 1.0),
+                        scale_y: finite(s.scale_y, 1.0),
+                        skew: finite(s.skew, 0.0),
+                        softness: finite(s.softness, 0.0).max(0.0),
+                        darkness: if s.darkness.is_finite() { s.darkness.clamp(0.0, 1.0) } else { 0.45 },
+                        color: color_from_hex(&s.color)?,
+                    },
+                );
+            }
+            keys.push(key);
+        }
+        Ok(buzz_scene::ShadowLayer::from_keys(self.enabled, self.hidden, self.locked, keys))
+    }
 }
 
 /// A named colour.
@@ -3146,6 +3261,7 @@ impl DocumentDto {
                     .collect(),
             }),
             rig_parts: Vec::new(),
+            shadow_layer: ShadowLayerDto::from_layer(scene.shadow_layer()),
         };
         dto.rig_parts = pool.parts;
         dto
@@ -3407,6 +3523,10 @@ impl DocumentDto {
                         .transpose()?,
                 });
             }
+        }
+
+        if let Some(shadows) = &self.shadow_layer {
+            *scene.shadow_layer_mut() = shadows.to_layer()?;
         }
 
         // Raise the allocator past everything the file already uses, so a new
@@ -3939,6 +4059,36 @@ mod tests {
             assert_eq!(a.height, b.height);
             assert_eq!(a.objects_at(0).len(), b.objects_at(0).len());
         }
+    }
+
+    /// **The Shadow layer survives save and load** (version 54), and a
+    /// document that never added one writes nothing for it.
+    #[test]
+    fn the_shadow_layer_round_trips() {
+        let plain = Scene::empty();
+        let plain_json = serde_json::to_string(&DocumentDto::from_scene(&plain)).unwrap();
+        assert!(!plain_json.contains("shadow_layer"), "{plain_json}");
+
+        let mut scene = Scene::empty();
+        let shadow = buzz_scene::ObjectShadow {
+            angle: 120.0,
+            length: 0.8,
+            offset: buzz_geom::Vec2::new(4.0, -2.0),
+            skew: 12.0,
+            softness: 6.0,
+            darkness: 0.6,
+            color: Color::from_rgb8(0x20, 0x10, 0x40),
+            ..Default::default()
+        };
+        {
+            let layer = scene.shadow_layer_mut();
+            layer.enabled = true;
+            layer.set_shadow(0, buzz_scene::ObjectId(42), shadow, true);
+            layer.set_shadow(12, buzz_scene::ObjectId(42), buzz_scene::ObjectShadow { on: false, ..shadow }, true);
+            layer.locked = true;
+        }
+        let back = DocumentDto::from_scene(&scene).to_scene().unwrap();
+        assert_eq!(back.shadow_layer(), scene.shadow_layer());
     }
 
     #[test]

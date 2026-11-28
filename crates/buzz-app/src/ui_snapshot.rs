@@ -354,6 +354,7 @@ fn draw_icon_contact_sheet(ui: &mut egui::Ui) {
                     range_anchor: None,
                     timeline_selection: None,
                     camera_selected: false,
+                    shadow_selected: false,
                     master_audio_layer: None,
                     reveal_layer: None,
                     selected_light: None,

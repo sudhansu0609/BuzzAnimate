@@ -30,6 +30,7 @@ pub mod background_specks;
 pub mod art;
 pub mod bucket;
 pub mod camera_track;
+pub mod shadow_layer;
 pub mod cleanup;
 pub mod effect_brush;
 pub mod even_lines;
@@ -90,6 +91,7 @@ pub use buzz_light::{
     SHADOW_LENGTH_RANGE, ShadeModel, ShadowAdjustment, ShadowFall,
 };
 pub use cleanup::{CleanupOptions, CleanupPlan, CleanupReport, CleanupScope};
+pub use shadow_layer::{ObjectShadow, ShadowKey, ShadowLayer};
 pub use camera_track::{
     CameraKey, CameraMove, CameraTrack, DEFAULT_FOCAL_DISTANCE, FocusKey, MAX_TILT, NamedAngle,
 };
@@ -317,6 +319,10 @@ pub struct Scene {
     /// The animated camera. Off until the user enables it. Private for the
     /// same reason as `stage`.
     camera: CameraTrack,
+    /// The Shadow layer: each stage object's own shadow, keyed on its row
+    /// under the camera's. See [`crate::shadow_layer`]. Private for the same
+    /// reason as `stage`.
+    shadows: ShadowLayer,
     /// Reusable symbols, organised into folders. Private for the same reason.
     library: Library,
     /// Imported sounds. Private for the same reason as the library.
@@ -413,6 +419,7 @@ impl Clone for Scene {
         Self {
             stage: self.stage,
             camera: self.camera.clone(),
+            shadows: self.shadows.clone(),
             library: self.library.clone(),
             sounds: self.sounds.clone(),
             images: self.images.clone(),
@@ -581,6 +588,7 @@ impl PartialEq for Scene {
     fn eq(&self, other: &Self) -> bool {
         self.stage == other.stage
             && self.camera == other.camera
+            && self.shadows == other.shadows
             && self.library == other.library
             && self.sounds == other.sounds
             && self.lights == other.lights
@@ -598,6 +606,7 @@ impl Default for Scene {
         let mut scene = Self {
             stage: StageProperties::default(),
             camera: CameraTrack::new(),
+            shadows: ShadowLayer::default(),
             library: Library::new(),
             sounds: SoundLibrary::default(),
             images: ImageLibrary::default(),
@@ -647,6 +656,7 @@ impl Scene {
         Self {
             stage: StageProperties::default(),
             camera: CameraTrack::new(),
+            shadows: ShadowLayer::default(),
             library: Library::new(),
             sounds: SoundLibrary::default(),
             images: ImageLibrary::default(),
@@ -1072,6 +1082,17 @@ impl Scene {
     pub fn camera_mut(&mut self) -> &mut CameraTrack {
         self.revision += 1;
         &mut self.camera
+    }
+
+    /// The Shadow layer. See [`crate::shadow_layer`].
+    pub fn shadow_layer(&self) -> &ShadowLayer {
+        &self.shadows
+    }
+
+    /// Mutable Shadow layer. Bumps the revision, so every change is undoable.
+    pub fn shadow_layer_mut(&mut self) -> &mut ShadowLayer {
+        self.revision += 1;
+        &mut self.shadows
     }
 
     /// **Move the camera nearer or further, carrying the layers with it.**
